@@ -81,7 +81,10 @@ slot_shape_problems() {
 		common=$(cd "$real" && cd "$(git rev-parse --git-common-dir)" && pwd -P) &&
 		[[ $top == "$real" && $common == "$repo" ]] ||
 		{ echo "not a worktree of $REPO"; return 0; }
-	changes=$(git -C "$real" status --porcelain --untracked-files=all 2>&1) || { echo "git status failed"; return 0; }
+	# status also inspects leased slots: no index refresh, whose index.lock
+	# would make a working agent's git add or commit fail.
+	changes=$(git --no-optional-locks -C "$real" status --porcelain --untracked-files=all 2>&1) ||
+		{ echo "git status failed"; return 0; }
 	[[ -z $changes ]] || echo "dirty"
 	git -C "$real" symbolic-ref -q HEAD >/dev/null && echo "on-branch $(git -C "$real" symbolic-ref --short HEAD)"
 	git -C "$real" rev-parse -q --verify 'HEAD^{commit}' >/dev/null || echo "no valid HEAD"

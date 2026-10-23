@@ -6,6 +6,7 @@ fake merge gate and fake agents. Never touches the live pool.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -47,8 +48,23 @@ FAKE_GH = textwrap.dedent('''\
         print(f"https://example.invalid/pull/{n}")
     elif a[:2] == ["pr", "view"]:
         p = next(p for p in db["prs"] if p["number"] == int(a[2]))
-        print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": head(p["head"]),
-                          "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"]}))
+        h = p.get("merged_head") or head(p["head"])
+        print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": h,
+                          "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"],
+                          "mergeCommit": {"oid": p["squash"]} if p.get("squash") else None}))
+    elif a[:1] == ["api"] and a[1].endswith("/rulesets/24420032"):
+        if os.path.exists(os.environ.get("FAKE_GH_DOWN", "/nonexistent")):
+            sys.exit("fake gh: api unavailable")
+        print(open(os.environ["FAKE_RULESET"]).read())
+    elif a[:2] == ["pr", "update-branch"]:
+        import tempfile
+        p = next(p for p in db["prs"] if p["number"] == int(a[2]))
+        w = tempfile.mkdtemp()
+        g = lambda *x: subprocess.run(["git", "-C", w, *x], check=True, capture_output=True)
+        subprocess.run(["git", "clone", "-q", "-b", p["head"], os.environ["FAKE_ORIGIN"], w], check=True)
+        g("merge", "-q", "--no-edit", "origin/" + p["base"])
+        g("push", "-q", "origin", "HEAD:" + p["head"])
+        print("updated")
     else:
         sys.exit("fake gh: unsupported " + " ".join(a))
 ''')
@@ -66,6 +82,109 @@ FAKE_GATE = textwrap.dedent('''\
 
 GREEN = [{"name": "ci", "conclusion": "SUCCESS"}, {"name": "race", "conclusion": "SUCCESS"}]
 
+# codex stand-in. Per task, log/codex-plan.json lists one action per
+# execution (the last repeats); every call is recorded in log/codex-calls.jsonl
+# with what the sandbox let it see and do.
+FAKE_CODEX = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json, os, re, subprocess, sys
+    from pathlib import Path
+    log = Path(os.environ["CG_TEST_LOG"]).parent
+    prompt = sys.argv[-1]
+    if prompt.startswith("You are the project manager"):
+        with open(log / "codex-calls.jsonl", "a") as f:
+            canary = (log / "pm-canary").read_text() if (log / "pm-canary").exists() else ""
+            try:
+                open(canary).read()
+                readable = True
+            except OSError:
+                readable = False
+            f.write(json.dumps({"key": "pm", "role": "pm", "cwd": os.getcwd(), "canary_readable": readable}) + "\\n")
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                                                             "text": (log / "pm-answer.json").read_text()}}))
+        sys.exit(0)
+    role = "review" if prompt.startswith("Independent review") else "implement"
+    tid = re.search(r"[Tt]ask ([A-Za-z0-9._-]+):", prompt).group(1)
+    key = tid if role == "implement" else "review:" + tid
+    calls = log / "codex-calls.jsonl"
+    n = sum(1 for l in calls.read_text().splitlines() if json.loads(l)["key"] == key) if calls.exists() else 0
+    plan = json.loads((log / "codex-plan.json").read_text()) if (log / "codex-plan.json").exists() else {}
+    acts = plan.get(key) or ["commit" if role == "implement" else "approve"]
+    act = acts[min(n, len(acts) - 1)]
+    home = Path(os.environ.get("CODEX_HOME", ""))
+    def can(f):
+        try:
+            f()
+            return True
+        except Exception:
+            return False
+    def touch_slot():
+        Path("probe-write").write_text("x")
+        Path("probe-write").unlink()
+    def make_ref():
+        subprocess.run(["git", "branch", "probe-ref"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-D", "probe-ref"], capture_output=True)
+    rec = {"key": key, "role": role, "act": act, "argv": sys.argv[1:-1], "prompt": prompt,
+           "codex_home": str(home), "auth_copied": (home / "auth.json").is_file(),
+           "keychain_readable": can(lambda: (Path.home() / "Library/Keychains/probe").read_text()),
+           "state_readable": can(lambda: (Path(os.environ["CG_COORD_STATE"]) / "state.json").read_text()),
+           "slot_write_ok": can(touch_slot), "ref_write_ok": can(make_ref)}
+    with open(calls, "a") as f:
+        f.write(json.dumps(rec) + "\\n")
+    with open(os.environ["CG_TEST_LOG"], "a") as f:
+        f.write(f"start {key}\\n")
+    def emit(kind, **item):
+        print(json.dumps({"type": kind, "item": item} if item else {"type": kind}), flush=True)
+    def say(text):
+        emit("item.completed", type="agent_message", text=text)
+    emit("thread.started")
+    if role == "review":
+        verdict = "REQUEST_CHANGES\\nBlocking: 1" if act == "reject" else "APPROVE\\nBlocking: 0"
+        say("reviewed\\nVerdict: " + verdict)
+        sys.exit(0)
+    if act == "claim-done":
+        say("DONE. All acceptance criteria are met and tests pass.")
+        sys.exit(0)
+    if act == "exit1":
+        sys.exit(1)
+    if act == "sleep-commit":
+        import time
+        time.sleep(4)
+    os.makedirs("work", exist_ok=True)
+    with open(f"work/{tid}.txt", "a") as f:
+        f.write(f"{tid} {n}\\n")
+    for cmd in (["git", "add", "work"], ["git", "commit", "-qm", tid]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        emit("item.completed", type="command_execution", command=" ".join(cmd), exit_code=r.returncode)
+    if act in ("refresh-commit", "foreign-commit"):
+        a = json.loads((home / "auth.json").read_text())
+        if act == "refresh-commit":
+            a["tokens"]["access_token"] = "refreshed"
+        else:
+            a["tokens"]["account_id"] = "acct-2"
+        (home / "auth.json").write_text(json.dumps(a))
+    say("DONE")
+''')
+
+
+def install_fake_codex(t, env):
+    """Puts the fake codex first on PATH, with a fake login and a keychain
+    file the sandbox must hide."""
+    (t / "bin/codex").write_text(FAKE_CODEX)
+    (t / "bin/codex").chmod(0o755)
+    (t / "home/.codex").mkdir(parents=True, exist_ok=True)
+    (t / "home/.codex/auth.json").write_text(json.dumps(
+        {"auth_mode": "chatgpt", "tokens": {"account_id": "acct-1", "access_token": "a"}}))
+    (t / "home/Library/Keychains").mkdir(parents=True, exist_ok=True)
+    (t / "home/Library/Keychains/probe").write_text("secret")
+    env["PATH"] = f"{t / 'bin'}:{env['PATH']}"
+
+
+def scratch_root(state):
+    """coordinator.scratch_root for that state directory."""
+    key = hashlib.sha256(os.path.realpath(state).encode()).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"cg-coord-{key}"
+
 
 def sh(script):
     return ["/bin/sh", "-c", script]
@@ -81,9 +200,18 @@ def commit(name, sleep=0):
 APPROVE = sh('git diff --stat "origin/v2.0...HEAD" >/dev/null && printf "looks fine\\nVerdict: APPROVE\\nBlocking: 0\\n"')
 
 
-class Pool(unittest.TestCase):
+class Fixture(unittest.TestCase):
+    """Throwaway remote, slots, leases and fakes; shared with test_campaign.py."""
+
     def setUp(self):
         self.t = Path(tempfile.mkdtemp()).resolve()
+        self.all_out = ""
+        # Agents may write /private/tmp, so fixtures there would make every
+        # sandbox assertion pass or fail for the wrong reason.
+        if str(self.t).startswith("/private/tmp/"):
+            shutil.rmtree(self.t, True)
+            self.fail(f"TMPDIR {tempfile.gettempdir()} is under /private/tmp, which the agent sandbox leaves "
+                      "writable; run the tests with the default TMPDIR")
         self.addCleanup(shutil.rmtree, self.t, True)
         t = self.t
         self.origin = t / "origin.git"
@@ -112,7 +240,11 @@ class Pool(unittest.TestCase):
                     "FAKE_GATE_REFUSE": str(t / "gate-refuse"), "CG_TEST_LOG": str(self.log),
                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
                     "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": "/dev/null",
-                    "HOME": str(t / "home"), "CG_COORD_SANDBOX_WRITABLE": str(t / "log")}
+                    "HOME": str(t / "home"), "CG_COORD_SANDBOX_WRITABLE": str(t / "log"),
+                    # Agents inherit only these (and the basics): see ENV_KEEP.
+                    "CG_COORD_SANDBOX_ENV": "CG_TEST_LOG:CG_COORD_STATE:CTL:FAKE_ORIGIN:GIT_AUTHOR_NAME:"
+                                            "GIT_AUTHOR_EMAIL:GIT_COMMITTER_NAME:GIT_COMMITTER_EMAIL"}
+        self.addCleanup(shutil.rmtree, scratch_root(self.state), True)
         self.git("init", "-q", "--bare", str(self.origin))
         self.git("clone", "-q", str(self.origin), str(self.seed))
         self.git("-C", str(self.seed), "commit", "-q", "--allow-empty", "-m", "base")
@@ -130,6 +262,7 @@ class Pool(unittest.TestCase):
         p = subprocess.run([sys.executable, str(COORD), *args], env={**self.env, **env},
                            capture_output=True, text=True)
         self.out = p.stdout + p.stderr
+        self.all_out += self.out
         if ok is not None:
             self.assertEqual(p.returncode == 0, ok, self.out)
         return p
@@ -189,6 +322,8 @@ class Pool(unittest.TestCase):
         for tok in tokens:
             self.assertNotIn(tok, self.out)
 
+
+class Pool(Fixture):
     # ------------------------------------------------------------ scheduling
 
     def test_two_concurrent_third_queued_then_full_flow(self):
@@ -292,6 +427,13 @@ class Pool(unittest.TestCase):
         other = B if slot == A else A
         self.assertIsNone(self.lease(other))
         self.run_until(lambda: self.status("x") == "awaiting_ci")
+
+    def test_run_on_an_empty_queue_leaves_a_usable_state(self):
+        (self.slots / R / "dirty.txt").write_text("x")  # makes prepare log an event
+        self.coord("run", "--once", ok=True)
+        self.assertTrue((self.state / "events.jsonl").exists())
+        self.coord("status", ok=True)
+        self.coord("run", "--once", ok=True)
 
     def test_missing_or_malformed_state(self):
         self.plan(self.task("x", commit("x", 1)))
@@ -823,6 +965,8 @@ class Pool(unittest.TestCase):
                 os.killpg(pid, 0)
             except ProcessLookupError:
                 break
+            except PermissionError:  # members still exiting
+                pass
             time.sleep(0.1)
         self.coord("run", "--once")
         t = self.st()["x"]
@@ -951,7 +1095,7 @@ class Pool(unittest.TestCase):
         self.coord("run", "--once", CG_COORD_SANDBOX_WRITABLE=f"{self.t / 'log'}:{self.t / 'home/.config'}")
         self.assertEqual(self.status("x"), "blocked")
         self.assertIn("contains protected", self.st()["x"]["reason"])
-        self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-agent-*/x")))
+        self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-coord-*/cg-agent-*/x")))
 
     def test_ignored_tool_configuration_in_slot_fails_the_task(self):
         # Unsandboxed command agents (or a sandbox gap) could leave it.
@@ -968,12 +1112,270 @@ class Pool(unittest.TestCase):
         self.assertIn("ignored tool configuration", self.st()["x"]["reason"])
         self.assertIsNotNone(self.lease(A))
 
-    def test_codex_adapter_refused(self):
-        f = self.t / "codex.json"
-        for spec in ({"agent": "codex"}, {"review": {"agent": "codex"}}):
-            f.write_text(json.dumps({"tasks": [{**self.task("x", commit("x")), **spec}]}))
+    def test_plan_rejects_bad_max_attempts(self):
+        f = self.t / "attempts.json"
+        for bad in (0, 6, "2", True):
+            f.write_text(json.dumps({"tasks": [self.task("x", commit("x"), max_attempts=bad)]}))
             self.coord("plan", str(f), ok=False)
-            self.assertIn("codex adapter is disabled", self.out)
+            self.assertIn("max_attempts", self.out)
+
+    # ------------------------------------------------------------ continuation and STOP
+
+    def test_agent_that_stops_short_is_continued_in_place(self):
+        # First execution exits 0 without a commit, the second leaves dirty
+        # work, the third commits it: one slot, one lease, one PR.
+        n = self.t / "log/n"
+        agent = sh(f'echo x >>{n}; c=$(wc -l <{n}); echo "start $c" >>"$CG_TEST_LOG"; '
+                   f'[ $c -eq 1 ] && exit 0; mkdir -p work; echo $c >work/x.txt; [ $c -eq 2 ] && exit 0; '
+                   f'git add work && git commit -qm x')
+        self.plan(self.task("x", agent, max_attempts=3))
+        self.run_until(lambda: self.status("x") == "awaiting_ci", 60)
+        cont = [e for e in self.events() if e["event"] == "continue"]
+        self.assertEqual([e["reason"].split(";")[0] for e in cont],
+                         ["agent produced no new commit", f"agent left {A} dirty"])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "acquired" and e["slot"] != R]), 1)
+        self.assertEqual(self.st()["x"]["tries"], 3)
+        self.assertEqual(len(json.loads(self.db.read_text())["prs"]), 1)
+
+    def test_continuation_is_bounded(self):
+        self.plan(self.task("x", commit("x"), validate=["false"], max_attempts=2))
+        self.run_until(lambda: self.status("x") == "failed", 40)
+        self.assertEqual(len(self.starts_of("x")), 2)
+        self.assertIn("validation failed", self.st()["x"]["reason"])
+        self.assertIsNotNone(self.lease(self.st()["x"]["slot"]))
+        self.coord("run", "--once")
+        self.assertEqual(len(self.starts_of("x")), 2)
+
+    def test_stop_file_prevents_launch_and_continuation(self):
+        stop = self.state / "STOP"
+        self.state.mkdir(exist_ok=True)
+        self.plan(self.task("a", sh("sleep 1; true"), max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.assertEqual(self.status("a"), "running")
+        stop.write_text("")
+        self.plan(self.task("b", commit("b")))
+        self.run_until(lambda: self.status("a") == "interrupted")
+        self.assertIn("not continued", self.st()["a"]["reason"])
+        self.assertEqual(self.status("b"), "pending")
+        self.assertIn("STOP", self.out)
+        stop.unlink()
+        self.run_until(lambda: self.status("b") == "awaiting_ci")
+
+    # ------------------------------------------------------------ authorization gate
+
+    def gate(self, *ids, raw=None):
+        g = self.t / "gate.json"
+        g.write_text(raw if raw is not None else json.dumps({"tasks": list(ids)}))
+        self.env["CG_COORD_AUTHORIZED"] = str(g)
+
+    def test_gate_holds_unauthorized_tasks_and_fails_closed(self):
+        self.gate("a")
+        self.plan(self.task("a", commit("a")), self.task("b", commit("b")))
+        self.coord("run", "--once", ok=True)
+        self.assertEqual((self.status("a"), self.status("b")), ("running", "pending"))
+        self.assertIn(("b", "implement"), [(e["task"], e.get("action")) for e in self.events()
+                                            if e["event"] == "deauthorized"])
+        self.gate(raw="{not json")
+        self.run_until(lambda: self.status("a") == "awaiting_review")
+        self.coord("run", "--once")
+        self.assertEqual((self.status("a"), self.status("b")), ("awaiting_review", "pending"))  # nothing reviewed
+        self.gate("a", "b")
+        self.run_until(lambda: self.status("a") == "awaiting_ci" and self.status("b") == "awaiting_ci")
+
+    def test_revoked_task_is_not_continued_and_resumes_when_reauthorized(self):
+        n = self.t / "log/n"
+        agent = sh(f'echo x >>{n}; [ $(wc -l <{n}) -eq 1 ] && exit 0; '
+                   'mkdir -p work && echo x >work/x.txt && git add work && git commit -qm x')
+        self.gate("x")
+        self.plan(self.task("x", agent, max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.gate()
+        self.run_until(lambda: self.status("x") == "blocked")
+        t = self.st()["x"]
+        self.assertTrue(t["reason"].startswith("deauthorized"))
+        self.assertIsNotNone(self.lease(t["slot"]))  # work and lease kept
+        self.gate("x")
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        self.assertIn("reauthorized", [e["event"] for e in self.events()])
+
+    def test_claude_agents_need_an_explicit_opt_in(self):
+        self.plan({**self.task("x", None), "agent": "claude", "command": None})
+        self.run_until(lambda: self.status("x") == "blocked")
+        self.assertIn("CG_COORD_ALLOW_CLAUDE", self.st()["x"]["reason"])
+
+    def test_reauthorized_task_without_its_lease_is_not_launched(self):
+        self.gate("x")
+        self.plan(self.task("x", sh("true"), max_attempts=3))
+        self.coord("run", "--once", ok=True)
+        self.gate()
+        self.run_until(lambda: self.status("x") == "blocked")
+        t = self.st()["x"]
+        token = (self.state / "tokens" / f"x.{t['slot']}.token").read_text().strip()
+        subprocess.run([str(POOL), "release", "--slot", t["slot"], "--token", token], env=self.env, check=True,
+                       capture_output=True)
+        self.foreign_lease(t["slot"])
+        self.gate("x")
+        self.run_until(lambda: self.status("x") == "interrupted")
+        self.assertIn("lease", self.st()["x"]["reason"])
+        self.assertEqual(len(self.starts_of("x")), 1)
+
+    def test_review_refuses_a_checkout_that_differs_from_the_remote(self):
+        """An agent rewrote a loose object in the shared store: the review
+        slot would show content the remote does not have."""
+        import zlib
+        self.gate("x")
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", ok=True)
+        self.gate()  # hold the review until the store is tampered with
+        self.run_until(lambda: self.status("x") == "awaiting_review", 30)
+        self.gate("x")
+        blob = self.git("-C", str(self.seed), "rev-parse", "task/x:work/x.txt")
+        obj = self.seed / ".git/objects" / blob[:2] / blob[2:]
+        forged = b"forged\n"
+        obj.chmod(0o644)
+        obj.write_bytes(zlib.compress(b"blob %d\0" % len(forged) + forged))
+        self.run_until(lambda: self.status("x") == "failed")
+        self.assertIn("differs from the remote", self.st()["x"]["reason"])
+        self.assertIn("checkout_mismatch", [e["event"] for e in self.events()])
+
+    def test_missing_review_slot_waits_without_losing_work(self):
+        hidden = self.t / "review-moved"
+        (self.slots / R).rename(hidden)
+        self.plan(self.task("x", commit("x")))
+        self.run_until(lambda: self.status("x") == "awaiting_review")
+        for _ in range(3):
+            self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "awaiting_review")
+        hidden.rename(self.slots / R)
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+
+    def test_validation_has_only_localhost_network(self):
+        import http.server
+        import threading
+        srv = http.server.HTTPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        # Another host the machine itself can reach, so a refusal is the
+        # sandbox's. Not this host's own LAN address: seatbelt counts every
+        # local interface address as localhost.
+        gw = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+        gw = next((l.split()[-1] for l in gw.splitlines() if "gateway:" in l), "")
+        remote = next((u for u in ([f"http://{gw}/"] if gw else []) + ["https://example.com/"]
+                       if subprocess.run(["curl", "-s", "-m", "5", "-o", "/dev/null", u]).returncode == 0), None)
+        if not remote:
+            self.skipTest("no non-localhost target reachable from this host")
+        # The listener above exists before launch (like adb or a proxy): denied.
+        # A listener the sandboxed process opens itself (a test's httptest): allowed.
+        own = ('python3 -c "import socket;s=socket.socket();s.bind((\'127.0.0.1\',0));s.listen();'
+               'c=socket.create_connection(s.getsockname());print(\'OWN-LISTENER-OK\')"')
+        probe = (f'(curl -s -m 5 -o /dev/null http://127.0.0.1:{port}/ && echo PREEXISTING-REACHED; '
+                 f'curl -s -m 5 -o /dev/null {remote} && echo REMOTE-REACHED; {own}) >>"$CG_TEST_LOG"; true')
+        self.plan(self.task("x", commit("x"), validate=[probe]))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        log = self.log.read_text()
+        self.assertIn("OWN-LISTENER-OK", log)
+        self.assertNotIn("PREEXISTING-REACHED", log)
+        self.assertNotIn("REMOTE-REACHED", log)
+
+    def starts_of(self, tid):
+        return [e for e in self.events() if e["event"] == "launched" and e["task"] == tid and e["kind"] == "implement"]
+
+    # ------------------------------------------------------------ codex adapter
+
+    def install_codex(self):
+        install_fake_codex(self.t, self.env)
+
+    def test_codex_implements_and_reviews_inside_the_sandbox(self):
+        self.install_codex()
+        (self.t / "log/codex-plan.json").write_text(json.dumps(
+            {"x": ["claim-done", "commit"], "review:x": ["write-then-approve"]}))
+        self.plan({**self.task("x", None, max_attempts=2), "agent": "codex", "command": None,
+                   "review": {"agent": "codex"}})
+        self.run_until(lambda: self.status("x") in ("awaiting_ci", "failed"), 60)
+        self.assertEqual(self.status("x"), "awaiting_ci", self.st()["x"].get("reason"))
+        calls = [json.loads(l) for l in (self.t / "log/codex-calls.jsonl").read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "implement", "review"])
+        for c in calls:
+            self.assertEqual(c["argv"][:4], ["exec", "--json", "--ephemeral",
+                                             "--dangerously-bypass-approvals-and-sandbox"])
+            self.assertTrue(c["codex_home"].startswith(tempfile.gettempdir().rstrip("/")) or
+                            "/cg-agent-" in c["codex_home"], c)
+            self.assertNotEqual(c["codex_home"], str(self.t / "home/.codex"))
+            self.assertTrue(c["auth_copied"])
+            self.assertFalse(c["keychain_readable"])
+            self.assertFalse(c["state_readable"])
+        self.assertIn("previous attempt ended", calls[1]["prompt"])
+        self.assertIn("no new commit", calls[1]["prompt"])
+        self.assertFalse(calls[2]["slot_write_ok"])  # reviewer cannot write the review slot
+        self.assertFalse(calls[2]["ref_write_ok"])   # nor create a branch
+        self.assertEqual(self.git("-C", str(self.slots / R), "status", "--porcelain", "--untracked-files=all"), "")
+        launched = [e for e in self.events() if e["event"] == "launched"]
+        self.assertTrue(all(e["argv0"] == "/usr/bin/sandbox-exec" for e in launched))
+        self.assert_no_token_leak()
+
+    def test_login_copy_abandoned_by_a_killed_coordinator_is_removed_on_restart(self):
+        """Killed after CODEX_HOME holds the copied login but before the task
+        records its scratch: nothing else knows that directory."""
+        self.install_codex()
+        (self.t / "home/.codex/auth.json").write_text('{"synthetic": "SECRET-CANARY"}')
+        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["commit"]}))
+        self.plan({**self.task("x", None), "agent": "codex", "command": None})
+        self.assertEqual(self.coord("run", "--once", CG_COORD_FAULT="launch_before_record").returncode, 70)
+        root = scratch_root(self.state)
+        left = list(root.glob("cg-agent-*/codex-home/auth.json"))
+        self.assertEqual(len(left), 1)
+        self.assertEqual(oct(left[0].stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(oct(root.stat().st_mode & 0o777), oct(0o700))
+        self.assertNotIn(str(left[0].parent.parent), json.dumps(self.st()))  # unrecorded
+        self.coord("run", "--once")
+        self.assertFalse(list(root.glob("cg-agent-*")), list(root.iterdir()))
+        swept = [e for e in self.events() if e["event"] == "scratch_swept"]
+        self.assertEqual(swept[0]["removed"], [left[0].parent.parent.name])
+        self.assertNotIn("SECRET-CANARY", self.all_out + (self.state / "events.jsonl").read_text())
+
+    def test_codex_login_copy_is_never_written_back(self):
+        self.install_codex()
+        auth = self.t / "home/.codex/auth.json"
+        before = auth.read_bytes()
+        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["refresh-commit"]}))
+        self.plan({**self.task("x", None), "agent": "codex", "command": None})
+        self.run_until(lambda: self.status("x") == "awaiting_ci", 60)
+        self.assertEqual(auth.read_bytes(), before)
+        self.assertIn("not copied back", self.all_out)
+
+    def test_validation_and_agents_cannot_read_owner_secrets(self):
+        """Agent-written code runs in validation too: it must see no keychain,
+        no other coordinator's state under the evidence root, no ssh keys."""
+        probes = {"keychain": self.t / "home/Library/Keychains/probe", "ssh": self.t / "home/.ssh/id_probe",
+                  "evidence": self.t / "home/Projekti/codegraph-evidence/coordinator/tokens/x.token",
+                  "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json",
+                  "aws": self.t / "home/.aws/credentials", "history": self.t / "home/.zsh_history",
+                  "other": self.t / "home/Documents/canary.txt", "gitconfig": self.t / "home/.gitconfig"}
+        for f in probes.values():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("secret")
+        user_tmp = os.path.realpath(subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,
+                                                   text=True).stdout.strip())
+        tmp_canary = Path(tempfile.mkdtemp(dir="/private/tmp")) / "canary"
+        tmp_canary.write_text("secret")
+        self.addCleanup(shutil.rmtree, tmp_canary.parent, True)
+        probes["private-tmp"] = tmp_canary
+        reads = "; ".join(f'cat {f} >/dev/null 2>&1 && echo LEAK-{k}' for k, f in probes.items())
+        reads += (f'; echo x >/private/tmp/cg-probe-$$ 2>/dev/null && echo LEAK-tmp-write'
+                  f'; (: >{user_tmp}/cg-sandbox-probe-$$) 2>/dev/null && echo LEAK-usertmp-write'
+                  f'; cat {user_tmp}/xcrun_db >/dev/null 2>&1 && echo LEAK-xcrun-read'
+                  '; [ -n "$CG_ENV_CANARY" ] && echo LEAK-env'
+                  '; cat work/x.txt >/dev/null 2>&1 && echo READ-OK')  # positive control: the slot
+        self.env["CG_ENV_CANARY"] = "token"
+        self.plan(self.task("x", sh(f'mkdir -p work && echo x >work/x.txt && ({reads}) >>"$CG_TEST_LOG"; '
+                                    'git add work && git commit -qm x'),
+                            validate=[f'({reads}) >>"$CG_TEST_LOG"; true']))
+        self.run_until(lambda: self.status("x") == "awaiting_ci")
+        log = self.log.read_text()
+        self.assertNotIn("LEAK", log)
+        self.assertEqual(log.count("READ-OK"), 2)
+
 
     # ------------------------------------------------------------ overlapping adopted PRs
 
@@ -994,13 +1396,31 @@ class Pool(unittest.TestCase):
             m = self.t / f"log/reviewed-{tid}"
             review = sh(f'if [ -e {m} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
                         f'else touch {m}; printf "Verdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
-            tasks.append(self.task(tid, commit(tid, 1), scope=["work/*"], review=review, pr=n,
-                                   branch=f"task/{tid}"))
+            # Rework holds until the test opens its gate, so the other PR's
+            # rejection always lands while it runs, however loaded the machine.
+            gate = self.t / f"log/go-{tid}"
+            rework = sh(f'echo "start {tid}" >>"$CG_TEST_LOG"; i=0; while [ ! -e {gate} ]; do '
+                        f'i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.1; done; '
+                        f'mkdir -p work && echo {tid}-$RANDOM >>work/{tid}.txt && git add work && '
+                        f'git commit -qm {tid} && echo "end {tid}" >>"$CG_TEST_LOG"')
+            tasks.append(self.task(tid, rework, scope=["work/*"], review=review, pr=n, branch=f"task/{tid}"))
         self.plan(*tasks)
+
+        def started():
+            lines = self.log.read_text().splitlines() if self.log.exists() else []
+            return [l.split()[1] for l in lines if l.startswith("start")]
+        self.run_until(lambda: started(), 90)
+        first = started()[0]
+        other = "p2" if first == "p1" else "p1"
+        self.run_until(lambda: len(started()) > 1 or [e for e in self.events() if e["event"] == "waiting_on"
+                                                      and e["task"] == other and e.get("other") == first], 90)
+        self.assertEqual(started(), [first])  # the other PR's rework did not start meanwhile
+        (self.t / f"log/go-{first}").touch()
+        (self.t / f"log/go-{other}").touch()
         self.run_until(lambda: all(t["status"] == "awaiting_ci" for t in self.st().values()), 90)
-        words = [l.split()[0] for l in self.log.read_text().splitlines()]
-        self.assertEqual(words, ["start", "end", "start", "end"])  # rework never overlapped
-        self.assertTrue([e for e in self.events() if e["event"] == "waiting_on" and e.get("other")])
+        # Safety: overlapping rework is serialized.
+        self.assertEqual(self.log.read_text().splitlines(),
+                         [f"start {first}", f"end {first}", f"start {other}", f"end {other}"])
         for tid in ("p1", "p2"):
             self.assertIn(f"{tid}-init.txt", self.git("--git-dir", str(self.origin), "ls-tree", "-r",
                                                       "--name-only", f"task/{tid}"))
@@ -1029,10 +1449,171 @@ class Units(unittest.TestCase):
         self.assertTrue(o([], ["docs/*"]))
 
     def test_adapters_never_bypass_permissions(self):
-        for name in ("claude", "codex"):
-            for review in (False, True):
-                argv = self.c.ADAPTERS[name]("p", "s", ["Read"], review)
-                self.assertFalse([a for a in argv if "dangerously" in a or a == "bypassPermissions"], argv)
+        for review in (False, True):
+            argv = self.c.ADAPTERS["claude"]("p", "s", ["Read"], review)
+            self.assertFalse([a for a in argv if "dangerously" in a or a == "bypassPermissions"], argv)
+
+    def test_codex_never_runs_outside_the_coordinator_sandbox(self):
+        argv = self.c.ADAPTERS["codex"]("p", "s", ["Read"], False)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        real = self.c.sandbox_available
+        self.c.sandbox_available = lambda: False
+        try:
+            with self.assertRaises(self.c.Refused):
+                self.c.isolate("codex", argv)
+        finally:
+            self.c.sandbox_available = real
+
+
+class ScratchSweep(unittest.TestCase):
+    """Restart-time removal of abandoned scratch (copied logins), with
+    synthetic credentials and real killed processes."""
+
+    HOLDER = textwrap.dedent('''\
+        import os, sys, time
+        sys.path.insert(0, sys.argv[1])
+        import coordinator
+        s = coordinator.new_scratch()
+        os.makedirs(s + "/codex-home", 0o700)
+        with open(s + "/codex-home/auth.json", "w") as f:
+            f.write("SECRET-CANARY")
+        print(s, flush=True)
+        time.sleep(600)
+    ''')
+
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.t, True)
+        self.state = self.t / "state"
+        self.env = {**os.environ, "CG_COORD_STATE": str(self.state)}
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(HERE))
+        import coordinator
+        self.c = coordinator
+        self.real_state = coordinator.STATE_DIR
+        coordinator.STATE_DIR = self.state
+        self.addCleanup(setattr, coordinator, "STATE_DIR", self.real_state)
+        self.root = scratch_root(self.state)
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def holder(self):
+        """A supervisor that created a scratch with a login copy and holds it."""
+        p = subprocess.Popen([sys.executable, "-c", self.HOLDER, str(HERE)], env=self.env,
+                             stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p, Path(p.stdout.readline().strip())
+
+    def test_hard_killed_supervisor_scratch_is_kept_while_alive_then_removed(self):
+        p, s = self.holder()
+        self.assertEqual(oct(self.root.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(oct(s.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))  # lock held: live
+        p.kill()  # SIGKILL: no cleanup runs
+        p.wait()
+        self.assertTrue((s / "codex-home/auth.json").exists())
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+        self.assertFalse(s.exists())
+        self.assertFalse(Path(f"{s}.lock").exists())
+
+    def test_scratch_a_live_process_still_uses_is_kept(self):
+        p, s = self.holder()
+        # Processes that outlived their supervisor without the lock fd: one
+        # named by its arguments, one working inside the scratch.
+        named = subprocess.Popen(["/bin/sh", "-c", "sleep 600", str(s)])
+        inside = subprocess.Popen(["sleep", "600"], cwd=s / "codex-home")
+        for a in (named, inside):
+            self.addCleanup(lambda a=a: (a.kill(), a.wait()))
+        p.kill()
+        p.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        named.kill()
+        named.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        inside.kill()
+        inside.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+
+    def test_lock_inherited_through_the_sandbox_keeps_scratch_after_a_hard_kill(self):
+        """The agent child neither names the scratch nor works in it: only
+        the lock it inherited (as launch and the campaign pass it) shows it is alive."""
+        if not self.c.sandbox_available():
+            self.skipTest("sandbox-exec is macOS only")
+        holder = textwrap.dedent('''\
+            import subprocess, sys, time
+            sys.path.insert(0, sys.argv[1])
+            import coordinator
+            argv, s = coordinator.sandboxed(["/bin/sleep", "600"], readonly=True, cwd="/")
+            child = subprocess.Popen(argv, cwd="/", pass_fds=coordinator.scratch_fds(s), start_new_session=True)
+            print(s, child.pid, flush=True)
+            time.sleep(600)
+        ''')
+        p = subprocess.Popen([sys.executable, "-c", holder, str(HERE)], env=self.env, stdout=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        s, pid = p.stdout.readline().split()
+        s, pid = Path(s), int(pid)
+        self.addCleanup(lambda: os.killpg(pid, signal.SIGKILL) if self.c.group_alive(pid) else None)
+        for _ in range(50):  # until sandbox-exec and env have exec'd into sleep
+            if subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
+                              text=True).stdout.strip() == "/bin/sleep 600":
+                break
+            time.sleep(0.1)
+        p.kill()
+        p.wait()
+        self.assertNotIn(str(s), subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True,
+                                                text=True).stdout)
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        os.killpg(pid, signal.SIGKILL)
+        while self.c.group_alive(pid):
+            time.sleep(0.05)
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+
+    def test_lock_unlinked_before_it_was_taken_is_replaced(self):
+        real = self.c.fcntl.flock
+        def race(fd, op):  # a sweep unlinks the fresh, not yet locked file
+            if op == self.c.fcntl.LOCK_EX and not getattr(race, "done", False):
+                race.done = True
+                os.unlink(next(self.root.glob("cg-agent-*.lock")))
+            return real(fd, op)
+        self.c.fcntl.flock = race
+        try:
+            s = self.c.new_scratch()
+        finally:
+            self.c.fcntl.flock = real
+        self.addCleanup(self.c.release_scratch, s)
+        self.assertTrue(Path(f"{s}.lock").exists())
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [Path(s).name]))  # still locked by us
+
+    def test_recorded_unknown_and_unlocked_entries_are_never_removed(self):
+        p, s = self.holder()
+        p.kill()
+        p.wait()
+        self.assertEqual(self.c.sweep_scratch({os.path.realpath(s)}), ([], []))  # a task records it
+        self.assertTrue(s.exists())
+        (self.root / "notes").mkdir()
+        (self.root / "cg-agent-nolock").mkdir()  # not made by new_scratch
+        (self.root / "cg-agent-link").symlink_to(self.t)
+        Path(f"{self.root}/cg-agent-link.lock").touch()
+        outside = Path(tempfile.mkdtemp(prefix="cg-agent-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        removed, kept = self.c.sweep_scratch(set())
+        self.assertEqual(removed, [s.name])
+        self.assertEqual(sorted(kept), ["cg-agent-link", "cg-agent-nolock", "notes"])
+        self.assertTrue(outside.exists() and self.t.exists())
+
+    def test_root_that_is_not_private_is_refused(self):
+        self.root.mkdir(mode=0o700)
+        os.chmod(self.root, 0o755)
+        with self.assertRaises(self.c.Refused):
+            self.c.sweep_scratch(set())
+        with self.assertRaises(self.c.Refused):
+            self.c.new_scratch()
+
+    def test_normal_release_removes_scratch_and_lock(self):
+        s = self.c.new_scratch()
+        Path(s, "auth.json").write_text("SECRET-CANARY")
+        self.c.release_scratch(s)
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 if __name__ == "__main__":

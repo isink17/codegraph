@@ -72,6 +72,7 @@ Run it from a checkout whose `scripts/agent-pool/pool.sh` is the current
 | `review` | reviewer `agent` (`claude`, `codex`, `command`), optional `focus` |
 | `publish` | default `true`; `false` stops after validation and keeps the lease |
 | `pr` | adopt an existing open PR: the task starts at review |
+| `max_attempts` | agent executions per implementation round, 1–5, default `1` (see Continuation) |
 
 Review is always required: the merge gate demands it.
 
@@ -94,15 +95,26 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 2. **Agent exit.** Success is never inferred from the exit code. The
    coordinator requires exit 0, a clean tree, the task branch still checked
    out, at least one new commit, every changed file inside `scope`, and
-   every `validate` command passing (logs kept as evidence). It then pushes
+   every `validate` command passing (logs kept as evidence). An agent that
+   fails these checks (non-zero exit, dirty tree, no new commit, a change
+   outside scope, a failing or dirtying validation) is **continued**: the
+   same slot and branch, a new execution whose prompt names the failed check
+   and says that the checks, not the agent's claim, decide completion. Up to
+   `max_attempts` executions, then `failed`. Leaving the branch or planting
+   tool configuration is never continued. While the STOP file exists,
+   nothing is launched or continued (a stopped continuation becomes
+   `interrupted`). It then pushes
    the branch (never with force), opens a PR to `base` with `gh` if none is
    open, and releases the worker through `pool.sh release`.
 3. **Review.** One review at a time. The review slot is leased with
    `--review` (busy: `BLOCKED_REVIEW_BUSY`, the task waits), detached at the
-   PR head that GitHub reports, and a reviewer runs in a new session with
-   only Read, Grep and Glob; the coordinator writes the full diff against
-   `origin/<base>` to a file the reviewer may read. No shell is allowed:
-   `git diff --output` would write files. Afterwards the slot must still be clean and at that head,
+   PR head that GitHub reports, and a reviewer runs in a new session in a
+   read-only sandbox: it may write only its scratch directory, `/tmp` and
+   `/dev`, not the review slot and not the repository's objects or refs.
+   A Claude Code reviewer gets only Read, Grep and Glob; a Codex reviewer has
+   a shell, bounded by that sandbox. The coordinator writes the full diff
+   against `origin/<base>` to a file the reviewer may read. Afterwards the
+   slot must still be clean and at that head,
    otherwise the review is invalid. The coordinator writes the merge-gate
    artifact itself (`PR`, `Reviewed-Head` = the head it checked out,
    `Verdict`, `Blocking`) and releases the slot. `REQUEST_CHANGES` or any
@@ -208,10 +220,106 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   coordinator are unwritable. `git` and `gh` are resolved to absolute
   paths at start-up, and the coordinator's git calls disable hooks and
   fsmonitor. On
-  other platforms Claude Code agents are refused; `command` agents
-  (owner-written argv) run unsandboxed. The Codex adapter is disabled:
-  `codex exec` applies its own Seatbelt sandbox, which cannot nest inside
-  ours, and its `read-only` mode still reads every file.
+  other platforms Claude Code and Codex agents are refused; `command` agents
+  (owner-written argv) run unsandboxed.
+- **Codex.** `codex exec --json --ephemeral
+  --dangerously-bypass-approvals-and-sandbox <prompt>`, only ever inside the
+  coordinator's sandbox above (Codex's own Seatbelt sandbox cannot nest in
+  it, so ours is the boundary; verified with codex-cli 0.163.0: a write
+  outside the slot fails with `Operation not permitted`). Its `CODEX_HOME`
+  is a private directory in the run's scratch directory, seeded with a copy
+  of `~/.codex/auth.json` (`CG_COORD_CODEX_AUTH`) and, if
+  `CG_COORD_CODEX_CONFIG` names one, an owner-written `config.toml`; the
+  owner's `~/.codex` (config, hooks, rules, MCP servers with their
+  credentials, sessions, shell snapshots) is never loaded or written.
+  The login copy is never written back, since the agent controls it; if
+  Codex refreshed it during a run, the coordinator says so, because a
+  refresh may rotate the token the owner's copy holds (`codex login` fixes
+  that). The run's JSONL events in `output.log` are the transcript.
+- **Scratch lifecycle (copied logins).** Scratch directories live in a
+  private root, `$TMPDIR/cg-coord-<hash of the state directory>` (mode
+  0700, owned by the owner; any other root is refused). Each
+  `cg-agent-*` directory has a sibling `.lock` file created and locked
+  first. The coordinator, campaign PM, validation or ci-local holds the
+  lock while it uses the directory, and the process it starts there (a
+  launched agent, a validation command, the PM's Codex, ci-local)
+  inherits it, so the lock stays held while any of them lives. A scratch directory is removed when its run is known to be
+  over. A coordinator or campaign supervisor that is hard-killed (SIGKILL,
+  power loss) removes nothing at that moment: its scratch, a copied
+  `auth.json` included, stays on disk until the next coordinator pass
+  (`run`, or the campaign's next tick), whose reconcile sweeps the root.
+  The sweep removes only a `cg-agent-*` directory it can prove abandoned:
+  no task records it, its lock exists and is free, no live process names
+  it in its arguments, and `lsof` reports nothing open in it. Everything
+  else (recorded, locked, in use, unverifiable, unknown entries, links) is
+  kept and listed in a `scratch_swept` event; a failed process listing
+  refuses the sweep (`scratch_sweep_refused`). Directories outside the
+  root are never touched. Events name directories only, never contents.
+- **Strict profile.** Codex agents, `command` agents, validation commands
+  and the campaign's ci-local and PM runs read by allow-list only: the
+  system (`/System`, `/usr`, `/bin`, `/sbin`, `/Library` without its
+  keychains, `/opt`, `/Applications`, `/private/etc`, `/private/var/db`,
+  `/dev`; not `/private/tmp`, which holds other sessions' files), the
+  install directories of the tools they run
+  (codex, node, go, git, python3, …; a prefix containing the home
+  directory or a protected path, or lying directly in the home directory
+  like `~/.local` or `~/go`, is never used), the Go module cache and
+  GOROOT, `CG_COORD_SANDBOX_READABLE` entries, the slot, the repository's
+  git directory, owner-writable directories and their scratch directory.
+  Nothing else in the home directory is readable (synthetic canaries in
+  `~/.aws`, `~/.ssh`, `~/.gitconfig`, shell history, `~/Documents`, the
+  keychain, the evidence root and the primary checkout were verified
+  unreadable; `go build` with cgo, `go test` and `git commit` work).
+  File metadata (existence, size) stays visible. Writes: only the scratch
+  directory, `/dev`, owner-listed directories and, for implementers, the
+  slot and the git objects and branch refs a commit needs. The process
+  starts from an empty environment (`env -i`) plus `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `LANG`, `LC_*`, `TERM`, `SHELL`, `PWD`, the scratch-based
+  `TMPDIR`/Go/XDG variables, and names listed in `CG_COORD_SANDBOX_ENV`;
+  tokens and agent sockets in the coordinator's environment never reach
+  it. `GIT_CONFIG_GLOBAL` is `/dev/null`, so commits use the repository's
+  own identity. cgo builds use the Command Line Tools' `clang` directly
+  (`CC`, `SDKROOT` resolved outside the sandbox, and the Command Line
+  Tools' `usr/bin` first on `PATH`, so `git` and `python3` in validation
+  commands are Apple's), never through `xcrun`,
+  whose lookup cache in the per-user temp directory the owner's own
+  builds trust; that cache is neither readable nor writable inside. The
+  scratch directory must not be under `/tmp` (refused). Network:
+  outbound only to this host (seatbelt's `localhost`, which includes the
+  host's own interface addresses) and DNS, except every TCP or UDP port
+  already listening when the process starts, of any user (adb, local API proxies, file
+  servers would otherwise hand out what the file rules keep back; ports
+  opened later, such as a test's own listener, work;
+  `CG_COORD_SANDBOX_LOCAL_PORTS` allows listed ports; if the listeners
+  cannot be listed, no local port is reachable); Codex agents additionally reach
+  TCP port 443 of any host, for their model API — seatbelt cannot filter
+  by host name, so there is no destination allow-list, and what they can
+  send is what they can read. Claude Code agents are refused unless the
+  owner sets `CG_COORD_ALLOW_CLAUDE=1`; they then run in the legacy
+  profile (reads allowed except the evidence root, coordinator
+  state, `CG_COORD_DENY_READ`, `~/.ssh`, `~/.config/gh`, `~/.netrc`,
+  `~/.git-credentials`, `~/.codex`; keychain readable; network open),
+  because Claude Code keeps its login in the keychain — where `gh` also
+  keeps the owner's GitHub token, so a Claude agent can read it. The
+  campaign supervisor refuses them. Both adapters default to `codex`.
+- **Verified content.** Agents can write the shared object store, and git
+  does not re-hash objects it already has. Before a review, the PR's head
+  branch is fetched from the remote into the coordinator's private
+  repository (`<state>/gate-repo`) and must be exactly the head under
+  review; after the review slot is checked out, its files must hash to
+  that head's tree in the private repository (`checkout_mismatch`
+  otherwise, the task fails with the review lease kept). The diff the
+  reviewer reads comes from the private repository. The campaign's
+  ci-local checkout is verified the same way, with ignored files counted
+  (Go compiles ignored directories too).
+- **Authorization gate.** With `CG_COORD_AUTHORIZED` set (the campaign
+  sets it), a task is launched, continued, resumed after an acquire or
+  reviewed only while its id is in that file; an unreadable or malformed
+  file authorizes nothing. A refused continuation keeps lease and work as
+  `blocked` (`deauthorized: …`) and resumes when the task is authorized
+  again (only if it still holds its lease; otherwise it is `interrupted`
+  for the owner); a refused launch or review leaves the task where it is.
+  Agents already running finish. Each refusal is a `deauthorized` event.
 - **Agents.** Launching needs a planned task with scope and acceptance
   criteria. Claude Code runs with `-p --output-format json --session-id
   <uuid> --permission-mode dontAsk --allowedTools …`: tools outside the
@@ -292,21 +400,34 @@ coordinator version.
 - Sandboxed Claude Code sessions keep no transcript under `~/.claude`;
   the agent's output log in the run directory is the record.
 - A run whose agent is still alive when the owner takes over keeps its
-  scratch directory under the system temp directory.
+  scratch directory under the system temp directory. macOS hides other
+  processes' environments, so an agent descendant that outlived its tree,
+  closed the inherited lock, holds nothing open in its scratch and does
+  not name it in its arguments looks abandoned to the sweep. A scratch
+  made under another `TMPDIR` is swept only by a coordinator run with
+  that `TMPDIR`. Scratch from coordinators before this layout sits
+  directly in `$TMPDIR/cg-agent-*`, outside any root, and is never swept:
+  remove it by hand after upgrading, once no agent runs.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no
   retry command and no automatic lease recovery. The owner inspects the
   slot and either fixes and releases the lease with the token in
   `<state>/tokens/`, or uses `pool.sh reclaim`.
-- Stale base and failing CI are detected, not repaired.
-- The Codex adapter is disabled (see Secret isolation) and has never been
-  run end to end.
+- Stale base and failing CI are detected, not repaired here (the campaign
+  supervisor updates stale branches, see `docs/agent-campaign.md`). Rework
+  fast-forwards the local task branch to the remote one first, so a base
+  merged in on GitHub is kept.
+- A Codex agent can read its own login (`auth.json` in its `CODEX_HOME`).
+  In the opt-in legacy profile, a Claude Code agent can read the keychain
+  (including `gh`'s GitHub token), other owner files outside the denied
+  paths, and the network.
+- Tests must run with a `TMPDIR` outside `/private/tmp`, which agents may
+  write; the fixture refuses otherwise.
 - The Claude Code adapter's tool list must include every command the agent
   needs (for example `Bash(go test:*)`), via `allowed_tools`.
 
 ## Possible later additions
 
-- A Plane adapter that creates tasks from work items and posts status back.
 - A `retry` command for failed tasks after owner inspection.
 - Diff-based overlap detection.

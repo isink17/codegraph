@@ -16,11 +16,14 @@ Exit codes: 0 ok, 1 refused or a task failed/interrupted, 2 usage.
 import argparse
 import fcntl
 import fnmatch
+import functools
+import hashlib
 import json
 import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import shutil
 import sys
@@ -53,6 +56,36 @@ SLOT_CONFIG = [".claude", ".mcp.json", "CLAUDE.local.md", ".envrc"]
 REVIEW_SLOT = "codegraph-review"
 WORKERS = ["codegraph-worker-a", "codegraph-worker-b"]
 MAX_IMPL = 2
+# Present: no agent is launched or continued; running agents are left alone.
+STOP_FILE = Path(os.environ.get("CG_COORD_STOP", STATE_DIR / "STOP"))
+# Codex agents get a private CODEX_HOME seeded with these; the owner's
+# ~/.codex (config, hooks, rules, MCP servers, sessions) is never loaded.
+CODEX_AUTH = Path(os.environ.get("CG_COORD_CODEX_AUTH", HOME / ".codex/auth.json"))
+CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
+# Unreadable to every agent and validation command: other coordinators' and
+# campaigns' state and tokens live under the evidence root.
+EVIDENCE = Path(os.environ.get("CG_COORD_EVIDENCE", HOME / "Projekti/codegraph-evidence"))
+DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p]
+# Owner credentials no agent needs. Only denied explicitly in the legacy
+# profile Claude Code agents run in; every other sandboxed process reads
+# nothing in the home directory that is not on its allow-list.
+SECRETS = [".ssh", ".config/gh", ".netrc", ".git-credentials", ".codex", "Library/Keychains"]
+# Readable to strict-sandboxed processes: the system, not the home directory.
+SYSTEM_READ = ["/System", "/usr", "/bin", "/sbin", "/Library", "/opt", "/Applications", "/private/etc",
+               "/private/var/db", "/private/var/select", "/dev"]
+# The only environment a sandboxed process inherits; everything else (tokens,
+# agent sockets, the owner's settings) stays out. CG_COORD_SANDBOX_ENV adds
+# owner-chosen names.
+ENV_KEEP = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL",
+            *filter(None, os.environ.get("CG_COORD_SANDBOX_ENV", "").split(":"))]
+CLT = Path("/Library/Developer/CommandLineTools")
+ALLOW_CLAUDE = os.environ.get("CG_COORD_ALLOW_CLAUDE") == "1"
+# Set by the campaign supervisor: a JSON file {"tasks": [ids]} of the tasks
+# currently authorized. Unset: every planned task is (owner-driven runs).
+AUTH_GATE = os.environ.get("CG_COORD_AUTHORIZED")
+MAX_JSON_LINE = 1 << 20
+TOOLS = ["codex", "node", "go", "gofmt", "git", "python3", "bash", "sh", "jq", "sed", "awk"]
+MAX_ATTEMPTS = 5
 
 PENDING, RUNNING, AWAITING_REVIEW, REVIEWING, CHANGES_REQUIRED = (
     "pending", "running", "awaiting_review", "reviewing", "review_changes_required")
@@ -63,7 +96,8 @@ TERMINAL = {COMPLETED}
 HOLDS_SLOT = {RUNNING, REVIEWING}
 
 TASK_FIELDS = {"id", "description", "base", "branch", "depends_on", "agent", "scope",
-               "acceptance", "validate", "review", "prompt", "publish", "allowed_tools", "command", "pr"}
+               "acceptance", "validate", "review", "prompt", "publish", "allowed_tools", "command", "pr",
+               "max_attempts"}
 
 
 class Refused(Exception):
@@ -158,11 +192,105 @@ def owner_writable():
     return out
 
 
-def sandboxed(argv, allow_read=(), slot=None):
+@functools.lru_cache(maxsize=None)
+def tool_dirs():
+    """Directories the strict profile lets agents read for their tools: each
+    tool's bin directory and, when safe, its install prefix (for codex, the
+    Node installation holding its package). A prefix that is the home
+    directory, contains it, or holds anything protected is not used;
+    CG_COORD_SANDBOX_READABLE adds owner-listed directories under the same
+    rule."""
+    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
+                 HOME / ".local", HOME / ".config", HOME / "Library"]
+    home = os.path.realpath(HOME)
+    def safe(d):
+        r = os.path.realpath(d).rstrip("/") + "/"
+        # A directory right in the home directory (~/.local, ~/go, ~/bin)
+        # holds more than one tool; never allow it whole.
+        if os.path.dirname(r.rstrip("/")) == home:
+            return False
+        return not any((os.path.realpath(p).rstrip("/") + "/").startswith(r) for p in protected)
+    out = []
+    for name in TOOLS:
+        w = shutil.which(name)
+        if not w:
+            continue
+        for path in {w, os.path.realpath(w)}:
+            for d in (Path(path).parent, Path(path).parent.parent):
+                if safe(d):
+                    out.append(str(d))
+    for d in filter(None, os.environ.get("CG_COORD_SANDBOX_READABLE", "").split(":")):
+        if not safe(d):
+            raise Refused(f"CG_COORD_SANDBOX_READABLE entry {d} contains a protected path")
+        out.append(d)
+    gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
+    goroot = run(["go", "env", "GOROOT"]).stdout.strip() if shutil.which("go") else ""
+    return tuple(sorted({*out, gomod, *([goroot] if goroot else [])}))
+
+
+def listening_ports():
+    """Ports something on this host already listens on (TCP and UDP),
+    read outside the sandbox; None when that cannot be determined. They
+    are denied inside: a local service (adb, an API proxy, a file server)
+    would hand out what the file and network rules keep back. Ports opened
+    later, such as a test's own listener, stay reachable. netstat sees
+    every user's sockets, lsof adds what it can name;
+    CG_COORD_SANDBOX_LOCAL_PORTS lists ports the owner allows anyway."""
+    ports = set()
+    for proto, state in (("tcp", "LISTEN"), ("udp", None)):
+        p = run(["/usr/sbin/netstat", "-an", "-p", proto])
+        if p.returncode != 0:
+            return None
+        for line in p.stdout.splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[0].startswith(proto) and (state is None or f[-1] == state):
+                m = re.search(r"\.(\d+)$", f[3])
+                if m:
+                    ports.add(int(m.group(1)))
+    p = run(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-Fn"])
+    if p.returncode not in (0, 1) or (p.returncode == 1 and p.stderr.strip()):
+        return None
+    ports |= {int(m.group(1)) for line in p.stdout.splitlines() if line.startswith("n")
+              for m in [re.search(r":(\d+)$", line.split("->")[0])] if m}
+    allowed = {int(x) for x in os.environ.get("CG_COORD_SANDBOX_LOCAL_PORTS", "").split(",") if x.strip().isdigit()}
+    return sorted(ports - allowed - {0})
+
+
+@functools.lru_cache(maxsize=None)
+def sdk_root():
+    """Resolved outside the sandbox: inside it, cc must not go through xcrun,
+    whose lookup cache in the per-user temp directory the owner's own
+    builds trust."""
+    p = run(["xcrun", "--show-sdk-path"]) if shutil.which("xcrun") else None
+    return p.stdout.strip() if p and p.returncode == 0 else ""
+
+
+def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False, cwd=None):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
-    directory the caller removes afterwards; None where no sandbox exists."""
+    directory the caller removes afterwards; None where no sandbox exists.
+    readonly: only the scratch directory, /tmp and /dev are writable (no slot,
+    no repository). codex: CODEX_HOME is a private directory in scratch (see
+    codex_home). keychain: the legacy profile for Claude Code agents, which
+    keep their login in the keychain: reads are allowed except the protected
+    paths. Everything else runs in the strict profile: reads only of the
+    system, its tools, the Go module cache, the slot, the repository's git
+    directory, its scratch directory and allow_read; network only to
+    localhost and, for codex (its model API), TCP 443."""
     if not sandbox_available():
         return None
+    extra = owner_writable()  # may refuse: before anything is created
+    if (os.path.realpath(tempfile.gettempdir()) + "/").startswith("/private/tmp/"):
+        raise Refused(f"TMPDIR {tempfile.gettempdir()} is under /tmp; scratch directories there would be shared "
+                      "with Claude Code agents")
+    scratch = new_scratch()
+    try:
+        return sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keychain, cwd)
+    except BaseException:
+        release_scratch(scratch)
+        raise
+
+
+def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keychain, cwd):
     def q(p, kind="subpath"):
         p = os.path.realpath(p)
         if '"' in p or "\\" in p:
@@ -182,38 +310,232 @@ def sandboxed(argv, allow_read=(), slot=None):
     # IDE locks are loaded by the owner's own sessions. Owner-listed
     # directories are added.
     gitdir = REPO / ".git"
-    extra = owner_writable()  # may refuse: before anything is created
-    scratch = tempfile.mkdtemp(prefix="cg-agent-")
-    writable = [q("/dev"), q(scratch), q("/private/tmp"),
-                # Branches only: remote-tracking refs decide which merge gate
-                # runs and what pool.sh treats as the base.
-                q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads"),
-                *[q(d) for d in extra]]
+    writable = [q("/dev"), q(scratch), *[q(d) for d in extra]]
+    if keychain:
+        writable.append(q("/private/tmp"))  # Claude Code keeps per-session files there
+    if not readonly:
+        # Branches only: remote-tracking refs decide which merge gate runs
+        # and what pool.sh treats as the base.
+        writable += [q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads")]
     no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 q(gitdir / "objects/info"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
-    if slot:
+    if slot and not readonly:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
+    protected = [q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
     # Later rules win: allow-list first, then the denials it must not undo.
-    profile = (f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
-               f"(deny file-read-data {q(STATE_DIR)} {q(LEASES)})(deny file-write* {' '.join(no_write)})"
-               + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
-    env = [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
-                                              ("XDG_CACHE_HOME", "cache"))]
+    profile = f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
+    if keychain:
+        profile += (f"(deny file-read-data {' '.join(protected)})"
+                    f"(deny file-read* {' '.join(q(HOME / d) for d in SECRETS if d != 'Library/Keychains')})")
+    else:
+        readable = [q(scratch), *[q(d) for d in [*SYSTEM_READ, *tool_dirs(), *extra]], q(gitdir)]
+        if slot:
+            readable.append(q(slot))
+        profile += (f"(deny file-read*)(allow file-read-metadata)(allow file-read* (literal \"/\") {' '.join(readable)})"
+                    # Denying the keychain files keeps TLS trust evaluation
+                    # working; denying the security daemon does not.
+                    f"(deny file-read* {' '.join(protected)} {q('/Library/Keychains')} "
+                    f"{' '.join(q(HOME / d) for d in SECRETS)})"
+                    "(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\") "
+                    "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))"
+                    + ("(allow network-outbound (remote tcp \"*:443\"))" if codex else ""))
+        ports = listening_ports()
+        if ports is None:  # unknown: no local service either
+            profile += '(deny network-outbound (remote ip "localhost:*"))'
+        elif ports:
+            profile += "(deny network-outbound " + " ".join(f'(remote ip "localhost:{n}")' for n in ports) + ")"
+    profile += (f"(deny file-write* {' '.join(no_write)})"
+                + "".join(f"(allow file-read-data {q(d)})" for d in allow_read))
+    env = [f"{k}={os.environ[k]}" for k in ENV_KEEP if k in os.environ]
+    env += [f"{k}={scratch}/{v}" for k, v in (("TMPDIR", ""), ("GOCACHE", "go-build"), ("GOPATH", "gopath"),
+                                               ("XDG_CACHE_HOME", "cache"), ("XDG_CONFIG_HOME", "config"),
+                                               ("GOENV", "config/go/env"))]
+    if cwd or slot:
+        env.append(f"PWD={os.path.realpath(cwd or slot)}")  # without it, getcwd needs the parents
+    if not keychain:
+        # The owner's ~/.gitconfig is unreadable (it may name credential
+        # helpers); the repository's own config, with its identity, is not.
+        env += ["GIT_CONFIG_GLOBAL=/dev/null"]
+        if (CLT / "usr/bin/clang").exists() and sdk_root():
+            env += [f"CC={CLT}/usr/bin/clang", f"SDKROOT={sdk_root()}",
+                    f"PATH={CLT}/usr/bin:{os.environ.get('PATH', '/usr/bin:/bin')}"]
+    if codex:
+        env.append(f"CODEX_HOME={scratch}/codex-home")
     gomod = os.environ.get("GOMODCACHE") or str(HOME / "go/pkg/mod")
-    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", *env, f"GOMODCACHE={gomod}", *argv], scratch
+    return [SANDBOX_EXEC, "-p", profile, "/usr/bin/env", "-i", *env, f"GOMODCACHE={gomod}", *argv], scratch
 
 
-def isolate(agent, argv, allow_read=(), slot=None):
-    """(argv, scratch or None)."""
-    wrapped = sandboxed(argv, allow_read, slot)
-    if wrapped:
-        return wrapped
-    if agent != "command":
-        raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
-    return argv, None
+def isolate(agent, argv, allow_read=(), slot=None, readonly=False, cwd=None):
+    """(argv, scratch or None, codex auth digest or None)."""
+    if agent == "claude" and not ALLOW_CLAUDE:
+        raise Refused("Claude Code agents need the keychain, which also holds the owner's GitHub token; "
+                      "set CG_COORD_ALLOW_CLAUDE=1 to run them anyway")
+    wrapped = sandboxed(argv, allow_read, slot, readonly, agent == "codex", agent == "claude", cwd)
+    if not wrapped:
+        if agent != "command":
+            raise Refused(f"no sandbox on this platform; refusing to run a {agent} agent that could read lease tokens")
+        return argv, None, None
+    if agent != "codex":
+        return *wrapped, None
+    try:
+        return *wrapped, codex_home(Path(wrapped[1]) / "codex-home")
+    except OSError as e:
+        release_scratch(wrapped[1])
+        raise Refused(f"cannot prepare CODEX_HOME: {e}")
+
+
+# Scratch directories hold copied Codex logins. Each lives in a private root
+# keyed by the state directory, next to a lock file its creator (and, after
+# launch, the agent's process tree) holds, so a restarted coordinator can
+# tell its own abandoned scratch from anything else and from live agents'.
+_scratch_locks = {}
+
+
+def scratch_root():
+    key = hashlib.sha256(os.path.realpath(STATE_DIR).encode()).hexdigest()[:12]
+    root = Path(tempfile.gettempdir()) / f"cg-coord-{key}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refused(f"{root} is not a private directory of this user; no scratch is created or removed there")
+    return root
+
+
+def new_scratch():
+    """The lock file comes first and stays locked, so a sweep never sees the
+    directory unowned."""
+    root = scratch_root()
+    while True:
+        fd, lock = tempfile.mkstemp(prefix="cg-agent-", suffix=".lock", dir=root)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # A sweep may have unlinked the lock before it was locked.
+            try:
+                ours = os.path.samestat(os.fstat(fd), os.lstat(lock))
+            except FileNotFoundError:
+                ours = False
+            if not ours:
+                os.close(fd)
+                continue
+            scratch = lock[:-len(".lock")]
+            os.mkdir(scratch, 0o700)
+        except BaseException:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
+            os.close(fd)
+            raise
+        _scratch_locks[scratch] = fd
+        return scratch
+
+
+def scratch_fds(scratch):
+    """pass_fds for a child that should hold scratch's lock while it lives."""
+    fd = _scratch_locks.get(scratch)
+    return (fd,) if fd is not None else ()
+
+
+def release_scratch(scratch):
+    shutil.rmtree(scratch, ignore_errors=True)
+    if not os.path.exists(scratch):
+        try:
+            os.unlink(f"{scratch}.lock")
+        except FileNotFoundError:
+            pass
+    fd = _scratch_locks.pop(scratch, None)
+    if fd is not None:
+        os.close(fd)
+
+
+def sweep_scratch(referenced):
+    """Removes this coordinator's scratch directories that nothing owns any
+    more (a crash or kill came between their creation and their removal).
+    Kept: any a task records (reconcile decides those). Kept and reported:
+    any whose lock is held or missing, any a live process names in its arguments
+    or has open (lsof; macOS hides other processes' environment), any lsof
+    cannot vouch for, and anything not made by new_scratch. Refuses without
+    a process list. Returns (removed, kept) names."""
+    root = scratch_root()
+    p = run(["ps", "-axww", "-o", "command="])
+    if p.returncode != 0:
+        raise Refused(f"ps failed: {p.stderr.strip()}")
+    removed, kept = [], []
+    for e in sorted(root.iterdir()):
+        if e.name.endswith(".lock") and re.fullmatch(r"cg-agent-\w+", e.name[:-5]):
+            if not e.with_suffix("").exists() and os.path.lexists(e):
+                fd = os.open(e, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    e.unlink()
+                except BlockingIOError:
+                    pass
+                finally:
+                    os.close(fd)
+            continue
+        st = os.lstat(e)
+        lock = e.with_name(e.name + ".lock")
+        if os.path.realpath(e) in referenced:
+            continue
+        if (not re.fullmatch(r"cg-agent-\w+", e.name) or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid() or os.path.realpath(e) in referenced or not lock.exists()
+                or any(n in p.stdout for n in {str(e), os.path.realpath(e)})):
+            kept.append(e.name)
+            continue
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            kept.append(e.name)
+            continue
+        try:
+            busy = run(["lsof", "-nP", "-t", "+D", str(e)])  # 1 and silent: nothing open (a warning keeps it)
+            if busy.returncode != 1 or busy.stdout.strip() or busy.stderr.strip():
+                kept.append(e.name)
+                continue
+            release_scratch(str(e))
+        finally:
+            os.close(fd)
+        (kept if e.exists() else removed).append(e.name)
+    return removed, kept
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def codex_home(home):
+    """Seeds a private CODEX_HOME with the owner's login (and an optional
+    owner-written config.toml). Returns the login's digest, which
+    codex_login_note compares afterwards."""
+    home.mkdir(mode=0o700)
+    shutil.copyfile(CODEX_AUTH, home / "auth.json")
+    os.chmod(home / "auth.json", 0o600)
+    if CODEX_CONFIG:
+        shutil.copyfile(CODEX_CONFIG, home / "config.toml")
+    return sha256(CODEX_AUTH)
+
+
+def codex_login_note(info):
+    """The copy is never written back: an agent controls it. If Codex
+    refreshed it during the run, the owner is told, because a refresh may
+    rotate the token the owner's own copy holds."""
+    digest = info.get("codex_auth")
+    new = Path(info["scratch"]) / "codex-home/auth.json"
+    try:
+        if digest and new.exists() and sha256(new) != digest:
+            return ("Codex changed its login copy during the run (token refresh?); not copied back. If the "
+                    "owner's codex later reports an invalid login, run `codex login`.")
+    except OSError:
+        pass
+    return None
 
 
 def scope_prefix(pattern):
@@ -239,7 +561,9 @@ def in_scope(path, scope):
 
 # ---------------------------------------------------------------- task model
 
-def load_tasks(path):
+def load_tasks(path, known=()):
+    """Validated tasks from path. Dependencies may also name tasks in known
+    (already planned)."""
     try:
         data = json.loads(Path(path).read_text())
     except (OSError, ValueError) as e:
@@ -262,39 +586,38 @@ def load_tasks(path):
         for req in ("description", "scope", "acceptance", "validate"):
             if not t.get(req):
                 raise Refused(f"task {tid}: {req} is required")
-        if t.get("agent", "claude") not in ADAPTERS:
+        if t.get("agent", "codex") not in ADAPTERS:
             raise Refused(f"task {tid}: agent must be one of {sorted(ADAPTERS)}")
         if t.get("agent") == "command" and not isinstance(t.get("command"), list):
             raise Refused(f"task {tid}: agent \"command\" needs a \"command\" argv list")
         review = t.get("review", {})
-        if review.get("agent", "claude") not in ADAPTERS:
+        if review.get("agent", "codex") not in ADAPTERS:
             raise Refused(f"task {tid}: review agent must be one of {sorted(ADAPTERS)}")
-        # codex exec applies its own Seatbelt sandbox, which cannot nest in
-        # ours, and its read-only mode still reads every file: no boundary
-        # keeps it from the lease tokens.
-        if "codex" in (t.get("agent"), review.get("agent")):
-            raise Refused(f"task {tid}: the codex adapter is disabled until it can be isolated from lease tokens")
+        attempts = t.get("max_attempts", 1)
+        if type(attempts) is not int or not 1 <= attempts <= MAX_ATTEMPTS:
+            raise Refused(f"task {tid}: max_attempts must be an integer from 1 to {MAX_ATTEMPTS}")
         out[tid] = {
             "id": tid,
             "description": t["description"],
             "base": t.get("base", "v2.0"),
             "branch": t.get("branch", f"task/{tid}"),
             "depends_on": list(t.get("depends_on", [])),
-            "agent": t.get("agent", "claude"),
+            "agent": t.get("agent", "codex"),
             "command": t.get("command"),
             "scope": list(t["scope"]),
             "acceptance": list(t["acceptance"]),
             "validate": list(t["validate"]),
-            "review": {"agent": review.get("agent", "claude"), "command": review.get("command"),
+            "review": {"agent": review.get("agent", "codex"), "command": review.get("command"),
                        "focus": review.get("focus", "")},
             "prompt": t.get("prompt", ""),
             "publish": t.get("publish", True),
             "allowed_tools": list(t.get("allowed_tools", [])),
             "pr": t.get("pr"),
+            "max_attempts": attempts,
         }
     for tid, t in out.items():
         for d in t["depends_on"]:
-            if d not in out:
+            if d not in out and d not in known:
                 raise Refused(f"task {tid} depends on unknown task {d}")
     seen, done = set(), set()
 
@@ -305,7 +628,8 @@ def load_tasks(path):
             raise Refused(f"dependency cycle through {n}")
         seen.add(n)
         for d in out[n]["depends_on"]:
-            visit(d)
+            if d in out:
+                visit(d)
         done.add(n)
     for tid in out:
         visit(tid)
@@ -320,7 +644,7 @@ def load_tasks(path):
 # Each adapter returns the argv to run in the slot. Only flags verified
 # against the installed CLIs' --help are used; none bypasses permissions.
 
-def implement_prompt(task, slot_path, findings=""):
+def implement_prompt(task, slot_path, findings="", previous=""):
     lines = [
         f"Task {task['id']}: {task['description']}",
         f"Working directory: {slot_path} (branch {task['branch']}, based on {REMOTE}/{task['base']}).",
@@ -334,6 +658,10 @@ def implement_prompt(task, slot_path, findings=""):
         lines += ["", task["prompt"]]
     if findings:
         lines += ["", "An independent review requested changes. Address them:", findings]
+    if previous:
+        lines += ["", "A previous attempt ended without passing the coordinator's checks:", previous,
+                  "Its work is still in this directory. Continue from the current state; the task is",
+                  "complete only when the checks pass, not when you say so."]
     return "\n".join(lines)
 
 
@@ -369,7 +697,11 @@ def claude_argv(prompt, session, tools, review, add_dirs=()):
 
 
 def codex_argv(prompt, session, tools, review, add_dirs=()):
-    return ["codex", "exec", "--json", "-s", "read-only" if review else "workspace-write", prompt]
+    # codex exec's own Seatbelt sandbox cannot nest inside ours, so it is
+    # switched off; this argv is only ever run under sandboxed() (isolate
+    # refuses codex where no sandbox exists), which is the boundary:
+    # writable slot for implementers, nothing but scratch for reviewers.
+    return ["codex", "exec", "--json", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", prompt]
 
 
 def command_argv(prompt, session, tools, review, add_dirs=()):
@@ -391,6 +723,7 @@ class Coordinator:
         self.lock_fd = None
         self.state = None
         self.prepare_refused = []
+        self.scratch_kept = []
 
     # Exclusive ownership: flock is released by the kernel if we crash, so a
     # dead coordinator never blocks a restart, and two live ones never overlap.
@@ -417,8 +750,8 @@ class Coordinator:
         try:
             self.state = json.loads(self.state_file.read_text())
             assert isinstance(self.state.get("tasks"), dict)
-        except (ValueError, AssertionError, AttributeError) as e:
-            raise Refused(f"{self.state_file} is malformed ({e}); left untouched")
+        except (ValueError, AssertionError, AttributeError, RecursionError) as e:
+            raise Refused(f"{self.state_file} is malformed ({type(e).__name__}); left untouched")
 
     def save(self):
         write_atomic(self.state_file, json.dumps(self.state, indent=2, sort_keys=True) + "\n")
@@ -598,10 +931,7 @@ class Coordinator:
             # Read from a private bare repository in the state directory,
             # which agents can neither read nor write: the shared object store
             # is writable to them, and git trusts objects it already has.
-            url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
-            store = self.dir / "gate-repo"
-            if not (store / "HEAD").exists():
-                run([GIT, "init", "-q", "--bare", str(store)], check=True)
+            url, store = self.private_store()
             run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
                  f"+refs/heads/{base}:refs/heads/{base}"], check=True)
             remote_sha = run([GIT, *GIT_SAFE, "ls-remote", url, f"refs/heads/{base}"],
@@ -624,6 +954,46 @@ class Coordinator:
             raise Refused(f"{gate} does not support --base")
         return gate
 
+    # ------------------------------------------------------------ verified content
+    # Agents can write the shared object store, and git does not re-hash
+    # objects it already has, so a checkout from it may differ from what the
+    # remote holds at the same SHA. What is reviewed and tested is therefore
+    # checked against a private repository fetched from the remote.
+
+    def private_store(self):
+        url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+        store = self.dir / "gate-repo"
+        if not (store / "HEAD").exists():
+            run([GIT, "init", "-q", "--bare", str(store)], check=True)
+        return url, store
+
+    def fetch_verified(self, branch, sha):
+        """Fetches the remote branch into the private repository; refuses
+        unless it is exactly sha."""
+        url, store = self.private_store()
+        run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+             f"+refs/heads/{branch}:refs/verify/{branch}"], check=True)
+        got = run([GIT, *GIT_SAFE, "-C", str(store), "rev-parse", "-q", "--verify", f"refs/verify/{branch}"]).stdout.strip()
+        if got != sha:
+            raise Refused(f"remote {branch} is {got[:12] or 'missing'}, not {sha[:12]}")
+        return store
+
+    def worktree_matches(self, path, sha):
+        """True when the files in path are exactly the tree of sha in the
+        private repository: tracked content and modes, and no other file,
+        ignored ones included (Go compiles ignored directories too)."""
+        _, store = self.private_store()
+        idx = self.dir / f".verify-{uuid.uuid4().hex}.index"
+        env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+        g = [GIT, *GIT_SAFE, "--git-dir", str(store), "--work-tree", str(path)]
+        try:
+            run([*g, "read-tree", sha], cwd=path, env=env, check=True)
+            run([*g, "add", "-A", "--force", "."], cwd=path, env=env, check=True)
+            tree = run([*g, "write-tree"], cwd=path, env=env, check=True).stdout.strip()
+        finally:
+            idx.unlink(missing_ok=True)
+        return tree == run([*g, "rev-parse", f"{sha}^{{tree}}"], check=True).stdout.strip()
+
     # ------------------------------------------------------------ GitHub
 
     def gh(self, *args):
@@ -644,7 +1014,7 @@ class Coordinator:
 
 # ---------------------------------------------------------------- processes
 
-def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
+def launch(c, t, argv, cwd, kind, status, scratch=None, codex_auth=None, **fields):
     """Starts argv detached in its own session and moves the task to status.
     The task is saved as holding the process before it exists; the wrapper
     writes its pid before running the agent and the exit status after, and
@@ -656,12 +1026,16 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
     wrapper = ['/bin/sh', '-c', 'echo $$ >"$0.pid.tmp" && mv "$0.pid.tmp" "$0.pid" || exit 125; '
                '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
     info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0],
-            "scratch": scratch}
+            "scratch": scratch, "codex_auth": codex_auth}
+    fault("launch_before_record")
     c.set(t, status, process=info, **fields)
     fault("launch_before_popen")
     with open(run_dir / "output.log", "w") as log:
+        # The agent's process tree inherits the scratch lock: held while any of it lives.
         proc = subprocess.Popen(wrapper, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=scratch_fds(scratch))
+    if scratch in _scratch_locks:
+        os.close(_scratch_locks.pop(scratch))
     fault("launch_after_popen")
     start = None
     for _ in range(3):  # ps can fail transiently under load
@@ -680,7 +1054,10 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, **fields):
 def drop_scratch(info):
     """Removes a run's scratch directory once its agent is known gone."""
     if info.get("scratch"):
-        shutil.rmtree(info["scratch"], ignore_errors=True)
+        note = codex_login_note(info)
+        if note:
+            print(note)
+        release_scratch(info["scratch"])
 
 
 def find_wrapper(needle):
@@ -706,18 +1083,30 @@ def agent_text(agent, out):
         return out
     text = ""
     for line in out.splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
+        rec = parse_json(line)
         if not isinstance(rec, dict):
             continue
+        item = rec.get("item")
+        item = item if isinstance(item, dict) else {}
+        found = None
         if agent == "claude" and rec.get("type") == "result":
-            text = rec.get("result") or ""
-        item = rec.get("item") or {}
+            found = rec.get("result")
         if agent == "codex" and rec.get("type") == "item.completed" and item.get("type") == "agent_message":
-            text = item.get("text") or ""
+            found = item.get("text")
+        if found is not None:
+            text = found if isinstance(found, str) else ""
     return text
+
+
+def parse_json(text, limit=MAX_JSON_LINE):
+    """JSON from untrusted output, or None: oversized, malformed and too
+    deeply nested input are all just not JSON."""
+    if len(text) > limit:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return None
 
 
 def exited_or_lost(exit_file):
@@ -775,6 +1164,30 @@ def slot_path(slot):
 
 # ---------------------------------------------------------------- scheduling
 
+def authorized(c, t, action):
+    """True when the campaign's gate (if any) authorizes t now. Fails closed:
+    an unreadable or malformed gate authorizes nothing. A refusal is
+    recorded once per task and action."""
+    if not AUTH_GATE:
+        return True
+    try:
+        data = parse_json(Path(AUTH_GATE).read_text())
+        ok = isinstance(data, dict) and isinstance(data.get("tasks"), list) and t["id"] in data["tasks"]
+    except OSError:
+        ok = False
+    if not ok and t.get("deauthorized") != action:
+        t["deauthorized"] = action
+        c.save()
+        c.event(t["id"], "deauthorized", action=action)
+    elif ok and t.get("deauthorized"):
+        t.pop("deauthorized")
+        c.save()
+    return ok
+
+
+DEAUTHORIZED = "deauthorized"
+
+
 def deps_met(c, t):
     return all(c.state["tasks"][d]["status"] == COMPLETED for d in t["depends_on"])
 
@@ -795,6 +1208,7 @@ def conflicts(c, t):
 
 
 def start_impl(c, t, findings=""):
+    t["tries"] = 0
     slot, rc, err = c.acquire(t, "auto")
     if not slot:
         if rc == 3:
@@ -807,12 +1221,20 @@ def start_impl(c, t, findings=""):
     return begin_impl(c, t, findings)
 
 
-def begin_impl(c, t, findings=""):
+def begin_impl(c, t, findings="", previous=""):
     slot = t["slot"]
     p = slot_path(slot)
     try:
         if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", f"refs/heads/{t['branch']}"]).returncode == 0:
             git(p, "switch", "-q", t["branch"])
+            # The PR branch may have moved on the remote (base merged in on
+            # GitHub); continue from there, never from behind it.
+            remote = f"refs/remotes/{REMOTE}/{t['branch']}"
+            if run([GIT, *GIT_SAFE, "-C", str(p), "rev-parse", "-q", "--verify", remote]).returncode == 0:
+                before = git(p, "rev-parse", "HEAD")
+                git(p, "merge", "-q", "--ff-only", remote)
+                if git(p, "rev-parse", "HEAD") != before:
+                    t["head"] = git(p, "rev-parse", "HEAD")  # the agent must add a commit to this
         else:
             # An adopted PR's branch exists only on the remote: continue it.
             remote = f"{REMOTE}/{t['branch']}"
@@ -825,15 +1247,17 @@ def begin_impl(c, t, findings=""):
     t["base_sha"] = git(p, "rev-parse", f"{REMOTE}/{t['base']}")
     t["head"] = t.get("head") or git(p, "rev-parse", "HEAD")  # the agent must add a commit to this
     t["session"] = str(uuid.uuid4())
-    prompt = implement_prompt(t, p, findings)
+    t["impl_findings"] = findings
+    prompt = implement_prompt(t, p, findings, previous)
     tools = IMPL_TOOLS + t["allowed_tools"]
     argv = t["command"] if t["agent"] == "command" else ADAPTERS[t["agent"]](prompt, t["session"], tools, False)
     try:
-        argv, scratch = isolate(t["agent"], argv, slot=p)
+        argv, scratch, auth = isolate(t["agent"], argv, slot=p)
     except Refused as e:
         c.block(t, f"{e}; lease kept")
         return None
-    launch(c, t, argv, p, "implement", RUNNING, scratch, attempt=t.get("attempt", 0) + 1)
+    launch(c, t, argv, p, "implement", RUNNING, scratch, auth, attempt=t.get("attempt", 0) + 1,
+           tries=t.get("tries", 0) + 1)
     print(f"{t['id']}: running in {slot}")
     return None
 
@@ -844,42 +1268,58 @@ def planted_config(p):
             if l.startswith("!! ") and set(l[3:].rstrip("/").split("/")) & set(SLOT_CONFIG)]
 
 
+def unfinished(c, t, reason):
+    """An agent that stopped short of the checks is continued in the same
+    slot with the reason, up to max_attempts executions; then, or under
+    STOP, the task fails with its lease and work kept."""
+    if t.get("tries", 1) >= t.get("max_attempts", 1):
+        return c.block(t, reason, FAILED)
+    if STOP_FILE.exists():
+        return c.block(t, f"{reason}; not continued: {STOP_FILE} present", INTERRUPTED)
+    if not authorized(c, t, "continue"):
+        return c.block(t, f"{DEAUTHORIZED}: not continued ({reason}); lease and work kept")
+    c.event(t["id"], "continue", reason=reason, tries=t.get("tries", 1))
+    print(f"{t['id']}: continuing ({t.get('tries', 1) + 1}/{t['max_attempts']}): {reason}")
+    return begin_impl(c, t, t.get("impl_findings", ""), reason)
+
+
 def finish_impl(c, t, rc):
     """Never trusts the exit code alone: the tree must be clean, the branch
     must hold new commits, every changed file must be in scope, and every
     validation command must pass. Any failure keeps the lease and the work."""
     p = slot_path(t["slot"])
     evidence = Path(t["process"]["dir"])
-    if rc != 0:
-        return c.block(t, f"agent exited {rc}; work and lease kept in {t['slot']}", FAILED)
-    if git(p, "status", "--porcelain", "--untracked-files=all"):
-        return c.block(t, f"agent left {t['slot']} dirty; lease kept", FAILED)
+    # Never continued, whatever else went wrong.
     planted = planted_config(p)
     if planted:
         return c.block(t, f"ignored tool configuration in {t['slot']}: {planted[:5]}; lease kept", FAILED)
     if git(p, "symbolic-ref", "--short", "HEAD", check=False) != t["branch"]:
         return c.block(t, f"agent left {t['slot']} off branch {t['branch']}; lease kept", FAILED)
+    if rc != 0:
+        return unfinished(c, t, f"agent exited {rc}; work and lease kept in {t['slot']}")
+    if git(p, "status", "--porcelain", "--untracked-files=all"):
+        return unfinished(c, t, f"agent left {t['slot']} dirty; lease kept")
     head = git(p, "rev-parse", "HEAD")
     if head == t.get("head") or git(p, "rev-list", "--count", f"{t['base_sha']}..HEAD") == "0":
-        return c.block(t, "agent produced no new commit; lease kept", FAILED)
+        return unfinished(c, t, "agent produced no new commit; lease kept")
     changed = git(p, "diff", "--no-renames", "--name-only", f"{t['base_sha']}...HEAD").splitlines()
     outside = [f for f in changed if not in_scope(f, t["scope"])]
     if outside:
-        return c.block(t, f"changes outside scope: {outside[:5]}; lease kept", FAILED)
+        return unfinished(c, t, f"changes outside scope: {outside[:5]}; lease kept")
     for i, cmd in enumerate(t["validate"]):
         # Validation runs code the agent wrote: same sandbox as the agent.
         argv, scratch = sandboxed(["/bin/sh", "-c", cmd], slot=p) or (["/bin/sh", "-c", cmd], None)
         try:
-            v = subprocess.run(argv, cwd=p, capture_output=True, text=True)
+            v = subprocess.run(argv, cwd=p, capture_output=True, text=True, pass_fds=scratch_fds(scratch))
         finally:
             if scratch:
-                shutil.rmtree(scratch, ignore_errors=True)
+                release_scratch(scratch)
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
-            return c.block(t, f"validation failed: {cmd}; lease kept", FAILED)
+            return unfinished(c, t, f"validation failed: {cmd}; lease kept")
     if git(p, "status", "--porcelain", "--untracked-files=all"):
-        return c.block(t, "validation left the tree dirty; lease kept", FAILED)
+        return unfinished(c, t, "validation left the tree dirty; lease kept")
     t["head"] = head
     if not t["publish"]:
         return c.block(t, f"validated at {head[:12]}; publish disabled, lease kept for the owner")
@@ -916,6 +1356,10 @@ def start_review(c, t):
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
     run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
+    try:
+        c.fetch_verified(pr["headRefName"], pr["headRefOid"])
+    except Refused as e:
+        return f"PR head not verifiable yet: {e}"
     slot, rc, err = c.acquire(t, REVIEW_SLOT, review=True)
     if not slot:
         if t.get("starting"):
@@ -932,22 +1376,36 @@ def begin_review(c, t, head):
     try:
         git(p, "fetch", "-q", REMOTE, f"+refs/pull/{t['pr']}/head:refs/coordinator/review", check=False)
         git(p, "checkout", "-q", "--detach", head)
+        branch = c.pr_view(t["pr"])["headRefName"]
+        store = c.fetch_verified(branch, head)
+        if not c.worktree_matches(p, head):
+            c.event(t["id"], "checkout_mismatch", slot=t["slot"], head=head)
+            leftovers = git(p, "status", "--porcelain", "--ignored", "--untracked-files=all")
+            why = (f"untracked or ignored files are in the review slot: {leftovers.splitlines()[:3]}" if leftovers
+                   else "the shared object store may have been altered")
+            return c.block(t, f"the review checkout of {head[:12]} differs from the remote's content ({why}); "
+                              "review lease kept", FAILED)
+        url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+        run([GIT, *GIT_SAFE, "-C", str(store), "fetch", "-q", "--no-tags", url,
+             f"+refs/heads/{t['base']}:refs/verify-base/{t['base']}"], check=True)
+        diff = run([GIT, *GIT_SAFE, "-C", str(store), "diff", f"refs/verify-base/{t['base']}...{head}"],
+                   check=True).stdout
     except Refused as e:
         return c.block(t, f"review checkout of {head[:12]} failed: {e}; review lease kept")
     t["review_session"] = str(uuid.uuid4())
     diff_dir = c.runs / f"{t['id']}-diff-{head[:12]}"
     diff_dir.mkdir(mode=0o700, exist_ok=True)
     diff_file = diff_dir / "pr.diff"
-    write_atomic(diff_file, git(p, "diff", f"{REMOTE}/{t['base']}...{head}") + "\n")
+    write_atomic(diff_file, diff + "\n")
     prompt = review_prompt(t, t["pr"], head, t["base"], diff_file)
     r = t["review"]
     argv = r["command"] if r["agent"] == "command" else ADAPTERS[r["agent"]](
         prompt, t["review_session"], READ_ONLY_TOOLS, True, [diff_dir])
     try:
-        argv, scratch = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p)
+        argv, scratch, auth = isolate(r["agent"], argv, allow_read=[diff_dir], slot=p, readonly=True)
     except Refused as e:
         return c.block(t, f"{e}; review lease kept")
-    launch(c, t, argv, p, "review", REVIEWING, scratch, review_head=head)
+    launch(c, t, argv, p, "review", REVIEWING, scratch, auth, review_head=head)
     print(f"{t['id']}: reviewing PR #{t['pr']} at {head[:12]}")
 
 
@@ -1078,6 +1536,11 @@ def recover_acquire(c, t):
         return c.block(t, f"a previous slot acquisition ({m}) did not complete; "
                           f"check pool.sh status for task={t['id']}", INTERRUPTED)
     slot, rc, err = c.settle_acquire(t)
+    if slot and STOP_FILE.exists():
+        return c.block(t, f"acquired {slot} before a stop; not launched: {STOP_FILE} present, lease kept",
+                       INTERRUPTED)
+    if slot and not authorized(c, t, "launch"):
+        return c.block(t, f"{DEAUTHORIZED}: acquired {slot} but not launched; lease kept")
     if slot:
         c.event(t["id"], "acquire_recovered", slot=slot, txn=m["txn"])
         if slot == REVIEW_SLOT:
@@ -1157,6 +1620,16 @@ def reconcile(c):
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)
         except Refused as e:
             c.block(t, f"post-run check failed: {e}; lease kept", FAILED)
+    referenced = {os.path.realpath(t["process"]["scratch"]) for t in c.state["tasks"].values()
+                  if isinstance(t.get("process"), dict) and t["process"].get("scratch")}
+    try:
+        removed, kept = sweep_scratch(referenced)
+    except (Refused, OSError) as e:
+        c.event(None, "scratch_sweep_refused", detail=str(e))
+    else:
+        if removed or kept != c.scratch_kept:
+            c.event(None, "scratch_swept", removed=removed, kept=kept)
+        c.scratch_kept = kept
 
 
 def schedule(c):
@@ -1184,14 +1657,34 @@ def schedule(c):
     if any(t.get("starting") for t in tasks.values()):
         print("acquire transaction open: no slot is acquired until it is resolved")
         return changed
+    if STOP_FILE.exists():
+        print(f"STOP: {STOP_FILE} present; no agent is launched")
+        return changed
     for t in tasks.values():
         if any(o.get("starting") for o in tasks.values()):
             break
         if t["status"] == AWAITING_REVIEW and not any(o["status"] == REVIEWING for o in tasks.values()):
+            if not authorized(c, t, "review"):
+                continue
             r = start_review(c, t)
             if r:
                 busy_note = f"{t['id']}: {r}"
             changed |= t["status"] != AWAITING_REVIEW
+    for t in tasks.values():
+        if t["status"] == BLOCKED and (t.get("reason") or "").startswith(DEAUTHORIZED) and t.get("slot") \
+                and authorized(c, t, "resume"):
+            if not c.read_token(t) or not c.lease_held(t):
+                c.block(t, f"reauthorized, but its lease on {t['slot']} is gone; owner must inspect", INTERRUPTED)
+                continue
+            c.event(t["id"], "reauthorized", slot=t["slot"])
+            if t["slot"] == REVIEW_SLOT:
+                try:
+                    begin_review(c, t, c.pr_view(t["pr"])["headRefOid"])
+                except Refused as e:
+                    print(f"{t['id']}: {e}")
+            else:
+                begin_impl(c, t, t.get("impl_findings", ""), t["reason"])
+            changed = True
     for t in tasks.values():
         if t["status"] not in (PENDING, CHANGES_REQUIRED):
             continue
@@ -1209,6 +1702,8 @@ def schedule(c):
             c.event(t["id"], "waiting_on", other=other)
         if other:
             continue
+        if not authorized(c, t, "implement"):
+            continue
         findings = t.get("findings", "") if t["status"] == CHANGES_REQUIRED else ""
         r = start_impl(c, t, findings)
         if r == "BLOCKED_POOL_BUSY":
@@ -1225,8 +1720,8 @@ def schedule(c):
 # ---------------------------------------------------------------- commands
 
 def cmd_plan(c, args):
-    tasks = load_tasks(args.tasks)
     existing = c.state["tasks"]
+    tasks = load_tasks(args.tasks, existing)
     for tid, t in tasks.items():
         if tid in existing:
             if existing[tid]["status"] != PENDING:
@@ -1244,6 +1739,7 @@ def cmd_plan(c, args):
 
 
 def cmd_run(c, args):
+    c.save()  # the events a pass writes are never left without a state file
     while True:
         changed = schedule(c)
         live = [t for t in c.state["tasks"].values() if t["status"] in HOLDS_SLOT]
