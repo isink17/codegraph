@@ -252,6 +252,7 @@ func TestRunFixtureReproducible(t *testing.T) {
 	if !bytes.Equal(outs[0], outs[1]) {
 		t.Fatalf("runs differ:\n%s\n---\n%s", outs[0], outs[1])
 	}
+	testProduce(t, bin)
 }
 
 func TestFactsPresentBoundaries(t *testing.T) {

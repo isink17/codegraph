@@ -82,8 +82,14 @@ func Run(cfg RunConfig) (*Record, error) {
 	var commands []string
 	cg := func(args ...string) ([]byte, error) {
 		commands = append(commands, "codegraph "+strings.ReplaceAll(strings.Join(args, " "), repo, "<workdir>/repo"))
-		out, err := exec.Command(cfg.Binary, args...).Output()
+		cmd := exec.Command(cfg.Binary, args...)
+		// Benchmark execution is offline, including the optional release check.
+		cmd.Env = append(os.Environ(), "CODEGRAPH_NO_UPDATE_CHECK=1", "CODEGRAPH_HOME="+filepath.Join(cfg.WorkDir, "home"))
+		out, err := cmd.Output()
 		if err != nil {
+			if exit, ok := err.(*exec.ExitError); ok {
+				return nil, fmt.Errorf("codegraph %v: %w: %s", args, err, exit.Stderr)
+			}
 			return nil, fmt.Errorf("codegraph %v: %w", args, err)
 		}
 		return out, nil
