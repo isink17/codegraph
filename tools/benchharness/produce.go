@@ -79,7 +79,13 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 			return fmt.Errorf("produce: fixture %s hash differs from manifest", f.Name)
 		}
 	}
-	binaryBytes, err := os.ReadFile(*binary)
+	// Treat --codegraph as a filesystem path consistently: a bare name must
+	// not hash a local file and then execute a different binary from PATH.
+	binaryPath, err := filepath.Abs(*binary)
+	if err != nil {
+		return err
+	}
+	binaryBytes, err := os.ReadFile(binaryPath)
 	if err != nil {
 		return err
 	}
@@ -99,7 +105,7 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 		fixture := filepath.Join(filepath.Dir(*manifest), f.Path)
 		record := filepath.Join(scratch, f.Name+".json")
 		work := filepath.Join(scratch, f.Name)
-		cmd := []string{"run", "--fixture", fixture, "--codegraph", *binary, "--sha", *sha, "--date", *date, "--workdir", work, "--out", record}
+		cmd := []string{"run", "--fixture", fixture, "--codegraph", binaryPath, "--sha", *sha, "--date", *date, "--workdir", work, "--out", record}
 		if err := invoke(cmd, io.Discard); err != nil {
 			return err
 		}

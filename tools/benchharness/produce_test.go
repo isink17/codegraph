@@ -2,12 +2,66 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestProduceUsesLocalBinaryInsteadOfPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses shell executables")
+	}
+	manifest, err := filepath.Abs("testdata/manifests/fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathDir := t.TempDir()
+	for dir, label := range map[string]string{root: "local", pathDir: "PATH"} {
+		if err := os.WriteFile(filepath.Join(dir, "codegraph"), []byte("#!/bin/sh\necho "+label+"\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", pathDir)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Error(err)
+		}
+	})
+	stop := errors.New("stop after checking execution")
+	err = produce([]string{"--manifest", manifest, "--codegraph", "codegraph", "--sha", testSHA, "--date", "2026-10-09T00:00:00Z", "--out", filepath.Join(root, "out")}, func(cmd []string, _ io.Writer) error {
+		if cmd[0] != "run" || cmd[3] != "--codegraph" {
+			t.Fatalf("unexpected command: %v", cmd)
+		}
+		if cmd[4] != filepath.Join(root, "codegraph") {
+			t.Fatalf("binary = %q, want absolute local path", cmd[4])
+		}
+		output, err := exec.Command(cmd[4]).Output()
+		if err != nil || string(output) != "local\n" {
+			t.Fatalf("executed binary: output %q, error %v", output, err)
+		}
+		return stop
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("produce: %v", err)
+	}
+}
 
 func testProduce(t *testing.T, bin string) {
 	t.Helper()
