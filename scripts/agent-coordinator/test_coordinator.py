@@ -6,6 +6,7 @@ fake merge gate and fake agents. Never touches the live pool.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -179,6 +180,12 @@ def install_fake_codex(t, env):
     env["PATH"] = f"{t / 'bin'}:{env['PATH']}"
 
 
+def scratch_root(state):
+    """coordinator.scratch_root for that state directory."""
+    key = hashlib.sha256(os.path.realpath(state).encode()).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"cg-coord-{key}"
+
+
 def sh(script):
     return ["/bin/sh", "-c", script]
 
@@ -237,6 +244,7 @@ class Fixture(unittest.TestCase):
                     # Agents inherit only these (and the basics): see ENV_KEEP.
                     "CG_COORD_SANDBOX_ENV": "CG_TEST_LOG:CG_COORD_STATE:CTL:FAKE_ORIGIN:GIT_AUTHOR_NAME:"
                                             "GIT_AUTHOR_EMAIL:GIT_COMMITTER_NAME:GIT_COMMITTER_EMAIL"}
+        self.addCleanup(shutil.rmtree, scratch_root(self.state), True)
         self.git("init", "-q", "--bare", str(self.origin))
         self.git("clone", "-q", str(self.origin), str(self.seed))
         self.git("-C", str(self.seed), "commit", "-q", "--allow-empty", "-m", "base")
@@ -1085,7 +1093,7 @@ class Pool(Fixture):
         self.coord("run", "--once", CG_COORD_SANDBOX_WRITABLE=f"{self.t / 'log'}:{self.t / 'home/.config'}")
         self.assertEqual(self.status("x"), "blocked")
         self.assertIn("contains protected", self.st()["x"]["reason"])
-        self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-agent-*/x")))
+        self.assertFalse(list(Path(tempfile.gettempdir()).glob("cg-coord-*/cg-agent-*/x")))
 
     def test_ignored_tool_configuration_in_slot_fails_the_task(self):
         # Unsandboxed command agents (or a sandbox gap) could leave it.
@@ -1304,6 +1312,26 @@ class Pool(Fixture):
         self.assertTrue(all(e["argv0"] == "/usr/bin/sandbox-exec" for e in launched))
         self.assert_no_token_leak()
 
+    def test_login_copy_abandoned_by_a_killed_coordinator_is_removed_on_restart(self):
+        """Killed after CODEX_HOME holds the copied login but before the task
+        records its scratch: nothing else knows that directory."""
+        self.install_codex()
+        (self.t / "home/.codex/auth.json").write_text('{"synthetic": "SECRET-CANARY"}')
+        (self.t / "log/codex-plan.json").write_text(json.dumps({"x": ["commit"]}))
+        self.plan({**self.task("x", None), "agent": "codex", "command": None})
+        self.assertEqual(self.coord("run", "--once", CG_COORD_FAULT="launch_before_record").returncode, 70)
+        root = scratch_root(self.state)
+        left = list(root.glob("cg-agent-*/codex-home/auth.json"))
+        self.assertEqual(len(left), 1)
+        self.assertEqual(oct(left[0].stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(oct(root.stat().st_mode & 0o777), oct(0o700))
+        self.assertNotIn(str(left[0].parent.parent), json.dumps(self.st()))  # unrecorded
+        self.coord("run", "--once")
+        self.assertFalse(list(root.glob("cg-agent-*")), list(root.iterdir()))
+        swept = [e for e in self.events() if e["event"] == "scratch_swept"]
+        self.assertEqual(swept[0]["removed"], [left[0].parent.parent.name])
+        self.assertNotIn("SECRET-CANARY", self.all_out + (self.state / "events.jsonl").read_text())
+
     def test_codex_login_copy_is_never_written_back(self):
         self.install_codex()
         auth = self.t / "home/.codex/auth.json"
@@ -1415,6 +1443,105 @@ class Units(unittest.TestCase):
                 self.c.isolate("codex", argv)
         finally:
             self.c.sandbox_available = real
+
+
+class ScratchSweep(unittest.TestCase):
+    """Restart-time removal of abandoned scratch (copied logins), with
+    synthetic credentials and real killed processes."""
+
+    HOLDER = textwrap.dedent('''\
+        import os, sys, time
+        sys.path.insert(0, sys.argv[1])
+        import coordinator
+        s = coordinator.new_scratch()
+        os.makedirs(s + "/codex-home", 0o700)
+        with open(s + "/codex-home/auth.json", "w") as f:
+            f.write("SECRET-CANARY")
+        print(s, flush=True)
+        time.sleep(600)
+    ''')
+
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.t, True)
+        self.state = self.t / "state"
+        self.env = {**os.environ, "CG_COORD_STATE": str(self.state)}
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(HERE))
+        import coordinator
+        self.c = coordinator
+        self.real_state = coordinator.STATE_DIR
+        coordinator.STATE_DIR = self.state
+        self.addCleanup(setattr, coordinator, "STATE_DIR", self.real_state)
+        self.root = scratch_root(self.state)
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def holder(self):
+        """A supervisor that created a scratch with a login copy and holds it."""
+        p = subprocess.Popen([sys.executable, "-c", self.HOLDER, str(HERE)], env=self.env,
+                             stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p, Path(p.stdout.readline().strip())
+
+    def test_hard_killed_supervisor_scratch_is_kept_while_alive_then_removed(self):
+        p, s = self.holder()
+        self.assertEqual(oct(self.root.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(oct(s.stat().st_mode & 0o777), oct(0o700))
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))  # lock held: live
+        p.kill()  # SIGKILL: no cleanup runs
+        p.wait()
+        self.assertTrue((s / "codex-home/auth.json").exists())
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+        self.assertFalse(s.exists())
+        self.assertFalse(Path(f"{s}.lock").exists())
+
+    def test_scratch_a_live_process_still_uses_is_kept(self):
+        p, s = self.holder()
+        # Processes that outlived their supervisor without the lock fd: one
+        # named by its arguments, one working inside the scratch.
+        named = subprocess.Popen(["/bin/sh", "-c", "sleep 600", str(s)])
+        inside = subprocess.Popen(["sleep", "600"], cwd=s / "codex-home")
+        for a in (named, inside):
+            self.addCleanup(lambda a=a: (a.kill(), a.wait()))
+        p.kill()
+        p.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        named.kill()
+        named.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        inside.kill()
+        inside.wait()
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+
+    def test_recorded_unknown_and_unlocked_entries_are_never_removed(self):
+        p, s = self.holder()
+        p.kill()
+        p.wait()
+        self.assertEqual(self.c.sweep_scratch({str(s)}), ([], [s.name]))  # a task records it
+        (self.root / "notes").mkdir()
+        (self.root / "cg-agent-nolock").mkdir()  # not made by new_scratch
+        (self.root / "cg-agent-link").symlink_to(self.t)
+        Path(f"{self.root}/cg-agent-link.lock").touch()
+        outside = Path(tempfile.mkdtemp(prefix="cg-agent-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        removed, kept = self.c.sweep_scratch(set())
+        self.assertEqual(removed, [s.name])
+        self.assertEqual(sorted(kept), ["cg-agent-link", "cg-agent-nolock", "notes"])
+        self.assertTrue(outside.exists() and self.t.exists())
+
+    def test_root_that_is_not_private_is_refused(self):
+        self.root.mkdir(mode=0o700)
+        os.chmod(self.root, 0o755)
+        with self.assertRaises(self.c.Refused):
+            self.c.sweep_scratch(set())
+        with self.assertRaises(self.c.Refused):
+            self.c.new_scratch()
+
+    def test_normal_release_removes_scratch_and_lock(self):
+        s = self.c.new_scratch()
+        Path(s, "auth.json").write_text("SECRET-CANARY")
+        self.c.release_scratch(s)
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import shutil
 import sys
@@ -277,6 +278,19 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     localhost and, for codex (its model API), TCP 443."""
     if not sandbox_available():
         return None
+    extra = owner_writable()  # may refuse: before anything is created
+    if (os.path.realpath(tempfile.gettempdir()) + "/").startswith("/private/tmp/"):
+        raise Refused(f"TMPDIR {tempfile.gettempdir()} is under /tmp; scratch directories there would be shared "
+                      "with Claude Code agents")
+    scratch = new_scratch()
+    try:
+        return sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keychain, cwd)
+    except BaseException:
+        release_scratch(scratch)
+        raise
+
+
+def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keychain, cwd):
     def q(p, kind="subpath"):
         p = os.path.realpath(p)
         if '"' in p or "\\" in p:
@@ -296,11 +310,6 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     # IDE locks are loaded by the owner's own sessions. Owner-listed
     # directories are added.
     gitdir = REPO / ".git"
-    extra = owner_writable()  # may refuse: before anything is created
-    if (os.path.realpath(tempfile.gettempdir()) + "/").startswith("/private/tmp/"):
-        raise Refused(f"TMPDIR {tempfile.gettempdir()} is under /tmp; scratch directories there would be shared "
-                      "with Claude Code agents")
-    scratch = tempfile.mkdtemp(prefix="cg-agent-")
     writable = [q("/dev"), q(scratch), *[q(d) for d in extra]]
     if keychain:
         writable.append(q("/private/tmp"))  # Claude Code keeps per-session files there
@@ -374,8 +383,107 @@ def isolate(agent, argv, allow_read=(), slot=None, readonly=False, cwd=None):
     try:
         return *wrapped, codex_home(Path(wrapped[1]) / "codex-home")
     except OSError as e:
-        shutil.rmtree(wrapped[1], ignore_errors=True)
+        release_scratch(wrapped[1])
         raise Refused(f"cannot prepare CODEX_HOME: {e}")
+
+
+# Scratch directories hold copied Codex logins. Each lives in a private root
+# keyed by the state directory, next to a lock file its creator (and, after
+# launch, the agent's process tree) holds, so a restarted coordinator can
+# tell its own abandoned scratch from anything else and from live agents'.
+_scratch_locks = {}
+
+
+def scratch_root():
+    key = hashlib.sha256(os.path.realpath(STATE_DIR).encode()).hexdigest()[:12]
+    root = Path(tempfile.gettempdir()) / f"cg-coord-{key}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Refused(f"{root} is not a private directory of this user; no scratch is created or removed there")
+    return root
+
+
+def new_scratch():
+    """The lock file comes first and stays locked, so a sweep never sees the
+    directory unowned."""
+    fd, lock = tempfile.mkstemp(prefix="cg-agent-", suffix=".lock", dir=scratch_root())
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        scratch = lock[:-len(".lock")]
+        os.mkdir(scratch, 0o700)
+    except BaseException:
+        os.unlink(lock)
+        os.close(fd)
+        raise
+    _scratch_locks[scratch] = fd
+    return scratch
+
+
+def release_scratch(scratch):
+    shutil.rmtree(scratch, ignore_errors=True)
+    if not os.path.exists(scratch):
+        try:
+            os.unlink(f"{scratch}.lock")
+        except FileNotFoundError:
+            pass
+    fd = _scratch_locks.pop(scratch, None)
+    if fd is not None:
+        os.close(fd)
+
+
+def sweep_scratch(referenced):
+    """Removes this coordinator's scratch directories that nothing owns any
+    more (a crash or kill came between their creation and their removal).
+    Kept, and reported: any a task records (reconcile decides those), any
+    whose lock is held or missing, any a live process names in its arguments
+    or has open (lsof; macOS hides other processes' environment), any lsof
+    cannot vouch for, and anything not made by new_scratch. Refuses without
+    a process list. Returns (removed, kept) names."""
+    root = scratch_root()
+    p = run(["ps", "-axww", "-o", "command="])
+    if p.returncode != 0:
+        raise Refused(f"ps failed: {p.stderr.strip()}")
+    removed, kept = [], []
+    for e in sorted(root.iterdir()):
+        if e.name.endswith(".lock") and re.fullmatch(r"cg-agent-\w+", e.name[:-5]):
+            if not e.with_suffix("").exists() and os.path.lexists(e):
+                fd = os.open(e, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    e.unlink()
+                except BlockingIOError:
+                    pass
+                finally:
+                    os.close(fd)
+            continue
+        st = os.lstat(e)
+        lock = e.with_name(e.name + ".lock")
+        if (not re.fullmatch(r"cg-agent-\w+", e.name) or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid() or str(e) in referenced or not lock.exists()
+                or any(n in p.stdout for n in {str(e), os.path.realpath(e)})):
+            kept.append(e.name)
+            continue
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            kept.append(e.name)
+            continue
+        try:
+            busy = run(["lsof", "-nP", "-w", "-t", "+D", str(e)])  # 1 and silent: nothing open
+            if busy.returncode != 1 or busy.stdout.strip() or busy.stderr.strip():
+                kept.append(e.name)
+                continue
+            release_scratch(str(e))
+        finally:
+            os.close(fd)
+        (kept if e.exists() else removed).append(e.name)
+    return removed, kept
 
 
 def sha256(path):
@@ -897,11 +1005,17 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, codex_auth=None, **field
                '"$@"; rc=$?; echo $rc >"$0.tmp" && mv "$0.tmp" "$0"', str(exit_file), *argv]
     info = {"pid": None, "start": None, "dir": str(run_dir), "cwd": str(cwd), "kind": kind, "argv0": argv[0],
             "scratch": scratch, "codex_auth": codex_auth}
+    fault("launch_before_record")
     c.set(t, status, process=info, **fields)
     fault("launch_before_popen")
+    lock = _scratch_locks.get(scratch)
     with open(run_dir / "output.log", "w") as log:
+        # The agent's process tree inherits the scratch lock: held while any of it lives.
         proc = subprocess.Popen(wrapper, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True,
+                                pass_fds=(lock,) if lock is not None else ())
+    if lock is not None:
+        os.close(_scratch_locks.pop(scratch))
     fault("launch_after_popen")
     start = None
     for _ in range(3):  # ps can fail transiently under load
@@ -923,7 +1037,7 @@ def drop_scratch(info):
         note = codex_login_note(info)
         if note:
             print(note)
-        shutil.rmtree(info["scratch"], ignore_errors=True)
+        release_scratch(info["scratch"])
 
 
 def find_wrapper(needle):
@@ -1179,7 +1293,7 @@ def finish_impl(c, t, rc):
             v = subprocess.run(argv, cwd=p, capture_output=True, text=True)
         finally:
             if scratch:
-                shutil.rmtree(scratch, ignore_errors=True)
+                release_scratch(scratch)
         (evidence / f"validate-{i}.log").write_text(f"$ {cmd}\nexit {v.returncode}\n{v.stdout}{v.stderr}")
         c.event(t["id"], "validated", command=cmd, exit=v.returncode, log=str(evidence / f"validate-{i}.log"))
         if v.returncode != 0:
@@ -1486,6 +1600,15 @@ def reconcile(c):
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)
         except Refused as e:
             c.block(t, f"post-run check failed: {e}; lease kept", FAILED)
+    referenced = {t["process"]["scratch"] for t in c.state["tasks"].values()
+                  if isinstance(t.get("process"), dict) and t["process"].get("scratch")}
+    try:
+        removed, kept = sweep_scratch(referenced)
+    except (Refused, OSError) as e:
+        c.event(None, "scratch_sweep_refused", detail=str(e))
+    else:
+        if removed or kept:
+            c.event(None, "scratch_swept", removed=removed, kept=kept)
 
 
 def schedule(c):

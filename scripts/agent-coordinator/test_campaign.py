@@ -10,6 +10,7 @@ Plane or GitHub.
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
-from test_coordinator import A, B, R, Fixture, install_fake_codex, POOL  # noqa: E402
+from test_coordinator import A, B, R, Fixture, install_fake_codex, POOL, scratch_root  # noqa: E402
 
 CAMPAIGN = HERE / "campaign.py"
 
@@ -113,6 +114,7 @@ class CampaignFixture(Fixture):
         install_fake_codex(t, self.env)
         self.camp = t / "camp"
         self.camp.mkdir()
+        self.addCleanup(shutil.rmtree, scratch_root(self.camp / "coordinator"), True)
         self.ctl = t / "ctl"
         self.ctl.mkdir()
         (t / "exc").mkdir()

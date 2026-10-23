@@ -236,6 +236,24 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   Codex refreshed it during a run, the coordinator says so, because a
   refresh may rotate the token the owner's copy holds (`codex login` fixes
   that). The run's JSONL events in `output.log` are the transcript.
+- **Scratch lifecycle (copied logins).** Scratch directories live in a
+  private root, `$TMPDIR/cg-coord-<hash of the state directory>` (mode
+  0700, owned by the owner; any other root is refused). Each
+  `cg-agent-*` directory has a sibling `.lock` file created and locked
+  first; the coordinator, campaign PM, validation or ci-local holds the
+  lock while it uses the directory, and a launched agent's process tree
+  inherits it. A scratch directory is removed when its run is known to be
+  over. A coordinator or campaign supervisor that is hard-killed (SIGKILL,
+  power loss) removes nothing at that moment: its scratch, a copied
+  `auth.json` included, stays on disk until the next coordinator pass
+  (`run`, or the campaign's next tick), whose reconcile sweeps the root.
+  The sweep removes only a `cg-agent-*` directory it can prove abandoned:
+  no task records it, its lock exists and is free, no live process names
+  it in its arguments, and `lsof` reports nothing open in it. Everything
+  else (recorded, locked, in use, unverifiable, unknown entries, links) is
+  kept and listed in a `scratch_swept` event; a failed process listing
+  refuses the sweep (`scratch_sweep_refused`). Directories outside the
+  root are never touched. Events name directories only, never contents.
 - **Strict profile.** Codex agents, `command` agents, validation commands
   and the campaign's ci-local and PM runs read by allow-list only: the
   system (`/System`, `/usr`, `/bin`, `/sbin`, `/Library` without its
@@ -381,7 +399,12 @@ coordinator version.
 - Sandboxed Claude Code sessions keep no transcript under `~/.claude`;
   the agent's output log in the run directory is the record.
 - A run whose agent is still alive when the owner takes over keeps its
-  scratch directory under the system temp directory.
+  scratch directory under the system temp directory. macOS hides other
+  processes' environments, so an agent descendant that outlived its tree,
+  closed the inherited lock, holds nothing open in its scratch and does
+  not name it in its arguments looks abandoned to the sweep. A scratch
+  made under another `TMPDIR` is swept only by a coordinator run with
+  that `TMPDIR`.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no

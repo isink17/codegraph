@@ -555,7 +555,7 @@ def local_ci(c, tid, t, head, base, cidir):
             rc, _ = run_detached(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp, timeout=CI_TIMEOUT)
             problems, errors = copy_evidence(out, staging)
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            co.release_scratch(scratch)
         # Nothing may have changed the tested files meanwhile (a process left
         # behind by an earlier run, for instance).
         if not problems and (co.git(sp, "status", "--porcelain", "--ignored", "--untracked-files=all")
