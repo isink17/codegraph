@@ -18,16 +18,25 @@ import (
 // need their own home still override it with t.Setenv.
 var testHome string
 
+// testHomeEnv marks helper processes that tests re-execute from this binary:
+// they keep the environment, and the CODEGRAPH_HOME, their parent test chose.
+const testHomeEnv = "CODEGRAPH_CLI_TEST_HOME"
+
 func TestMain(m *testing.M) {
+	if testHome = os.Getenv(testHomeEnv); testHome != "" {
+		os.Exit(m.Run())
+	}
 	dir, err := os.MkdirTemp("", "codegraph-cli-test-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cli tests: private CODEGRAPH_HOME:", err)
 		os.Exit(1)
 	}
 	testHome = filepath.Join(dir, "home")
-	if err := os.Setenv("CODEGRAPH_HOME", testHome); err != nil {
-		fmt.Fprintln(os.Stderr, "cli tests: set CODEGRAPH_HOME:", err)
-		os.Exit(1)
+	for k, v := range map[string]string{"CODEGRAPH_HOME": testHome, testHomeEnv: testHome} {
+		if err := os.Setenv(k, v); err != nil {
+			fmt.Fprintln(os.Stderr, "cli tests: set", k+":", err)
+			os.Exit(1)
+		}
 	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
@@ -35,6 +44,9 @@ func TestMain(m *testing.M) {
 }
 
 func TestHostConfigCannotReachCLITests(t *testing.T) {
+	if got := os.Getenv("CODEGRAPH_HOME"); testHome == "" || got != testHome {
+		t.Fatalf("CODEGRAPH_HOME = %q, want the private test home %q", got, testHome)
+	}
 	prev := startupVersionCheck
 	startupVersionCheck = func(context.Context, io.Writer) {}
 	t.Cleanup(func() { startupVersionCheck = prev })

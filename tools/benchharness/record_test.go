@@ -207,6 +207,8 @@ func TestRunFixtureReproducible(t *testing.T) {
 		t.Skip("builds codegraph")
 	}
 	tmp := t.TempDir()
+	// The binary under test must not read the host's codegraph config.
+	t.Setenv("CODEGRAPH_HOME", filepath.Join(tmp, "home"))
 	bin := filepath.Join(tmp, "codegraph")
 	if runtime.GOOS == "windows" {
 		bin += ".exe" // exec resolves explicit paths only with the executable suffix
