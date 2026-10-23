@@ -4,7 +4,7 @@
 set -uo pipefail
 
 script="$(cd "$(dirname "$0")" && pwd)/merge-gate.sh"
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/merge-gate-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 failures=0
 

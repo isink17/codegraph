@@ -42,7 +42,7 @@ paths() { printf '%s\0' "$@"; }
 ) || failures=$((failures + $?))
 
 # classify and check-docs against a real repository.
-repo=$(mktemp -d)
+repo=$(mktemp -d "${TMPDIR:-/tmp}/ci-changes-test.XXXXXX") || exit 1
 trap 'rm -rf "$repo"' EXIT
 git -C "$repo" init -q
 git -C "$repo" config user.email ci@example.invalid
@@ -99,7 +99,7 @@ expect empty-diff docs_only=false "$(run pull_request "$docs" "$docs")"
 expect check-docs-missing-base fail "$(docs_check "$missing" "$docs")"
 
 # git diff failing must not read as an empty, docs-only change.
-fakebin=$(mktemp -d)
+fakebin=$(mktemp -d "${TMPDIR:-/tmp}/ci-changes-fakebin.XXXXXX") || exit 1
 realgit=$(command -v git)
 printf '#!/bin/sh\ncase "$1" in diff) exit 1 ;; esac\nexec "%s" "$@"\n' "$realgit" >"$fakebin/git"
 chmod +x "$fakebin/git"
