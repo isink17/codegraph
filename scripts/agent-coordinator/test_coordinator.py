@@ -1394,13 +1394,31 @@ class Pool(Fixture):
             m = self.t / f"log/reviewed-{tid}"
             review = sh(f'if [ -e {m} ]; then printf "Verdict: APPROVE\\nBlocking: 0\\n"; '
                         f'else touch {m}; printf "Verdict: REQUEST_CHANGES\\nBlocking: 1\\n"; fi')
-            tasks.append(self.task(tid, commit(tid, 1), scope=["work/*"], review=review, pr=n,
-                                   branch=f"task/{tid}"))
+            # Rework holds until the test opens its gate, so the other PR's
+            # rejection always lands while it runs, however loaded the machine.
+            gate = self.t / f"log/go-{tid}"
+            rework = sh(f'echo "start {tid}" >>"$CG_TEST_LOG"; i=0; while [ ! -e {gate} ]; do '
+                        f'i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.1; done; '
+                        f'mkdir -p work && echo {tid}-$RANDOM >>work/{tid}.txt && git add work && '
+                        f'git commit -qm {tid} && echo "end {tid}" >>"$CG_TEST_LOG"')
+            tasks.append(self.task(tid, rework, scope=["work/*"], review=review, pr=n, branch=f"task/{tid}"))
         self.plan(*tasks)
+
+        def started():
+            lines = self.log.read_text().splitlines() if self.log.exists() else []
+            return [l.split()[1] for l in lines if l.startswith("start")]
+        self.run_until(lambda: started(), 90)
+        first = started()[0]
+        other = "p2" if first == "p1" else "p1"
+        self.run_until(lambda: len(started()) > 1 or [e for e in self.events() if e["event"] == "waiting_on"
+                                                      and e["task"] == other and e.get("other") == first], 90)
+        self.assertEqual(started(), [first])  # the other PR's rework did not start meanwhile
+        (self.t / f"log/go-{first}").touch()
+        (self.t / f"log/go-{other}").touch()
         self.run_until(lambda: all(t["status"] == "awaiting_ci" for t in self.st().values()), 90)
-        words = [l.split()[0] for l in self.log.read_text().splitlines()]
-        self.assertEqual(words, ["start", "end", "start", "end"])  # rework never overlapped
-        self.assertTrue([e for e in self.events() if e["event"] == "waiting_on" and e.get("other")])
+        # Safety: overlapping rework is serialized.
+        self.assertEqual(self.log.read_text().splitlines(),
+                         [f"start {first}", f"end {first}", f"start {other}", f"end {other}"])
         for tid in ("p1", "p2"):
             self.assertIn(f"{tid}-init.txt", self.git("--git-dir", str(self.origin), "ls-tree", "-r",
                                                       "--name-only", f"task/{tid}"))
