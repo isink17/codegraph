@@ -240,9 +240,10 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   private root, `$TMPDIR/cg-coord-<hash of the state directory>` (mode
   0700, owned by the owner; any other root is refused). Each
   `cg-agent-*` directory has a sibling `.lock` file created and locked
-  first; the coordinator, campaign PM, validation or ci-local holds the
-  lock while it uses the directory, and a launched agent's process tree
-  inherits it. A scratch directory is removed when its run is known to be
+  first. The coordinator, campaign PM, validation or ci-local holds the
+  lock while it uses the directory, and the process it starts there (a
+  launched agent, a validation command, the PM's Codex, ci-local)
+  inherits it, so the lock stays held while any of them lives. A scratch directory is removed when its run is known to be
   over. A coordinator or campaign supervisor that is hard-killed (SIGKILL,
   power loss) removes nothing at that moment: its scratch, a copied
   `auth.json` included, stays on disk until the next coordinator pass
@@ -404,7 +405,9 @@ coordinator version.
   closed the inherited lock, holds nothing open in its scratch and does
   not name it in its arguments looks abandoned to the sweep. A scratch
   made under another `TMPDIR` is swept only by a coordinator run with
-  that `TMPDIR`.
+  that `TMPDIR`. Scratch from coordinators before this layout sits
+  directly in `$TMPDIR/cg-agent-*`, outside any root, and is never swept:
+  remove it by hand after upgrading, once no agent runs.
 - An agent's descendants that leave its process group (a new session) are
   not tracked or signalled.
 - `failed`, `blocked` and `interrupted` tasks need the owner: there is no

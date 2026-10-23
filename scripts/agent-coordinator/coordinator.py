@@ -410,17 +410,36 @@ def scratch_root():
 def new_scratch():
     """The lock file comes first and stays locked, so a sweep never sees the
     directory unowned."""
-    fd, lock = tempfile.mkstemp(prefix="cg-agent-", suffix=".lock", dir=scratch_root())
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        scratch = lock[:-len(".lock")]
-        os.mkdir(scratch, 0o700)
-    except BaseException:
-        os.unlink(lock)
-        os.close(fd)
-        raise
-    _scratch_locks[scratch] = fd
-    return scratch
+    root = scratch_root()
+    while True:
+        fd, lock = tempfile.mkstemp(prefix="cg-agent-", suffix=".lock", dir=root)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # A sweep may have unlinked the lock before it was locked.
+            try:
+                ours = os.path.samestat(os.fstat(fd), os.lstat(lock))
+            except FileNotFoundError:
+                ours = False
+            if not ours:
+                os.close(fd)
+                continue
+            scratch = lock[:-len(".lock")]
+            os.mkdir(scratch, 0o700)
+        except BaseException:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
+            os.close(fd)
+            raise
+        _scratch_locks[scratch] = fd
+        return scratch
+
+
+def scratch_fds(scratch):
+    """pass_fds for a child that should hold scratch's lock while it lives."""
+    fd = _scratch_locks.get(scratch)
+    return (fd,) if fd is not None else ()
 
 
 def release_scratch(scratch):
@@ -438,8 +457,8 @@ def release_scratch(scratch):
 def sweep_scratch(referenced):
     """Removes this coordinator's scratch directories that nothing owns any
     more (a crash or kill came between their creation and their removal).
-    Kept, and reported: any a task records (reconcile decides those), any
-    whose lock is held or missing, any a live process names in its arguments
+    Kept: any a task records (reconcile decides those). Kept and reported:
+    any whose lock is held or missing, any a live process names in its arguments
     or has open (lsof; macOS hides other processes' environment), any lsof
     cannot vouch for, and anything not made by new_scratch. Refuses without
     a process list. Returns (removed, kept) names."""
@@ -462,8 +481,10 @@ def sweep_scratch(referenced):
             continue
         st = os.lstat(e)
         lock = e.with_name(e.name + ".lock")
+        if os.path.realpath(e) in referenced:
+            continue
         if (not re.fullmatch(r"cg-agent-\w+", e.name) or not stat.S_ISDIR(st.st_mode)
-                or st.st_uid != os.getuid() or str(e) in referenced or not lock.exists()
+                or st.st_uid != os.getuid() or os.path.realpath(e) in referenced or not lock.exists()
                 or any(n in p.stdout for n in {str(e), os.path.realpath(e)})):
             kept.append(e.name)
             continue
@@ -475,7 +496,7 @@ def sweep_scratch(referenced):
             kept.append(e.name)
             continue
         try:
-            busy = run(["lsof", "-nP", "-w", "-t", "+D", str(e)])  # 1 and silent: nothing open
+            busy = run(["lsof", "-nP", "-t", "+D", str(e)])  # 1 and silent: nothing open (a warning keeps it)
             if busy.returncode != 1 or busy.stdout.strip() or busy.stderr.strip():
                 kept.append(e.name)
                 continue
@@ -702,6 +723,7 @@ class Coordinator:
         self.lock_fd = None
         self.state = None
         self.prepare_refused = []
+        self.scratch_kept = []
 
     # Exclusive ownership: flock is released by the kernel if we crash, so a
     # dead coordinator never blocks a restart, and two live ones never overlap.
@@ -1008,13 +1030,11 @@ def launch(c, t, argv, cwd, kind, status, scratch=None, codex_auth=None, **field
     fault("launch_before_record")
     c.set(t, status, process=info, **fields)
     fault("launch_before_popen")
-    lock = _scratch_locks.get(scratch)
     with open(run_dir / "output.log", "w") as log:
         # The agent's process tree inherits the scratch lock: held while any of it lives.
         proc = subprocess.Popen(wrapper, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True,
-                                pass_fds=(lock,) if lock is not None else ())
-    if lock is not None:
+                                stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=scratch_fds(scratch))
+    if scratch in _scratch_locks:
         os.close(_scratch_locks.pop(scratch))
     fault("launch_after_popen")
     start = None
@@ -1290,7 +1310,7 @@ def finish_impl(c, t, rc):
         # Validation runs code the agent wrote: same sandbox as the agent.
         argv, scratch = sandboxed(["/bin/sh", "-c", cmd], slot=p) or (["/bin/sh", "-c", cmd], None)
         try:
-            v = subprocess.run(argv, cwd=p, capture_output=True, text=True)
+            v = subprocess.run(argv, cwd=p, capture_output=True, text=True, pass_fds=scratch_fds(scratch))
         finally:
             if scratch:
                 release_scratch(scratch)
@@ -1600,15 +1620,16 @@ def reconcile(c):
             (finish_impl if t["status"] == RUNNING else finish_review)(c, t, rc)
         except Refused as e:
             c.block(t, f"post-run check failed: {e}; lease kept", FAILED)
-    referenced = {t["process"]["scratch"] for t in c.state["tasks"].values()
+    referenced = {os.path.realpath(t["process"]["scratch"]) for t in c.state["tasks"].values()
                   if isinstance(t.get("process"), dict) and t["process"].get("scratch")}
     try:
         removed, kept = sweep_scratch(referenced)
     except (Refused, OSError) as e:
         c.event(None, "scratch_sweep_refused", detail=str(e))
     else:
-        if removed or kept:
+        if removed or kept != c.scratch_kept:
             c.event(None, "scratch_swept", removed=removed, kept=kept)
+        c.scratch_kept = kept
 
 
 def schedule(c):

@@ -389,13 +389,13 @@ def stream_agents(c):
 
 # ---------------------------------------------------------------- merging
 
-def run_logged(c, tag, argv, log, cwd=None, env=None):
+def run_logged(c, tag, argv, log, cwd=None, env=None, pass_fds=()):
     """Runs argv with its output streamed to the terminal and kept in log."""
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a") as f:
         f.write(f"$ {' '.join(map(str, argv))}\n")
         p = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env, text=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=pass_fds)
         out = []
         for line in p.stdout:
             f.write(line)
@@ -406,7 +406,7 @@ def run_logged(c, tag, argv, log, cwd=None, env=None):
     return rc, "".join(out)
 
 
-def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrapper=None):
+def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrapper=None, pass_fds=()):
     """Runs argv in its own session with its output in log (streamed to the
     terminal), not a pipe. defer_signals: SIGINT/SIGTERM wait until it exits
     (a merge relaxes and restores a ruleset). timeout: the session is killed
@@ -424,7 +424,7 @@ def run_detached(c, tag, argv, log, cwd, timeout=None, defer_signals=False, wrap
             start = f.tell()
             f.flush()
             p = subprocess.Popen(argv, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                 start_new_session=True)
+                                 start_new_session=True, pass_fds=pass_fds)
         seen, end = start, (time.monotonic() + timeout if timeout else None)
         finished = False
         try:
@@ -552,7 +552,8 @@ def local_ci(c, tid, t, head, base, cidir):
         shutil.rmtree(cidir, ignore_errors=True)
         staging = cidir.parent / f".ci-local-{uuid.uuid4().hex[:8]}"
         try:
-            rc, _ = run_detached(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp, timeout=CI_TIMEOUT)
+            rc, _ = run_detached(c, tag, argv, cidir.parent / "ci-local.log", cwd=sp, timeout=CI_TIMEOUT,
+                                 pass_fds=co.scratch_fds(scratch))
             problems, errors = copy_evidence(out, staging)
         finally:
             co.release_scratch(scratch)
@@ -1112,7 +1113,7 @@ def cmd_propose(c, args):
         out_dir = c.dir / "proposals"
         out_dir.mkdir(exist_ok=True)
         log = out_dir / f"{tk}-{now().strftime('%Y%m%dT%H%M%S')}.log"
-        rc, text = run_logged(c, f"pm:{tk}", argv, log, cwd=tree)
+        rc, text = run_logged(c, f"pm:{tk}", argv, log, cwd=tree, pass_fds=co.scratch_fds(scratch))
     finally:
         if scratch:
             co.drop_scratch({"scratch": scratch, "codex_auth": auth})

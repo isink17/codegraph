@@ -1531,11 +1531,63 @@ class ScratchSweep(unittest.TestCase):
         inside.wait()
         self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
 
+    def test_lock_inherited_through_the_sandbox_keeps_scratch_after_a_hard_kill(self):
+        """The agent child neither names the scratch nor works in it: only
+        the lock it inherited (as launch and the campaign pass it) shows it is alive."""
+        if not self.c.sandbox_available():
+            self.skipTest("sandbox-exec is macOS only")
+        holder = textwrap.dedent('''\
+            import subprocess, sys, time
+            sys.path.insert(0, sys.argv[1])
+            import coordinator
+            argv, s = coordinator.sandboxed(["/bin/sleep", "600"], readonly=True, cwd="/")
+            child = subprocess.Popen(argv, cwd="/", pass_fds=coordinator.scratch_fds(s), start_new_session=True)
+            print(s, child.pid, flush=True)
+            time.sleep(600)
+        ''')
+        p = subprocess.Popen([sys.executable, "-c", holder, str(HERE)], env=self.env, stdout=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        s, pid = p.stdout.readline().split()
+        s, pid = Path(s), int(pid)
+        self.addCleanup(lambda: os.killpg(pid, signal.SIGKILL) if self.c.group_alive(pid) else None)
+        for _ in range(50):  # until sandbox-exec and env have exec'd into sleep
+            if subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
+                              text=True).stdout.strip() == "/bin/sleep 600":
+                break
+            time.sleep(0.1)
+        p.kill()
+        p.wait()
+        self.assertNotIn(str(s), subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True,
+                                                text=True).stdout)
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [s.name]))
+        os.killpg(pid, signal.SIGKILL)
+        while self.c.group_alive(pid):
+            time.sleep(0.05)
+        self.assertEqual(self.c.sweep_scratch(set()), ([s.name], []))
+
+    def test_lock_unlinked_before_it_was_taken_is_replaced(self):
+        real = self.c.fcntl.flock
+        def race(fd, op):  # a sweep unlinks the fresh, not yet locked file
+            if op == self.c.fcntl.LOCK_EX and not getattr(race, "done", False):
+                race.done = True
+                os.unlink(next(self.root.glob("cg-agent-*.lock")))
+            return real(fd, op)
+        self.c.fcntl.flock = race
+        try:
+            s = self.c.new_scratch()
+        finally:
+            self.c.fcntl.flock = real
+        self.addCleanup(self.c.release_scratch, s)
+        self.assertTrue(Path(f"{s}.lock").exists())
+        self.assertEqual(self.c.sweep_scratch(set()), ([], [Path(s).name]))  # still locked by us
+
     def test_recorded_unknown_and_unlocked_entries_are_never_removed(self):
         p, s = self.holder()
         p.kill()
         p.wait()
-        self.assertEqual(self.c.sweep_scratch({str(s)}), ([], [s.name]))  # a task records it
+        self.assertEqual(self.c.sweep_scratch({os.path.realpath(s)}), ([], []))  # a task records it
+        self.assertTrue(s.exists())
         (self.root / "notes").mkdir()
         (self.root / "cg-agent-nolock").mkdir()  # not made by new_scratch
         (self.root / "cg-agent-link").symlink_to(self.t)
