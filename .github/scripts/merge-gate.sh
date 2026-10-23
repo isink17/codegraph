@@ -62,7 +62,9 @@ want_header=$(printf 'PR: #%s\nReviewed-Head: %s\nVerdict: APPROVE\nBlocking: 0'
 # Pull request state.
 state=$(gh pr view "$pr" --json state,isDraft,baseRefName,headRefOid,mergeable \
 	--jq '[.state, (.isDraft|tostring), .baseRefName, .headRefOid, .mergeable] | join(" ")')
-read -r pr_state draft pr_base head mergeable <<<"$state"
+# Process substitution, not here-strings: bash 3.2 backs those with a file in
+# /tmp, which the local CI sandbox does not allow.
+read -r pr_state draft pr_base head mergeable < <(printf '%s\n' "$state")
 [ "$pr_state" = OPEN ] || fail "PR is $pr_state"
 [ "$draft" = false ] || fail "PR is a draft"
 [ "$pr_base" = "$base" ] || fail "PR targets $pr_base, not $base"
@@ -86,7 +88,7 @@ while IFS=$'\t' read -r name status conclusion app; do
 	*) fail "check '$name' concluded $conclusion" ;;
 	esac
 	if [ "$name" = ci ] && [ "$app" = github-actions ] && [ "$conclusion" = success ]; then ci_ok=true; fi
-done <<<"$checks"
+done < <(printf '%s\n' "$checks")
 [ "$ci_ok" = true ] || fail "aggregate 'ci' check from GitHub Actions has not succeeded on $sha"
 
 # Legacy commit statuses, if any were ever posted, must be green too.
@@ -101,6 +103,6 @@ echo "merge-gate: PASS: PR #$pr head $sha (reviewed, checks green, up to date wi
 
 gh pr merge "$pr" --squash --match-head-commit "$sha"
 merged=$(gh pr view "$pr" --json state,mergeCommit --jq '[.state, .mergeCommit.oid] | join(" ")')
-read -r merged_state merge_commit <<<"$merged"
+read -r merged_state merge_commit < <(printf '%s\n' "$merged")
 [ "$merged_state" = MERGED ] || fail "after merge the PR is $merged_state"
 echo "merge-gate: MERGED: PR #$pr as $merge_commit"

@@ -70,7 +70,7 @@ classify() {
 		return
 	fi
 	# A temp file keeps a failing git diff from looking like an empty list.
-	paths=$(mktemp)
+	paths=$(mktemp "${TMPDIR:-/tmp}/ci-changes.XXXXXX") || { echo "mktemp failed: full CI" >&2; echo docs_only=false; return; }
 	if ! git diff --no-renames --name-only -z "$range" >"$paths"; then
 		rm -f "$paths"
 		echo "git diff $range failed: full CI" >&2
