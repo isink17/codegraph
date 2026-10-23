@@ -965,6 +965,8 @@ class Pool(Fixture):
                 os.killpg(pid, 0)
             except ProcessLookupError:
                 break
+            except PermissionError:  # members still exiting
+                pass
             time.sleep(0.1)
         self.coord("run", "--once")
         t = self.st()["x"]

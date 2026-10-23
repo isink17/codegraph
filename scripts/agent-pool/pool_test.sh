@@ -399,6 +399,18 @@ for s in $A $B $R; do
 done
 [[ -z $(ls "$CG_POOL_LEASES") || $(ls "$CG_POOL_LEASES") == archive ]] || fail "leftover lease files: $(ls "$CG_POOL_LEASES")"
 
+# status inspects leased slots: it must not refresh their index, whose
+# index.lock would make the working agent's git add or commit fail.
+"$POOL" acquire --slot $A --task busy --agent x >/dev/null
+f=$(git -C "$CG_POOL_ROOT/$A" ls-files | head -n 1)
+idx=$(git -C "$CG_POOL_ROOT/$A" rev-parse --path-format=absolute --git-path index)
+[[ -n $f ]] || fail "no tracked file in $A"
+touch -t 202001010000 "$CG_POOL_ROOT/$A/$f"
+before=$(shasum "$idx")
+"$POOL" status >/dev/null
+[[ $(shasum "$idx") == "$before" ]] || fail "status rewrote the index of leased $A"
+"$POOL" release --slot $A --token "$(token $A)" >/dev/null || fail "release of $A after status check"
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1
