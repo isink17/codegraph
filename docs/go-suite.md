@@ -36,12 +36,21 @@ macOS and Linux legs of `.github/workflows/ci.yml` use, and that the local CI
 reproduction uses. Go's `-timeout` is a ceiling, not a target: a passing
 package does not wait for it, and a hang still fails at it.
 
-Why not lower: `internal/store` is the slowest package. On Darwin arm64 with
-Go 1.26.1 and CGO it ran 3,028 tests in 187.8 s with a 300 s timeout. An
-earlier run with `-timeout 90s` failed
-only because that package exceeded the ceiling. That was a wrong bound, not a
-product failure. 20m leaves more than 6× headroom over that measurement for a
-loaded machine.
+Why not lower: an earlier campaign ran with `-timeout 90s`, and it failed
+only because `internal/store` exceeded that ceiling. That was a wrong bound,
+not a product failure. The reference run of this script on Darwin arm64, Go
+1.26.1, CGO, commit 605daac, took 199 s wall time with every package passing:
+
+| Package | Elapsed | Tests passed |
+|---|---|---|
+| internal/indexer | 191.5 s | 1,593 |
+| internal/store | 182.0 s | 3,192 |
+| internal/diff | 135.5 s | 419 |
+| all 53 packages | 199 s wall | 7,218 |
+
+Focused `internal/diff` tests ran in another worker slot during part of
+that run, so its timings are slightly loaded. 20m leaves more than 6× headroom over the slowest package for a loaded or
+slower machine.
 
 Do not run two full suites at the same time on one machine, for example two
 worker slots or a suite beside the local CI reproduction. The packages then
