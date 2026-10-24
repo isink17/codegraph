@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type kotlinScopeSymbol struct {
@@ -152,7 +154,9 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		var dst kotlinScopeSymbol
 		strategy := ""
-		if member, ok := strings.CutPrefix(e.name, "this."); ok {
+		if e.evidence == graph.KotlinUnprovenThisReceiverEvidence {
+			continue
+		} else if member, ok := strings.CutPrefix(e.name, "this."); ok {
 			dst, strategy = kotlinThisMember(e, member, syms)
 		} else if strings.Contains(e.name, ".") {
 			parts := strings.Split(e.name, ".")

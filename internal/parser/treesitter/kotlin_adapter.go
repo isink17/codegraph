@@ -1326,11 +1326,15 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := name
+		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call) {
+			evidence = graph.KotlinUnprovenThisReceiverEvidence
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 			Col:         int(fnNode.StartPoint().Column) + 1,
 		})
@@ -1343,4 +1347,29 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			Range:         rng,
 		})
 	}
+}
+
+// kotlinThisReceiverUnproven refuses receiver-changing lexical contexts. A
+// lambda passed to a call may be a receiver lambda, and an extension function
+// has its extension receiver as unlabelled `this`; neither is proved by the
+// enclosing declaration container.
+func kotlinThisReceiverUnproven(call *sitter.Node) bool {
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "lambda_literal":
+			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+				if parent.Type() == "call_expression" {
+					return true
+				}
+				if parent.Type() == "function_declaration" {
+					break
+				}
+			}
+		case "function_declaration":
+			if len(kotlinFunctionPartsOf(kotlinDeclarationView{decl: node}).between) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }

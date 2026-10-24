@@ -148,6 +148,10 @@ const JavaLocalReceiverEvidence = "java:local_receiver"
 // field's stated class or interface type, type arguments dropped.
 const JavaFieldReceiverEvidence = "java:field_receiver"
 
+// KotlinUnprovenThisReceiverEvidence marks a Kotlin `this.member()` call whose
+// lexical context may change `this` to a lambda or extension receiver.
+const KotlinUnprovenThisReceiverEvidence = "kotlin:unproven_this_receiver"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,

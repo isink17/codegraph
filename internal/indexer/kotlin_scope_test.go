@@ -141,3 +141,69 @@ func TestKotlinExplicitThisUsesInnermostDeclaredType(t *testing.T) {
 	assertJVMQueryRelation(t, r, "Outer.Inner.save", "Outer.Inner.validate")
 	assertJVMNoQueryRelation(t, r, "Outer.Inner.save", "Outer.validate")
 }
+
+func TestKotlinReceiverSoundnessLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"With.kt": `package withcase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun withRun(other: OtherService) { with(other) { this.validate() } }
+    fun nestedRun(other: OtherService) { with(other) { run { this.validate() } } }
+}`,
+		"Apply.kt": `package applycase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun applyRun(other: OtherService) { other.apply { this.validate() } }
+}`,
+		"Extension.kt": `package extcase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun OtherService.execute() { this.validate() }
+}`,
+		"Lambda.kt": `package lambdacase
+class UserService {
+    fun validate() {}
+    fun run() { val callback = { this.validate() } }
+}`,
+	})
+	for _, path := range []string{"With.kt", "Apply.kt", "Extension.kt"} {
+		if got := r.edgeState(t, path, "this.validate"); !strings.Contains(got, ":: [/]") {
+			t.Fatalf("%s this.validate = %s, want unresolved receiver identity", path, got)
+		}
+		assertJVMReference(t, r, path, "this.validate", false)
+	}
+	if got := r.edgeState(t, "Lambda.kt", "this.validate"); !strings.Contains(got, "Lambda.kt:lambdacase.UserService.validate(function)") {
+		t.Fatalf("ordinary lambda this.validate = %s, want enclosing target", got)
+	}
+	assertJVMReference(t, r, "Lambda.kt", "this.validate", true)
+	assertJVMQueryRelation(t, r, "lambdacase.UserService.run", "lambdacase.UserService.validate")
+	r.assertFreshParity(t, "receiver-changing contexts")
+
+	r.write(t, "With.kt", `package withcase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun withRun(other: OtherService) { this.validate() }
+}`)
+	r.update(t, "With.kt")
+	if got := r.edgeState(t, "With.kt", "this.validate"); !strings.Contains(got, "With.kt:withcase.UserService.validate(function)") {
+		t.Fatalf("ordinary member after lambda removal = %s, want resolved", got)
+	}
+	assertJVMReference(t, r, "With.kt", "this.validate", true)
+
+	r.write(t, "Extension.kt", `package extcase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun execute() { this.validate() }
+}`)
+	r.update(t, "Extension.kt")
+	if got := r.edgeState(t, "Extension.kt", "this.validate"); !strings.Contains(got, "Extension.kt:extcase.UserService.validate(function)") {
+		t.Fatalf("ordinary member after extension removal = %s, want resolved", got)
+	}
+	assertJVMReference(t, r, "Extension.kt", "this.validate", true)
+	r.assertFreshParity(t, "receiver context removal")
+}

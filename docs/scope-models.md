@@ -191,6 +191,12 @@ caller's persisted type. Nested types use their own container identity, so an
 enclosing type's member is not selected. This source-level rule does not model
 inherited members or overload selection.
 
+Calls inside receiver-changing lambdas (`with`, `apply`, `run`, or an
+unproven lambda call) and inside member extension functions stay unresolved,
+because the enclosing declaration container does not prove what unlabelled
+`this` denotes. An ordinary lambda with no receiver-changing call context can
+retain the enclosing type's `this`.
+
 Visibility is modelled as follows:
 - `private` means the same file.
 - `protected` means the same file or the same container.

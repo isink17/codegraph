@@ -4,11 +4,40 @@ package treesitter
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
+
+func TestKotlinThisReceiverEvidence(t *testing.T) {
+	src := []byte(`class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun withRun(other: OtherService) { with(other) { this.validate() } }
+    fun OtherService.execute() { this.validate() }
+    fun run() { val callback = { this.validate() } }
+}`)
+	parsed, err := NewKotlin().Parse(context.Background(), "Receivers.kt", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]string{
+		4: graph.KotlinUnprovenThisReceiverEvidence,
+		5: graph.KotlinUnprovenThisReceiverEvidence,
+		6: "this.validate",
+	}
+	got := map[int]string{}
+	for _, edge := range parsed.Edges {
+		if edge.DstName == "this.validate" {
+			got[edge.Line] = edge.Evidence
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("this receiver evidence = %+v, want %+v", got, want)
+	}
+}
 
 func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	tests := []struct {
