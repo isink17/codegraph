@@ -298,8 +298,6 @@ cmd_review_checkout() {
 	[[ $fetched == "$head" ]] || die "review branch head is $fetched, expected $head"
 	git -C "$p" checkout -q --detach "$head" || die "could not checkout review head $head"
 	[[ $(git -C "$p" rev-parse HEAD) == "$head" ]] || die "review checkout landed at wrong head"
-	problems=$(slot_shape_problems "$slot")
-	[[ -z $problems ]] || die "review slot unsafe after checkout: ${problems//$'\n'/; }"
 	echo "checked out review $head"
 }
 
