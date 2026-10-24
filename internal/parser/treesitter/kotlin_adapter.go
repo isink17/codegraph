@@ -1327,7 +1327,7 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call) {
+		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call, content) {
 			evidence = graph.KotlinUnprovenThisReceiverEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -1353,12 +1353,15 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 // lambda passed to a call may be a receiver lambda, and an extension function
 // has its extension receiver as unlabelled `this`; neither is proved by the
 // enclosing declaration container.
-func kotlinThisReceiverUnproven(call *sitter.Node) bool {
+func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		switch node.Type() {
 		case "lambda_literal":
 			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
 				if parent.Type() == "call_expression" {
+					return true
+				}
+				if parent.Type() == "property_declaration" && kotlinReceiverFunctionType(parent, content) {
 					return true
 				}
 				if parent.Type() == "function_declaration" {
@@ -1369,6 +1372,16 @@ func kotlinThisReceiverUnproven(call *sitter.Node) bool {
 			if len(kotlinFunctionPartsOf(kotlinDeclarationView{decl: node}).between) > 0 {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func kotlinReceiverFunctionType(property *sitter.Node, content []byte) bool {
+	for _, typ := range findDescendants(property, "function_type") {
+		text := strings.Join(strings.Fields(nodeText(typ, content)), "")
+		if dot := strings.IndexByte(text, '.'); dot >= 0 && strings.Contains(text[dot:], ".(") {
+			return true
 		}
 	}
 	return false

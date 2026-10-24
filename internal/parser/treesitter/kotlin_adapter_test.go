@@ -18,20 +18,21 @@ class UserService {
     fun withRun(other: OtherService) { with(other) { this.validate() } }
     fun OtherService.execute() { this.validate() }
     fun run() { val callback = { this.validate() } }
+    fun typed() { val callback: OtherService.() -> Unit = { this.validate() } }
+    fun ordinary(items: List<Int>, value: Int) {
+        items.forEach { this.validate() }
+        value.let { this.validate() }
+    }
 }`)
 	parsed, err := NewKotlin().Parse(context.Background(), "Receivers.kt", src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[int]string{
-		4: graph.KotlinUnprovenThisReceiverEvidence,
-		5: graph.KotlinUnprovenThisReceiverEvidence,
-		6: "this.validate",
-	}
-	got := map[int]string{}
+	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence}
+	var got []string
 	for _, edge := range parsed.Edges {
 		if edge.DstName == "this.validate" {
-			got[edge.Line] = edge.Evidence
+			got = append(got, edge.Evidence)
 		}
 	}
 	if !reflect.DeepEqual(got, want) {

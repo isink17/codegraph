@@ -168,8 +168,22 @@ class UserService {
     fun validate() {}
     fun run() { val callback = { this.validate() } }
 }`,
+		"Typed.kt": `package typedcase
+class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun typed() { val callback: OtherService.() -> Unit = { this.validate() } }
+}`,
+		"Ordinary.kt": `package ordinarycase
+class UserService {
+    fun validate() {}
+    fun ordinary(items: List<Int>, value: Int) {
+        items.forEach { this.validate() }
+        value.let { this.validate() }
+    }
+}`,
 	})
-	for _, path := range []string{"With.kt", "Apply.kt", "Extension.kt"} {
+	for _, path := range []string{"With.kt", "Apply.kt", "Extension.kt", "Typed.kt"} {
 		if got := r.edgeState(t, path, "this.validate"); !strings.Contains(got, ":: [/]") {
 			t.Fatalf("%s this.validate = %s, want unresolved receiver identity", path, got)
 		}
@@ -180,6 +194,9 @@ class UserService {
 	}
 	assertJVMReference(t, r, "Lambda.kt", "this.validate", true)
 	assertJVMQueryRelation(t, r, "lambdacase.UserService.run", "lambdacase.UserService.validate")
+	if got := r.edgeState(t, "Ordinary.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("call-passed ordinary lambdas this.validate = %s, want unresolved without receiver proof", got)
+	}
 	r.assertFreshParity(t, "receiver-changing contexts")
 
 	r.write(t, "With.kt", `package withcase
