@@ -2,6 +2,10 @@ package diff
 
 import (
 	"encoding/json"
+	"go/build"
+	"go/build/constraint"
+	"io"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -215,13 +219,17 @@ func TestGoBuildConstraintChangeIsUncertain(t *testing.T) {
 		name, from, to, detail string
 		head                   string // whole head file, when set
 	}{
-		{name: "added", from: "", to: "//go:build linux\n\n", detail: "none -> linux"},
-		{name: "added ignore", from: "", to: "//go:build ignore\n\n", detail: "none -> ignore"},
-		{name: "removed", from: "//go:build linux\n\n", to: "", detail: "linux -> none"},
+		{name: "added", from: "", to: "//go:build linux\n\n", detail: "(none) -> linux"},
+		{name: "added ignore", from: "", to: "//go:build ignore\n\n", detail: "(none) -> ignore"},
+		{name: "added none tag", from: "", to: "//go:build none\n\n", detail: "(none) -> none"},
+		{name: "removed", from: "//go:build linux\n\n", to: "", detail: "linux -> (none)"},
 		{name: "narrowed", from: "//go:build linux\n\n", to: "//go:build linux && amd64\n\n", detail: "linux -> linux && amd64"},
 		{name: "plus build changed", from: "// +build linux\n\n", to: "// +build darwin\n\n", detail: "linux -> darwin"},
+		{name: "plus build loses its blank line", from: "// +build linux\n\n", to: "// +build linux\n", detail: "linux -> (none)"},
+		{name: "second go:build line", from: "//go:build linux\n\n", to: "//go:build linux\n//go:build amd64\n\n", detail: "linux -> invalid: multiple //go:build lines"},
 		{name: "spacing only", from: "//go:build linux&&amd64\n\n", to: "//go:build linux && amd64\n\n"},
 		{name: "plus build to go:build", from: "// +build linux\n// +build amd64\n\n", to: "//go:build linux && amd64\n\n"},
+		{name: "plus build in the package doc", from: "", to: "// +build linux\n"},
 		{name: "doc comment", from: "", to: "// Package p is documented.\n"},
 		{name: "directive after package clause", head: "package p\n\n//go:build linux\n\nfunc T() int { return 1 }\n"},
 	}
@@ -268,6 +276,65 @@ func TestGoBuildConstraintChangeIsUncertain(t *testing.T) {
 		for _, tc := range cases {
 			if a, b := docs["go-ast"][tc.name], docs["tree-sitter"][tc.name]; a != b {
 				t.Errorf("%s: adapters disagree:\n go/ast:      %s\n tree-sitter: %s", tc.name, a, b)
+			}
+		}
+	}
+}
+
+// TestGoBuildConstraintMatchesGoBuild checks goBuildConstraint against the go
+// command's own reading: for every header and build context, go/build's
+// MatchFile must agree with evaluating the extracted expression.
+func TestGoBuildConstraintMatchesGoBuild(t *testing.T) {
+	headers := []string{
+		"",
+		"//go:build linux\n\n",
+		"//go:build none\n\n",
+		"//go:build !linux && (amd64 || foo)\n\n",
+		"// Package p.\n//go:build linux\n",
+		"// +build linux\n\n",
+		"// +build linux\n",
+		"// +build linux darwin\n// +build amd64\n\n",
+		"// +build linux\n\n//go:build darwin\n\n",
+		"/* //go:build linux */\n\n",
+		"/*\n//go:build linux\n*/\n\n",
+		"// +build !\n\n",
+		"//go:build linux\n//go:build darwin\n\n",
+	}
+	contexts := []build.Context{
+		{GOOS: "linux", GOARCH: "amd64"},
+		{GOOS: "darwin", GOARCH: "arm64"},
+		{GOOS: "darwin", GOARCH: "amd64", BuildTags: []string{"foo"}},
+		{GOOS: "windows", GOARCH: "arm64", BuildTags: []string{"none"}},
+	}
+	for _, h := range headers {
+		src := h + "package p\n"
+		got := goBuildConstraint([]byte(src))
+		for _, ctx := range contexts {
+			ctx.Compiler = "gc"
+			ctx.OpenFile = func(string) (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(src)), nil }
+			match, err := ctx.MatchFile(".", "x.go")
+			if strings.HasPrefix(got, "invalid: ") {
+				if err == nil {
+					t.Errorf("%q: goBuildConstraint %q, but go/build accepts the file", h, got)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%q: go/build: %v", h, err)
+			}
+			want := true
+			if got != "(none)" {
+				x, err := constraint.Parse("//go:build " + got)
+				if err != nil {
+					t.Fatalf("%q: canonical %q does not parse: %v", h, got, err)
+				}
+				want = x.Eval(func(tag string) bool {
+					return tag == ctx.GOOS || tag == ctx.GOARCH || tag == "gc" || slices.Contains(ctx.BuildTags, tag) ||
+						(tag == "unix" && ctx.GOOS != "windows")
+				})
+			}
+			if match != want {
+				t.Errorf("%q on %s/%s %v: go/build matches=%v, goBuildConstraint %q evaluates %v", h, ctx.GOOS, ctx.GOARCH, ctx.BuildTags, match, got, want)
 			}
 		}
 	}

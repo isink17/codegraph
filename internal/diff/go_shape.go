@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"bytes"
 	"encoding/json"
 	"go/ast"
 	"go/build/constraint"
@@ -213,43 +214,89 @@ func sameShapes(a, b []goShape) bool {
 	return true
 }
 
-// goBuildConstraint is the file's build constraint in canonical form, "none"
-// without one. The graph indexes a file whatever its constraint says, so a
+// goBuildConstraint is the file's build constraint as the go command reads
+// it, in canonical form; "(none)" without one, which no constraint expression
+// can spell. The graph indexes a file whatever its constraint says, so a
 // changed constraint can add or drop the file from a build while every
-// declaration and edge stays the same. A //go:build line wins over // +build
-// lines, as in the go command.
+// declaration and edge stays the same. The header rules follow go/build
+// (parseFileHeader, shouldBuild): a //go:build line anywhere in the leading
+// comments controls, two of them make the file invalid, and without one only
+// the // +build lines followed by a blank line before the first non-comment
+// line count, ANDed, skipping lines that do not parse.
 func goBuildConstraint(src []byte) string {
-	f, err := goparser.ParseFile(token.NewFileSet(), "", src, goparser.PackageClauseOnly|goparser.ParseComments)
-	if err != nil {
-		return "unparsed"
-	}
-	var plus []constraint.Expr
-	for _, group := range f.Comments {
-		if group.Pos() > f.Package {
-			break
+	end, inSlashStar, ended := 0, false, false
+	var goBuild string
+	seen := 0
+	p := src
+lines:
+	for len(p) > 0 {
+		line := p
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			line, p = line[:i], p[i+1:]
+		} else {
+			p = p[len(p):]
 		}
-		for _, c := range group.List {
-			switch {
-			case constraint.IsGoBuild(c.Text):
-				if x, err := constraint.Parse(c.Text); err == nil {
-					return x.String()
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 && !ended {
+			end = len(src) - len(p)
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("//")) {
+			ended = true
+		}
+		if !inSlashStar && constraint.IsGoBuild(string(line)) {
+			seen++
+			goBuild = string(line)
+		}
+		for len(line) > 0 {
+			if inSlashStar {
+				i := bytes.Index(line, []byte("*/"))
+				if i < 0 {
+					continue lines
 				}
-				return "unparsed " + c.Text
-			case constraint.IsPlusBuild(c.Text):
-				x, err := constraint.Parse(c.Text)
-				if err != nil {
-					return "unparsed " + c.Text
-				}
-				plus = append(plus, x)
+				inSlashStar = false
+				line = bytes.TrimSpace(line[i+2:])
+				continue
 			}
+			if bytes.HasPrefix(line, []byte("//")) {
+				continue lines
+			}
+			if bytes.HasPrefix(line, []byte("/*")) {
+				inSlashStar = true
+				line = bytes.TrimSpace(line[2:])
+				continue
+			}
+			break lines
 		}
 	}
-	if len(plus) == 0 {
-		return "none"
+	switch {
+	case seen > 1:
+		return "invalid: multiple //go:build lines"
+	case seen == 1:
+		x, err := constraint.Parse(goBuild)
+		if err != nil {
+			return "invalid: " + goBuild
+		}
+		return x.String()
 	}
-	x := plus[0]
-	for _, y := range plus[1:] {
-		x = &constraint.AndExpr{X: x, Y: y}
+	var x constraint.Expr
+	for _, line := range bytes.Split(src[:end], []byte("\n")) {
+		text := string(bytes.TrimSpace(line))
+		if !constraint.IsPlusBuild(text) {
+			continue
+		}
+		y, err := constraint.Parse(text)
+		if err != nil {
+			continue
+		}
+		if x == nil {
+			x = y
+		} else {
+			x = &constraint.AndExpr{X: x, Y: y}
+		}
+	}
+	if x == nil {
+		return "(none)"
 	}
 	return x.String()
 }
