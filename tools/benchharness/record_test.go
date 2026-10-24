@@ -255,6 +255,7 @@ func TestRunFixtureReproducible(t *testing.T) {
 		t.Fatalf("runs differ:\n%s\n---\n%s", outs[0], outs[1])
 	}
 	testProduce(t, bin)
+	testVerifyBundle(t, bin)
 }
 
 func TestFactsPresentBoundaries(t *testing.T) {
