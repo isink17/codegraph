@@ -2,6 +2,10 @@ package diff
 
 import (
 	"encoding/json"
+	"go/build"
+	"go/build/constraint"
+	"io"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -202,5 +206,136 @@ func TestGoUnmodeledReportsUnreadableSource(t *testing.T) {
 	changes[0].After = file(head)
 	if got := goUnmodeledUncertainty(changes, Revision{source: read(src)}, Revision{source: read(head)}, nil); len(got) != 1 || got[0].Detail != "type T" {
 		t.Fatalf("readable: %+v", got)
+	}
+}
+
+// TestGoBuildConstraintChangeIsUncertain pins that a changed build constraint,
+// which can add or drop a file from a build while the graph stays the same,
+// is reported as limited_evidence at score 0, and that rewrites with the same
+// meaning stay quiet.
+func TestGoBuildConstraintChangeIsUncertain(t *testing.T) {
+	const body = "package p\n\nfunc T() int { return 1 }\n"
+	cases := []struct {
+		name, from, to, detail string
+		head                   string // whole head file, when set
+	}{
+		{name: "added", from: "", to: "//go:build linux\n\n", detail: "(none) -> linux"},
+		{name: "added ignore", from: "", to: "//go:build ignore\n\n", detail: "(none) -> ignore"},
+		{name: "added none tag", from: "", to: "//go:build none\n\n", detail: "(none) -> none"},
+		{name: "removed", from: "//go:build linux\n\n", to: "", detail: "linux -> (none)"},
+		{name: "narrowed", from: "//go:build linux\n\n", to: "//go:build linux && amd64\n\n", detail: "linux -> linux && amd64"},
+		{name: "plus build changed", from: "// +build linux\n\n", to: "// +build darwin\n\n", detail: "linux -> darwin"},
+		{name: "plus build loses its blank line", from: "// +build linux\n\n", to: "// +build linux\n", detail: "linux -> (none)"},
+		{name: "second go:build line", from: "//go:build linux\n\n", to: "//go:build linux\n//go:build amd64\n\n", detail: "linux -> invalid: multiple //go:build lines"},
+		{name: "spacing only", from: "//go:build linux&&amd64\n\n", to: "//go:build linux && amd64\n\n"},
+		{name: "plus build to go:build", from: "// +build linux\n// +build amd64\n\n", to: "//go:build linux && amd64\n\n"},
+		{name: "plus build in the package doc", from: "", to: "// +build linux\n"},
+		{name: "doc comment", from: "", to: "// Package p is documented.\n"},
+		{name: "directive after package clause", head: "package p\n\n//go:build linux\n\nfunc T() int { return 1 }\n"},
+	}
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.22\n", "p/use.go": "package p\n\nfunc U() { _ = T() }\n"}
+	docs := map[string]map[string]string{}
+	for name, adapter := range testGoAdapters {
+		docs[name] = map[string]string{}
+		t.Run(name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					base := map[string]string{"p/lib.go": tc.from + body}
+					for k, v := range files {
+						base[k] = v
+					}
+					to := tc.to + body
+					if tc.head != "" {
+						to = tc.head
+					}
+					d := editScenario(t, adapter, base, func(r *gittest.Repo) {
+						r.Write("p/lib.go", to)
+					}).Diff
+					var got []string
+					for _, u := range d.Risk.Uncertainty {
+						if u.Reason == "go_build_constraint_change_unmodeled" && u.Identity == "p/lib.go" {
+							got = append(got, u.Detail)
+						}
+					}
+					if strings.Join(got, "|") != tc.detail {
+						t.Fatalf("constraint uncertainty = %v, want %q; risk %s", got, tc.detail, canonical(d.Risk))
+					}
+					want := "no_risk_evidence"
+					if tc.detail != "" {
+						want = "limited_evidence"
+					}
+					if d.Risk.Assessment != want || d.Risk.Score == nil || *d.Risk.Score != 0 {
+						t.Fatalf("assessment %s score %v, want %s at 0: %s", d.Risk.Assessment, d.Risk.Score, want, canonical(d.Risk))
+					}
+					docs[name][tc.name] = canonical(d)
+				})
+			}
+		})
+	}
+	if len(docs) > 1 {
+		for _, tc := range cases {
+			if a, b := docs["go-ast"][tc.name], docs["tree-sitter"][tc.name]; a != b {
+				t.Errorf("%s: adapters disagree:\n go/ast:      %s\n tree-sitter: %s", tc.name, a, b)
+			}
+		}
+	}
+}
+
+// TestGoBuildConstraintMatchesGoBuild checks goBuildConstraint against the go
+// command's own reading: for every header and build context, go/build's
+// MatchFile must agree with evaluating the extracted expression.
+func TestGoBuildConstraintMatchesGoBuild(t *testing.T) {
+	headers := []string{
+		"",
+		"//go:build linux\n\n",
+		"//go:build none\n\n",
+		"//go:build !linux && (amd64 || foo)\n\n",
+		"// Package p.\n//go:build linux\n",
+		"// +build linux\n\n",
+		"// +build linux\n",
+		"// +build linux darwin\n// +build amd64\n\n",
+		"// +build linux\n\n//go:build darwin\n\n",
+		"/* //go:build linux */\n\n",
+		"/*\n//go:build linux\n*/\n\n",
+		"// +build !\n\n",
+		"//go:build linux\n//go:build darwin\n\n",
+	}
+	contexts := []build.Context{
+		{GOOS: "linux", GOARCH: "amd64"},
+		{GOOS: "darwin", GOARCH: "arm64"},
+		{GOOS: "darwin", GOARCH: "amd64", BuildTags: []string{"foo"}},
+		{GOOS: "windows", GOARCH: "arm64", BuildTags: []string{"none"}},
+	}
+	for _, h := range headers {
+		src := h + "package p\n"
+		got := goBuildConstraint([]byte(src))
+		for _, ctx := range contexts {
+			ctx.Compiler = "gc"
+			ctx.OpenFile = func(string) (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(src)), nil }
+			match, err := ctx.MatchFile(".", "x.go")
+			if strings.HasPrefix(got, "invalid: ") {
+				if err == nil {
+					t.Errorf("%q: goBuildConstraint %q, but go/build accepts the file", h, got)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%q: go/build: %v", h, err)
+			}
+			want := true
+			if got != "(none)" {
+				x, err := constraint.Parse("//go:build " + got)
+				if err != nil {
+					t.Fatalf("%q: canonical %q does not parse: %v", h, got, err)
+				}
+				want = x.Eval(func(tag string) bool {
+					return tag == ctx.GOOS || tag == ctx.GOARCH || tag == "gc" || slices.Contains(ctx.BuildTags, tag) ||
+						(tag == "unix" && ctx.GOOS != "windows")
+				})
+			}
+			if match != want {
+				t.Errorf("%q on %s/%s %v: go/build matches=%v, goBuildConstraint %q evaluates %v", h, ctx.GOOS, ctx.GOARCH, ctx.BuildTags, match, got, want)
+			}
+		}
 	}
 }

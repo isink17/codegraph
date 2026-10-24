@@ -67,7 +67,7 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 	sort.Slice(input.Fixtures, func(i, j int) bool { return input.Fixtures[i].Name < input.Fixtures[j].Name })
 	seen := map[string]bool{}
 	for _, f := range input.Fixtures {
-		if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(f.Name) || f.Name == "fixtures" || seen[f.Name] || filepath.IsAbs(f.Path) || f.Path == "" {
+		if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(f.Name) || f.Name == "fixtures" || f.Name == "manifest" || seen[f.Name] || filepath.IsAbs(f.Path) || f.Path == "" {
 			return fmt.Errorf("produce: invalid or duplicate fixture %q", f.Name)
 		}
 		seen[f.Name] = true
@@ -147,15 +147,39 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 		fmt.Fprintf(&sums, "%s  %s\n", hashBytes(files[name]), name)
 	}
 	files["SHA256SUMS"] = sums.Bytes()
-	if err := os.MkdirAll(*out, 0755); err != nil {
+	// Publish only after all records passed the existing validator.
+	return writeBundle(*out, files)
+}
+
+// writeBundle writes every file into a sibling staging directory and renames
+// it to out, so a failed write never leaves a partial bundle that a rerun
+// would then refuse as a nonempty output directory. out is absent or empty.
+// A symlinked out is refused: removing it would replace the link, not fill
+// its target.
+func writeBundle(out string, files map[string][]byte) error {
+	if fi, err := os.Lstat(out); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("produce: output directory %s is a symlink", out)
+	}
+	parent := filepath.Dir(filepath.Clean(out))
+	if err := os.MkdirAll(parent, 0755); err != nil {
 		return err
 	}
-	// Publish only after all records passed the existing validator.
-	for _, name := range append(names, "SHA256SUMS") {
-		if err := os.WriteFile(filepath.Join(*out, name), files[name], 0644); err != nil {
+	stage, err := os.MkdirTemp(parent, ".produce-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	if err := os.Chmod(stage, 0755); err != nil {
+		return err
+	}
+	for name, b := range files {
+		if err := os.WriteFile(filepath.Join(stage, name), b, 0644); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := os.Remove(out); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(stage, out)
 }
 func hashBytes(b []byte) string { return fmt.Sprintf("%x", sha256.Sum256(b)) }
