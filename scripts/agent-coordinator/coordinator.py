@@ -268,9 +268,9 @@ def sdk_root():
 def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keychain=False, cwd=None):
     """(argv, scratch): argv run under sandbox-exec, and the private scratch
     directory the caller removes afterwards; None where no sandbox exists.
-    readonly: only the scratch directory, /tmp and /dev are writable (no slot,
-    no repository). codex: CODEX_HOME is a private directory in scratch (see
-    codex_home). keychain: the legacy profile for Claude Code agents, which
+    readonly: only the scratch directory and /dev are writable (/tmp too under
+    the keychain profile; no slot, no repository). codex: CODEX_HOME is a
+    private directory in scratch (see codex_home). keychain: the legacy profile for Claude Code agents, which
     keep their login in the keychain: reads are allowed except the protected
     paths. Everything else runs in the strict profile: reads only of the
     system, its tools, the Go module cache, the slot, the repository's git
@@ -304,7 +304,8 @@ def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keycha
     # configuration from. An agent may write its slot, the git objects and
     # refs a commit needs, its own worktree admin files except their config
     # and pointers, a private scratch directory (TMPDIR, Go and XDG caches;
-    # the shared Go module cache stays readable), /tmp and /dev. Claude
+    # the shared Go module cache stays readable) and /dev; /tmp only under the
+    # keychain profile, which Claude Code needs. Claude
     # Code's session data is not writable: Claude Code runs without it (verified with
     # 2.1.296), and its shell snapshots, session environments, memory and
     # IDE locks are loaded by the owner's own sessions. Owner-listed
