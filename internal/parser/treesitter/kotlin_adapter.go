@@ -1359,7 +1359,7 @@ func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
 		case "lambda_literal":
 			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
 				if parent.Type() == "call_expression" {
-					return true
+					return !kotlinKnownOrdinaryLambdaCall(parent, content)
 				}
 				if parent.Type() == "property_declaration" && kotlinReceiverFunctionType(parent, content) {
 					return true
@@ -1375,6 +1375,26 @@ func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
 		}
 	}
 	return false
+}
+
+// Kotlin's standard-library higher-order helpers below take ordinary lambda
+// parameters, so unlabelled `this` remains the enclosing receiver. Unknown
+// lambda calls stay unresolved because they may be receiver-function calls.
+func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte) bool {
+	fn := childByFieldName(call, "function")
+	if fn == nil && call.ChildCount() > 0 {
+		fn = call.Child(0)
+	}
+	name := nodeText(fn, content)
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		name = name[dot+1:]
+	}
+	switch name {
+	case "also", "filter", "fold", "forEach", "let", "map", "onEach", "runCatching", "use":
+		return true
+	default:
+		return false
+	}
 }
 
 func kotlinReceiverFunctionType(property *sitter.Node, content []byte) bool {

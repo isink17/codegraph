@@ -194,9 +194,10 @@ class UserService {
 	}
 	assertJVMReference(t, r, "Lambda.kt", "this.validate", true)
 	assertJVMQueryRelation(t, r, "lambdacase.UserService.run", "lambdacase.UserService.validate")
-	if got := r.edgeState(t, "Ordinary.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
-		t.Fatalf("call-passed ordinary lambdas this.validate = %s, want unresolved without receiver proof", got)
+	if got := r.edgeState(t, "Ordinary.kt", "this.validate"); !strings.Contains(got, "Ordinary.kt:ordinarycase.UserService.validate(function)") {
+		t.Fatalf("call-passed ordinary lambdas this.validate = %s, want enclosing target", got)
 	}
+	assertJVMReference(t, r, "Ordinary.kt", "this.validate", true)
 	r.assertFreshParity(t, "receiver-changing contexts")
 
 	r.write(t, "With.kt", `package withcase
