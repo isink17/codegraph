@@ -101,6 +101,15 @@ var rustPrivateVisibilityCases = []struct {
 		"a.rs":   "mod m; fn helper() {}",
 		"a/m.rs": "pub struct S;\nfn helper() {}\nimpl crate::a::m::S {\n    pub fn go() {\n        super::helper();\n    }\n}\n",
 	}, "a/m.rs", "super::helper", "a.rs:crate::a::helper", true},
+	// A bare name inside an impl method resolves from the impl's module and
+	// never reaches an associated fn, which needs Self:: (rustc: helper
+	// compiles; assoc is E0425).
+	{"bare call from an impl method", tree{
+		"lib.rs": "fn helper() {}\npub struct S;\nimpl S {\n    pub fn go() {\n        helper();\n    }\n}\n",
+	}, "lib.rs", "helper", "lib.rs:crate::helper", false},
+	{"bare call never reaches an associated fn", tree{
+		"lib.rs": "pub struct S;\nimpl S {\n    fn assoc() {}\n    pub fn go() {\n        assoc();\n    }\n}\n",
+	}, "lib.rs", "assoc", "", false},
 	{"bare call from an impl of a qualified type", tree{
 		"lib.rs": "mod b;",
 		"b.rs":   "pub struct S;\nimpl S {\n    fn helper() {}\n}\nimpl crate::b::S {\n    pub fn go() {\n        helper();\n    }\n}\nfn helper() {}\n",
