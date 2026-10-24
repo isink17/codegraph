@@ -4,6 +4,7 @@
 #   pool.sh status [slot]
 #   pool.sh acquire --slot <slot|auto> --task <task> --agent <agent> [--pr N] [--owner who] [--pid PID] [--review]
 #   pool.sh release --slot <slot> --token <token>
+#   pool.sh review-checkout --slot codegraph-review --token <token> --branch <branch> --head SHA
 #   pool.sh reclaim --slot <slot> --token <token> --reason <text>
 #   pool.sh prepare --slot <slot> | --all
 #
@@ -272,6 +273,36 @@ cmd_release() {
 	echo "released $slot at $(git -C "$p" rev-parse --short HEAD)"
 }
 
+cmd_review_checkout() {
+	local slot="" token="" branch="" head="" p problems fetched
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--slot) need "$@"; slot=$2; shift 2 ;;
+		--token) need "$@"; token=$2; shift 2 ;;
+		--branch) need "$@"; branch=$2; shift 2 ;;
+		--head) need "$@"; head=$2; shift 2 ;;
+		*) die "unknown argument $1" 2 ;;
+		esac
+	done
+	[[ $slot == "$REVIEW" && -n $token && -n $branch && $head =~ ^[0-9a-fA-F]{40}$ ]] ||
+		die "review-checkout needs --slot $REVIEW, --token, --branch and a 40-character --head" 2
+	git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "invalid review branch" 2
+	own_lease "$slot" "$token"
+	p=$(slot_path "$slot")
+	problems=$(slot_shape_problems "$slot")
+	[[ -z $problems ]] || die "$slot is not safe for review checkout: ${problems//$'\n'/; }"
+	git -C "$p" fetch -q "$REMOTE" "+refs/heads/$branch:refs/coordinator/review" ||
+		die "could not fetch review branch $branch"
+	fetched=$(git -C "$p" rev-parse -q --verify refs/coordinator/review^{commit}) ||
+		die "fetched review branch is unavailable"
+	[[ $fetched == "$head" ]] || die "review branch head is $fetched, expected $head"
+	git -C "$p" checkout -q --detach "$head" || die "could not checkout review head $head"
+	[[ $(git -C "$p" rev-parse HEAD) == "$head" ]] || die "review checkout landed at wrong head"
+	problems=$(slot_shape_problems "$slot")
+	[[ -z $problems ]] || die "review slot unsafe after checkout: ${problems//$'\n'/; }"
+	echo "checked out review $head"
+}
+
 # Explicit recovery of a lease whose recorded process is gone. The lease is
 # archived, never deleted, and the slot's files are not touched.
 cmd_reclaim() {
@@ -345,7 +376,8 @@ case ${1:-} in
 status) shift; cmd_status "$@" ;;
 acquire) shift; cmd_acquire "$@" ;;
 release) shift; cmd_release "$@" ;;
+review-checkout) shift; cmd_review_checkout "$@" ;;
 reclaim) shift; cmd_reclaim "$@" ;;
 prepare) shift; cmd_prepare "$@" ;;
-*) die "usage: pool.sh status|acquire|release|reclaim|prepare (see header)" 2 ;;
+*) die "usage: pool.sh status|acquire|review-checkout|release|reclaim|prepare (see header)" 2 ;;
 esac

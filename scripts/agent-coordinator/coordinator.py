@@ -1374,8 +1374,14 @@ def start_review(c, t):
 def begin_review(c, t, head):
     p = slot_path(t["slot"])
     try:
-        git(p, "fetch", "-q", REMOTE, f"+refs/pull/{t['pr']}/head:refs/coordinator/review", check=False)
-        git(p, "checkout", "-q", "--detach", head)
+        token = c.read_token(t)
+        if not token:
+            raise Refused("review lease token missing")
+        checkout = c.pool("review-checkout", "--slot", t["slot"], "--token", token,
+                          "--branch", c.pr_view(t["pr"])["headRefName"], "--head", head)
+        if checkout.returncode != 0:
+            raise Refused(checkout.stderr.strip() or checkout.stdout.strip() or
+                          "pool.sh review-checkout refused")
         branch = c.pr_view(t["pr"])["headRefName"]
         store = c.fetch_verified(branch, head)
         if not c.worktree_matches(p, head):
