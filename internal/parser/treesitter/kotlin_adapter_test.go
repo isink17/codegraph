@@ -19,6 +19,14 @@ class UserService {
     fun OtherService.execute() { this.validate() }
     fun run() { val callback = { this.validate() } }
     fun typed() { val callback: OtherService.() -> Unit = { this.validate() } }
+    fun nested(other: OtherService, items: List<Int>) {
+        with(other) { items.forEach { this.validate() } }
+    }
+    fun OtherService.executeMany(items: List<Int>) {
+        items.forEach { this.validate() }
+    }
+    fun List<Int>.map(block: UserService.() -> Unit) {}
+    fun shadowed(items: List<Int>) { items.map { this.validate() } }
     fun ordinary(items: List<Int>, value: Int) {
         items.forEach { this.validate() }
         value.let { this.validate() }
@@ -28,7 +36,7 @@ class UserService {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, "this.validate", "this.validate"}
+	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", "this.validate"}
 	var got []string
 	for _, edge := range parsed.Edges {
 		if edge.DstName == "this.validate" {

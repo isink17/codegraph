@@ -78,7 +78,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports, views)
 	}
 	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, views, &pf)
-	kotlinExtractCalls(root, content, kotlinSwallowedHeads(views), &pf)
+	kotlinExtractCalls(root, content, kotlinSwallowedHeads(views), pf.Scope.Imports, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
@@ -1309,7 +1309,7 @@ func kotlinDeclarationSignature(view kotlinDeclarationView, content []byte) stri
 
 // kotlinExtractCalls emits every call expression except skip, the heads of
 // recovered swallowed declarations; calls inside their bodies are kept.
-func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node]bool, pf *graph.ParsedFile) {
+func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node]bool, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		if skip[call] {
 			continue
@@ -1327,7 +1327,7 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call, content) {
+		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call, content, imports) {
 			evidence = graph.KotlinUnprovenThisReceiverEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -1353,13 +1353,17 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 // lambda passed to a call may be a receiver lambda, and an extension function
 // has its extension receiver as unlabelled `this`; neither is proved by the
 // enclosing declaration container.
-func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
+func kotlinThisReceiverUnproven(call *sitter.Node, content []byte, imports []graph.ScopeImport) bool {
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		switch node.Type() {
 		case "lambda_literal":
+			ordinary := false
+			inCall := false
 			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
 				if parent.Type() == "call_expression" {
-					return !kotlinKnownOrdinaryLambdaCall(parent, content)
+					inCall = true
+					ordinary = kotlinKnownOrdinaryLambdaCall(parent, content, imports)
+					break
 				}
 				if parent.Type() == "property_declaration" && kotlinReceiverFunctionType(parent, content) {
 					return true
@@ -1367,6 +1371,9 @@ func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
 				if parent.Type() == "function_declaration" {
 					break
 				}
+			}
+			if inCall && !ordinary {
+				return true
 			}
 		case "function_declaration":
 			if len(kotlinFunctionPartsOf(kotlinDeclarationView{decl: node}).between) > 0 {
@@ -1378,9 +1385,10 @@ func kotlinThisReceiverUnproven(call *sitter.Node, content []byte) bool {
 }
 
 // Kotlin's standard-library higher-order helpers below take ordinary lambda
-// parameters, so unlabelled `this` remains the enclosing receiver. Unknown
-// lambda calls stay unresolved because they may be receiver-function calls.
-func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte) bool {
+// parameters, so unlabelled `this` remains the enclosing receiver. The call
+// must be a qualified helper with no non-Kotlin import or same-file shadow;
+// unknown or shadowed calls stay unresolved.
+func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []graph.ScopeImport) bool {
 	fn := childByFieldName(call, "function")
 	if fn == nil && call.ChildCount() > 0 {
 		fn = call.Child(0)
@@ -1388,6 +1396,26 @@ func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte) bool {
 	name := nodeText(fn, content)
 	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
 		name = name[dot+1:]
+	} else {
+		return false
+	}
+	for _, imp := range imports {
+		if imp.Wildcard && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
+			return false
+		}
+		if (imp.LocalName == name || imp.ImportedName == name) && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
+			return false
+		}
+	}
+	root := call
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	for _, decl := range findDescendants(root, "function_declaration") {
+		declName := kotlinFunctionName(kotlinDeclarationView{decl: decl})
+		if declName != nil && nodeText(declName, content) == name {
+			return false
+		}
 	}
 	switch name {
 	case "also", "filter", "fold", "forEach", "let", "map", "onEach", "runCatching", "use":
