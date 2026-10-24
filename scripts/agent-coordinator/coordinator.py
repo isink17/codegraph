@@ -270,9 +270,9 @@ def sandboxed(argv, allow_read=(), slot=None, readonly=False, codex=False, keych
     directory the caller removes afterwards; None where no sandbox exists.
     readonly: only the scratch directory and /dev are writable (/tmp too under
     the keychain profile; no slot, no repository). codex: CODEX_HOME is a
-    private directory in scratch (see codex_home). keychain: the legacy profile for Claude Code agents, which
-    keep their login in the keychain: reads are allowed except the protected
-    paths. Everything else runs in the strict profile: reads only of the
+    private directory in scratch (see codex_home). keychain: the legacy
+    profile for Claude Code agents, which keep their login in the keychain:
+    reads are allowed except the protected paths. Everything else runs in the strict profile: reads only of the
     system, its tools, the Go module cache, the slot, the repository's git
     directory, its scratch directory and allow_read; network only to
     localhost and, for codex (its model API), TCP 443."""
@@ -305,11 +305,10 @@ def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keycha
     # refs a commit needs, its own worktree admin files except their config
     # and pointers, a private scratch directory (TMPDIR, Go and XDG caches;
     # the shared Go module cache stays readable) and /dev; /tmp only under the
-    # keychain profile, which Claude Code needs. Claude
-    # Code's session data is not writable: Claude Code runs without it (verified with
-    # 2.1.296), and its shell snapshots, session environments, memory and
-    # IDE locks are loaded by the owner's own sessions. Owner-listed
-    # directories are added.
+    # keychain profile, which Claude Code needs. Claude Code's session data is
+    # not writable: Claude Code runs without it (verified with 2.1.296), and
+    # its shell snapshots, session environments, memory and IDE locks are
+    # loaded by the owner's own sessions. Owner-listed directories are added.
     gitdir = REPO / ".git"
     writable = [q("/dev"), q(scratch), *[q(d) for d in extra]]
     if keychain:

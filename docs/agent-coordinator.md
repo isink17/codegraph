@@ -399,11 +399,12 @@ coordinator version.
   tools that ignore `TMPDIR`. Nothing the coordinator or pool.sh executes
   lives there, but Claude Code keeps small per-session files there (for
   example its Bash working directory), which an agent could alter. The
-  strict profile does not allow `/tmp`: a tool that ignores `TMPDIR` fails
-  there, for example macOS `mktemp` without a template and here-documents
-  in `/bin/bash` 3.2. Scripts that run under it pass `mktemp` an explicit
-  template under `${TMPDIR:-/tmp}` and avoid here-documents and
-  here-strings.
+  strict profile does not allow `/tmp`, so here-documents and here-strings
+  in `/bin/bash` 3.2, which always use `/tmp`, fail there. macOS `mktemp`
+  without a template ignores `TMPDIR` and writes the per-user directory
+  under `/var/folders`, which neither profile allows. Scripts that run in
+  the sandbox pass `mktemp` an explicit template under `${TMPDIR:-/tmp}` and
+  avoid here-documents and here-strings.
 - Sandboxed Claude Code sessions keep no transcript under `~/.claude`;
   the agent's output log in the run directory is the record.
 - A run whose agent is still alive when the owner takes over keeps its
@@ -429,8 +430,8 @@ coordinator version.
   In the opt-in legacy profile, a Claude Code agent can read the keychain
   (including `gh`'s GitHub token), other owner files outside the denied
   paths, and the network.
-- Tests must run with a `TMPDIR` outside `/private/tmp`, which agents may
-  write; the fixture refuses otherwise.
+- Tests must run with a `TMPDIR` outside `/private/tmp`, which Claude Code
+  agents (keychain profile) may write; the fixture refuses otherwise.
 - The Claude Code adapter's tool list must include every command the agent
   needs (for example `Bash(go test:*)`), via `allowed_tools`.
 
