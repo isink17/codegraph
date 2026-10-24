@@ -72,6 +72,20 @@ record must pass the existing validator with `--expect-sha` and `--fixture`
 before bundle files are written. Fixture hash mismatches and nonempty output
 directories are refused.
 
+To check a bundle completely, including a rerun, use `verify-bundle` with a
+binary rebuilt from the recorded commit:
+
+    go run ./tools/benchharness verify-bundle --bundle "$W/bundle" \
+      --manifest tools/benchharness/testdata/manifests/fixtures.json \
+      --codegraph "$W/codegraph"
+
+It refuses missing, unlisted or modified files and a binary or fixture
+manifest whose hash differs from `MANIFEST.json`. It then runs `produce` again
+with the recorded commit and date and compares every file byte for byte,
+printing each difference. A pass on the producing machine checks the tooling
+only. It is not an independent third-party rerun; see
+[docs/benchmarks/README.md](../../docs/benchmarks/README.md).
+
 ## Methodology (`fixture-callgraph-context/v1`)
 
 - Fixture: `src/` (indexed from a fresh copy, fresh database) plus
