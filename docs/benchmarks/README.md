@@ -9,10 +9,10 @@ They are not bundles and cannot be checked with `verify-bundle`.
 
 ## Produce
 
-Build `codegraph` from the commit being measured, then write a bundle from the
-committed fixture manifest:
+Build `codegraph` from a clean checkout of the commit being measured, then write
+a bundle from the committed fixture manifest:
 
-    go build -trimpath -o "$W/codegraph" ./cmd/codegraph
+    go build -trimpath -buildvcs=false -o "$W/codegraph" ./cmd/codegraph
     go run ./tools/benchharness produce \
       --manifest tools/benchharness/testdata/manifests/fixtures.json \
       --codegraph "$W/codegraph" --sha "$SHA" \
@@ -31,7 +31,8 @@ Every record passes `validate --expect-sha` before any file is written.
 ## Publish
 
 Publish the whole bundle directory unchanged, together with the CodeGraph
-commit, the harness revision and the exact build command. A table or claim
+commit, the harness revision and the exact build command (build `codegraph` with
+the same Go toolchain the harness runs on). A table or claim
 derived from a bundle must:
 
 - name the bundle and the record it comes from
@@ -50,8 +51,13 @@ derived from a bundle must:
 On a separate machine:
 
 1. Check out the recorded commit and the producer's harness revision.
-2. Use the Go version and OS/arch recorded in `MANIFEST.json`.
-3. Build `codegraph` with the same build command.
+2. Use the OS/arch recorded in `MANIFEST.json`, and the Go toolchain recorded
+   there as `go_version`. That is the harness's own toolchain; the producer
+   must build `codegraph` with the same one.
+3. Build `codegraph` with the producer's exact build command, for example
+   `go build -trimpath -buildvcs=false`. Without `-buildvcs=false`, Go stamps
+   VCS state such as `vcs.modified` into the binary, so an untracked or
+   modified file changes the binary hash even at the same commit.
 4. Run:
 
        go run ./tools/benchharness verify-bundle \

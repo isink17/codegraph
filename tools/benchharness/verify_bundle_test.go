@@ -111,6 +111,17 @@ func testVerifyBundle(t *testing.T, bin string) {
 			os.WriteFile(filepath.Join(d, "extra.json"), []byte("{}"), 0o644)
 		}, bin},
 		{"different binary", "binary sha256", func(string) {}, otherBin},
+		{"subdirectory", "sub is not a regular file", func(d string) {
+			os.Mkdir(filepath.Join(d, "sub"), 0o755)
+		}, bin},
+		{"symlink", "summary.md is not a regular file", func(d string) {
+			os.Remove(filepath.Join(d, "summary.md"))
+			os.Symlink(filepath.Join(good, "summary.md"), filepath.Join(d, "summary.md"))
+		}, bin},
+		{"CRLF SHA256SUMS", `SHA256SUMS: differs from the rerun`, func(d string) {
+			b, _ := os.ReadFile(filepath.Join(d, "SHA256SUMS"))
+			os.WriteFile(filepath.Join(d, "SHA256SUMS"), bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n")), 0o644)
+		}, bin},
 		{"different recorded commit", "go-calls.json: differs from the rerun", func(d string) {
 			edit(d, "MANIFEST.json", testSHA, strings.Repeat("c", 40))
 			resum(d)
@@ -120,7 +131,7 @@ func testVerifyBundle(t *testing.T, bin string) {
 		dir := copyBundle(fmt.Sprintf("case%d", i))
 		c.mutate(dir)
 		out, err := verify(dir, c.binary)
-		if err == nil || !strings.Contains(out, c.want) {
+		if err == nil || !strings.Contains(out+err.Error(), c.want) {
 			t.Errorf("%s: err %v, want report containing %q, got:\n%s", c.name, err, c.want, out)
 		}
 	}

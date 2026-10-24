@@ -167,7 +167,8 @@ func unionNames(a, b map[string][]byte) []string {
 	return names
 }
 
-// lineDiff lists the first differing lines by position, bounded.
+// lineDiff lists the first differing lines by position, bounded. Lines are
+// quoted: bundle bytes are untrusted, and a stray \r must stay visible.
 func lineDiff(a, b []byte) string {
 	x, y := strings.Split(string(a), "\n"), strings.Split(string(b), "\n")
 	var out strings.Builder
@@ -187,7 +188,7 @@ func lineDiff(a, b []byte) string {
 			out.WriteString("  ...\n")
 			break
 		}
-		fmt.Fprintf(&out, "  line %d\n  - bundle: %s\n  + rerun:  %s\n", i+1, l, r)
+		fmt.Fprintf(&out, "  line %d\n  - bundle: %q\n  + rerun:  %q\n", i+1, l, r)
 		shown++
 	}
 	return out.String()
