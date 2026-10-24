@@ -185,6 +185,12 @@ Exactly one candidate binds. Any competitor leaves the call unresolved, includin
 
 For `Q.m()`, `Q` must resolve the same way to a Kotlin class, interface, object or enum, or to a top-level Java type. `m` must then be the unique member declared directly on that type; for a Java owner it must be a unique visible static method.
 
+Inside a Kotlin class or object, `this.m()` binds when `this` is the explicit
+receiver and `m` is exactly one visible function declared directly on the
+caller's persisted type. Nested types use their own container identity, so an
+enclosing type's member is not selected. This source-level rule does not model
+inherited members or overload selection.
+
 Visibility is modelled as follows:
 - `private` means the same file.
 - `protected` means the same file or the same container.
@@ -204,9 +210,10 @@ The JVM target must meet all of these:
 
 Java `new` of a Kotlin class is not bound. Also not modelled:
 - Kotlin class constructor calls
-- `this.` calls
+- labelled or other explicit receivers, including `super.`, `this@Label.` and
+  qualified `this` forms
 - companion members reached through the class name
-- value and expression receivers
+- value, field and expression receivers such as `service.m()`
 - inheritance and extension dispatch
 - typealiases, default imports and builtins
 

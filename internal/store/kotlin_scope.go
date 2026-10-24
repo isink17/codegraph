@@ -71,6 +71,11 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		for i := 1; i < len(parts); i++ {
 			packages[strings.Join(parts[:i], ".")] = struct{}{}
 		}
+		for _, part := range strings.Split(e.container, ".") {
+			if part != "" {
+				names[part] = struct{}{}
+			}
+		}
 	}
 	scopeFileIDs := sortedIDs(fileIDs)
 	if err := sqliteBatchedIDQuery(ctx, q, scopeFileIDs,
@@ -147,7 +152,9 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		var dst kotlinScopeSymbol
 		strategy := ""
-		if strings.Contains(e.name, ".") {
+		if member, ok := strings.CutPrefix(e.name, "this."); ok {
+			dst, strategy = kotlinThisMember(e, member, syms)
+		} else if strings.Contains(e.name, ".") {
 			parts := strings.Split(e.name, ".")
 			member := parts[len(parts)-1]
 			qualifier := strings.Join(parts[:len(parts)-1], ".")
@@ -191,6 +198,24 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	}
 	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_kotlin_scope_resolution)`)
 	return len(res), err
+}
+
+func kotlinThisMember(e struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+}, name string, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
+	ownerName := kotlinJoin(e.pkg, e.container)
+	var owners []kotlinScopeSymbol
+	for _, s := range syms {
+		if s.language == "kotlin" && s.qname == ownerName && kotlinTypeEligible(s) && kotlinVisible(s, e) {
+			owners = append(owners, s)
+		}
+	}
+	owner := kotlinUnique(owners)
+	if owner.id == 0 {
+		return kotlinScopeSymbol{}, ""
+	}
+	return kotlinMember(owner, name, e, syms)
 }
 
 func kotlinType(name string, e struct {
