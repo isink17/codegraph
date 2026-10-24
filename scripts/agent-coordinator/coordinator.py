@@ -31,6 +31,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()
@@ -1004,7 +1005,21 @@ class Coordinator:
 
     def pr_view(self, pr):
         return json.loads(self.gh("pr", "view", str(pr), "--json",
-                                  "number,state,headRefOid,headRefName,baseRefName,statusCheckRollup"))
+                                  "number,state,headRefOid,headRefName,baseRefName,statusCheckRollup,headRepository"))
+
+    def remote_repository_name(self):
+        configured = os.environ.get("CG_COORD_REPOSITORY_NAME")
+        if configured:
+            return configured.casefold()
+        url = run([GIT, *GIT_SAFE, "-C", str(REPO), "remote", "get-url", REMOTE], check=True).stdout.strip()
+        name = urlparse(url).path.lstrip("/") if "://" in url else url.split(":", 1)[-1]
+        return name.removesuffix(".git").casefold()
+
+    def verify_pr_head_repository(self, pr):
+        repository = pr.get("headRepository") or {}
+        name = repository.get("nameWithOwner", "") if isinstance(repository, dict) else ""
+        if not name or name.casefold() != self.remote_repository_name():
+            raise Refused("fork pull requests are unsupported by review orchestration")
 
     def find_pr(self, branch):
         prs = json.loads(self.gh("pr", "list", "--head", branch, "--state", "all", "--json", "number,state"))
@@ -1355,6 +1370,10 @@ def start_review(c, t):
         return f"{e}"
     if pr["state"] != "OPEN":
         return reconcile_pr(c, t, pr)
+    try:
+        c.verify_pr_head_repository(pr)
+    except Refused as e:
+        return f"PR head not verifiable yet: {e}"
     run([GIT, *GIT_SAFE, "-C", str(REPO), "fetch", "-q", REMOTE])
     try:
         c.fetch_verified(pr["headRefName"], pr["headRefOid"])
