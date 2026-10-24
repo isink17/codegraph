@@ -188,4 +188,39 @@ func TestWriteBundleLeavesNothingOnFailure(t *testing.T) {
 	if entries, _ := os.ReadDir(root); len(entries) != 1 {
 		t.Fatalf("staging left behind: %v", entries)
 	}
+	// A non-empty output is never replaced.
+	if err := writeBundle(out, map[string][]byte{"b.json": []byte("{}")}); err == nil {
+		t.Fatal("non-empty output replaced")
+	}
+	if _, err := os.Stat(filepath.Join(out, "a.json")); err != nil {
+		t.Fatalf("existing bundle lost: %v", err)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 1 {
+		t.Fatalf("staging left behind: %v", entries)
+	}
+	slash := filepath.Join(root, "slash") + string(filepath.Separator)
+	if err := writeBundle(slash, map[string][]byte{"a.json": []byte("{}")}); err != nil {
+		t.Fatalf("trailing separator: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "slash", "a.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteBundleRefusesSymlinkedOutput(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	if err := writeBundle(link, map[string][]byte{"a.json": []byte("{}")}); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("symlinked output: %v", err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink replaced")
+	}
 }

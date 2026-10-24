@@ -154,7 +154,12 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 // writeBundle writes every file into a sibling staging directory and renames
 // it to out, so a failed write never leaves a partial bundle that a rerun
 // would then refuse as a nonempty output directory. out is absent or empty.
+// A symlinked out is refused: removing it would replace the link, not fill
+// its target.
 func writeBundle(out string, files map[string][]byte) error {
+	if fi, err := os.Lstat(out); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("produce: output directory %s is a symlink", out)
+	}
 	parent := filepath.Dir(filepath.Clean(out))
 	if err := os.MkdirAll(parent, 0755); err != nil {
 		return err
