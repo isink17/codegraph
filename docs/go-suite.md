@@ -23,6 +23,9 @@ list and no `-run` filter. `OUT/events.jsonl` is the raw event stream, and
 - `elapsed`
 - test counts, including subtests
 
+A line of the event stream that is not JSON, for example the half line of a
+killed run, is counted in `malformed_lines` and fails the run.
+
 The summary also records the `go test` exit code, wall time, the timeout and
 `all_passed`. The script exits 0 only when `go test` exits 0 and every package
 is `pass` or `no_tests`. A timeout is always a failure, never a pass, and is
@@ -49,8 +52,8 @@ not a product failure. The reference run of this script on Darwin arm64, Go
 | all 53 packages | 199 s wall | 7,218 |
 
 Focused `internal/diff` tests ran in another worker slot during part of
-that run, so its timings are slightly loaded. 20m leaves more than 6× headroom over the slowest package for a loaded or
-slower machine.
+that run, so its timings are slightly loaded. 20m leaves more than 6×
+headroom over the slowest package for a loaded or slower machine.
 
 Do not run two full suites at the same time on one machine, for example two
 worker slots or a suite beside the local CI reproduction. The packages then

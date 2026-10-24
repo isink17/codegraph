@@ -17,7 +17,7 @@ expect() {
 		failures=$((failures + 1))
 	fi
 }
-summary() { bash "$here/run.sh" summarize "$1"; }
+summary() { bash "$here/run.sh" summarize "$@"; }
 
 events=$here/testdata/events.jsonl
 expect results "m/a=pass m/b=timeout m/c=fail m/d=build_failed m/e=no_tests" \
@@ -32,6 +32,14 @@ expect passing-run true "$(summary "$work/passing.jsonl" | jq .all_passed)"
 { cat "$work/passing.jsonl"; echo '{"Action":"start","Package":"m/x"}'; } >"$work/killed.jsonl"
 expect killed-package incomplete "$(summary "$work/killed.jsonl" | jq -r '.packages[] | select(.package == "m/x") | .result')"
 expect killed-run-not-passed false "$(summary "$work/killed.jsonl" | jq .all_passed)"
+
+# go test failing outside any package event still fails the run.
+expect nonzero-exit-not-passed false "$(summary "$work/passing.jsonl" 1 | jq .all_passed)"
+
+# A run killed mid-write ends with half a line: still summarized, never a pass.
+{ cat "$work/killed.jsonl"; printf '{"Action":"pass","Pack'; } >"$work/truncated.jsonl"
+expect truncated-run "m/x=incomplete 1 false" \
+	"$(summary "$work/truncated.jsonl" | jq -r '"\(.packages[] | select(.package == "m/x") | "\(.package)=\(.result)") \(.malformed_lines) \(.all_passed)"')"
 
 : >"$work/empty.jsonl"
 expect empty-run-not-passed false "$(summary "$work/empty.jsonl" | jq .all_passed)"
