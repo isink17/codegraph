@@ -113,7 +113,7 @@ func TestKotlinExplicitThisMemberCallResolvesThroughQueries(t *testing.T) {
 	r.write(t, "UserService.kt", `class UserService {
     fun validate() {}
     fun save() { this.validate() }
-    fun other() { service.validate() }
+		fun other() { service.validate() }
 }`)
 	r.update(t, "UserService.kt")
 	if got := r.edgeState(t, "UserService.kt", "service.validate"); !strings.Contains(got, ":: [/]") {
