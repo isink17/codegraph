@@ -23,12 +23,14 @@ func main() {
 
 func run(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: benchharness produce|run|ingest|calibrate|validate|summarize|compare ...")
+		return fmt.Errorf("usage: benchharness produce|verify-bundle|run|ingest|calibrate|validate|summarize|compare ...")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
 	case "produce":
 		return produce(args[1:], run)
+	case "verify-bundle":
+		return verifyBundle(args[1:], run, stdout)
 	case "run":
 		var cfg RunConfig
 		out := fs.String("out", "", "record JSON output path (required)")
