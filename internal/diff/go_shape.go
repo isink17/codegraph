@@ -3,6 +3,7 @@ package diff
 import (
 	"encoding/json"
 	"go/ast"
+	"go/build/constraint"
 	goparser "go/parser"
 	"go/scanner"
 	"go/token"
@@ -163,21 +164,25 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 			before.Language != "go" || after.Language != "go" || incomplete[c.Identity] {
 			continue
 		}
-		read := func(r Revision, h string) (map[string][]goShape, bool) {
+		read := func(r Revision, h string) ([]byte, map[string][]goShape, bool) {
 			if r.source == nil {
-				return nil, false
+				return nil, nil, false
 			}
 			b, ok := r.source(c.Identity)
 			if !ok || sha256Hex(b) != h {
-				return nil, false
+				return nil, nil, false
 			}
-			return goShapes(b)
+			shapes, ok := goShapes(b)
+			return b, shapes, ok
 		}
-		bs, bok := read(base, before.ContentHash)
-		hs, hok := read(head, after.ContentHash)
+		bb, bs, bok := read(base, before.ContentHash)
+		hb, hs, hok := read(head, after.ContentHash)
 		if !bok || !hok {
 			out = append(out, RiskUncertainty{Reason: "go_declaration_shape_unavailable", Identity: c.Identity})
 			continue
+		}
+		if x, y := goBuildConstraint(bb), goBuildConstraint(hb); x != y {
+			out = append(out, RiskUncertainty{Reason: "go_build_constraint_change_unmodeled", Identity: c.Identity, Detail: x + " -> " + y})
 		}
 		for key, x := range bs {
 			y, ok := hs[key]
@@ -206,4 +211,45 @@ func sameShapes(a, b []goShape) bool {
 		}
 	}
 	return true
+}
+
+// goBuildConstraint is the file's build constraint in canonical form, "none"
+// without one. The graph indexes a file whatever its constraint says, so a
+// changed constraint can add or drop the file from a build while every
+// declaration and edge stays the same. A //go:build line wins over // +build
+// lines, as in the go command.
+func goBuildConstraint(src []byte) string {
+	f, err := goparser.ParseFile(token.NewFileSet(), "", src, goparser.PackageClauseOnly|goparser.ParseComments)
+	if err != nil {
+		return "unparsed"
+	}
+	var plus []constraint.Expr
+	for _, group := range f.Comments {
+		if group.Pos() > f.Package {
+			break
+		}
+		for _, c := range group.List {
+			switch {
+			case constraint.IsGoBuild(c.Text):
+				if x, err := constraint.Parse(c.Text); err == nil {
+					return x.String()
+				}
+				return "unparsed " + c.Text
+			case constraint.IsPlusBuild(c.Text):
+				x, err := constraint.Parse(c.Text)
+				if err != nil {
+					return "unparsed " + c.Text
+				}
+				plus = append(plus, x)
+			}
+		}
+	}
+	if len(plus) == 0 {
+		return "none"
+	}
+	x := plus[0]
+	for _, y := range plus[1:] {
+		x = &constraint.AndExpr{X: x, Y: y}
+	}
+	return x.String()
 }

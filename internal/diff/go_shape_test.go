@@ -204,3 +204,71 @@ func TestGoUnmodeledReportsUnreadableSource(t *testing.T) {
 		t.Fatalf("readable: %+v", got)
 	}
 }
+
+// TestGoBuildConstraintChangeIsUncertain pins that a changed build constraint,
+// which can add or drop a file from a build while the graph stays the same,
+// is reported as limited_evidence at score 0, and that rewrites with the same
+// meaning stay quiet.
+func TestGoBuildConstraintChangeIsUncertain(t *testing.T) {
+	const body = "package p\n\nfunc T() int { return 1 }\n"
+	cases := []struct {
+		name, from, to, detail string
+		head                   string // whole head file, when set
+	}{
+		{name: "added", from: "", to: "//go:build linux\n\n", detail: "none -> linux"},
+		{name: "added ignore", from: "", to: "//go:build ignore\n\n", detail: "none -> ignore"},
+		{name: "removed", from: "//go:build linux\n\n", to: "", detail: "linux -> none"},
+		{name: "narrowed", from: "//go:build linux\n\n", to: "//go:build linux && amd64\n\n", detail: "linux -> linux && amd64"},
+		{name: "plus build changed", from: "// +build linux\n\n", to: "// +build darwin\n\n", detail: "linux -> darwin"},
+		{name: "spacing only", from: "//go:build linux&&amd64\n\n", to: "//go:build linux && amd64\n\n"},
+		{name: "plus build to go:build", from: "// +build linux\n// +build amd64\n\n", to: "//go:build linux && amd64\n\n"},
+		{name: "doc comment", from: "", to: "// Package p is documented.\n"},
+		{name: "directive after package clause", head: "package p\n\n//go:build linux\n\nfunc T() int { return 1 }\n"},
+	}
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.22\n", "p/use.go": "package p\n\nfunc U() { _ = T() }\n"}
+	docs := map[string]map[string]string{}
+	for name, adapter := range testGoAdapters {
+		docs[name] = map[string]string{}
+		t.Run(name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					base := map[string]string{"p/lib.go": tc.from + body}
+					for k, v := range files {
+						base[k] = v
+					}
+					to := tc.to + body
+					if tc.head != "" {
+						to = tc.head
+					}
+					d := editScenario(t, adapter, base, func(r *gittest.Repo) {
+						r.Write("p/lib.go", to)
+					}).Diff
+					var got []string
+					for _, u := range d.Risk.Uncertainty {
+						if u.Reason == "go_build_constraint_change_unmodeled" && u.Identity == "p/lib.go" {
+							got = append(got, u.Detail)
+						}
+					}
+					if strings.Join(got, "|") != tc.detail {
+						t.Fatalf("constraint uncertainty = %v, want %q; risk %s", got, tc.detail, canonical(d.Risk))
+					}
+					want := "no_risk_evidence"
+					if tc.detail != "" {
+						want = "limited_evidence"
+					}
+					if d.Risk.Assessment != want || d.Risk.Score == nil || *d.Risk.Score != 0 {
+						t.Fatalf("assessment %s score %v, want %s at 0: %s", d.Risk.Assessment, d.Risk.Score, want, canonical(d.Risk))
+					}
+					docs[name][tc.name] = canonical(d)
+				})
+			}
+		})
+	}
+	if len(docs) > 1 {
+		for _, tc := range cases {
+			if a, b := docs["go-ast"][tc.name], docs["tree-sitter"][tc.name]; a != b {
+				t.Errorf("%s: adapters disagree:\n go/ast:      %s\n tree-sitter: %s", tc.name, a, b)
+			}
+		}
+	}
+}
