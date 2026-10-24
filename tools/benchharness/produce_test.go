@@ -99,6 +99,11 @@ func testProduce(t *testing.T, bin string) {
 			t.Fatalf("missing checksum: %s", entry.Name())
 		}
 	}
+	// The bundled record has its fixture path rewritten; it must still pass
+	// the validator on its own.
+	if err := run([]string{"validate", "--expect-sha", testSHA, "--fixture", "testdata/go-calls", filepath.Join(a, "go-calls.json")}, io.Discard); err != nil {
+		t.Fatalf("bundled record: %v", err)
+	}
 	if err := run(args(a), io.Discard); err == nil {
 		t.Fatal("nonempty output accepted")
 	}
@@ -141,5 +146,81 @@ func TestProduceRejectsFixtureMismatch(t *testing.T) {
 	err := run([]string{"produce", "--manifest", path, "--codegraph", "unused", "--sha", testSHA, "--date", "2026-10-09T00:00:00Z", "--out", filepath.Join(root, "out")}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "hash differs") {
 		t.Fatalf("fixture mismatch: %v", err)
+	}
+}
+
+func TestProduceRejectsReservedFixtureName(t *testing.T) {
+	root := t.TempDir()
+	m := produceFixtureManifest{Schema: "codegraph.benchmark_fixtures/v1", Fixtures: []produceFixture{{Name: "manifest", Path: ".", SHA256: strings.Repeat("0", 64)}}}
+	raw, _ := marshalJSON(m)
+	path := filepath.Join(root, "fixtures.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// manifest.json is MANIFEST.json on case-insensitive filesystems.
+	err := run([]string{"produce", "--manifest", path, "--codegraph", "unused", "--sha", testSHA, "--date", "2026-10-09T00:00:00Z", "--out", filepath.Join(root, "out")}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), `invalid or duplicate fixture "manifest"`) {
+		t.Fatalf("reserved name: %v", err)
+	}
+}
+
+func TestWriteBundleLeavesNothingOnFailure(t *testing.T) {
+	root := t.TempDir()
+	out := filepath.Join(root, "bundle")
+	// A name with a missing subdirectory cannot be written.
+	err := writeBundle(out, map[string][]byte{"a.json": []byte("{}"), "missing/b.json": []byte("{}")})
+	if err == nil {
+		t.Fatal("write into a missing subdirectory succeeded")
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 0 {
+		t.Fatalf("failed write left %v", entries)
+	}
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBundle(out, map[string][]byte{"a.json": []byte("{}")}); err != nil {
+		t.Fatalf("empty existing output: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(out, "a.json")); err != nil || string(b) != "{}" {
+		t.Fatalf("written bundle: %q %v", b, err)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 1 {
+		t.Fatalf("staging left behind: %v", entries)
+	}
+	// A non-empty output is never replaced.
+	if err := writeBundle(out, map[string][]byte{"b.json": []byte("{}")}); err == nil {
+		t.Fatal("non-empty output replaced")
+	}
+	if _, err := os.Stat(filepath.Join(out, "a.json")); err != nil {
+		t.Fatalf("existing bundle lost: %v", err)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 1 {
+		t.Fatalf("staging left behind: %v", entries)
+	}
+	slash := filepath.Join(root, "slash") + string(filepath.Separator)
+	if err := writeBundle(slash, map[string][]byte{"a.json": []byte("{}")}); err != nil {
+		t.Fatalf("trailing separator: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "slash", "a.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteBundleRefusesSymlinkedOutput(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	if err := writeBundle(link, map[string][]byte{"a.json": []byte("{}")}); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("symlinked output: %v", err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink replaced")
 	}
 }
