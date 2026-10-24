@@ -17,6 +17,61 @@ binary.
     go run ./tools/benchharness summarize record.json > summary.md
     go run ./tools/benchharness compare old.json record.json   # refuses incompatible records
 
+## Produce a local artifact bundle
+
+From the repository root, build the binary from the commit being tested, then:
+
+    go run ./tools/benchharness produce \
+      --manifest tools/benchharness/testdata/manifests/fixtures.json \
+      --codegraph "$W/codegraph" --sha "$SHA" \
+      --date 2026-10-23T00:00:00Z --out "$W/bundle"
+
+Use an absent or empty output directory. The committed manifest pins the
+existing synthetic `go-calls` fixture with the same directory hash as `run`;
+fixture paths are relative to the input manifest. No corpus, truth set or
+third-party source is downloaded or imported. This command makes no network
+requests and publishes nothing.
+
+The existing run path uses a fresh `CODEGRAPH_HOME` under its work directory
+and `CODEGRAPH_NO_UPDATE_CHECK=1`, isolating user configuration and disabling
+release checks. These settings also apply when rerunning the ledger commands.
+
+The bundle contains one `codegraph.benchmark/v1` JSON record per fixture,
+`summary.md` (the existing summaries concatenated in fixture-name order), a
+copy of the input as `fixtures.json`, `MANIFEST.json`, and `SHA256SUMS`.
+The latter hashes every bundle file except itself, in filename order.
+The manifest records the supplied CodeGraph commit, binary SHA-256, harness
+Go version and OS/arch, input manifest hash, fixture hashes, and exact argv
+templates for run/validate/summarize. `<codegraph>` means the binary with the
+recorded hash; `<manifest-dir>` is the original input manifest directory;
+`<scratch>` is fresh scratch space. Output filenames are bundle-relative.
+The records also retain the existing CodeGraph command ledger, whose
+`<workdir>` denotes scratch space. Physical scratch/output paths are excluded
+from artifact bytes. The commit is operator-supplied provenance, not proof
+that a binary was built from it; the binary hash pins the actual executable.
+
+For an independent third-party rerun, check out the recorded CodeGraph commit
+and the harness revision used by the producer, use the recorded Go version,
+OS/arch and environment (also recorded in each record), and build the binary
+using the same build flags. Verify its SHA-256 against `MANIFEST.json`.
+Use this repository's committed fixture manifest, the same `--sha` and
+`--date`, and a fresh output directory in the command above. Compare bundle
+files byte for byte; no new measurements or published results are required.
+Different binary builds or environments may legitimately differ.
+
+To check an existing bundle locally on macOS:
+
+    (cd "$W/bundle" && shasum -a 256 -c SHA256SUMS)
+    go run ./tools/benchharness validate --expect-sha "$SHA" \
+      --fixture tools/benchharness/testdata/go-calls "$W/bundle/go-calls.json"
+    go run ./tools/benchharness summarize "$W/bundle/go-calls.json"
+
+On systems with GNU coreutils, `sha256sum -c SHA256SUMS` also works.
+Checksums establish internal consistency, not authenticity. Every produced
+record must pass the existing validator with `--expect-sha` and `--fixture`
+before bundle files are written. Fixture hash mismatches and nonempty output
+directories are refused.
+
 ## Methodology (`fixture-callgraph-context/v1`)
 
 - Fixture: `src/` (indexed from a fresh copy, fresh database) plus

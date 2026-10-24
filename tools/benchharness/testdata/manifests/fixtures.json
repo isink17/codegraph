@@ -1,0 +1,10 @@
+{
+  "schema": "codegraph.benchmark_fixtures/v1",
+  "fixtures": [
+    {
+      "name": "go-calls",
+      "path": "../go-calls",
+      "sha256": "fd1e32c3ba7fa05fb2cc28ac8e17bc8287ba07c7e26ef3ea10d332f72d769305"
+    }
+  ]
+}
