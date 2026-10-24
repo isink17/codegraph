@@ -1,0 +1,37 @@
+{"ImportPath":"m/d [m/d.test]","Action":"build-output","Output":"# m/d [m/d.test]\n"}
+{"ImportPath":"m/d [m/d.test]","Action":"build-output","Output":"d/d_test.go:3:27: undefined: undefined\n"}
+{"ImportPath":"m/d [m/d.test]","Action":"build-fail"}
+{"Action":"start","Package":"m/a"}
+{"Action":"start","Package":"m/b"}
+{"Action":"start","Package":"m/c"}
+{"Action":"start","Package":"m/d"}
+{"Action":"output","Package":"m/d","Output":"FAIL\tm/d [build failed]\n"}
+{"Action":"start","Package":"m/e"}
+{"Action":"fail","Package":"m/d","Elapsed":0,"FailedBuild":"m/d [m/d.test]"}
+{"Action":"output","Package":"m/e","Output":"?   \tm/e\t[no test files]\n"}
+{"Action":"skip","Package":"m/e","Elapsed":0}
+{"Action":"run","Package":"m/a","Test":"TestOK"}
+{"Action":"output","Package":"m/a","Test":"TestOK","Output":"=== RUN   TestOK\n"}
+{"Action":"output","Package":"m/a","Test":"TestOK","Output":"--- PASS: TestOK (0.00s)\n"}
+{"Action":"pass","Package":"m/a","Test":"TestOK","Elapsed":0}
+{"Action":"run","Package":"m/a","Test":"TestSkip"}
+{"Action":"output","Package":"m/a","Test":"TestSkip","Output":"=== RUN   TestSkip\n"}
+{"Action":"output","Package":"m/a","Test":"TestSkip","Output":"    a_test.go:4: x\n"}
+{"Action":"output","Package":"m/a","Test":"TestSkip","Output":"--- SKIP: TestSkip (0.00s)\n"}
+{"Action":"skip","Package":"m/a","Test":"TestSkip","Elapsed":0}
+{"Action":"output","Package":"m/a","Output":"PASS\n"}
+{"Action":"run","Package":"m/b","Test":"TestSlow"}
+{"Action":"output","Package":"m/b","Test":"TestSlow","Output":"=== RUN   TestSlow\n"}
+{"Action":"run","Package":"m/c","Test":"TestBad"}
+{"Action":"output","Package":"m/c","Test":"TestBad","Output":"=== RUN   TestBad\n"}
+{"Action":"output","Package":"m/c","Test":"TestBad","Output":"    c_test.go:3: no\n"}
+{"Action":"output","Package":"m/c","Test":"TestBad","Output":"--- FAIL: TestBad (0.00s)\n"}
+{"Action":"fail","Package":"m/c","Test":"TestBad","Elapsed":0}
+{"Action":"output","Package":"m/c","Output":"FAIL\n"}
+{"Action":"output","Package":"m/a","Output":"ok  \tm/a\t0.263s\n"}
+{"Action":"pass","Package":"m/a","Elapsed":0.263}
+{"Action":"output","Package":"m/c","Output":"FAIL\tm/c\t0.263s\n"}
+{"Action":"fail","Package":"m/c","Elapsed":0.263}
+{"Action":"output","Package":"m/b","Test":"TestSlow","Output":"panic: test timed out after 1s\n"}
+{"Action":"output","Package":"m/b","Output":"FAIL\tm/b\t1.266s\n"}
+{"Action":"fail","Package":"m/b","Elapsed":1.266}
