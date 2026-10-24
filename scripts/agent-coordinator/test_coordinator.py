@@ -51,6 +51,7 @@ FAKE_GH = textwrap.dedent('''\
         h = p.get("merged_head") or head(p["head"])
         print(json.dumps({"number": p["number"], "state": p["state"], "headRefOid": h,
                           "headRefName": p["head"], "baseRefName": p["base"], "statusCheckRollup": p["checks"],
+                          "headRepository": {"nameWithOwner": p.get("head_repository", "isink17/codegraph")},
                           "mergeCommit": {"oid": p["squash"]} if p.get("squash") else None}))
     elif a[:1] == ["api"] and a[1].endswith("/rulesets/24420032"):
         if os.path.exists(os.environ.get("FAKE_GH_DOWN", "/nonexistent")):
@@ -235,6 +236,7 @@ class Fixture(unittest.TestCase):
                     "CG_POOL_ROOT": str(self.slots), "CG_POOL_LEASES": str(self.leases),
                     "CG_POOL_CWD_FILE": str(self.cwds), "CG_POOL_REPO": str(self.seed),
                     "CG_COORD_STATE": str(self.state), "CG_COORD_POOL": str(POOL),
+                    "CG_COORD_REPOSITORY_NAME": "isink17/codegraph",
                     "CG_COORD_GH": str(t / "bin/gh"), "CG_COORD_GATE": str(t / "bin/gate"),
                     "FAKE_GH_DB": str(self.db), "FAKE_ORIGIN": str(self.origin),
                     "FAKE_GATE_REFUSE": str(t / "gate-refuse"), "CG_TEST_LOG": str(self.log),
@@ -1237,6 +1239,19 @@ class Pool(Fixture):
         self.run_until(lambda: self.status("x") == "failed")
         self.assertIn("differs from the remote", self.st()["x"]["reason"])
         self.assertIn("checkout_mismatch", [e["event"] for e in self.events()])
+
+    def test_fork_pull_request_is_refused_before_review_checkout(self):
+        self.gate("x")
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", ok=True)
+        self.gate()
+        self.run_until(lambda: self.status("x") == "awaiting_review")
+        self.set_pr(self.st()["x"]["pr"], head_repository="someone/fork")
+        self.gate("x")
+        result = self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "awaiting_review")
+        self.assertIn("fork pull requests are unsupported", result.stdout + result.stderr)
+        self.assertIsNone(self.lease(R))
 
     def test_missing_review_slot_waits_without_losing_work(self):
         hidden = self.t / "review-moved"

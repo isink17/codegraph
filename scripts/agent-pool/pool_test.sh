@@ -67,7 +67,49 @@ grep -q BLOCKED_POOL_BUSY "$T/out" || fail "no BLOCKED_POOL_BUSY"
 # Review slot is never leased for implementation.
 expect 1 "$POOL" acquire --slot $R --task impl --agent x
 expect 0 "$POOL" acquire --slot $R --task review --agent x --review
-expect 0 "$POOL" release --slot $R --token "$(token $R)"
+RR_TOKEN=$(token $R)
+RHEAD=$(git -C "$T/seed" rev-parse origin/v2.0)
+g -C "$T/seed" switch -q --detach origin/v2.0
+g -C "$T/seed" commit -q --allow-empty -m review-head
+RHEAD=$(git -C "$T/seed" rev-parse HEAD)
+g -C "$T/seed" push -q origin HEAD:refs/heads/review-head
+
+# Review checkout requires the live lease token and refuses every unsafe state.
+expect 2 "$POOL" review-checkout --slot $R --branch review-head --head "$RHEAD"
+expect 1 "$POOL" review-checkout --slot $R --token missing --branch review-head --head "$RHEAD"
+expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$(printf '%040d' 0)"
+expect 0 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+[[ $(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD) == "$RHEAD" ]] || fail "review checkout landed at wrong head"
+expect 0 "$POOL" release --slot $R --token "$RR_TOKEN"
+RBEFORE=$(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD)
+expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+[[ $(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD) == "$RBEFORE" ]] || fail "checkout without lease changed review slot"
+
+# Malformed lease never authorizes checkout; a real lease does not bypass safety checks.
+printf 'slot=%s\n' "$R" >"$CG_POOL_LEASES/$R.lease"
+expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+rm "$CG_POOL_LEASES/$R.lease"
+expect 0 "$POOL" acquire --slot $R --task review-safe --agent x --review
+RR_TOKEN=$(token $R)
+echo "$CG_POOL_ROOT/$R/sub" >"$T/cwds"
+expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+: >"$T/cwds"
+echo dirty >"$CG_POOL_ROOT/$R/dirty.txt"
+expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+rm "$CG_POOL_ROOT/$R/dirty.txt"
+mkdir "$T/fail-checkout"
+cat >"$T/fail-checkout/git" <<EOF
+#!/bin/sh
+for arg in "\$@"; do [ "\$arg" = checkout ] && { echo injected checkout failure >&2; exit 128; }; done
+exec $(command -v git) "\$@"
+EOF
+chmod +x "$T/fail-checkout/git"
+RBEFORE=$(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD)
+expect 1 env PATH="$T/fail-checkout:$PATH" "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+[[ $(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD) == "$RBEFORE" ]] || fail "failed checkout changed review slot"
+expect 0 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
+expect 1 "$POOL" review-checkout --slot $R --token wrong --branch review-head --head "$RHEAD"
+expect 0 "$POOL" release --slot $R --token "$RR_TOKEN"
 
 # Release refuses an unpushed branch, accepts it once pushed.
 g -C "$CG_POOL_ROOT/$A" switch -q -c work

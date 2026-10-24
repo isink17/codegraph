@@ -28,6 +28,7 @@ Leases live in `~/Projekti/codegraph-evidence/pool/<slot>.lease`.
 scripts/agent-pool/pool.sh status
 scripts/agent-pool/pool.sh acquire --slot auto --task <branch> --agent <name> [--pr N] [--pid PID]
 scripts/agent-pool/pool.sh release --slot <slot> --token <token>
+scripts/agent-pool/pool.sh review-checkout --slot codegraph-review --token <token> --branch <branch> --head <sha>
 scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 ```
 
@@ -47,8 +48,13 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   (see Recovery). There is no time-based expiry, and a missing PID is never
   permission to reclaim a slot.
 - The review slot is leased only with `--review`, and only for review:
-  read-only commands and `git checkout --detach <reviewed-sha>`. No edits,
-  commits, stashes or branches. Return it to `origin/v2.0` afterwards.
+  read-only commands and the token-validated `review-checkout` operation. No
+  edits, commits, stashes or branches. Return it to `origin/v2.0` afterwards.
+- Review checkout must use `review-checkout`, which validates the matching lease
+  token, review-slot ownership, clean/unused slot, remote branch head, and exact
+  SHA before checkout. A refused acquire therefore cannot authorize checkout
+  through supported orchestration. This does not prevent a trusted owner from
+  running arbitrary Git commands outside this workflow.
 - After acquiring: `git -C <slot> switch -c <task-branch> origin/v2.0`, do
   bounded work, commit, open a PR to `v2.0`, get an independent review of the
   exact head SHA. Evidence goes to `~/Projekti/codegraph-evidence/<wave>/`,
