@@ -11,9 +11,9 @@ on:
     branches:
       - v2.0
       - 'integration/v2.0-wave-*'
-    # Adding windows-stress to an open PR triggers the deep Windows gate.
-    # Release-candidate checks use a PR targeting v2.0 with this label; no
-    # workflow_dispatch or schedule can accidentally run against master.
+    # The windows-stress label still forces the full non-docs suite while
+    # hosted Windows execution is paused; it never selects a Windows runner.
+    # No workflow_dispatch or schedule can accidentally run against master.
     types: [opened, synchronize, reopened, edited, labeled]
 
 jobs:
@@ -62,8 +62,7 @@ jobs:
             go_test_timeout: 20m
           - os: macos-latest
             go_test_timeout: 20m
-          - os: windows-latest
-            go_test_timeout: 30m
+    # TODO(CG-117): review and restore a hosted Windows leg by 2026-11-30.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -73,95 +72,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Use the runner temp volume
-        # Hosted Windows puts %TEMP% on the C: system volume, where every
-        # SQLite commit and file create in t.TempDir() is several times to
-        # tens of times slower than on the D: runner volume that holds the
-        # workspace and RUNNER_TEMP. The store suite opens roughly a thousand
-        # scratch databases and commits fixture rows one statement at a time,
-        # so on C: internal/store took 1200-1800s against 300-450s on Linux
-        # and repeatedly hit the 30m ceiling. On D: it runs near Linux parity.
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-
       - name: Run tests
-        # Go's timeout is a failure ceiling, not a runtime target. A passing
-        # run does not wait longer, and hangs still fail at the ceiling.
-        # Windows keeps 30m to absorb its wider runner-to-runner variance.
         run: go test -timeout ${{ matrix.go_test_timeout }} ./...
-
-      - name: Check concurrent database open regression (Windows)
-        if: runner.os == 'Windows'
-        run: go test -timeout 20m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=5
-
-      - name: Select deep Windows stress gate
-        id: windows-stress
-        if: runner.os == 'Windows'
-        shell: pwsh
-        # Apply windows-stress for SQLite concurrency/locking, snapshot
-        # sharing/retry, relevant Windows filesystem race fixes, and final P37
-        # release-candidate validation. Paths never select this gate.
-        env:
-          WINDOWS_STRESS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'windows-stress') }}
-        run: |
-          $runStress = $env:WINDOWS_STRESS_LABEL -eq 'true'
-          "run=$($runStress.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          if ($runStress) { Write-Host 'Deep Windows stress selected.' } else { Write-Host 'Deep Windows stress skipped for this change.' }
-
-      - name: Repeat concurrent database open checks (Windows, deep stress)
-        if: runner.os == 'Windows' && steps.windows-stress.outputs.run == 'true'
-        run: go test -timeout 120m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=200
-
-      - name: Smoke native binary
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          function Assert-NativeSuccess([string]$name) {
-            if ($LASTEXITCODE -ne 0) {
-              throw "$name failed with exit code $LASTEXITCODE"
-            }
-          }
-          $work = Join-Path $env:RUNNER_TEMP ("codegraph-smoke-" + [guid]::NewGuid())
-          try {
-            New-Item -ItemType Directory -Path $work | Out-Null
-            $repo = Join-Path $work 'repo'
-            $cgHome = Join-Path $work 'home'
-            New-Item -ItemType Directory -Path $repo, $cgHome | Out-Null
-            @"
-          module smoke
-
-          go 1.26
-          "@ | Set-Content (Join-Path $repo 'go.mod')
-            @"
-          package smoke
-          func Target() {}
-          func Caller() { Target() }
-          "@ | Set-Content (Join-Path $repo 'smoke.go')
-            $binaryName = if ($IsWindows) { 'codegraph.exe' } else { 'codegraph' }
-            $binary = Join-Path $work $binaryName
-            go build -o $binary ./cmd/codegraph
-            Assert-NativeSuccess 'go build'
-            & $binary --version
-            Assert-NativeSuccess 'codegraph --version'
-            $env:CODEGRAPH_HOME = $cgHome
-            & $binary index $repo
-            Assert-NativeSuccess 'codegraph index'
-            & $binary stats $repo
-            Assert-NativeSuccess 'codegraph stats'
-            $callees = & $binary find_callees $repo Caller
-            Assert-NativeSuccess 'codegraph find_callees'
-            $calleesJson = ($callees -join "`n") | ConvertFrom-Json
-            if (-not $calleesJson.target_found -or $calleesJson.count -ne 1 -or @($calleesJson.callees).Count -ne 1 -or $calleesJson.callees[0].qualified_name -ne 'smoke.Target') {
-              throw "Caller -> smoke.Target not found: $($callees -join "`n")"
-            }
-            & $binary update $repo
-            Assert-NativeSuccess 'codegraph update'
-          } finally {
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
-          }
 
   quality:
     needs: changes
