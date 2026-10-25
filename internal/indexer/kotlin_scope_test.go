@@ -225,3 +225,62 @@ class UserService {
 	assertJVMReference(t, r, "Extension.kt", "this.validate", true)
 	r.assertFreshParity(t, "receiver context removal")
 }
+
+func TestKotlinCrossFileExtensionShadowsOrdinaryLambdaHelper(t *testing.T) {
+	const caller = `package p
+class UserService {
+    fun validate() {}
+    fun run(api: ReceiverApi) { api.forEach { this.validate() } }
+}`
+	const api = `package p
+class OtherService { fun validate() {} }
+class ReceiverApi
+fun ReceiverApi.forEach(action: OtherService.() -> Unit) {}
+`
+	r := newLifecycleRepo(t, tree{"UserService.kt": caller, "ReceiverApi.kt": api})
+	if got := r.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("cross-file custom forEach bound enclosing receiver: %s", got)
+	}
+	assertJVMReference(t, r, "UserService.kt", "this.validate", false)
+	if got := r.edgeState(t, "UserService.kt", "this.validate"); strings.Contains(got, "UserService.validate") || strings.Contains(got, "OtherService.validate") {
+		t.Fatalf("cross-file custom forEach fabricated receiver identity: %s", got)
+	}
+	r.assertFreshParity(t, "cross-file extension")
+
+	const ordinary = `package p
+class UserService {
+    fun validate() {}
+    fun run(items: List<Int>) { items.forEach { this.validate() } }
+}`
+	standard := newLifecycleRepo(t, tree{"UserService.kt": ordinary, "ReceiverApi.kt": "package p\nclass ReceiverApi\n"})
+	if got := standard.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, "UserService.validate") {
+		t.Fatalf("standard-library forEach lost support: %s", got)
+	}
+	assertJVMReference(t, standard, "UserService.kt", "this.validate", true)
+	db, err := sql.Open(store.SQLiteDriverName(), standard.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE files SET parser_profile='treesitter:kotlin:v13' WHERE path='UserService.kt'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+	standard.write(t, "ReceiverApi.kt", api)
+	if summary := standard.update(t, "ReceiverApi.kt", "UserService.kt"); summary.FilesIndexed == 0 || !strings.Contains(strings.Join(summary.ParserProfileLanguages, ","), "kotlin") {
+		t.Fatalf("v13-to-v14 receiver evidence transition = %+v", summary)
+	}
+	if got := standard.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("same-package custom extension did not withdraw standard helper binding: %s", got)
+	}
+	assertJVMReference(t, standard, "UserService.kt", "this.validate", false)
+	standard.assertFreshParity(t, "custom extension added")
+
+	standard.write(t, "ReceiverApi.kt", "package p\nclass ReceiverApi\n")
+	standard.update(t, "ReceiverApi.kt", "UserService.kt")
+	if got := standard.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, "UserService.validate") {
+		t.Fatalf("removing custom extension did not restore standard helper binding: %s", got)
+	}
+	assertJVMReference(t, standard, "UserService.kt", "this.validate", true)
+	standard.assertFreshParity(t, "custom extension removed")
+}

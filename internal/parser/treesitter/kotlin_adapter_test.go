@@ -36,7 +36,7 @@ class UserService {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", "this.validate"}
+	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinOrdinaryLambdaReceiverEvidence + "forEach", graph.KotlinOrdinaryLambdaReceiverEvidence + "let"}
 	var got []string
 	for _, edge := range parsed.Edges {
 		if edge.DstName == "this.validate" {

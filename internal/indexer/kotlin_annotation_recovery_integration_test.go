@@ -262,7 +262,7 @@ func TestKotlinV6ToV7DetachedAnnotationRecoveryConvergence(t *testing.T) {
 	if summary.FilesChanged != 3 || summary.FilesIndexed != 3 || strings.Join(summary.ParserProfileLanguages, ",") != "kotlin" || summary.ResolveMode != "repo" {
 		t.Fatalf("v6-to-v7 update=%+v", summary)
 	}
-	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v13", "Synth.kt": "treesitter:kotlin:v13", "Other.kt": "treesitter:kotlin:v13", "Caller.java": "treesitter:java:v14", "main.go": "go-ast:go:v6", "caller.ts": "treesitter:typescript:v2"} {
+	for path, want := range map[string]string{"Split.kt": "treesitter:kotlin:v14", "Synth.kt": "treesitter:kotlin:v14", "Other.kt": "treesitter:kotlin:v14", "Caller.java": "treesitter:java:v14", "main.go": "go-ast:go:v6", "caller.ts": "treesitter:typescript:v2"} {
 		if got := fileParserProfile(t, s.raw(t), repo, path); got != want {
 			t.Fatalf("%s profile=%q, want %q", path, got, want)
 		}
@@ -330,7 +330,7 @@ func TestKotlinSemanticTransitionFailureIsPendingAndRetryConverges(t *testing.T)
 	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, fmt.Sprintf("parser.semantic.pending.%d.kotlin", repo)).Scan(&pending); err != nil {
 		t.Fatalf("pending marker: %v", err)
 	}
-	wantPending := fmt.Sprintf("v1:%s:%d", oldMarker, parser.SemanticEpochForProfile("treesitter:kotlin:v13"))
+	wantPending := fmt.Sprintf("v1:%s:%d", oldMarker, parser.SemanticEpochForProfile("treesitter:kotlin:v14"))
 	if pending != wantPending {
 		t.Fatalf("pending marker=%q, want %q", pending, wantPending)
 	}
@@ -353,7 +353,7 @@ func TestKotlinSemanticTransitionFailureIsPendingAndRetryConverges(t *testing.T)
 	if err := s.raw(t).QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, semanticKey).Scan(&gotMarker); err != nil {
 		t.Fatal(err)
 	}
-	if gotMarker != strconv.Itoa(parser.SemanticEpochForProfile("treesitter:kotlin:v13")) {
+	if gotMarker != strconv.Itoa(parser.SemanticEpochForProfile("treesitter:kotlin:v14")) {
 		t.Fatalf("converged marker=%q", gotMarker)
 	}
 	if err := s.Store.CheckParserSemanticGraph(ctx, repo); err != nil {

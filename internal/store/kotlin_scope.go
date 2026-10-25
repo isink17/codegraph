@@ -156,6 +156,8 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		strategy := ""
 		if e.evidence == graph.KotlinUnprovenThisReceiverEvidence {
 			continue
+		} else if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && kotlinPackageExtension(helper, e.pkg, syms) {
+			continue
 		} else if member, ok := strings.CutPrefix(e.name, "this."); ok {
 			dst, strategy = kotlinThisMember(e, member, syms)
 		} else if strings.Contains(e.name, ".") {
@@ -202,6 +204,18 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	}
 	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_kotlin_scope_resolution)`)
 	return len(res), err
+}
+
+func kotlinPackageExtension(name, pkg string, syms []kotlinScopeSymbol) bool {
+	for _, s := range syms {
+		if s.language == "kotlin" && s.pkg == pkg && s.container == pkg && s.name == name && kotlinExtension(s) && kotlinVisible(s, struct {
+			id, file                             int64
+			name, kind, evidence, pkg, container string
+		}{pkg: pkg}) {
+			return true
+		}
+	}
+	return false
 }
 
 func kotlinThisMember(e struct {

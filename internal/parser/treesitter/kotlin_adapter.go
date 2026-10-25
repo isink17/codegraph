@@ -1327,8 +1327,14 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if strings.HasPrefix(name, "this.") && kotlinThisReceiverUnproven(call, content, imports) {
-			evidence = graph.KotlinUnprovenThisReceiverEvidence
+		if strings.HasPrefix(name, "this.") {
+			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
+			switch {
+			case unproven:
+				evidence = graph.KotlinUnprovenThisReceiverEvidence
+			case ordinary != "":
+				evidence = graph.KotlinOrdinaryLambdaReceiverEvidence + ordinary
+			}
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
@@ -1353,11 +1359,12 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 // lambda passed to a call may be a receiver lambda, and an extension function
 // has its extension receiver as unlabelled `this`; neither is proved by the
 // enclosing declaration container.
-func kotlinThisReceiverUnproven(call *sitter.Node, content []byte, imports []graph.ScopeImport) bool {
+func kotlinThisReceiverEvidence(call *sitter.Node, content []byte, imports []graph.ScopeImport) (bool, string) {
+	ordinaryName := ""
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		switch node.Type() {
 		case "lambda_literal":
-			ordinary := false
+			ordinary := ""
 			inCall := false
 			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
 				if parent.Type() == "call_expression" {
@@ -1366,29 +1373,32 @@ func kotlinThisReceiverUnproven(call *sitter.Node, content []byte, imports []gra
 					break
 				}
 				if parent.Type() == "property_declaration" && kotlinReceiverFunctionType(parent, content) {
-					return true
+					return true, ""
 				}
 				if parent.Type() == "function_declaration" {
 					break
 				}
 			}
-			if inCall && !ordinary {
-				return true
+			if inCall {
+				if ordinary == "" {
+					return true, ""
+				}
+				ordinaryName = ordinary
 			}
 		case "function_declaration":
 			if len(kotlinFunctionPartsOf(kotlinDeclarationView{decl: node}).between) > 0 {
-				return true
+				return true, ""
 			}
 		}
 	}
-	return false
+	return false, ordinaryName
 }
 
 // Kotlin's standard-library higher-order helpers below take ordinary lambda
 // parameters, so unlabelled `this` remains the enclosing receiver. The call
 // must be a qualified helper with no non-Kotlin import or same-file shadow;
 // unknown or shadowed calls stay unresolved.
-func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []graph.ScopeImport) bool {
+func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []graph.ScopeImport) string {
 	fn := childByFieldName(call, "function")
 	if fn == nil && call.ChildCount() > 0 {
 		fn = call.Child(0)
@@ -1397,14 +1407,14 @@ func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []
 	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
 		name = name[dot+1:]
 	} else {
-		return false
+		return ""
 	}
 	for _, imp := range imports {
 		if imp.Wildcard && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
-			return false
+			return ""
 		}
 		if (imp.LocalName == name || imp.ImportedName == name) && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
-			return false
+			return ""
 		}
 	}
 	root := call
@@ -1414,14 +1424,14 @@ func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []
 	for _, decl := range findDescendants(root, "function_declaration") {
 		declName := kotlinFunctionName(kotlinDeclarationView{decl: decl})
 		if declName != nil && nodeText(declName, content) == name {
-			return false
+			return ""
 		}
 	}
 	switch name {
 	case "also", "filter", "fold", "forEach", "let", "map", "onEach", "runCatching", "use":
-		return true
+		return name
 	default:
-		return false
+		return ""
 	}
 }
 

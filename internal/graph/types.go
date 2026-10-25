@@ -152,6 +152,11 @@ const JavaFieldReceiverEvidence = "java:field_receiver"
 // lexical context may change `this` to a lambda or extension receiver.
 const KotlinUnprovenThisReceiverEvidence = "kotlin:unproven_this_receiver"
 
+// KotlinOrdinaryLambdaReceiverEvidence prefixes a standard-library-looking
+// helper name whose lambda was proved ordinary by the parser. The store still
+// checks repository-wide same-package extension shadowing.
+const KotlinOrdinaryLambdaReceiverEvidence = "kotlin:ordinary_lambda_receiver:"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,
