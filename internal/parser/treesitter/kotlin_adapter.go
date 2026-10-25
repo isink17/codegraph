@@ -1354,6 +1354,9 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
+		if kotlinCallableShadow(call, name, content) {
+			evidence = graph.KotlinCallableShadowEvidence
+		}
 		if strings.HasPrefix(name, "this.") {
 			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
 			switch {
@@ -1381,6 +1384,37 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			Range:         rng,
 		})
 	}
+}
+
+func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
+	var fn *sitter.Node
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() == "function_declaration" {
+			fn = node
+			break
+		}
+	}
+	if fn == nil {
+		return false
+	}
+	params := firstChild(fn, "function_value_parameters")
+	for _, param := range findDescendants(params, "parameter") {
+		if id := firstChild(param, "simple_identifier"); id != nil && nodeText(id, content) == name && len(findDescendants(param, "function_type")) > 0 {
+			return true
+		}
+	}
+	body := firstChild(fn, "function_body")
+	for _, property := range findDescendants(body, "property_declaration") {
+		binding := firstChild(property, "variable_declaration")
+		id := firstChild(binding, "simple_identifier")
+		if id == nil || nodeText(id, content) != name || property.StartPoint().Row > call.StartPoint().Row {
+			continue
+		}
+		if len(findDescendants(property, "lambda_literal")) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func kotlinCallArity(call *sitter.Node) *int {

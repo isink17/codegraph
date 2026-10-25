@@ -27,6 +27,86 @@ fun call() { Service.run() }`,
 	}
 }
 
+func TestKotlinConstructorCallableShadowingLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Shadow.kt": `class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`,
+	})
+	lines := r.projection(t)
+	for _, want := range []string{
+		`edge Shadow.kt:local -calls-> "Target" => :: [/]`,
+		`edge Shadow.kt:parameter -calls-> "Target" => :: [/]`,
+		`edge Shadow.kt:positive -constructs-> "Target" => Shadow.kt:Target(class)`,
+	} {
+		found := false
+		for _, line := range lines {
+			if strings.Contains(line, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("projection missing %q: %v", want, lines)
+		}
+	}
+	assertKotlinTargetReferences(t, r, 4)
+
+	r.write(t, "Shadow.kt", `class Target
+fun local() { Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`)
+	r.update(t, "Shadow.kt")
+	assertKotlinTargetReferences(t, r, 2, 4)
+	r.assertFreshParity(t, "callable shadow removal")
+
+	r.write(t, "Shadow.kt", `class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`)
+	r.update(t, "Shadow.kt")
+	assertKotlinTargetReferences(t, r, 4)
+	r.assertFreshParity(t, "callable shadow rebound")
+}
+
+func TestKotlinAmbiguousCallableCandidateDoesNotConstruct(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Types.kt": `class Target`,
+		"Callables.kt": `fun Target() {}
+fun Target(value: kotlin.Int) {}`,
+		"Caller.kt": `fun create() { Target() }`,
+	})
+	assertJVMUnresolved(t, r, "Caller.kt", "Target")
+	r.assertFreshParity(t, "ambiguous callable candidates")
+}
+
+func assertKotlinTargetReferences(t *testing.T, r *lifecycleRepo, boundLines ...int) {
+	t.Helper()
+	want := map[int]bool{}
+	for _, line := range boundLines {
+		want[line] = true
+	}
+	rows, err := r.raw(t).Query(`SELECT r.start_line, r.symbol_id IS NOT NULL FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Shadow.kt' AND r.ref_kind='call' AND r.qualified_name='Target' ORDER BY r.start_line`, r.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var line int
+		var bound bool
+		if err := rows.Scan(&line, &bound); err != nil {
+			t.Fatal(err)
+		}
+		if bound != want[line] {
+			t.Fatalf("reference Shadow.kt:%d bound=%v, want=%v", line, bound, want[line])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestKotlinExplicitThisMemberCallResolvesThroughQueries(t *testing.T) {
 	const caller = `class UserService {
     fun validate() {}

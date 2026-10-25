@@ -179,10 +179,13 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 				}
 			}
 		} else {
+			if e.evidence == graph.KotlinCallableShadowEvidence {
+				continue
+			}
 			owner := kotlinType(e.name, e, syms, imports[e.file])
-			function, functionStrategy := kotlinBare(e, syms, imports[e.file])
+			function, functionStrategy, functionCount := kotlinBare(e, syms, imports[e.file])
 			if owner.language == "kotlin" && owner.kind == "class" {
-				if function.id == 0 && kotlinKotlinConstructible(owner, e) && kotlinZeroArgConstruction(e.callArity) {
+				if functionCount == 0 && kotlinKotlinConstructible(owner, e) && kotlinZeroArgConstruction(e.callArity) {
 					dst, strategy, kind = owner, kotlinOwnerStrategy(owner.qname, e.name, imports[e.file]), "constructs"
 				}
 			} else if owner.language == "java" && kotlinJavaConstructible(owner, e, syms) {
@@ -283,7 +286,7 @@ func kotlinType(name string, e kotlinScopeEdge, syms []kotlinScopeSymbol, import
 	return kotlinUnique(c)
 }
 
-func kotlinBare(e kotlinScopeEdge, syms []kotlinScopeSymbol, imports []kotlinScopeImport) (kotlinScopeSymbol, string) {
+func kotlinBare(e kotlinScopeEdge, syms []kotlinScopeSymbol, imports []kotlinScopeImport) (kotlinScopeSymbol, string, int) {
 	var c []kotlinScopeSymbol
 	strategy := "kotlin_package_scope"
 	for _, s := range syms {
@@ -318,7 +321,7 @@ func kotlinBare(e kotlinScopeEdge, syms []kotlinScopeSymbol, imports []kotlinSco
 			strategy = "kotlin_import_scope"
 		}
 	}
-	return kotlinUnique(c), strategy
+	return kotlinUnique(c), strategy, len(c)
 }
 
 func kotlinMember(owner kotlinScopeSymbol, name string, e kotlinScopeEdge, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {

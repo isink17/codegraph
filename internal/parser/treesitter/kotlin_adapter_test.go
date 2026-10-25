@@ -102,6 +102,20 @@ func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	}
 }
 
+func TestKotlinCallableShadowEvidence(t *testing.T) {
+	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(`class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Edges) != 3 || parsed.Edges[0].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[1].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[2].Evidence != "Target" {
+		t.Fatalf("shadow evidence = %+v", parsed.Edges)
+	}
+}
+
 func TestKotlinClassPrimaryConstructorEvidence(t *testing.T) {
 	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", []byte(`class Implicit
 class Empty()
