@@ -81,6 +81,25 @@ fun Target(value: kotlin.Int) {}`,
 	r.assertFreshParity(t, "ambiguous callable candidates")
 }
 
+func TestKotlinTypedCallableValueShadowing(t *testing.T) {
+	r := newLifecycleRepo(t, tree{"Shadow.kt": `class Target
+fun create(callback: () -> Unit) {
+    val Target: () -> Unit = callback
+    Target()
+}
+fun positive() { Target() }`})
+	if got := r.edgeState(t, "Shadow.kt", "Target"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("typed callable shadow = %s", got)
+	}
+	lines := r.projection(t)
+	for _, line := range lines {
+		if strings.Contains(line, `Shadow.kt:positive -constructs-> "Target"`) {
+			return
+		}
+	}
+	t.Fatalf("typed callable shadow removed positive construction: %v", lines)
+}
+
 func assertKotlinTargetReferences(t *testing.T, r *lifecycleRepo, boundLines ...int) {
 	t.Helper()
 	want := map[int]bool{}

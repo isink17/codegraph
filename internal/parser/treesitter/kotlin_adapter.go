@@ -1410,7 +1410,7 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 		if id == nil || nodeText(id, content) != name || property.StartPoint().Row > call.StartPoint().Row {
 			continue
 		}
-		if len(findDescendants(property, "lambda_literal")) > 0 {
+		if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
 			return true
 		}
 	}

@@ -106,12 +106,13 @@ func TestKotlinCallableShadowEvidence(t *testing.T) {
 	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(`class Target
 fun local() { val Target = {}; Target() }
 fun parameter(Target: () -> Unit) { Target() }
+fun typed(callback: () -> Unit) { val Target: () -> Unit = callback; Target() }
 fun positive() { Target() }
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Edges) != 3 || parsed.Edges[0].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[1].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[2].Evidence != "Target" {
+	if len(parsed.Edges) != 4 || parsed.Edges[0].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[1].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[2].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[3].Evidence != "Target" {
 		t.Fatalf("shadow evidence = %+v", parsed.Edges)
 	}
 }
