@@ -284,3 +284,92 @@ class UserService {
 	assertJVMReference(t, standard, "UserService.kt", "this.validate", true)
 	standard.assertFreshParity(t, "invisible private extension")
 }
+
+func TestKotlinConservativeClassConstructionLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/Types.kt": `package lib
+class UserRepository
+class Empty()
+class Required(val value: kotlin.Int)
+abstract class AbstractType
+interface Backend
+object Singleton
+class Ambiguous
+`,
+		"lib/Other.kt": `package lib
+class Ambiguous
+`,
+		"Caller.kt": `package app
+import lib.UserRepository
+import lib.Empty
+import lib.Required
+import lib.AbstractType
+import lib.Backend
+import lib.Singleton
+import lib.Ambiguous
+class UserService {
+    fun create() { UserRepository() }
+    fun empty() { Empty() }
+    fun required() { Required(1) }
+    fun abstractType() { AbstractType() }
+    fun backend() { Backend() }
+    fun singleton() { Singleton() }
+    fun ambiguous() { Ambiguous() }
+}`,
+	})
+	for _, tc := range []struct {
+		name, target string
+		bound        bool
+	}{
+		{"UserRepository", "lib.UserRepository", true},
+		{"Empty", "lib.Empty", true},
+		{"Required", "lib.Required", false},
+		{"AbstractType", "lib.AbstractType", false},
+		{"Backend", "lib.Backend", false},
+		{"Singleton", "lib.Singleton", false},
+		{"Ambiguous", "lib.Ambiguous", false},
+	} {
+		state := r.edgeState(t, "Caller.kt", tc.name)
+		if tc.bound && !strings.Contains(state, tc.target) {
+			t.Errorf("%s = %s", tc.name, state)
+		}
+		if !tc.bound && !strings.Contains(state, ":: [/]") {
+			t.Errorf("%s = %s", tc.name, state)
+		}
+	}
+	callers, err := r.store.FindCallers(context.Background(), r.repoID, "lib.UserRepository", 0, 10, 0)
+	if err != nil || len(callers) != 1 || callers[0].QualifiedName != "app.UserService.create" {
+		t.Fatalf("constructor callers = %#v, %v", callers, err)
+	}
+	callees, err := r.store.FindCallees(context.Background(), r.repoID, "app.UserService.create", 0, 10, 0)
+	if err != nil || len(callees) != 1 || callees[0].QualifiedName != "lib.UserRepository" {
+		t.Fatalf("constructor callees = %#v, %v", callees, err)
+	}
+	var referenceTarget string
+	if err := r.raw(t).QueryRow(`SELECT s.qualified_name FROM references_tbl r JOIN symbols s ON s.id=r.symbol_id JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Caller.kt' AND r.name='UserRepository'`, r.repoID).Scan(&referenceTarget); err != nil || referenceTarget != "lib.UserRepository" {
+		t.Fatalf("constructor reference target = %q, %v; want lib.UserRepository", referenceTarget, err)
+	}
+	impact, err := r.store.ImpactRadius(context.Background(), r.repoID, []string{"lib.UserRepository"}, nil, 1, 10, 0)
+	if err != nil || impact == nil {
+		t.Fatalf("constructor impact = %#v, %v", impact, err)
+	}
+	r.assertFreshParity(t, "initial Kotlin construction")
+	r.write(t, "lib/Other.kt", "package lib\nclass Other\n")
+	r.update(t, "lib/Other.kt")
+	if got := r.edgeState(t, "Caller.kt", "Ambiguous"); !strings.Contains(got, "lib/Types.kt") {
+		t.Fatalf("ambiguity removal did not rebind: %s", got)
+	}
+	r.write(t, "lib/Types.kt", "package lib\nclass UserRepository(val value: kotlin.Int)\nclass Empty()\nclass Required(val value: kotlin.Int)\nabstract class AbstractType\ninterface Backend\nobject Singleton\nclass Ambiguous\n")
+	r.update(t, "lib/Types.kt")
+	if got := r.edgeState(t, "Caller.kt", "UserRepository"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("constructor arity removal unexpectedly remained bound: %s", got)
+	}
+	var cleared sql.NullInt64
+	if err := r.raw(t).QueryRow(`SELECT symbol_id FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Caller.kt' AND r.name='UserRepository'`, r.repoID).Scan(&cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Valid {
+		t.Fatalf("constructor reference retained stale target %d", cleared.Int64)
+	}
+	r.assertFreshParity(t, "constructor proof removal")
+}

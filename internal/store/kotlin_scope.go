@@ -11,12 +11,20 @@ import (
 type kotlinScopeSymbol struct {
 	id, file                                                           int64
 	name, qname, container, kind, visibility, signature, pkg, language string
+	modifiers, syntaxState, declarationKind                            string
+	constructorParams                                                  int
 	static                                                             sql.NullInt64
 }
 
 type kotlinScopeImport struct {
 	source, imported, local string
 	wildcard                bool
+}
+
+type kotlinScopeEdge struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+	callArity                            sql.NullInt64
 }
 
 // resolveKotlinScope is deliberately source-evidence only. It owns every edge
@@ -26,20 +34,16 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_veto(edge_id INTEGER PRIMARY KEY) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
-	type edge struct {
-		id, file                             int64
-		name, kind, evidence, pkg, container string
-	}
-	var edges []edge
-	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,
+	var edges []kotlinScopeEdge
+	if err := sqliteBatchedQuery(ctx, q, `SELECT e.id,e.dst_name,e.edge_kind,e.evidence,e.file_id,e.call_arity,
 		COALESCE(fs.package_name,''),s.container_name
 		FROM edges e JOIN files f ON f.id=e.file_id JOIN symbols s ON s.id=e.src_symbol_id
 		JOIN file_scope_evidence fs ON fs.repo_id=e.repo_id AND fs.file_id=e.file_id
 		WHERE e.repo_id=? AND f.language='kotlin' AND e.dst_symbol_id IS NULL`, " AND e.id IN (%s)",
 		[]any{repoID}, int64SliceToAny(sortedIDs(only)), len(only) > 0,
 		func(rows *sql.Rows) error {
-			var e edge
-			if err := rows.Scan(&e.id, &e.name, &e.kind, &e.evidence, &e.file, &e.pkg, &e.container); err != nil {
+			var e kotlinScopeEdge
+			if err := rows.Scan(&e.id, &e.name, &e.kind, &e.evidence, &e.file, &e.callArity, &e.pkg, &e.container); err != nil {
 				return err
 			}
 			edges = append(edges, e)
@@ -115,14 +119,16 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		for _, n := range nameChunk {
 			fixed = append(fixed, n)
 		}
-		if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.signature,COALESCE(fs.package_name,''),f.language,s.is_static
+		if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.signature,COALESCE(fs.package_name,''),f.language,s.is_static,
+			COALESCE(te.modifiers,''),COALESCE(te.syntax_state,''),COALESCE(te.declaration_kind,''),COALESCE((SELECT COUNT(*) FROM jvm_callable_type_evidence ce WHERE ce.repo_id=s.repo_id AND ce.symbol_id=s.id AND ce.position='parameter'),0)
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.repo_id=s.repo_id AND fs.file_id=s.file_id
+		LEFT JOIN jvm_type_evidence te ON te.repo_id=s.repo_id AND te.symbol_id=s.id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0 AND s.name IN (`+sqlitePlaceholders(len(nameChunk))+`)`,
 			" AND COALESCE(fs.package_name,'') IN (%s)",
 			fixed, stringSliceToAny(packageList), true,
 			func(rows *sql.Rows) error {
 				var s kotlinScopeSymbol
-				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg, &s.language, &s.static); err != nil {
+				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg, &s.language, &s.static, &s.modifiers, &s.syntaxState, &s.declarationKind, &s.constructorParams); err != nil {
 					return err
 				}
 				syms = append(syms, s)
@@ -148,12 +154,13 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		return 0, err
 	}
 	res := make([]struct {
-		edge, dst int64
-		strategy  string
+		edge, dst      int64
+		strategy, kind string
 	}, 0)
 	for _, e := range edges {
 		var dst kotlinScopeSymbol
 		strategy := ""
+		kind := e.kind
 		if e.evidence == graph.KotlinUnprovenThisReceiverEvidence {
 			continue
 		} else if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && kotlinPackageExtension(helper, e.pkg, e.file, syms) {
@@ -173,17 +180,22 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 			}
 		} else {
 			owner := kotlinType(e.name, e, syms, imports[e.file])
-			if owner.language == "java" && kotlinJavaConstructible(owner, e, syms) {
+			function, functionStrategy := kotlinBare(e, syms, imports[e.file])
+			if owner.language == "kotlin" && owner.kind == "class" {
+				if function.id == 0 && kotlinKotlinConstructible(owner, e) && kotlinZeroArgConstruction(e.callArity) {
+					dst, strategy, kind = owner, kotlinOwnerStrategy(owner.qname, e.name, imports[e.file]), "constructs"
+				}
+			} else if owner.language == "java" && kotlinJavaConstructible(owner, e, syms) {
 				dst, strategy = owner, kotlinOwnerStrategy(owner.qname, e.name, imports[e.file])
 			} else {
-				dst, strategy = kotlinBare(e, syms, imports[e.file])
+				dst, strategy = function, functionStrategy
 			}
 		}
 		if dst.id != 0 {
 			res = append(res, struct {
-				edge, dst int64
-				strategy  string
-			}{e.id, dst.id, strategy})
+				edge, dst      int64
+				strategy, kind string
+			}{e.id, dst.id, strategy, kind})
 		}
 	}
 	if len(res) == 0 {
@@ -191,37 +203,40 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	}
 	resRows := make([][]any, 0, len(res))
 	for _, r := range res {
-		resRows = append(resRows, []any{r.edge, r.dst, r.strategy})
+		resRows = append(resRows, []any{r.edge, r.dst, r.strategy, r.kind})
 	}
-	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_resolution(edge_id INTEGER PRIMARY KEY,dst_symbol_id INTEGER NOT NULL,strategy TEXT NOT NULL) WITHOUT ROWID`); err != nil {
+	if _, err := q.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS tmp_kotlin_scope_resolution(edge_id INTEGER PRIMARY KEY,dst_symbol_id INTEGER NOT NULL,strategy TEXT NOT NULL,edge_kind TEXT NOT NULL) WITHOUT ROWID`); err != nil {
 		return 0, err
 	}
 	if _, err := q.ExecContext(ctx, `DELETE FROM tmp_kotlin_scope_resolution`); err != nil {
 		return 0, err
 	}
-	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO tmp_kotlin_scope_resolution(edge_id,dst_symbol_id,strategy) VALUES `, "(?,?,?)", nil, resRows); err != nil {
+	if err := sqliteBatchedValuesExec(ctx, q, `INSERT INTO tmp_kotlin_scope_resolution(edge_id,dst_symbol_id,strategy,edge_kind) VALUES `, "(?,?,?,?)", nil, resRows); err != nil {
 		return 0, err
 	}
-	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_kotlin_scope_resolution)`)
+	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),edge_kind=(SELECT edge_kind FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_kotlin_scope_resolution)`)
 	return len(res), err
+}
+
+func kotlinKotlinConstructible(s kotlinScopeSymbol, e kotlinScopeEdge) bool {
+	return s.language == "kotlin" && s.kind == "class" && s.declarationKind == "class" && s.syntaxState == "known" && s.constructorParams == 0 &&
+		!strings.Contains(s.modifiers, "abstract") && !strings.Contains(s.modifiers, "sealed") && !strings.Contains(s.modifiers, "interface") && kotlinVisible(s, e)
+}
+
+func kotlinZeroArgConstruction(arity sql.NullInt64) bool {
+	return arity.Valid && arity.Int64 == 0
 }
 
 func kotlinPackageExtension(name, pkg string, callerFile int64, syms []kotlinScopeSymbol) bool {
 	for _, s := range syms {
-		if s.language == "kotlin" && s.pkg == pkg && s.container == pkg && s.name == name && kotlinExtension(s) && kotlinVisible(s, struct {
-			id, file                             int64
-			name, kind, evidence, pkg, container string
-		}{file: callerFile, pkg: pkg}) {
+		if s.language == "kotlin" && s.pkg == pkg && s.container == pkg && s.name == name && kotlinExtension(s) && kotlinVisible(s, kotlinScopeEdge{file: callerFile, pkg: pkg}) {
 			return true
 		}
 	}
 	return false
 }
 
-func kotlinThisMember(e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}, name string, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
+func kotlinThisMember(e kotlinScopeEdge, name string, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
 	ownerName := kotlinJoin(e.pkg, e.container)
 	var owners []kotlinScopeSymbol
 	for _, s := range syms {
@@ -236,10 +251,7 @@ func kotlinThisMember(e struct {
 	return kotlinMember(owner, name, e, syms)
 }
 
-func kotlinType(name string, e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}, syms []kotlinScopeSymbol, imports []kotlinScopeImport) kotlinScopeSymbol {
+func kotlinType(name string, e kotlinScopeEdge, syms []kotlinScopeSymbol, imports []kotlinScopeImport) kotlinScopeSymbol {
 	var c []kotlinScopeSymbol
 	for _, s := range syms {
 		if !kotlinTypeEligible(s) {
@@ -271,10 +283,7 @@ func kotlinType(name string, e struct {
 	return kotlinUnique(c)
 }
 
-func kotlinBare(e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}, syms []kotlinScopeSymbol, imports []kotlinScopeImport) (kotlinScopeSymbol, string) {
+func kotlinBare(e kotlinScopeEdge, syms []kotlinScopeSymbol, imports []kotlinScopeImport) (kotlinScopeSymbol, string) {
 	var c []kotlinScopeSymbol
 	strategy := "kotlin_package_scope"
 	for _, s := range syms {
@@ -312,10 +321,7 @@ func kotlinBare(e struct {
 	return kotlinUnique(c), strategy
 }
 
-func kotlinMember(owner kotlinScopeSymbol, name string, e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
+func kotlinMember(owner kotlinScopeSymbol, name string, e kotlinScopeEdge, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
 	var c []kotlinScopeSymbol
 	if owner.language == "java" {
 		for _, s := range syms {
@@ -349,10 +355,7 @@ func kotlinTypeEligible(s kotlinScopeSymbol) bool {
 // without guessing an overload. An absent Java constructor symbol may be the
 // implicit default constructor, but when source facts do contain constructors,
 // at least one must be visible to this Kotlin caller.
-func kotlinJavaConstructible(owner kotlinScopeSymbol, e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}, syms []kotlinScopeSymbol) bool {
+func kotlinJavaConstructible(owner kotlinScopeSymbol, e kotlinScopeEdge, syms []kotlinScopeSymbol) bool {
 	seen := false
 	for _, s := range syms {
 		if s.language != "java" || s.kind != "constructor" || !strings.HasPrefix(s.qname, owner.qname+".") {
@@ -396,10 +399,7 @@ func kotlinExtension(s kotlinScopeSymbol) bool {
 func kotlinExtensionSignature(name, signature string) bool {
 	return strings.Contains(strings.TrimSpace(signature), "."+name+"(")
 }
-func kotlinVisible(s kotlinScopeSymbol, e struct {
-	id, file                             int64
-	name, kind, evidence, pkg, container string
-}) bool {
+func kotlinVisible(s kotlinScopeSymbol, e kotlinScopeEdge) bool {
 	if s.language == "java" {
 		switch s.visibility {
 		case "private":
