@@ -276,11 +276,11 @@ class UserService {
 	assertJVMReference(t, standard, "UserService.kt", "this.validate", false)
 	standard.assertFreshParity(t, "custom extension added")
 
-	standard.write(t, "ReceiverApi.kt", "package p\nclass ReceiverApi\n")
+	standard.write(t, "ReceiverApi.kt", "package p\nclass ReceiverApi\nprivate fun ReceiverApi.forEach(action: OtherService.() -> Unit) {}\n")
 	standard.update(t, "ReceiverApi.kt", "UserService.kt")
 	if got := standard.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, "UserService.validate") {
-		t.Fatalf("removing custom extension did not restore standard helper binding: %s", got)
+		t.Fatalf("invisible private extension incorrectly withdrew standard helper binding: %s", got)
 	}
 	assertJVMReference(t, standard, "UserService.kt", "this.validate", true)
-	standard.assertFreshParity(t, "custom extension removed")
+	standard.assertFreshParity(t, "invisible private extension")
 }
