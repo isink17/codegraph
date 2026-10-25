@@ -187,12 +187,13 @@ func snapshot(ctx context.Context, repoRoot, ref string, registry *parser.Regist
 // first use. err holds the first failure of the process itself, which also
 // stops the process; a blob over the limit is only unavailable.
 type blobReader struct {
-	ctx  context.Context
-	root string
-	cmd  *exec.Cmd
-	in   io.WriteCloser
-	out  *bufio.Reader
-	err  error
+	ctx    context.Context
+	root   string
+	cmd    *exec.Cmd
+	in     io.WriteCloser
+	stdout io.ReadCloser
+	out    *bufio.Reader
+	err    error
 }
 
 func (b *blobReader) read(object string, limit int64) ([]byte, bool) {
@@ -208,6 +209,7 @@ func (b *blobReader) read(object string, limit int64) ([]byte, bool) {
 		if err == nil {
 			var out io.ReadCloser
 			if out, err = cmd.StdoutPipe(); err == nil {
+				b.stdout = out
 				b.out = bufio.NewReader(out)
 				err = cmd.Start()
 			}
@@ -263,7 +265,9 @@ func (b *blobReader) close() {
 	}
 	_ = b.in.Close()
 	_ = b.cmd.Wait()
+	_ = b.stdout.Close()
 	b.cmd = nil
+	b.stdout = nil
 }
 
 func parseTree(raw []byte) ([]treeEntry, error) {
