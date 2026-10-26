@@ -77,9 +77,13 @@ func Decode(text string) (*Decoded, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compactfmt: @tool: %w", err)
 	}
+	if strings.TrimSpace(toolName) == "" {
+		return nil, fmt.Errorf("compactfmt: empty tool name")
+	}
 
 	out := &Decoded{Version: version, Tool: toolName}
 	var current *DecodedSection
+	seenSections := make(map[string]bool)
 	for i := 2; i < len(lines); i++ {
 		line := lines[i]
 		switch {
@@ -88,6 +92,13 @@ func Decode(text string) (*Decoded, error) {
 			if err != nil {
 				return nil, fmt.Errorf("compactfmt: line %d: @section: %w", i+1, err)
 			}
+			if strings.TrimSpace(name) == "" {
+				return nil, fmt.Errorf("compactfmt: line %d: empty section name", i+1)
+			}
+			if seenSections[name] {
+				return nil, fmt.Errorf("compactfmt: line %d: duplicate section %q", i+1, name)
+			}
+			seenSections[name] = true
 			out.Sections = append(out.Sections, DecodedSection{Name: name})
 			current = &out.Sections[len(out.Sections)-1]
 		case strings.HasPrefix(line, "@columns "):
@@ -103,6 +114,9 @@ func Decode(text string) (*Decoded, error) {
 			}
 			seen := make(map[string]bool, len(cols))
 			for _, col := range cols {
+				if strings.TrimSpace(col) == "" {
+					return nil, fmt.Errorf("compactfmt: line %d: section %q has an empty column name", i+1, current.Name)
+				}
 				if seen[col] {
 					return nil, fmt.Errorf("compactfmt: line %d: section %q has duplicate column %q", i+1, current.Name, col)
 				}
