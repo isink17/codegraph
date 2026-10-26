@@ -1340,7 +1340,10 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 		return fmt.Errorf("unknown tool %q", name)
 	}
 	args := map[string]any{}
-	if len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
+	if len(raw) > 0 {
+		if strings.TrimSpace(string(raw)) == "null" {
+			return fmt.Errorf("arguments must be a JSON object")
+		}
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return fmt.Errorf("invalid arguments payload: %w", err)
 		}
