@@ -10260,8 +10260,8 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	args := []any{repoID}
 	if pathFilter != "" {
 		prefix := CanonicalRelPath(pathFilter)
-		query += ` AND path LIKE ?`
-		args = append(args, prefix+"%")
+		query += ` AND path LIKE ? ESCAPE '\'`
+		args = append(args, escapeSQLLikePrefix(prefix)+"%")
 	}
 	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))
