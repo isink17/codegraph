@@ -64,21 +64,21 @@
 
 ## Cross-platform compatibility
 
-CodeGraph officially targets Windows, macOS and Linux. Every implementation
-must account for platform differences, even while Windows-hosted CI is paused.
-Use `path/filepath` for native filesystem paths and `path` for slash-delimited
-logical paths where appropriate. Never assume separators, drive letters,
-volume roots or filename casing behave identically across operating systems.
-Git output may use slash-separated paths on Windows; normalize only at clearly
-defined filesystem boundaries. Portable input validation must recognize POSIX
-absolute paths, Windows drive paths and UNC paths regardless of the current
-host OS; avoid relying on host-specific `filepath.IsAbs` behavior for portable
-inputs. Close files, pipes, SQLite connections and subprocess resources
-correctly because Windows may refuse cleanup while handles remain open. Use
-portable test fixtures and platform-aware assertions, and add focused tests for
-Windows-style inputs where useful on Linux/macOS. The temporary absence of
-Windows-hosted CI is a coverage limitation, not permission to ignore Windows
-compatibility.
+CodeGraph officially supports Windows, macOS and Linux. Every implementation
+agent must consider all three; the temporary Windows CI pause does not change
+that requirement. Use `path/filepath` for host-native filesystem paths and
+`path` for slash-delimited logical paths. Never assume separators, drive
+letters, UNC paths, volume roots or filename casing behave identically. Git
+may emit slash-separated paths on Windows; normalize at filesystem boundaries,
+not indiscriminately. Portable input validation must recognize POSIX,
+Windows drive-letter and UNC absolute paths on every host; do not rely only on
+host-specific `filepath.IsAbs`. Close files, pipes, subprocess streams, SQLite
+connections and other resources deterministically; Windows may reject deletion
+while handles remain open. Avoid Unix-only shell assumptions in Go and
+portable scripts; prefer portable Go APIs over OS-specific commands. Use
+platform-specific path fixtures that run on any host and add regressions for
+known cross-platform bugs. Cross-compilation is not Windows runtime validation;
+state explicitly when a change was not executed on Windows.
 
 ## Verification
 

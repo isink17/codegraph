@@ -11,8 +11,8 @@ on:
     branches:
       - v2.0
       - 'integration/v2.0-wave-*'
-    # The windows-stress label still forces the full non-docs suite while
-    # hosted Windows execution is paused; it never selects a Windows runner.
+    # The windows-stress label forces the full remaining non-docs suite; it
+    # cannot select a Windows runner during the temporary pause.
     # No workflow_dispatch or schedule can accidentally run against master.
     types: [opened, synchronize, reopened, edited, labeled]
 
@@ -62,7 +62,11 @@ jobs:
             go_test_timeout: 20m
           - os: macos-latest
             go_test_timeout: 20m
-    # TODO(CG-117): review and restore a hosted Windows leg by 2026-11-30.
+    # Temporary Windows CI pause: reduce Actions minutes while CG-117 tracks
+    # outstanding Windows compatibility issues. Windows remains supported.
+    # Reassess by 2026-11-30; this is not an automatic re-enable date. To
+    # restore: reassess CG-117, add windows-latest and its native test/stress/
+    # smoke steps, then verify the aggregate ci check. Do not auto-enable.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
