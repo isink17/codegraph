@@ -589,6 +589,36 @@ func TestListFilesUsesCanonicalLogicalPrefixes(t *testing.T) {
 	}
 }
 
+func TestListFilesTreatsLikeMetacharactersLiterally(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	for _, path := range []string{
+		"src/a_b/one.go",
+		"src/aXb/two.go",
+		"src/literal%/three.go",
+		"src/literalX/four.go",
+	} {
+		if _, err := insertTestFile(ctx, s, repoID, path); err != nil {
+			t.Fatalf("insertTestFile(%q): %v", path, err)
+		}
+	}
+	for _, tc := range []struct {
+		prefix string
+		want   string
+	}{
+		{"src/a_b/", "src/a_b/one.go"},
+		{"src/literal%/", "src/literal%/three.go"},
+	} {
+		rows, err := s.ListFiles(ctx, repoID, tc.prefix, 20, 0)
+		if err != nil {
+			t.Fatalf("ListFiles(%q): %v", tc.prefix, err)
+		}
+		if len(rows) != 1 || rows[0]["path"] != tc.want {
+			t.Errorf("ListFiles(%q) paths = %v, want [%q]", tc.prefix, rows, tc.want)
+		}
+	}
+}
+
 func TestListFilesKeepsBackslashIdentityOnPOSIX(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows path storage cannot distinguish separator spellings")
