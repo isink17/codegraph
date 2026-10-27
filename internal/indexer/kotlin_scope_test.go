@@ -297,7 +297,12 @@ class ReceiverApi {
     fun forEach(action: OtherService.() -> Unit) {}
 }
 `
-	r := newLifecycleRepo(t, tree{"UserService.kt": caller, "ReceiverApi.kt": api})
+	r := newLifecycleRepo(t, tree{"UserService.kt": caller, "ReceiverApi.kt": "package p\nclass ReceiverApi\n"})
+	if got := r.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, "UserService.validate") {
+		t.Fatalf("standard-library forEach did not resolve before member addition: %s", got)
+	}
+	r.write(t, "ReceiverApi.kt", api)
+	r.update(t, "ReceiverApi.kt")
 	if got := r.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
 		t.Fatalf("cross-file member forEach bound enclosing receiver: %s", got)
 	}
