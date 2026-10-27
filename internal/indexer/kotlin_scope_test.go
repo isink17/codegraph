@@ -284,3 +284,23 @@ class UserService {
 	assertJVMReference(t, standard, "UserService.kt", "this.validate", true)
 	standard.assertFreshParity(t, "invisible private extension")
 }
+
+func TestKotlinCrossFileMemberShadowsOrdinaryLambdaHelper(t *testing.T) {
+	const caller = `package p
+class UserService {
+    fun validate() {}
+    fun run(api: ReceiverApi) { api.forEach { this.validate() } }
+}`
+	const api = `package p
+class OtherService { fun validate() {} }
+class ReceiverApi {
+    fun forEach(action: OtherService.() -> Unit) {}
+}
+`
+	r := newLifecycleRepo(t, tree{"UserService.kt": caller, "ReceiverApi.kt": api})
+	if got := r.edgeState(t, "UserService.kt", "this.validate"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("cross-file member forEach bound enclosing receiver: %s", got)
+	}
+	assertJVMReference(t, r, "UserService.kt", "this.validate", false)
+	r.assertFreshParity(t, "cross-file member receiver lambda")
+}

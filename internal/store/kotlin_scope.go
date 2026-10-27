@@ -156,7 +156,7 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		strategy := ""
 		if e.evidence == graph.KotlinUnprovenThisReceiverEvidence {
 			continue
-		} else if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && kotlinPackageExtension(helper, e.pkg, e.file, syms) {
+		} else if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && (kotlinPackageExtension(helper, e.pkg, e.file, syms) || kotlinMemberReceiverLambda(helper, e, syms)) {
 			continue
 		} else if member, ok := strings.CutPrefix(e.name, "this."); ok {
 			dst, strategy = kotlinThisMember(e, member, syms)
@@ -212,6 +212,19 @@ func kotlinPackageExtension(name, pkg string, callerFile int64, syms []kotlinSco
 			id, file                             int64
 			name, kind, evidence, pkg, container string
 		}{file: callerFile, pkg: pkg}) {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinMemberReceiverLambda(name string, e struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+}, syms []kotlinScopeSymbol) bool {
+	for _, s := range syms {
+		signature := strings.Join(strings.Fields(s.signature), "")
+		if s.language == "kotlin" && s.kind == "function" && s.container != s.pkg && s.name == name && strings.Contains(signature, ".()") && kotlinVisible(s, e) {
 			return true
 		}
 	}
