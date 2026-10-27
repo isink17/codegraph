@@ -59,12 +59,14 @@ var resolverPolicyRegistry = map[string]int{
 	// Java's 2 never reads a local or parameter receiver as a type name (JLS
 	// 6.4.2) and binds calls on explicitly typed ones; epoch 1 may bind such
 	// a receiver spelled like a type to that type's static method.
+	// Kotlin's 2 re-decides stale receiver-helper bindings left by incremental
+	// updates that did not track the helper name in ordinary-lambda evidence.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
 	"go":         4,
 	"java":       2,
-	"kotlin":     1,
+	"kotlin":     2,
 	"hcl":        1,
 	"lua":        1,
 	"scala":      1,

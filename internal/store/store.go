@@ -5507,8 +5507,8 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 		return nil, err
 	}
 	seen := make(map[string]struct{})
-	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 3)) {
-		terms := make([]string, 0, len(chunk)*3)
+	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 4)) {
+		terms := make([]string, 0, len(chunk)*4)
 		args := []any{repoID}
 		for _, name := range chunk {
 			if name == "" {
@@ -5516,6 +5516,9 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 			}
 			terms = append(terms, "e.dst_name=?", "e.dst_name LIKE ?", "e.dst_name LIKE ?")
 			args = append(args, name, name+".%", "%."+name+".%")
+			// `this.member` also depends on the helper owning its surrounding lambda.
+			terms = append(terms, "(f.language='kotlin' AND e.evidence=?)")
+			args = append(args, graph.KotlinOrdinaryLambdaReceiverEvidence+name)
 		}
 		if len(terms) == 0 {
 			continue
