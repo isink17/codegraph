@@ -78,7 +78,7 @@ func (a *KotlinAdapter) Parse(ctx context.Context, path string, content []byte) 
 		pf.Scope.JVMFacade = kotlinJVMFacade(root, path, content, pf.Scope.Imports, views)
 	}
 	kotlinExtractSymbols(root, module, "", "module", content, pf.Scope.Imports, views, &pf)
-	kotlinExtractCalls(root, content, kotlinSwallowedHeads(views), &pf)
+	kotlinExtractCalls(root, content, kotlinSwallowedHeads(views), pf.Scope.Imports, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:kotlin:" + testTargetModule(module, "Test", "Tests") + ":" + target
 	})
@@ -1309,7 +1309,7 @@ func kotlinDeclarationSignature(view kotlinDeclarationView, content []byte) stri
 
 // kotlinExtractCalls emits every call expression except skip, the heads of
 // recovered swallowed declarations; calls inside their bodies are kept.
-func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node]bool, pf *graph.ParsedFile) {
+func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node]bool, imports []graph.ScopeImport, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		if skip[call] {
 			continue
@@ -1326,11 +1326,21 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			continue
 		}
 		line := int(call.StartPoint().Row) + 1
+		evidence := name
+		if strings.HasPrefix(name, "this.") {
+			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
+			switch {
+			case unproven:
+				evidence = graph.KotlinUnprovenThisReceiverEvidence
+			case ordinary != "":
+				evidence = graph.KotlinOrdinaryLambdaReceiverEvidence + ordinary
+			}
+		}
 		pf.Edges = append(pf.Edges, graph.Edge{
 			SrcSymbolID: 0,
 			DstName:     name,
 			Kind:        "calls",
-			Evidence:    name,
+			Evidence:    evidence,
 			Line:        line,
 			Col:         int(fnNode.StartPoint().Column) + 1,
 		})
@@ -1343,4 +1353,94 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			Range:         rng,
 		})
 	}
+}
+
+// kotlinThisReceiverUnproven refuses receiver-changing lexical contexts. A
+// lambda passed to a call may be a receiver lambda, and an extension function
+// has its extension receiver as unlabelled `this`; neither is proved by the
+// enclosing declaration container.
+func kotlinThisReceiverEvidence(call *sitter.Node, content []byte, imports []graph.ScopeImport) (bool, string) {
+	ordinaryName := ""
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		switch node.Type() {
+		case "lambda_literal":
+			ordinary := ""
+			inCall := false
+			for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+				if parent.Type() == "call_expression" {
+					inCall = true
+					ordinary = kotlinKnownOrdinaryLambdaCall(parent, content, imports)
+					break
+				}
+				if parent.Type() == "property_declaration" && kotlinReceiverFunctionType(parent, content) {
+					return true, ""
+				}
+				if parent.Type() == "function_declaration" {
+					break
+				}
+			}
+			if inCall {
+				if ordinary == "" {
+					return true, ""
+				}
+				ordinaryName = ordinary
+			}
+		case "function_declaration":
+			if len(kotlinFunctionPartsOf(kotlinDeclarationView{decl: node}).between) > 0 {
+				return true, ""
+			}
+		}
+	}
+	return false, ordinaryName
+}
+
+// Kotlin's standard-library higher-order helpers below take ordinary lambda
+// parameters, so unlabelled `this` remains the enclosing receiver. The call
+// must be a qualified helper with no non-Kotlin import or same-file shadow;
+// unknown or shadowed calls stay unresolved.
+func kotlinKnownOrdinaryLambdaCall(call *sitter.Node, content []byte, imports []graph.ScopeImport) string {
+	fn := childByFieldName(call, "function")
+	if fn == nil && call.ChildCount() > 0 {
+		fn = call.Child(0)
+	}
+	name := nodeText(fn, content)
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		name = name[dot+1:]
+	} else {
+		return ""
+	}
+	for _, imp := range imports {
+		if imp.Wildcard && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
+			return ""
+		}
+		if (imp.LocalName == name || imp.ImportedName == name) && !strings.HasPrefix(imp.SourceSpecifier, "kotlin.") {
+			return ""
+		}
+	}
+	root := call
+	for root.Parent() != nil {
+		root = root.Parent()
+	}
+	for _, decl := range findDescendants(root, "function_declaration") {
+		declName := kotlinFunctionName(kotlinDeclarationView{decl: decl})
+		if declName != nil && nodeText(declName, content) == name {
+			return ""
+		}
+	}
+	switch name {
+	case "also", "filter", "fold", "forEach", "let", "map", "onEach", "runCatching", "use":
+		return name
+	default:
+		return ""
+	}
+}
+
+func kotlinReceiverFunctionType(property *sitter.Node, content []byte) bool {
+	for _, typ := range findDescendants(property, "function_type") {
+		text := strings.Join(strings.Fields(nodeText(typ, content)), "")
+		if dot := strings.IndexByte(text, '.'); dot >= 0 && strings.Contains(text[dot:], ".(") {
+			return true
+		}
+	}
+	return false
 }

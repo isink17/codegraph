@@ -4,11 +4,49 @@ package treesitter
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
+
+func TestKotlinThisReceiverEvidence(t *testing.T) {
+	src := []byte(`class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun withRun(other: OtherService) { with(other) { this.validate() } }
+    fun OtherService.execute() { this.validate() }
+    fun run() { val callback = { this.validate() } }
+    fun typed() { val callback: OtherService.() -> Unit = { this.validate() } }
+    fun nested(other: OtherService, items: List<Int>) {
+        with(other) { items.forEach { this.validate() } }
+    }
+    fun OtherService.executeMany(items: List<Int>) {
+        items.forEach { this.validate() }
+    }
+    fun List<Int>.map(block: UserService.() -> Unit) {}
+    fun shadowed(items: List<Int>) { items.map { this.validate() } }
+    fun ordinary(items: List<Int>, value: Int) {
+        items.forEach { this.validate() }
+        value.let { this.validate() }
+    }
+}`)
+	parsed, err := NewKotlin().Parse(context.Background(), "Receivers.kt", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinOrdinaryLambdaReceiverEvidence + "forEach", graph.KotlinOrdinaryLambdaReceiverEvidence + "let"}
+	var got []string
+	for _, edge := range parsed.Edges {
+		if edge.DstName == "this.validate" {
+			got = append(got, edge.Evidence)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("this receiver evidence = %+v, want %+v", got, want)
+	}
+}
 
 func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	tests := []struct {

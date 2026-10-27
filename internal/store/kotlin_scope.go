@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 type kotlinScopeSymbol struct {
@@ -70,6 +72,11 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 		}
 		for i := 1; i < len(parts); i++ {
 			packages[strings.Join(parts[:i], ".")] = struct{}{}
+		}
+		for _, part := range strings.Split(e.container, ".") {
+			if part != "" {
+				names[part] = struct{}{}
+			}
 		}
 	}
 	scopeFileIDs := sortedIDs(fileIDs)
@@ -147,7 +154,13 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		var dst kotlinScopeSymbol
 		strategy := ""
-		if strings.Contains(e.name, ".") {
+		if e.evidence == graph.KotlinUnprovenThisReceiverEvidence {
+			continue
+		} else if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && (kotlinPackageExtension(helper, e.pkg, e.file, syms) || kotlinMemberReceiverLambda(helper, e, syms)) {
+			continue
+		} else if member, ok := strings.CutPrefix(e.name, "this."); ok {
+			dst, strategy = kotlinThisMember(e, member, syms)
+		} else if strings.Contains(e.name, ".") {
 			parts := strings.Split(e.name, ".")
 			member := parts[len(parts)-1]
 			qualifier := strings.Join(parts[:len(parts)-1], ".")
@@ -191,6 +204,49 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	}
 	_, err := q.ExecContext(ctx, `UPDATE edges SET dst_symbol_id=(SELECT dst_symbol_id FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_strategy=(SELECT strategy FROM tmp_kotlin_scope_resolution WHERE edge_id=edges.id),resolution_confidence='high' WHERE id IN (SELECT edge_id FROM tmp_kotlin_scope_resolution)`)
 	return len(res), err
+}
+
+func kotlinPackageExtension(name, pkg string, callerFile int64, syms []kotlinScopeSymbol) bool {
+	for _, s := range syms {
+		if s.language == "kotlin" && s.pkg == pkg && s.container == pkg && s.name == name && kotlinExtension(s) && kotlinVisible(s, struct {
+			id, file                             int64
+			name, kind, evidence, pkg, container string
+		}{file: callerFile, pkg: pkg}) {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinMemberReceiverLambda(name string, e struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+}, syms []kotlinScopeSymbol) bool {
+	for _, s := range syms {
+		signature := strings.Join(strings.Fields(s.signature), "")
+		if s.language == "kotlin" && s.kind == "function" && s.container != s.pkg && s.name == name && strings.Contains(signature, ".()") && kotlinVisible(s, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinThisMember(e struct {
+	id, file                             int64
+	name, kind, evidence, pkg, container string
+}, name string, syms []kotlinScopeSymbol) (kotlinScopeSymbol, string) {
+	ownerName := kotlinJoin(e.pkg, e.container)
+	var owners []kotlinScopeSymbol
+	for _, s := range syms {
+		if s.language == "kotlin" && s.qname == ownerName && kotlinTypeEligible(s) && kotlinVisible(s, e) {
+			owners = append(owners, s)
+		}
+	}
+	owner := kotlinUnique(owners)
+	if owner.id == 0 {
+		return kotlinScopeSymbol{}, ""
+	}
+	return kotlinMember(owner, name, e, syms)
 }
 
 func kotlinType(name string, e struct {
@@ -286,7 +342,7 @@ func kotlinMember(owner kotlinScopeSymbol, name string, e struct {
 		return c[0], "kotlin_package_scope"
 	}
 	for _, s := range syms {
-		if s.name == name && s.pkg == owner.pkg && s.container == strings.TrimPrefix(owner.qname, owner.pkg+".") && kotlinVisible(s, e) && !kotlinExtension(s) {
+		if s.name == name && s.kind == "function" && s.pkg == owner.pkg && s.container == strings.TrimPrefix(owner.qname, owner.pkg+".") && kotlinVisible(s, e) && !kotlinExtension(s) {
 			c = append(c, s)
 		}
 	}
