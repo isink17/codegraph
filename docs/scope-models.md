@@ -216,11 +216,12 @@ The JVM target must meet all of these:
 
 Kotlin construction uses the existing class symbol as its target; no distinct
 constructor symbol is created. A call binds only for a visible Kotlin `class`
-with a proven zero-argument primary/implicit constructor and an unambiguous
-same-package or explicit-import type. Explicit empty primary constructors are
-included. Calls with arguments, secondary constructors, abstract/sealed types,
-interfaces, objects, ambiguous types, and same-name function/type collisions
-remain unresolved. Also not modelled:
+with a proven public zero-argument primary/implicit constructor and an
+unambiguous same-package or explicit-import type. Explicit empty primary
+constructors are included. Calls with arguments or trailing lambdas, secondary
+constructors, non-public or unknown constructor visibility, abstract/sealed,
+enum, or inner classes, interfaces, objects, ambiguous types, and same-name
+function/type collisions remain unresolved. Also not modelled:
 - Kotlin constructor overload selection or default-parameter behavior
 - labelled or other explicit receivers, including `super.`, `this@Label.` and
   qualified `this` forms

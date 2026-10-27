@@ -764,11 +764,13 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 	if nameNode == nil {
 		return
 	}
+	isEnum := false
 	if kind == "class" {
 		for _, word := range strings.Fields(string(content[node.StartByte():nameNode.StartByte()])) {
 			if word == "interface" {
 				kind = "interface"
-				break
+			} else if word == "enum" {
+				isEnum = true
 			}
 		}
 	}
@@ -795,12 +797,23 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 	if mods := firstChild(node, "modifiers"); mods != nil {
 		modifiers = nodeText(mods, content)
 	}
+	if isEnum && !kotlinHasToken(modifiers, "enum") {
+		modifiers = strings.TrimSpace(modifiers + " enum")
+	}
 	typeParams := firstChild(node, "type_parameters") != nil
 	state := "known"
 	if node.HasError() || nameNode.HasError() {
 		state = "unknown"
 	}
-	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: kind, Modifiers: modifiers, TypeParams: typeParams, OwnerName: container, SyntaxState: state, Provenance: "kotlin:tree-sitter:class-declaration"}
+	constructorVisibility := "public"
+	if ctor := firstChild(node, "primary_constructor"); ctor != nil {
+		if ctor.HasError() {
+			constructorVisibility = "unknown"
+		} else {
+			constructorVisibility = kotlinVisibility(ctor)
+		}
+	}
+	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: kind, Modifiers: modifiers, ConstructorVisibility: constructorVisibility, TypeParams: typeParams, OwnerName: container, SyntaxState: state, Provenance: "kotlin:tree-sitter:class-declaration"}
 	if len(findDescendants(node, "secondary_constructor")) > 0 {
 		fact.SyntaxState = "unknown"
 	} else if ctor := firstChild(node, "primary_constructor"); ctor != nil {
@@ -1418,6 +1431,9 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 }
 
 func kotlinCallArity(call *sitter.Node) *int {
+	if kotlinCallHeadHasTrailingLambda(call) {
+		return nil // A trailing lambda may belong to the constructor call; keep its arity unknown.
+	}
 	suffix := firstChild(call, "call_suffix")
 	args := firstChild(suffix, "value_arguments")
 	if args == nil || args.HasError() {
@@ -1430,6 +1446,14 @@ func kotlinCallArity(call *sitter.Node) *int {
 		}
 	}
 	return &count
+}
+
+func kotlinCallHeadHasTrailingLambda(call *sitter.Node) bool {
+	parent := call.Parent()
+	if parent == nil || parent.Type() != "call_expression" || parent.ChildCount() < 2 || parent.Child(0).StartByte() != call.StartByte() {
+		return false
+	}
+	return len(findDescendants(firstChild(parent, "call_suffix"), "annotated_lambda")) > 0
 }
 
 // kotlinThisReceiverUnproven refuses receiver-changing lexical contexts. A

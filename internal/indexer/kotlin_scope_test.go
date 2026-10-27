@@ -415,9 +415,14 @@ func TestKotlinConservativeClassConstructionLifecycle(t *testing.T) {
 class UserRepository
 class Empty()
 class Required(val value: kotlin.Int)
+class PrivateConstructor private constructor()
+class InternalConstructor internal constructor()
 abstract class AbstractType
 interface Backend
 object Singleton
+enum class Color { RED }
+class Invokable { operator fun invoke(block: () -> Unit) {} }
+class Outer { inner class Inner }
 class Ambiguous
 `,
 		"lib/Other.kt": `package lib
@@ -427,17 +432,27 @@ class Ambiguous
 import lib.UserRepository
 import lib.Empty
 import lib.Required
+import lib.PrivateConstructor
+import lib.InternalConstructor
 import lib.AbstractType
 import lib.Backend
 import lib.Singleton
+import lib.Color
+import lib.Invokable
+import lib.Outer.Inner
 import lib.Ambiguous
 class UserService {
     fun create() { UserRepository() }
     fun empty() { Empty() }
     fun required() { Required(1) }
+    fun privateConstructor() { PrivateConstructor() }
+    fun internalConstructor() { InternalConstructor() }
     fun abstractType() { AbstractType() }
     fun backend() { Backend() }
     fun singleton() { Singleton() }
+    fun enumType() { Color() }
+    fun trailingLambda() { Invokable() {} }
+    fun innerType() { Inner() }
     fun ambiguous() { Ambiguous() }
 }`,
 	})
@@ -448,9 +463,14 @@ class UserService {
 		{"UserRepository", "lib.UserRepository", true},
 		{"Empty", "lib.Empty", true},
 		{"Required", "lib.Required", false},
+		{"PrivateConstructor", "lib.PrivateConstructor", false},
+		{"InternalConstructor", "lib.InternalConstructor", false},
 		{"AbstractType", "lib.AbstractType", false},
 		{"Backend", "lib.Backend", false},
 		{"Singleton", "lib.Singleton", false},
+		{"Color", "lib.Color", false},
+		{"Invokable", "lib.Invokable", false},
+		{"Inner", "lib.Outer.Inner", false},
 		{"Ambiguous", "lib.Ambiguous", false},
 	} {
 		state := r.edgeState(t, "Caller.kt", tc.name)

@@ -121,6 +121,9 @@ func TestKotlinClassPrimaryConstructorEvidence(t *testing.T) {
 	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", []byte(`class Implicit
 class Empty()
 class Required(val value: kotlin.Int)
+class Private private constructor()
+class Internal internal constructor()
+enum class Enum { Entry }
 class Unsupported { constructor(value: kotlin.Int) }`))
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +140,30 @@ class Unsupported { constructor(value: kotlin.Int) }`))
 	if byName["Unsupported"].SyntaxState != "unknown" {
 		t.Fatalf("secondary constructor state = %+v", byName["Unsupported"])
 	}
+	if byName["Implicit"].ConstructorVisibility != "public" || byName["Private"].ConstructorVisibility != "private" || byName["Internal"].ConstructorVisibility != "internal" {
+		t.Fatalf("primary constructor visibility = %+v", byName)
+	}
+	if !strings.Contains(byName["Enum"].Modifiers, "enum") {
+		t.Fatalf("enum kind=%q modifiers=%q", byName["Enum"].Kind, byName["Enum"].Modifiers)
+	}
+}
+
+func TestKotlinCallArityRefusesNestedTrailingLambdaHead(t *testing.T) {
+	source := []byte(`class Target
+fun run() { Target() {} }`)
+	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range parsed.Edges {
+		if edge.DstName == "Target" {
+			if edge.CallArity != nil {
+				t.Fatalf("Target() trailing-lambda head arity = %d, want unknown", *edge.CallArity)
+			}
+			return
+		}
+	}
+	t.Fatalf("Target() edge missing: %+v", parsed.Edges)
 }
 
 func TestKotlinJVMTypeSyntaxEvidence(t *testing.T) {

@@ -202,20 +202,21 @@ type ParsedFile struct {
 // JVMTypeEvidence is source syntax only. It never claims a canonical JVM type
 // or compiler lowering result.
 type JVMTypeEvidence struct {
-	SymbolIndex     int
-	EvidenceKey     string
-	OwnerName       string
-	FilePath        string
-	SourceLanguage  string
-	Kind            string
-	Modifiers       string
-	TypeParams      bool
-	UnderlyingType  string
-	UnderlyingState string
-	AliasTarget     string
-	SyntaxState     string
-	Provenance      string
-	Params          []JVMCallableTypeEvidence
+	SymbolIndex           int
+	EvidenceKey           string
+	OwnerName             string
+	FilePath              string
+	SourceLanguage        string
+	Kind                  string
+	Modifiers             string
+	ConstructorVisibility string
+	TypeParams            bool
+	UnderlyingType        string
+	UnderlyingState       string
+	AliasTarget           string
+	SyntaxState           string
+	Provenance            string
+	Params                []JVMCallableTypeEvidence
 }
 
 type JVMCallableTypeEvidence struct {

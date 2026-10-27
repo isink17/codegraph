@@ -11,7 +11,7 @@ import (
 type kotlinScopeSymbol struct {
 	id, file                                                           int64
 	name, qname, container, kind, visibility, signature, pkg, language string
-	modifiers, syntaxState, declarationKind                            string
+	modifiers, syntaxState, declarationKind, constructorVisibility     string
 	constructorParams                                                  int
 	static                                                             sql.NullInt64
 }
@@ -120,7 +120,7 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 			fixed = append(fixed, n)
 		}
 		if err := sqliteBatchedQuery(ctx, q, `SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.kind,s.visibility,s.signature,COALESCE(fs.package_name,''),f.language,s.is_static,
-			COALESCE(te.modifiers,''),COALESCE(te.syntax_state,''),COALESCE(te.declaration_kind,''),COALESCE((SELECT COUNT(*) FROM jvm_callable_type_evidence ce WHERE ce.repo_id=s.repo_id AND ce.symbol_id=s.id AND ce.position='parameter'),0)
+			COALESCE(te.modifiers,''),COALESCE(te.syntax_state,''),COALESCE(te.declaration_kind,''),COALESCE(te.constructor_visibility,'unknown'),COALESCE((SELECT COUNT(*) FROM jvm_callable_type_evidence ce WHERE ce.repo_id=s.repo_id AND ce.symbol_id=s.id AND ce.position='parameter'),0)
 		FROM symbols s JOIN files f ON f.id=s.file_id LEFT JOIN file_scope_evidence fs ON fs.repo_id=s.repo_id AND fs.file_id=s.file_id
 		LEFT JOIN jvm_type_evidence te ON te.repo_id=s.repo_id AND te.symbol_id=s.id
 		WHERE s.repo_id=? AND f.language IN ('java','kotlin') AND f.is_deleted=0 AND s.name IN (`+sqlitePlaceholders(len(nameChunk))+`)`,
@@ -128,7 +128,7 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 			fixed, stringSliceToAny(packageList), true,
 			func(rows *sql.Rows) error {
 				var s kotlinScopeSymbol
-				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg, &s.language, &s.static, &s.modifiers, &s.syntaxState, &s.declarationKind, &s.constructorParams); err != nil {
+				if err := rows.Scan(&s.id, &s.file, &s.name, &s.qname, &s.container, &s.kind, &s.visibility, &s.signature, &s.pkg, &s.language, &s.static, &s.modifiers, &s.syntaxState, &s.declarationKind, &s.constructorVisibility, &s.constructorParams); err != nil {
 					return err
 				}
 				syms = append(syms, s)
@@ -223,7 +223,16 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 
 func kotlinKotlinConstructible(s kotlinScopeSymbol, e kotlinScopeEdge) bool {
 	return s.language == "kotlin" && s.kind == "class" && s.declarationKind == "class" && s.syntaxState == "known" && s.constructorParams == 0 &&
-		!strings.Contains(s.modifiers, "abstract") && !strings.Contains(s.modifiers, "sealed") && !strings.Contains(s.modifiers, "interface") && kotlinVisible(s, e)
+		s.constructorVisibility == "public" && !kotlinHasModifier(s.modifiers, "abstract") && !kotlinHasModifier(s.modifiers, "sealed") && !kotlinHasModifier(s.modifiers, "interface") && !kotlinHasModifier(s.modifiers, "enum") && !kotlinHasModifier(s.modifiers, "inner") && kotlinVisible(s, e)
+}
+
+func kotlinHasModifier(modifiers, want string) bool {
+	for _, modifier := range strings.Fields(modifiers) {
+		if modifier == want {
+			return true
+		}
+	}
+	return false
 }
 
 func kotlinZeroArgConstruction(arity sql.NullInt64) bool {
