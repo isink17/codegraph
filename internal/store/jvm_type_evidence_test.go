@@ -19,7 +19,7 @@ func TestJVMTypeEvidenceReplacementLifecycle(t *testing.T) {
 				{Language: "kotlin", Kind: "function", Name: "use", QualifiedName: "api.use", StableKey: "func:kotlin:api.use"},
 			},
 			JVMTypeEvidence: []graph.JVMTypeEvidence{
-				{SymbolIndex: 0, Kind: "value_class", Modifiers: "value", SyntaxState: "known", Provenance: "test:tree"},
+				{SymbolIndex: 0, Kind: "value_class", Modifiers: "value", ConstructorVisibility: "private", SyntaxState: "known", Provenance: "test:tree"},
 				{SymbolIndex: 1, Kind: "function", SyntaxState: "known", Provenance: "test:tree", Params: []graph.JVMCallableTypeEvidence{{Position: "parameter", Syntax: "Alias", SyntaxState: "known"}, {Position: "result", Syntax: "Token", SyntaxState: "known"}}},
 			},
 		}
@@ -37,7 +37,7 @@ func TestJVMTypeEvidenceReplacementLifecycle(t *testing.T) {
 	state := func() string {
 		t.Helper()
 		var got string
-		if err := f.store.db.QueryRowContext(f.ctx, `SELECT declaration_kind||'|'||modifiers||'|'||syntax_state||'|'||provenance FROM jvm_type_evidence WHERE symbol_id=(SELECT id FROM symbols WHERE stable_key='type:kotlin:api.Token')`).Scan(&got); err != nil {
+		if err := f.store.db.QueryRowContext(f.ctx, `SELECT declaration_kind||'|'||modifiers||'|'||constructor_visibility||'|'||syntax_state||'|'||provenance FROM jvm_type_evidence WHERE symbol_id=(SELECT id FROM symbols WHERE stable_key='type:kotlin:api.Token')`).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 		return got
@@ -46,7 +46,7 @@ func TestJVMTypeEvidenceReplacementLifecycle(t *testing.T) {
 	if err := f.store.db.QueryRowContext(f.ctx, `SELECT evidence_domain||'|'||state||'|'||evidence_version||'|'||provenance FROM jvm_compilation_scope_evidence WHERE repo_id=?`, f.repoID).Scan(&scopeState); err != nil || scopeState != "jvm-type-identity|unknown|1|store:default-no-compilation-scope-evidence" {
 		t.Fatalf("compilation scope default = %q, err=%v", scopeState, err)
 	}
-	for _, tc := range []struct{ input, want string }{{"value", "value_class|value|known|test:tree"}, {"ordinary", "class||known|test:tree"}, {"unknown", "value_class|value|unknown|test:tree"}, {"value", "value_class|value|known|test:tree"}} {
+	for _, tc := range []struct{ input, want string }{{"value", "value_class|value|private|known|test:tree"}, {"ordinary", "class||private|known|test:tree"}, {"unknown", "value_class|value|private|unknown|test:tree"}, {"value", "value_class|value|private|known|test:tree"}} {
 		write(tc.input)
 		if got := state(); got != tc.want {
 			t.Fatalf("state = %q, want %q", got, tc.want)
@@ -55,6 +55,10 @@ func TestJVMTypeEvidenceReplacementLifecycle(t *testing.T) {
 		if err := f.store.db.QueryRowContext(f.ctx, `SELECT COUNT(*) FROM jvm_callable_type_evidence c JOIN symbols s ON s.id=c.symbol_id WHERE s.stable_key='func:kotlin:api.use'`).Scan(&signatures); err != nil || signatures != 2 {
 			t.Fatalf("callable syntax facts = %d, err=%v", signatures, err)
 		}
+	}
+	var constructorVisibility string
+	if err := f.store.db.QueryRowContext(f.ctx, `SELECT constructor_visibility FROM jvm_type_evidence WHERE declaration_kind='function'`).Scan(&constructorVisibility); err != nil || constructorVisibility != "unknown" {
+		t.Fatalf("unspecified constructor visibility = %q, err=%v", constructorVisibility, err)
 	}
 	if _, err := f.store.MarkFilesDeletedBatch(f.ctx, f.repoID, 2, []string{"Token.kt"}); err != nil {
 		t.Fatal(err)
@@ -79,7 +83,7 @@ func TestJVMCompilationScopeMigrationDefaultsExistingReposUnknown(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DROP TABLE jvm_type_dependency_pending_paths; DROP TABLE jvm_type_dependency_index_state; DROP TABLE jvm_type_dependencies; DROP TABLE jvm_type_declarations; DELETE FROM schema_migrations WHERE version=7; DROP TABLE jvm_compilation_scope_evidence; DROP TABLE jvm_callable_type_evidence; DROP TABLE jvm_type_evidence; DELETE FROM schema_migrations WHERE version=6`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE jvm_type_dependency_pending_paths; DROP TABLE jvm_type_dependency_index_state; DROP TABLE jvm_type_dependencies; DROP TABLE jvm_type_declarations; DELETE FROM schema_migrations WHERE version IN (7,12); DROP TABLE jvm_compilation_scope_evidence; DROP TABLE jvm_callable_type_evidence; DROP TABLE jvm_type_evidence; DELETE FROM schema_migrations WHERE version=6`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

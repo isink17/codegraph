@@ -12,7 +12,7 @@ import (
 func TestJVMTypeEvidenceProfileUpgradeReparsesStoredFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	writeProfileFile(t, filepath.Join(root, "Types.kt"), "package api\ntypealias Local = kotlin.String\nclass Token\nfun use(value: Token): Token = value\n")
+	writeProfileFile(t, filepath.Join(root, "Types.kt"), "package api\ntypealias Local = kotlin.String\nclass Token\nclass Hidden private constructor()\nfun use(value: Token): Token = value\n")
 	writeProfileFile(t, filepath.Join(root, "Aliases.kt"), "package api\ntypealias OnlyAlias = kotlin.String\n")
 	writeProfileFile(t, filepath.Join(root, "Types.java"), "package api; class JavaType<T> { String use(Token value) { return null; } }")
 	s := newProfileStore(t)
@@ -35,13 +35,15 @@ func TestJVMTypeEvidenceProfileUpgradeReparsesStoredFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var java, kotlin, alias bool
+	var java, kotlin, alias, publicConstructor, privateConstructor bool
 	for _, fact := range facts {
 		java = java || fact.SourceLanguage == "java" && fact.Kind == "class_declaration"
 		kotlin = kotlin || fact.SourceLanguage == "kotlin" && fact.Kind == "class"
 		alias = alias || fact.Kind == "typealias" && fact.SyntaxState == "unknown"
+		publicConstructor = publicConstructor || fact.SourceLanguage == "kotlin" && fact.Kind == "class" && fact.ConstructorVisibility == "public"
+		privateConstructor = privateConstructor || fact.SourceLanguage == "kotlin" && fact.Kind == "class" && fact.ConstructorVisibility == "private"
 	}
-	if !java || !kotlin || !alias {
+	if !java || !kotlin || !alias || !publicConstructor || !privateConstructor {
 		t.Fatalf("upgraded source facts: %+v", facts)
 	}
 }

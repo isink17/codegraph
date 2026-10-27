@@ -1614,10 +1614,15 @@ func projectionDiff(want, got []string) string {
 func (r *lifecycleRepo) edgeState(t *testing.T, srcPath, dstName string) string {
 	t.Helper()
 	prefix := "edge " + srcPath + ":"
-	needle := `-calls-> "` + dstName + `"`
 	for _, line := range r.projection(t) {
-		if strings.HasPrefix(line, prefix) && strings.Contains(line, needle) {
-			return line[strings.Index(line, needle)+len(needle):]
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		for _, kind := range []string{"calls", "constructs"} {
+			needle := `-` + kind + `-> "` + dstName + `"`
+			if strings.Contains(line, needle) {
+				return line[strings.Index(line, needle)+len(needle):]
+			}
 		}
 	}
 	return "<no edge>"

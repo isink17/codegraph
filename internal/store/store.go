@@ -3138,7 +3138,11 @@ func insertParsedFileGraph(
 			if underlyingState == "" {
 				underlyingState = "unknown"
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_type_evidence(repo_id,file_id,symbol_id,evidence_key,owner_name,source_language,declaration_kind,modifiers,has_type_parameters,underlying_type,underlying_state,alias_target,syntax_state,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, repoID, fileID, symbolID, evidenceKey, fact.OwnerName, language, fact.Kind, fact.Modifiers, boolInt(fact.TypeParams), fact.UnderlyingType, underlyingState, fact.AliasTarget, fact.SyntaxState, fact.Provenance); err != nil {
+			constructorVisibility := fact.ConstructorVisibility
+			if constructorVisibility == "" {
+				constructorVisibility = "unknown"
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_type_evidence(repo_id,file_id,symbol_id,evidence_key,owner_name,source_language,declaration_kind,modifiers,constructor_visibility,has_type_parameters,underlying_type,underlying_state,alias_target,syntax_state,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, repoID, fileID, symbolID, evidenceKey, fact.OwnerName, language, fact.Kind, fact.Modifiers, constructorVisibility, boolInt(fact.TypeParams), fact.UnderlyingType, underlyingState, fact.AliasTarget, fact.SyntaxState, fact.Provenance); err != nil {
 				return nil, err
 			}
 			ordinals := map[string]int{}

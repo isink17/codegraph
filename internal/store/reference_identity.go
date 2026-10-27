@@ -60,7 +60,7 @@ WITH matched AS (
 	  ON r.file_id = e.file_id
 	 AND r.start_line = e.line
 	 AND r.start_col = e.start_col
-	WHERE e.repo_id = ? AND e.edge_kind = 'calls'
+	WHERE e.repo_id = ? AND e.edge_kind IN ('calls', 'constructs')
 	  AND r.call_name IS NOT NULL
 	  AND (
 		e.dst_name = r.call_name

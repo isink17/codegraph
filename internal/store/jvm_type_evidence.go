@@ -17,7 +17,7 @@ type JVMCompilationScope struct {
 // JVMTypeEvidence returns source facts in a stable path/key order. The rows
 // describe syntax and provenance; they do not contain canonical JVM identity.
 func (s *Store) JVMTypeEvidence(ctx context.Context, repoID int64) ([]graph.JVMTypeEvidence, error) {
-	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT e.evidence_key,e.owner_name,e.source_language,e.declaration_kind,e.modifiers,e.has_type_parameters,e.underlying_type,e.underlying_state,e.alias_target,e.syntax_state,e.provenance,f.path,c.position,c.syntax,c.syntax_state FROM jvm_type_evidence e JOIN files f ON f.id=e.file_id LEFT JOIN jvm_callable_type_evidence c ON c.repo_id=e.repo_id AND c.symbol_id=e.symbol_id WHERE e.repo_id=? AND f.is_deleted=0 ORDER BY f.path,e.evidence_key,c.position,c.ordinal`, repoID)
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `SELECT e.evidence_key,e.owner_name,e.source_language,e.declaration_kind,e.modifiers,e.constructor_visibility,e.has_type_parameters,e.underlying_type,e.underlying_state,e.alias_target,e.syntax_state,e.provenance,f.path,c.position,c.syntax,c.syntax_state FROM jvm_type_evidence e JOIN files f ON f.id=e.file_id LEFT JOIN jvm_callable_type_evidence c ON c.repo_id=e.repo_id AND c.symbol_id=e.symbol_id WHERE e.repo_id=? AND f.is_deleted=0 ORDER BY f.path,e.evidence_key,c.position,c.ordinal`, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +28,7 @@ func (s *Store) JVMTypeEvidence(ctx context.Context, repoID int64) ([]graph.JVMT
 		var fact graph.JVMTypeEvidence
 		var hasTypeParams int
 		var position, syntax, syntaxState sql.NullString
-		if err := rows.Scan(&fact.EvidenceKey, &fact.OwnerName, &fact.SourceLanguage, &fact.Kind, &fact.Modifiers, &hasTypeParams, &fact.UnderlyingType, &fact.UnderlyingState, &fact.AliasTarget, &fact.SyntaxState, &fact.Provenance, &fact.FilePath, &position, &syntax, &syntaxState); err != nil {
+		if err := rows.Scan(&fact.EvidenceKey, &fact.OwnerName, &fact.SourceLanguage, &fact.Kind, &fact.Modifiers, &fact.ConstructorVisibility, &hasTypeParams, &fact.UnderlyingType, &fact.UnderlyingState, &fact.AliasTarget, &fact.SyntaxState, &fact.Provenance, &fact.FilePath, &position, &syntax, &syntaxState); err != nil {
 			return nil, err
 		}
 		idx, ok := byKey[fact.EvidenceKey]
