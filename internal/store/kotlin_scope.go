@@ -68,6 +68,9 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 	for _, e := range edges {
 		fileIDs[e.file] = struct{}{}
 		packages[e.pkg] = struct{}{}
+		if helper, ok := strings.CutPrefix(e.evidence, graph.KotlinOrdinaryLambdaReceiverEvidence); ok && helper != "" {
+			names[helper] = struct{}{}
+		}
 		parts := strings.Split(e.name, ".")
 		for _, p := range parts {
 			if p != "" {
