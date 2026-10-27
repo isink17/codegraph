@@ -27,6 +27,105 @@ fun call() { Service.run() }`,
 	}
 }
 
+func TestKotlinConstructorCallableShadowingLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Shadow.kt": `class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`,
+	})
+	lines := r.projection(t)
+	for _, want := range []string{
+		`edge Shadow.kt:local -calls-> "Target" => :: [/]`,
+		`edge Shadow.kt:parameter -calls-> "Target" => :: [/]`,
+		`edge Shadow.kt:positive -constructs-> "Target" => Shadow.kt:Target(class)`,
+	} {
+		found := false
+		for _, line := range lines {
+			if strings.Contains(line, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("projection missing %q: %v", want, lines)
+		}
+	}
+	assertKotlinTargetReferences(t, r, 4)
+
+	r.write(t, "Shadow.kt", `class Target
+fun local() { Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`)
+	r.update(t, "Shadow.kt")
+	assertKotlinTargetReferences(t, r, 2, 4)
+	r.assertFreshParity(t, "callable shadow removal")
+
+	r.write(t, "Shadow.kt", `class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun positive() { Target() }`)
+	r.update(t, "Shadow.kt")
+	assertKotlinTargetReferences(t, r, 4)
+	r.assertFreshParity(t, "callable shadow rebound")
+}
+
+func TestKotlinAmbiguousCallableCandidateDoesNotConstruct(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"Types.kt": `class Target`,
+		"Callables.kt": `fun Target() {}
+fun Target(value: kotlin.Int) {}`,
+		"Caller.kt": `fun create() { Target() }`,
+	})
+	assertJVMUnresolved(t, r, "Caller.kt", "Target")
+	r.assertFreshParity(t, "ambiguous callable candidates")
+}
+
+func TestKotlinTypedCallableValueShadowing(t *testing.T) {
+	r := newLifecycleRepo(t, tree{"Shadow.kt": `class Target
+fun create(callback: () -> Unit) {
+    val Target: () -> Unit = callback
+    Target()
+}
+fun positive() { Target() }`})
+	if got := r.edgeState(t, "Shadow.kt", "Target"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("typed callable shadow = %s", got)
+	}
+	lines := r.projection(t)
+	for _, line := range lines {
+		if strings.Contains(line, `Shadow.kt:positive -constructs-> "Target"`) {
+			return
+		}
+	}
+	t.Fatalf("typed callable shadow removed positive construction: %v", lines)
+}
+
+func assertKotlinTargetReferences(t *testing.T, r *lifecycleRepo, boundLines ...int) {
+	t.Helper()
+	want := map[int]bool{}
+	for _, line := range boundLines {
+		want[line] = true
+	}
+	rows, err := r.raw(t).Query(`SELECT r.start_line, r.symbol_id IS NOT NULL FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Shadow.kt' AND r.ref_kind='call' AND r.qualified_name='Target' ORDER BY r.start_line`, r.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var line int
+		var bound bool
+		if err := rows.Scan(&line, &bound); err != nil {
+			t.Fatal(err)
+		}
+		if bound != want[line] {
+			t.Fatalf("reference Shadow.kt:%d bound=%v, want=%v", line, bound, want[line])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestKotlinExplicitThisMemberCallResolvesThroughQueries(t *testing.T) {
 	const caller = `class UserService {
     fun validate() {}
@@ -308,4 +407,121 @@ class ReceiverApi {
 	}
 	assertJVMReference(t, r, "UserService.kt", "this.validate", false)
 	r.assertFreshParity(t, "cross-file member receiver lambda")
+}
+
+func TestKotlinConservativeClassConstructionLifecycle(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/Types.kt": `package lib
+class UserRepository
+class Empty()
+class Required(val value: kotlin.Int)
+abstract class AbstractType
+interface Backend
+object Singleton
+class Ambiguous
+`,
+		"lib/Other.kt": `package lib
+class Ambiguous
+`,
+		"Caller.kt": `package app
+import lib.UserRepository
+import lib.Empty
+import lib.Required
+import lib.AbstractType
+import lib.Backend
+import lib.Singleton
+import lib.Ambiguous
+class UserService {
+    fun create() { UserRepository() }
+    fun empty() { Empty() }
+    fun required() { Required(1) }
+    fun abstractType() { AbstractType() }
+    fun backend() { Backend() }
+    fun singleton() { Singleton() }
+    fun ambiguous() { Ambiguous() }
+}`,
+	})
+	for _, tc := range []struct {
+		name, target string
+		bound        bool
+	}{
+		{"UserRepository", "lib.UserRepository", true},
+		{"Empty", "lib.Empty", true},
+		{"Required", "lib.Required", false},
+		{"AbstractType", "lib.AbstractType", false},
+		{"Backend", "lib.Backend", false},
+		{"Singleton", "lib.Singleton", false},
+		{"Ambiguous", "lib.Ambiguous", false},
+	} {
+		state := r.edgeState(t, "Caller.kt", tc.name)
+		if tc.bound && !strings.Contains(state, tc.target) {
+			t.Errorf("%s = %s", tc.name, state)
+		}
+		if !tc.bound && !strings.Contains(state, ":: [/]") {
+			t.Errorf("%s = %s", tc.name, state)
+		}
+	}
+	callers, err := r.store.FindCallers(context.Background(), r.repoID, "lib.UserRepository", 0, 10, 0)
+	if err != nil || len(callers) != 1 || callers[0].QualifiedName != "app.UserService.create" {
+		t.Fatalf("constructor callers = %#v, %v", callers, err)
+	}
+	callees, err := r.store.FindCallees(context.Background(), r.repoID, "app.UserService.create", 0, 10, 0)
+	if err != nil || len(callees) != 1 || callees[0].QualifiedName != "lib.UserRepository" {
+		t.Fatalf("constructor callees = %#v, %v", callees, err)
+	}
+	var referenceTarget string
+	if err := r.raw(t).QueryRow(`SELECT s.qualified_name FROM references_tbl r JOIN symbols s ON s.id=r.symbol_id JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Caller.kt' AND r.name='UserRepository'`, r.repoID).Scan(&referenceTarget); err != nil || referenceTarget != "lib.UserRepository" {
+		t.Fatalf("constructor reference target = %q, %v; want lib.UserRepository", referenceTarget, err)
+	}
+	impact, err := r.store.ImpactRadius(context.Background(), r.repoID, []string{"lib.UserRepository"}, nil, 1, 10, 0)
+	if err != nil || impact == nil {
+		t.Fatalf("constructor impact = %#v, %v", impact, err)
+	}
+	r.assertFreshParity(t, "initial Kotlin construction")
+	r.write(t, "lib/Other.kt", "package lib\nclass Other\n")
+	r.update(t, "lib/Other.kt")
+	if got := r.edgeState(t, "Caller.kt", "Ambiguous"); !strings.Contains(got, "lib/Types.kt") {
+		t.Fatalf("ambiguity removal did not rebind: %s", got)
+	}
+	r.write(t, "lib/Types.kt", "package lib\nclass UserRepository(val value: kotlin.Int)\nclass Empty()\nclass Required(val value: kotlin.Int)\nabstract class AbstractType\ninterface Backend\nobject Singleton\nclass Ambiguous\n")
+	r.update(t, "lib/Types.kt")
+	if got := r.edgeState(t, "Caller.kt", "UserRepository"); !strings.Contains(got, ":: [/]") {
+		t.Fatalf("constructor arity removal unexpectedly remained bound: %s", got)
+	}
+	var cleared sql.NullInt64
+	if err := r.raw(t).QueryRow(`SELECT symbol_id FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Caller.kt' AND r.name='UserRepository'`, r.repoID).Scan(&cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Valid {
+		t.Fatalf("constructor reference retained stale target %d", cleared.Int64)
+	}
+	r.assertFreshParity(t, "constructor proof removal")
+}
+
+func TestKotlinConstructionHonorsFilePrivateClassVisibility(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"lib/Types.kt": `package lib
+class PublicTarget
+private class FilePrivateTarget`,
+		"lib/Caller.kt": `package lib
+private class SameFilePrivateTarget
+fun create() { PublicTarget(); FilePrivateTarget(); SameFilePrivateTarget() }`,
+	})
+	for _, tc := range []struct {
+		name, want string
+		bound      bool
+	}{
+		{"public class", "PublicTarget", true},
+		{"private class in another file", "FilePrivateTarget", false},
+		{"private class in same file", "SameFilePrivateTarget", true},
+	} {
+		got := r.edgeState(t, "lib/Caller.kt", tc.want)
+		if tc.bound && !strings.Contains(got, "lib/") {
+			t.Errorf("%s = %s, want visible class target", tc.name, got)
+		}
+		if !tc.bound && !strings.Contains(got, ":: [/]") {
+			t.Errorf("%s = %s, want unresolved private class target", tc.name, got)
+		}
+	}
+	r.assertFreshParity(t, "Kotlin class visibility")
 }

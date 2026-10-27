@@ -557,4 +557,5 @@ func resolverSetResolvedSQL(strategy string) string {
 // (no `SET`) so callers can compose it.
 const resolverClearResolutionSQL = `dst_symbol_id = NULL,
 			resolution_strategy = '',
-			resolution_confidence = ''`
+			resolution_confidence = '',
+			edge_kind = CASE WHEN edge_kind = 'constructs' AND EXISTS (SELECT 1 FROM files WHERE files.id = edges.file_id AND files.language = 'kotlin') THEN 'calls' ELSE edge_kind END`

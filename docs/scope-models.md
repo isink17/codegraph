@@ -214,8 +214,14 @@ The JVM target must meet all of these:
 - A call with arguments needs a proven fixed arity.
 - A known `@JvmName` literal binds under the JVM name. An unprovable rename refuses.
 
-Java `new` of a Kotlin class is not bound. Also not modelled:
-- Kotlin class constructor calls
+Kotlin construction uses the existing class symbol as its target; no distinct
+constructor symbol is created. A call binds only for a visible Kotlin `class`
+with a proven zero-argument primary/implicit constructor and an unambiguous
+same-package or explicit-import type. Explicit empty primary constructors are
+included. Calls with arguments, secondary constructors, abstract/sealed types,
+interfaces, objects, ambiguous types, and same-name function/type collisions
+remain unresolved. Also not modelled:
+- Kotlin constructor overload selection or default-parameter behavior
 - labelled or other explicit receivers, including `super.`, `this@Label.` and
   qualified `this` forms
 - companion members reached through the class name

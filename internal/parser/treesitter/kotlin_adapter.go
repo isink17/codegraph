@@ -764,6 +764,14 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 	if nameNode == nil {
 		return
 	}
+	if kind == "class" {
+		for _, word := range strings.Fields(string(content[node.StartByte():nameNode.StartByte()])) {
+			if word == "interface" {
+				kind = "interface"
+				break
+			}
+		}
+	}
 	name := nodeText(nameNode, content)
 
 	qualified := kotlinQualified(module, name)
@@ -792,7 +800,26 @@ func kotlinAddType(view kotlinDeclarationView, module, parent, kind string, cont
 	if node.HasError() || nameNode.HasError() {
 		state = "unknown"
 	}
-	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: "class", Modifiers: modifiers, TypeParams: typeParams, OwnerName: container, SyntaxState: state, Provenance: "kotlin:tree-sitter:class-declaration"}
+	fact := graph.JVMTypeEvidence{SymbolIndex: len(pf.Symbols) - 1, Kind: kind, Modifiers: modifiers, TypeParams: typeParams, OwnerName: container, SyntaxState: state, Provenance: "kotlin:tree-sitter:class-declaration"}
+	if len(findDescendants(node, "secondary_constructor")) > 0 {
+		fact.SyntaxState = "unknown"
+	} else if ctor := firstChild(node, "primary_constructor"); ctor != nil {
+		for i := range int(ctor.NamedChildCount()) {
+			param := ctor.NamedChild(i)
+			if param.Type() != "class_parameter" {
+				continue
+			}
+			var typ *sitter.Node
+			for j := range int(param.ChildCount()) {
+				child := param.Child(j)
+				if child.Type() == "user_type" || child.Type() == "nullable_type" || child.Type() == "type_identifier" {
+					typ = child
+				}
+			}
+			syntaxState, syntax := kotlinTypeSyntax(typ, content)
+			fact.Params = append(fact.Params, graph.JVMCallableTypeEvidence{Position: "parameter", Syntax: syntax, SyntaxState: syntaxState})
+		}
+	}
 	if strings.Contains(modifiers, "value") || strings.Contains(modifiers, "inline") {
 		fact.UnderlyingState = "unknown"
 		if ctor := firstChild(node, "primary_constructor"); ctor != nil {
@@ -1327,6 +1354,9 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
+		if kotlinCallableShadow(call, name, content) {
+			evidence = graph.KotlinCallableShadowEvidence
+		}
 		if strings.HasPrefix(name, "this.") {
 			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
 			switch {
@@ -1343,6 +1373,7 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			Evidence:    evidence,
 			Line:        line,
 			Col:         int(fnNode.StartPoint().Column) + 1,
+			CallArity:   kotlinCallArity(call),
 		})
 		rng := nodeRange(call)
 		rng.StartCol = int(fnNode.StartPoint().Column) + 1
@@ -1353,6 +1384,52 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 			Range:         rng,
 		})
 	}
+}
+
+func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
+	var fn *sitter.Node
+	for node := call.Parent(); node != nil; node = node.Parent() {
+		if node.Type() == "function_declaration" {
+			fn = node
+			break
+		}
+	}
+	if fn == nil {
+		return false
+	}
+	params := firstChild(fn, "function_value_parameters")
+	for _, param := range findDescendants(params, "parameter") {
+		if id := firstChild(param, "simple_identifier"); id != nil && nodeText(id, content) == name && len(findDescendants(param, "function_type")) > 0 {
+			return true
+		}
+	}
+	body := firstChild(fn, "function_body")
+	for _, property := range findDescendants(body, "property_declaration") {
+		binding := firstChild(property, "variable_declaration")
+		id := firstChild(binding, "simple_identifier")
+		if id == nil || nodeText(id, content) != name || property.StartPoint().Row > call.StartPoint().Row {
+			continue
+		}
+		if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func kotlinCallArity(call *sitter.Node) *int {
+	suffix := firstChild(call, "call_suffix")
+	args := firstChild(suffix, "value_arguments")
+	if args == nil || args.HasError() {
+		return nil
+	}
+	count := 0
+	for i := range int(args.NamedChildCount()) {
+		if args.NamedChild(i).Type() == "value_argument" {
+			count++
+		}
+	}
+	return &count
 }
 
 // kotlinThisReceiverUnproven refuses receiver-changing lexical contexts. A

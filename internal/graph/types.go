@@ -171,6 +171,11 @@ const RustCallBlockScopeEvidence = "rust:block_scope_item"
 // declaration is proven to be its callee.
 const TypeScriptCallLocalBindingEvidence = "typescript:local_binding"
 
+// KotlinCallableShadowEvidence marks a call whose simple name is proven to be
+// a local callable value or function-typed parameter. It vetoes constructor
+// inference without pretending to resolve invoke dispatch.
+const KotlinCallableShadowEvidence = "kotlin:callable_shadow"
+
 // RustTraitImplVisibility is the visibility recorded for an item of a trait
 // impl (`impl Trait for T`). Such an item is as visible as the trait, which
 // the parser does not know, so it is neither private nor public.
