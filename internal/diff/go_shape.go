@@ -185,6 +185,9 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 		if x, y := goBuildConstraint(bb), goBuildConstraint(hb); x != y {
 			out = append(out, RiskUncertainty{Reason: "go_build_constraint_change_unmodeled", Identity: c.Identity, Detail: x + " -> " + y})
 		}
+		if !sameGoImports(bb, hb) {
+			out = append(out, RiskUncertainty{Reason: "go_import_change_unmodeled", Identity: c.Identity})
+		}
 		for key, x := range bs {
 			y, ok := hs[key]
 			if !ok || sameShapes(x, y) {
@@ -200,6 +203,27 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 		}
 	}
 	return out
+}
+
+func sameGoImports(a, b []byte) bool {
+	imports := func(src []byte) []string {
+		f, _ := goparser.ParseFile(token.NewFileSet(), "", src, goparser.ImportsOnly)
+		if f == nil {
+			return nil
+		}
+		out := make([]string, 0, len(f.Imports))
+		for _, spec := range f.Imports {
+			name := ""
+			if spec.Name != nil {
+				name = spec.Name.Name
+			}
+			path, _ := strconv.Unquote(spec.Path.Value)
+			out = append(out, name+" "+path)
+		}
+		sort.Strings(out)
+		return out
+	}
+	return strings.Join(imports(a), "\n") == strings.Join(imports(b), "\n")
 }
 
 func sameShapes(a, b []goShape) bool {
