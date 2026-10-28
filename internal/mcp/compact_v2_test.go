@@ -28,7 +28,8 @@ func compactFixtureCalls() map[string]map[string]any {
 // Pins the old serializers before introducing v2: v1's ambiguous cells are a
 // compatibility contract, not an encoding v2 may silently replace.
 func TestCompactV1AndJSONGoldenCompatibility(t *testing.T) {
-	s, ctx := detailFixture(t)
+	// One file per scan pins database IDs without changing or normalizing wire bytes.
+	s, ctx := detailFixtureWithStableIDs(t, true)
 	for tool, args := range compactFixtureCalls() {
 		t.Run(tool, func(t *testing.T) {
 			original, failed := callToolRaw(t, s, ctx, tool, args)
