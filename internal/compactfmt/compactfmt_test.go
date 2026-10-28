@@ -315,6 +315,10 @@ func TestDecodeErrors(t *testing.T) {
 		"truncated escape":  "@codegraph.compact/v1\n@tool t\n@section s\n@columns a\nvalue\\\n",
 		"no sections":       "@codegraph.compact/v1\n@tool t\n",
 		"duplicate column":  "@codegraph.compact/v1\n@tool t\n@section s\n@columns a\ta\n1\t2\n",
+		"duplicate section": "@codegraph.compact/v1\n@tool t\n@section s\n@columns a\n1\n@section s\n@columns b\n2\n",
+		"empty tool":        "@codegraph.compact/v1\n@tool \n@section s\n@columns a\n",
+		"empty section":     "@codegraph.compact/v1\n@tool t\n@section \n@columns a\n",
+		"empty column":      "@codegraph.compact/v1\n@tool t\n@section s\n@columns \n",
 	}
 	for name, text := range cases {
 		if _, err := Decode(text); err == nil {

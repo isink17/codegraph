@@ -62,6 +62,24 @@
 - Avoid adding cloud services, heavy UI, or client-specific behavior in core packages
 - Use `codegraph` MCP for codebase exploration and context queries when available (`codegraph serve --repo-root <repo>`).
 
+## Cross-platform compatibility
+
+CodeGraph officially supports Windows, macOS and Linux. Every implementation
+agent must consider all three; the temporary Windows CI pause does not change
+that requirement. Use `path/filepath` for host-native filesystem paths and
+`path` for slash-delimited logical paths. Never assume separators, drive
+letters, UNC paths, volume roots or filename casing behave identically. Git
+may emit slash-separated paths on Windows; normalize at filesystem boundaries,
+not indiscriminately. Portable input validation must recognize POSIX,
+Windows drive-letter and UNC absolute paths on every host; do not rely only on
+host-specific `filepath.IsAbs`. Close files, pipes, subprocess streams, SQLite
+connections and other resources deterministically; Windows may reject deletion
+while handles remain open. Avoid Unix-only shell assumptions in Go and
+portable scripts; prefer portable Go APIs over OS-specific commands. Use
+platform-specific path fixtures that run on any host and add regressions for
+known cross-platform bugs. Cross-compilation is not Windows runtime validation;
+state explicitly when a change was not executed on Windows.
+
 ## Verification
 
 - Run `go test ./...` when tests exist

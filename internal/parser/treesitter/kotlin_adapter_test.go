@@ -4,11 +4,49 @@ package treesitter
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
 )
+
+func TestKotlinThisReceiverEvidence(t *testing.T) {
+	src := []byte(`class OtherService { fun validate() {} }
+class UserService {
+    fun validate() {}
+    fun withRun(other: OtherService) { with(other) { this.validate() } }
+    fun OtherService.execute() { this.validate() }
+    fun run() { val callback = { this.validate() } }
+    fun typed() { val callback: OtherService.() -> Unit = { this.validate() } }
+    fun nested(other: OtherService, items: List<Int>) {
+        with(other) { items.forEach { this.validate() } }
+    }
+    fun OtherService.executeMany(items: List<Int>) {
+        items.forEach { this.validate() }
+    }
+    fun List<Int>.map(block: UserService.() -> Unit) {}
+    fun shadowed(items: List<Int>) { items.map { this.validate() } }
+    fun ordinary(items: List<Int>, value: Int) {
+        items.forEach { this.validate() }
+        value.let { this.validate() }
+    }
+}`)
+	parsed, err := NewKotlin().Parse(context.Background(), "Receivers.kt", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, "this.validate", graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinUnprovenThisReceiverEvidence, graph.KotlinOrdinaryLambdaReceiverEvidence + "forEach", graph.KotlinOrdinaryLambdaReceiverEvidence + "let"}
+	var got []string
+	for _, edge := range parsed.Edges {
+		if edge.DstName == "this.validate" {
+			got = append(got, edge.Evidence)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("this receiver evidence = %+v, want %+v", got, want)
+	}
+}
 
 func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	tests := []struct {
@@ -62,6 +100,70 @@ func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 	if err != nil || len(parsed.KotlinJVMCallableEvidence) != 1 || parsed.KotlinJVMCallableEvidence[0].Known {
 		t.Fatalf("aliased unsupported JVM annotation = %+v, err = %v", parsed.KotlinJVMCallableEvidence, err)
 	}
+}
+
+func TestKotlinCallableShadowEvidence(t *testing.T) {
+	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(`class Target
+fun local() { val Target = {}; Target() }
+fun parameter(Target: () -> Unit) { Target() }
+fun typed(callback: () -> Unit) { val Target: () -> Unit = callback; Target() }
+fun positive() { Target() }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Edges) != 4 || parsed.Edges[0].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[1].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[2].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[3].Evidence != "Target" {
+		t.Fatalf("shadow evidence = %+v", parsed.Edges)
+	}
+}
+
+func TestKotlinClassPrimaryConstructorEvidence(t *testing.T) {
+	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", []byte(`class Implicit
+class Empty()
+class Required(val value: kotlin.Int)
+class Private private constructor()
+class Internal internal constructor()
+enum class Enum { Entry }
+class Unsupported { constructor(value: kotlin.Int) }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]graph.JVMTypeEvidence{}
+	for _, fact := range parsed.JVMTypeEvidence {
+		if fact.SymbolIndex >= 0 && parsed.Symbols[fact.SymbolIndex].Kind == "class" {
+			byName[parsed.Symbols[fact.SymbolIndex].Name] = fact
+		}
+	}
+	if len(byName["Implicit"].Params) != 0 || len(byName["Empty"].Params) != 0 || len(byName["Required"].Params) != 1 {
+		t.Fatalf("primary constructor parameters = %+v", byName)
+	}
+	if byName["Unsupported"].SyntaxState != "unknown" {
+		t.Fatalf("secondary constructor state = %+v", byName["Unsupported"])
+	}
+	if byName["Implicit"].ConstructorVisibility != "public" || byName["Private"].ConstructorVisibility != "private" || byName["Internal"].ConstructorVisibility != "internal" {
+		t.Fatalf("primary constructor visibility = %+v", byName)
+	}
+	if !strings.Contains(byName["Enum"].Modifiers, "enum") {
+		t.Fatalf("enum kind=%q modifiers=%q", byName["Enum"].Kind, byName["Enum"].Modifiers)
+	}
+}
+
+func TestKotlinCallArityRefusesNestedTrailingLambdaHead(t *testing.T) {
+	source := []byte(`class Target
+fun run() { Target() {} }`)
+	parsed, err := NewKotlin().Parse(context.Background(), "Types.kt", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range parsed.Edges {
+		if edge.DstName == "Target" {
+			if edge.CallArity != nil {
+				t.Fatalf("Target() trailing-lambda head arity = %d, want unknown", *edge.CallArity)
+			}
+			return
+		}
+	}
+	t.Fatalf("Target() edge missing: %+v", parsed.Edges)
 }
 
 func TestKotlinJVMTypeSyntaxEvidence(t *testing.T) {

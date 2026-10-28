@@ -3138,7 +3138,11 @@ func insertParsedFileGraph(
 			if underlyingState == "" {
 				underlyingState = "unknown"
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_type_evidence(repo_id,file_id,symbol_id,evidence_key,owner_name,source_language,declaration_kind,modifiers,has_type_parameters,underlying_type,underlying_state,alias_target,syntax_state,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, repoID, fileID, symbolID, evidenceKey, fact.OwnerName, language, fact.Kind, fact.Modifiers, boolInt(fact.TypeParams), fact.UnderlyingType, underlyingState, fact.AliasTarget, fact.SyntaxState, fact.Provenance); err != nil {
+			constructorVisibility := fact.ConstructorVisibility
+			if constructorVisibility == "" {
+				constructorVisibility = "unknown"
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO jvm_type_evidence(repo_id,file_id,symbol_id,evidence_key,owner_name,source_language,declaration_kind,modifiers,constructor_visibility,has_type_parameters,underlying_type,underlying_state,alias_target,syntax_state,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, repoID, fileID, symbolID, evidenceKey, fact.OwnerName, language, fact.Kind, fact.Modifiers, constructorVisibility, boolInt(fact.TypeParams), fact.UnderlyingType, underlyingState, fact.AliasTarget, fact.SyntaxState, fact.Provenance); err != nil {
 				return nil, err
 			}
 			ordinals := map[string]int{}
@@ -5503,8 +5507,8 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 		return nil, err
 	}
 	seen := make(map[string]struct{})
-	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 3)) {
-		terms := make([]string, 0, len(chunk)*3)
+	for _, chunk := range chunkStrings(names, sqliteBatchSize(1, 4)) {
+		terms := make([]string, 0, len(chunk)*4)
 		args := []any{repoID}
 		for _, name := range chunk {
 			if name == "" {
@@ -5512,6 +5516,9 @@ func (s *Store) jvmScopeEdgeNames(ctx context.Context, repoID int64, names []str
 			}
 			terms = append(terms, "e.dst_name=?", "e.dst_name LIKE ?", "e.dst_name LIKE ?")
 			args = append(args, name, name+".%", "%."+name+".%")
+			// `this.member` also depends on the helper owning its surrounding lambda.
+			terms = append(terms, "(f.language='kotlin' AND e.evidence=?)")
+			args = append(args, graph.KotlinOrdinaryLambdaReceiverEvidence+name)
 		}
 		if len(terms) == 0 {
 			continue
@@ -10260,8 +10267,8 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	args := []any{repoID}
 	if pathFilter != "" {
 		prefix := CanonicalRelPath(pathFilter)
-		query += ` AND path LIKE ?`
-		args = append(args, prefix+"%")
+		query += ` AND path LIKE ? ESCAPE '\'`
+		args = append(args, escapeSQLLikePrefix(prefix)+"%")
 	}
 	query += ` ORDER BY path ASC LIMIT ? OFFSET ?`
 	args = append(args, safeLimit(limit), safeOffset(offset))

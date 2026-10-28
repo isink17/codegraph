@@ -148,6 +148,15 @@ const JavaLocalReceiverEvidence = "java:local_receiver"
 // field's stated class or interface type, type arguments dropped.
 const JavaFieldReceiverEvidence = "java:field_receiver"
 
+// KotlinUnprovenThisReceiverEvidence marks a Kotlin `this.member()` call whose
+// lexical context may change `this` to a lambda or extension receiver.
+const KotlinUnprovenThisReceiverEvidence = "kotlin:unproven_this_receiver"
+
+// KotlinOrdinaryLambdaReceiverEvidence prefixes a standard-library-looking
+// helper name whose lambda was proved ordinary by the parser. The store still
+// checks repository-wide same-package extension shadowing.
+const KotlinOrdinaryLambdaReceiverEvidence = "kotlin:ordinary_lambda_receiver:"
+
 // RustCallBlockScopeEvidence marks a Rust call that something the adapter
 // does not record as a module item may answer: it sits in a `mod` declared
 // inside a block, or an enclosing block item, `use`, statement macro,
@@ -161,6 +170,11 @@ const RustCallBlockScopeEvidence = "rust:block_scope_item"
 // module-level declaration rebinds against an import. No import and no module
 // declaration is proven to be its callee.
 const TypeScriptCallLocalBindingEvidence = "typescript:local_binding"
+
+// KotlinCallableShadowEvidence marks a call whose simple name is proven to be
+// a local callable value or function-typed parameter. It vetoes constructor
+// inference without pretending to resolve invoke dispatch.
+const KotlinCallableShadowEvidence = "kotlin:callable_shadow"
 
 // RustTraitImplVisibility is the visibility recorded for an item of a trait
 // impl (`impl Trait for T`). Such an item is as visible as the trait, which
@@ -188,20 +202,21 @@ type ParsedFile struct {
 // JVMTypeEvidence is source syntax only. It never claims a canonical JVM type
 // or compiler lowering result.
 type JVMTypeEvidence struct {
-	SymbolIndex     int
-	EvidenceKey     string
-	OwnerName       string
-	FilePath        string
-	SourceLanguage  string
-	Kind            string
-	Modifiers       string
-	TypeParams      bool
-	UnderlyingType  string
-	UnderlyingState string
-	AliasTarget     string
-	SyntaxState     string
-	Provenance      string
-	Params          []JVMCallableTypeEvidence
+	SymbolIndex           int
+	EvidenceKey           string
+	OwnerName             string
+	FilePath              string
+	SourceLanguage        string
+	Kind                  string
+	Modifiers             string
+	ConstructorVisibility string
+	TypeParams            bool
+	UnderlyingType        string
+	UnderlyingState       string
+	AliasTarget           string
+	SyntaxState           string
+	Provenance            string
+	Params                []JVMCallableTypeEvidence
 }
 
 type JVMCallableTypeEvidence struct {

@@ -185,6 +185,18 @@ Exactly one candidate binds. Any competitor leaves the call unresolved, includin
 
 For `Q.m()`, `Q` must resolve the same way to a Kotlin class, interface, object or enum, or to a top-level Java type. `m` must then be the unique member declared directly on that type; for a Java owner it must be a unique visible static method.
 
+Inside a Kotlin class or object, `this.m()` binds when `this` is the explicit
+receiver and `m` is exactly one visible function declared directly on the
+caller's persisted type. Nested types use their own container identity, so an
+enclosing type's member is not selected. This source-level rule does not model
+inherited members or overload selection.
+
+Calls inside receiver-changing lambdas (`with`, `apply`, `run`, or an
+unproven lambda call) and inside member extension functions stay unresolved,
+because the enclosing declaration container does not prove what unlabelled
+`this` denotes. An ordinary lambda with no receiver-changing call context can
+retain the enclosing type's `this`.
+
 Visibility is modelled as follows:
 - `private` means the same file.
 - `protected` means the same file or the same container.
@@ -202,11 +214,19 @@ The JVM target must meet all of these:
 - A call with arguments needs a proven fixed arity.
 - A known `@JvmName` literal binds under the JVM name. An unprovable rename refuses.
 
-Java `new` of a Kotlin class is not bound. Also not modelled:
-- Kotlin class constructor calls
-- `this.` calls
+Kotlin construction uses the existing class symbol as its target; no distinct
+constructor symbol is created. A call binds only for a visible Kotlin `class`
+with a proven public zero-argument primary/implicit constructor and an
+unambiguous same-package or explicit-import type. Explicit empty primary
+constructors are included. Calls with arguments or trailing lambdas, secondary
+constructors, non-public or unknown constructor visibility, abstract/sealed,
+enum, or inner classes, interfaces, objects, ambiguous types, and same-name
+function/type collisions remain unresolved. Also not modelled:
+- Kotlin constructor overload selection or default-parameter behavior
+- labelled or other explicit receivers, including `super.`, `this@Label.` and
+  qualified `this` forms
 - companion members reached through the class name
-- value and expression receivers
+- value, field and expression receivers such as `service.m()`
 - inheritance and extension dispatch
 - typealiases, default imports and builtins
 

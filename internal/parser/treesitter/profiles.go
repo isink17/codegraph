@@ -135,7 +135,10 @@ func (a *JavaAdapter) Profile() parser.Profile {
 	return parser.NewProfile("java", "treesitter:java:v14", true)
 }
 
-// Kotlin v12 persists source-only JVM type declarations, aliases and callable
+// Kotlin v15 records Kotlin call arity and primary-constructor evidence for
+// conservative class construction. Kotlin v14 marks `this.member()` calls inside receiver-changing lambdas and
+// extension functions as unproven receiver evidence. Kotlin v12 persists
+// source-only JVM type declarations, aliases and callable
 // type syntax; it does not change edge resolution. Kotlin v11 refuses duplicate
 // package headers recovered as expressions.
 // v10 reads the package from the package_header node instead of the
@@ -164,7 +167,7 @@ func (a *KotlinAdapter) Profile() parser.Profile {
 	case 9:
 		return parser.NewProfile("kotlin", "treesitter:kotlin:v9", true)
 	}
-	return parser.NewProfile("kotlin", "treesitter:kotlin:v12", true)
+	return parser.NewProfile("kotlin", "treesitter:kotlin:v15", true)
 }
 
 // C# v5 reads using directives from their syntax tokens: a namespace whose

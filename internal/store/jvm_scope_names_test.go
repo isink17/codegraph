@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/isink17/codegraph/internal/graph"
 )
 
 func TestJVMScopeEdgeNamesSkipsNonJVMRepository(t *testing.T) {
@@ -81,5 +83,66 @@ func BenchmarkJVMScopeEdgeNamesNonJVM(b *testing.B) {
 		if _, err := s.jvmScopeEdgeNames(ctx, repo.ID, names); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestJVMScopeEdgeNamesReceiverHelperDependencies(t *testing.T) {
+	f := newGateFixture(t)
+	for _, lang := range []string{"kotlin", "java", "php"} {
+		file := f.file(t, "Caller."+lang, lang)
+		src := f.symbol(t, file, "run", lang+".run", lang)
+		for _, bound := range []bool{false, true} {
+			name := fmt.Sprintf("%s.this%d", lang, map[bool]int{false: 0, true: 1}[bound])
+			id := f.edge(t, file, src, name)
+			var target any
+			if bound {
+				target = src
+			}
+			if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET evidence=?,dst_symbol_id=? WHERE id=?`, graph.KotlinOrdinaryLambdaReceiverEvidence+"forEach", target, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		id := f.edge(t, file, src, lang+".otherHelper")
+		if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET evidence=? WHERE id=?`, graph.KotlinOrdinaryLambdaReceiverEvidence+"map", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other, err := f.store.UpsertRepo(f.ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := insertTestFileLang(f.ctx, f.store, other.ID, "Other.kt", "kotlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := insertTestSymbolLang(f.ctx, f.store, other.ID, file, "run", "other.run", "kotlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := insertTestEdge(f.ctx, f.store, other.ID, file, src, "other.this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, `UPDATE edges SET evidence=? WHERE id=?`, graph.KotlinOrdinaryLambdaReceiverEvidence+"forEach", id); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.store.jvmScopeEdgeNames(f.ctx, f.repoID, []string{"forEach"})
+	want := []string{"kotlin.this0", "kotlin.this1"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("names=%v err=%v want=%v", got, err, want)
+	}
+	for _, name := range []string{"unrelated", "forEa", "forEachSuffix"} {
+		if got, err := f.store.jvmScopeEdgeNames(f.ctx, f.repoID, []string{name}); err != nil || len(got) != 0 {
+			t.Errorf("unrelated %q names=%v err=%v", name, got, err)
+		}
+	}
+	// Cross multiple bind-budget batches without broadening the selected population.
+	names := make([]string, 1100)
+	for i := range names {
+		names[i] = fmt.Sprintf("unrelated%d", i)
+	}
+	names[len(names)-1] = "forEach"
+	if got, err := f.store.jvmScopeEdgeNames(f.ctx, f.repoID, names); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("batched names=%v err=%v want=%v", got, err, want)
 	}
 }
