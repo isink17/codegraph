@@ -67,7 +67,7 @@ func produce(args []string, invoke func([]string, io.Writer) error) error {
 	sort.Slice(input.Fixtures, func(i, j int) bool { return input.Fixtures[i].Name < input.Fixtures[j].Name })
 	seen := map[string]bool{}
 	for _, f := range input.Fixtures {
-		if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(f.Name) || f.Name == "fixtures" || f.Name == "manifest" || seen[f.Name] || filepath.IsAbs(f.Path) || f.Path == "" {
+		if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(f.Name) || f.Name == "fixtures" || f.Name == "manifest" || seen[f.Name] || isAbsolutePath(f.Path) || f.Path == "" {
 			return fmt.Errorf("produce: invalid or duplicate fixture %q", f.Name)
 		}
 		seen[f.Name] = true

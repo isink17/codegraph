@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -60,6 +61,6 @@ func GitTopLevel() (string, bool) {
 	if err := cmd.Run(); err != nil {
 		return "", false
 	}
-	v := strings.TrimSpace(stdout.String())
+	v := filepath.FromSlash(strings.TrimSpace(stdout.String()))
 	return v, v != ""
 }

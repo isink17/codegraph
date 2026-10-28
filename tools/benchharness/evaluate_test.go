@@ -135,10 +135,12 @@ func TestIngestRejectsTaskSetMismatch(t *testing.T) {
 		edit func(*Manifest)
 		want string
 	}{
-		"sha":          {func(m *Manifest) { m.TaskSetSHA256 = strings.Repeat("0", 64) }, "task set sha256"},
-		"unknown task": {func(m *Manifest) { m.Sessions[0].Task = "t9" }, "not in the task set"},
-		"absolute":     {func(m *Manifest) { m.TaskSet = "/etc/tasks.json" }, "relative path"},
-		"missing file": {func(m *Manifest) { m.TaskSet = "nope.json" }, "nope.json"},
+		"sha":                    {func(m *Manifest) { m.TaskSetSHA256 = strings.Repeat("0", 64) }, "task set sha256"},
+		"unknown task":           {func(m *Manifest) { m.Sessions[0].Task = "t9" }, "not in the task set"},
+		"absolute":               {func(m *Manifest) { m.TaskSet = "/etc/tasks.json" }, "relative path"},
+		"windows relative drive": {func(m *Manifest) { m.TaskSet = `C:tasks.json` }, "relative path"},
+		"windows absolute":       {func(m *Manifest) { m.TaskSet = `C:\etc\tasks.json` }, "relative path"},
+		"missing file":           {func(m *Manifest) { m.TaskSet = "nope.json" }, "nope.json"},
 	} {
 		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z", "")
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

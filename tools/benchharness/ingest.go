@@ -114,7 +114,7 @@ func validateManifest(m *Manifest) error {
 	if !sha64RE.MatchString(m.TaskSetSHA256) {
 		bad("manifest task_set_sha256 must be 64 hex")
 	}
-	if filepath.IsAbs(m.TaskSet) {
+	if isAbsolutePath(m.TaskSet) {
 		bad("manifest task_set must be a relative path")
 	}
 	arms := map[string]bool{}
@@ -137,7 +137,7 @@ func validateManifest(m *Manifest) error {
 			bad("session %s: unknown arm, empty task, rep < 1 or duplicate", k)
 		}
 		keys[k] = true
-		if s.Transcript == "" || filepath.IsAbs(s.Transcript) || !sha64RE.MatchString(s.TranscriptSHA256) {
+		if s.Transcript == "" || isAbsolutePath(s.Transcript) || !sha64RE.MatchString(s.TranscriptSHA256) {
 			bad("session %s: transcript must be a relative path with a 64-hex sha256", k)
 		}
 		if s.Subagents != nil {

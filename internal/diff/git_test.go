@@ -396,3 +396,16 @@ func TestBlobReaderStopsAStalledGit(t *testing.T) {
 		finish(t, br)
 	})
 }
+
+func TestBlobReaderReportsShutdownFailure(t *testing.T) {
+	const object = "0123456789012345678901234567890123456789"
+	fakeGit(t, "printf '%s blob 3\\nabc\\n' \"$object\"\nexit 1\n")
+	br := &blobReader{ctx: t.Context(), root: t.TempDir()}
+	if data, ok := br.read(object, 64); !ok || string(data) != "abc" {
+		t.Fatalf("read = %q, %v, %v", data, ok, br.err)
+	}
+	br.close()
+	if br.err == nil {
+		t.Fatal("expected git shutdown error")
+	}
+}
