@@ -105,13 +105,20 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 		t.Fatalf("CLI risk = %+v (%v)", risk.Diff.Risk, err)
 	}
 	filenameUncertainty := false
+	bodyUncertainty := false
 	for _, u := range risk.Diff.Risk.Uncertainty {
 		if u.Reason == "go_filename_build_role_change_unmodeled" && u.Identity == "util.go" {
 			filenameUncertainty = true
 		}
+		if u.Reason == "go_function_body_change_unmodeled" && u.Identity == "main.go" && u.Detail == "func A" {
+			bodyUncertainty = true
+		}
 	}
 	if !filenameUncertainty {
 		t.Fatalf("CLI diff omitted filename build-role uncertainty: %+v", risk.Diff.Risk.Uncertainty)
+	}
+	if !bodyUncertainty {
+		t.Fatalf("CLI diff omitted function-body uncertainty: %+v", risk.Diff.Risk.Uncertainty)
 	}
 	cliJSON, _ := json.Marshal(viaCLI)
 	var mcpDocument any
