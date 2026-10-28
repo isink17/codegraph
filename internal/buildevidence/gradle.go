@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -391,32 +392,36 @@ func canonicalRepoPath(root, abs string) (string, error) {
 func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 	h := sha256.New()
 	write := func(name string, data []byte) {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(name)))
+		h.Write(size[:])
 		h.Write([]byte(name))
-		h.Write([]byte{0})
+		binary.BigEndian.PutUint64(size[:], uint64(len(data)))
+		h.Write(size[:])
 		h.Write(data)
-		h.Write([]byte{0})
 	}
 	writeFile := func(name, path string) error {
 		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		h.Write([]byte(name))
-		h.Write([]byte{0})
 		info, err := f.Stat()
 		if err != nil {
 			f.Close()
 			return err
 		}
-		_, _ = fmt.Fprintf(h, "%o", info.Mode().Perm())
-		h.Write([]byte{0})
-		_, copyErr := io.Copy(h, f)
+		content := sha256.New()
+		_, copyErr := io.Copy(content, f)
 		closeErr := f.Close()
-		h.Write([]byte{0})
 		if copyErr != nil {
 			return copyErr
 		}
-		return closeErr
+		if closeErr != nil {
+			return closeErr
+		}
+		write("file:"+name, []byte(fmt.Sprintf("%o", info.Mode().Perm())))
+		write("content:"+name, content.Sum(nil))
+		return nil
 	}
 	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
