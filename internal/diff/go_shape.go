@@ -3,6 +3,7 @@ package diff
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/build/constraint"
 	goparser "go/parser"
@@ -200,6 +201,24 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 			if hidden {
 				out = append(out, RiskUncertainty{Reason: "go_declaration_change_unmodeled", Identity: c.Identity, Detail: key})
 			}
+		}
+	}
+	return out
+}
+
+func goFilenameBuildRoleUncertainty(renames FileRenames) []RiskUncertainty {
+	var out []RiskUncertainty
+	for _, r := range renames.Exact {
+		if r.Language != "go" {
+			continue
+		}
+		before, after := goBuildRole(r.From), goBuildRole(r.To)
+		if before != after {
+			out = append(out, RiskUncertainty{
+				Reason:   "go_filename_build_role_change_unmodeled",
+				Identity: r.From,
+				Detail:   fmt.Sprintf("%s -> %s: %q -> %q", r.From, r.To, before, after),
+			})
 		}
 	}
 	return out

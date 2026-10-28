@@ -200,6 +200,7 @@ func Compare(base, head Revision, offset, limit int) (Result, error) {
 	var unmodeled []RiskUncertainty
 	if semanticOK {
 		unmodeled = goUnmodeledUncertainty(all, base, head, incomplete)
+		unmodeled = append(unmodeled, goFilenameBuildRoleUncertainty(renames)...)
 	}
 	doc := DiffDocument{Schema: Schema, Coverage: coverage, FileRenames: renames, DeclarationPairs: pairs, Risk: assessRisk(all, coverage, lims, unmodeled, base.GraphData.Declarations, head.GraphData.Declarations, baseEdges, headEdges, pairs), Summary: summary, Files: ChangeSection{Added: []Change{}, Removed: []Change{}, Modified: []Change{}}, Symbols: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Edges: EdgeSection{Added: []Change{}, Removed: []Change{}, Retargeted: []Change{}, ResolutionChanged: []Change{}, EvidenceChanged: []Change{}}, TestLinks: SymbolSection{Added: []Change{}, Removed: []Change{}, Changed: []Change{}}, Total: len(all), Offset: offset, Limit: limit, Truncated: offset+len(changes) < len(all)}
 	for _, c := range changes {

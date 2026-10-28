@@ -309,6 +309,41 @@ func TestGoBuildConstraintChangeIsUncertain(t *testing.T) {
 	}
 }
 
+func TestGoFilenameBuildRoleChangeIsUncertain(t *testing.T) {
+	const gomod = "module example.com/m\n\ngo 1.22\n"
+	files := map[string]string{
+		"go.mod":         gomod,
+		"p/lib_linux.go": "package p\n\nfunc T() int { return 1 }\n",
+		"p/use.go":       "package p\n\nfunc U() int { return T() }\n",
+	}
+	for adapterName, adapter := range testGoAdapters {
+		t.Run(adapterName, func(t *testing.T) {
+			d := editScenario(t, adapter, files, func(r *gittest.Repo) {
+				r.Git("mv", "p/lib_linux.go", "p/lib_windows.go")
+			}).Diff
+			if d.Risk.Assessment != AssessmentRiskEvidence || d.Risk.Score == nil || *d.Risk.Score != 5 {
+				t.Fatalf("filename build-role change altered edge-based risk score: %+v", d.Risk)
+			}
+			var filenameUncertainty []RiskUncertainty
+			for _, u := range d.Risk.Uncertainty {
+				if u.Reason == "go_filename_build_role_change_unmodeled" {
+					filenameUncertainty = append(filenameUncertainty, u)
+				}
+			}
+			if len(filenameUncertainty) != 1 || filenameUncertainty[0].Identity != "p/lib_linux.go" || filenameUncertainty[0].Detail != `p/lib_linux.go -> p/lib_windows.go: "|linux" -> "|windows"` {
+				t.Fatalf("GOOS filename constraint uncertainty = %+v", filenameUncertainty)
+			}
+
+			sameRole := editScenario(t, adapter, files, func(r *gittest.Repo) {
+				r.Git("mv", "p/lib_linux.go", "p/other_linux.go")
+			}).Diff.Risk
+			if hasUncertainty(sameRole, "go_filename_build_role_change_unmodeled", "p/lib_linux.go") {
+				t.Fatalf("same-role filename rename was marked as a build-role change: %+v", sameRole.Uncertainty)
+			}
+		})
+	}
+}
+
 // TestGoBuildConstraintMatchesGoBuild checks goBuildConstraint against the go
 // command's own reading: for every header and build context, go/build's
 // MatchFile must agree with evaluating the extracted expression.
