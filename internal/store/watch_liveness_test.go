@@ -75,6 +75,60 @@ func TestLiveWatcherFollowsLocks(t *testing.T) {
 	check("exited", LiveWatcherNone, false)
 }
 
+// A failed live-lock probe cannot rule out a recovering watcher.
+func TestLiveWatcherUnprobeableLiveLockKeepsPending(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	completeFullScan(t, s, repoID)
+	lock, err := s.OpenWatcherLock(repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+	path := watchLivePath(s.path, repoID)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	f := freshness(t, s, repoID)
+	if f.LiveWatcher != freshnessUnknown || !slices.Contains(f.Reasons, "reconcile_pending") || f.Verdict == graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("unprobeable live lock: watcher %s verdict %s reasons %v", f.LiveWatcher, f.Verdict, f.Reasons)
+	}
+}
+
+func TestLiveWatcherSecondProbeErrorKeepsPending(t *testing.T) {
+	s, repoID := freshnessStore(t, t.TempDir())
+	completeFullScan(t, s, repoID)
+	lock, err := s.OpenWatcherLock(repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lock.Close)
+	if err := lock.Hold(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.HoldLive(); err != nil {
+		t.Fatal(err)
+	}
+	lock.Release()
+	probes := 0
+	probeLockFile = func(f *os.File, exclusive bool) (bool, error) {
+		if f.Name() == watchLivePath(s.path, repoID) {
+			probes++
+			if probes == 2 {
+				return false, errors.New("injected lock failure")
+			}
+		}
+		return lockFile(f, exclusive)
+	}
+	t.Cleanup(func() { probeLockFile = lockFile })
+	f := freshness(t, s, repoID)
+	if probes != 2 || f.LiveWatcher != freshnessUnknown || !slices.Contains(f.Reasons, "reconcile_pending") || f.Verdict == graph.FreshnessVerdictConsistentWithLastScan {
+		t.Fatalf("second live probe: probes %d watcher %s verdict %s reasons %v", probes, f.LiveWatcher, f.Verdict, f.Reasons)
+	}
+}
+
 // A second watcher of the same repository waits out the first's live lock;
 // it is never reported watching while it is not, and without the live lock it
 // keeps its unverified lock after it reconciles.
@@ -206,8 +260,7 @@ func startWatchLockChild(t *testing.T, db, root string) *exec.Cmd {
 	return cmd
 }
 
-// A lock that cannot be opened proves nothing: unknown, and an unverified
-// lock that cannot be probed keeps reconcile_pending.
+// A lock that cannot be opened proves nothing and keeps reconcile_pending.
 func TestLiveWatcherUnprobeableIsUnknown(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("needs a permission-denied open")
@@ -224,8 +277,7 @@ func TestLiveWatcherUnprobeableIsUnknown(t *testing.T) {
 			t.Fatal(err)
 		}
 		f := freshness(t, s, repoID)
-		pending := path == watchLockPath(s.path, repoID)
-		if f.LiveWatcher != freshnessUnknown || slices.Contains(f.Reasons, "reconcile_pending") != pending {
+		if f.LiveWatcher != freshnessUnknown || !slices.Contains(f.Reasons, "reconcile_pending") {
 			t.Fatalf("%s unprobeable: live_watcher %s reasons %v", path, f.LiveWatcher, f.Reasons)
 		}
 		if err := os.Chmod(path, 0o644); err != nil {
