@@ -103,6 +103,9 @@ Gradle starts, including symlinked parents.
 dimensions to unknown. `Artifact.ValidateCurrent` refuses a changed fingerprint;
 `CurrentFingerprint` recomputes the local file inputs above. These checks do not
 attest omitted Gradle inputs or promote incomplete evidence to complete.
+Local fingerprint records use length framing and per-file content hashes. Artifacts
+created with the earlier delimiter-only fingerprint must be explicitly re-exported;
+their old fingerprints fail the current freshness check.
 
 ## Stored JVM type evidence
 
