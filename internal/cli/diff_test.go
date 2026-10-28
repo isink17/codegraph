@@ -27,7 +27,7 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 	base := r.Commit("", "base")
 	r.Write("main.go", "package main\nfunc A() { B() }\nfunc B() {}\n")
 	r.Write("lib.go", "package main\nfunc C() { Gone() }\n")
-	r.Git("mv", "util.go", "helpers.go")
+	r.Git("mv", "util.go", "helpers_linux.go")
 	head := r.Commit("", "head")
 
 	var cliOut, cliErr bytes.Buffer
@@ -95,7 +95,7 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 			} `json:"file_renames"`
 		} `json:"diff"`
 	}
-	if err := json.Unmarshal(cliOut.Bytes(), &renames); err != nil || len(renames.Diff.FileRenames.Exact) != 1 || renames.Diff.FileRenames.Exact[0].From != "util.go" || renames.Diff.FileRenames.Exact[0].To != "helpers.go" {
+	if err := json.Unmarshal(cliOut.Bytes(), &renames); err != nil || len(renames.Diff.FileRenames.Exact) != 1 || renames.Diff.FileRenames.Exact[0].From != "util.go" || renames.Diff.FileRenames.Exact[0].To != "helpers_linux.go" {
 		t.Fatalf("CLI renames = %+v (%v)", renames.Diff.FileRenames, err)
 	}
 	var risk struct {
@@ -103,6 +103,15 @@ func TestDiffCLIAndMCPReturnSameDocument(t *testing.T) {
 	}
 	if err := json.Unmarshal(cliOut.Bytes(), &risk); err != nil || risk.Diff.Risk.Assessment != diff.AssessmentRiskEvidence || risk.Diff.Risk.Score == nil || *risk.Diff.Risk.Score != 20 {
 		t.Fatalf("CLI risk = %+v (%v)", risk.Diff.Risk, err)
+	}
+	filenameUncertainty := false
+	for _, u := range risk.Diff.Risk.Uncertainty {
+		if u.Reason == "go_filename_build_role_change_unmodeled" && u.Identity == "util.go" {
+			filenameUncertainty = true
+		}
+	}
+	if !filenameUncertainty {
+		t.Fatalf("CLI diff omitted filename build-role uncertainty: %+v", risk.Diff.Risk.Uncertainty)
 	}
 	cliJSON, _ := json.Marshal(viaCLI)
 	var mcpDocument any
