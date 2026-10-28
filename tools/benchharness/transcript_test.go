@@ -362,14 +362,15 @@ func TestIngestRejectsManifestMismatch(t *testing.T) {
 		edit func(*Manifest)
 		want string
 	}{
-		"model":                 {func(m *Manifest) { m.Model = "claude-other" }, "manifest model"},
-		"client version":        {func(m *Manifest) { m.Client.Version = "1.0.0" }, "manifest version"},
-		"transcript sha":        {func(m *Manifest) { m.Sessions[0].TranscriptSHA256 = strings.Repeat("0", 64) }, "transcript sha256"},
-		"unknown arm":           {func(m *Manifest) { m.Sessions[0].Arm = "nope" }, "unknown arm"},
-		"short sha":             {func(m *Manifest) { m.CodeGraph.SHA = "abc" }, "codegraph sha"},
-		"absolute path":         {func(m *Manifest) { m.Sessions[0].Transcript = "/etc/x.jsonl" }, "relative path"},
-		"windows absolute path": {func(m *Manifest) { m.Sessions[0].Transcript = `C:\etc\x.jsonl` }, "relative path"},
-		"duplicate":             {func(m *Manifest) { m.Sessions[1] = m.Sessions[2] }, "duplicate"},
+		"model":                  {func(m *Manifest) { m.Model = "claude-other" }, "manifest model"},
+		"client version":         {func(m *Manifest) { m.Client.Version = "1.0.0" }, "manifest version"},
+		"transcript sha":         {func(m *Manifest) { m.Sessions[0].TranscriptSHA256 = strings.Repeat("0", 64) }, "transcript sha256"},
+		"unknown arm":            {func(m *Manifest) { m.Sessions[0].Arm = "nope" }, "unknown arm"},
+		"short sha":              {func(m *Manifest) { m.CodeGraph.SHA = "abc" }, "codegraph sha"},
+		"absolute path":          {func(m *Manifest) { m.Sessions[0].Transcript = "/etc/x.jsonl" }, "relative path"},
+		"windows relative drive": {func(m *Manifest) { m.Sessions[0].Transcript = `C:x.jsonl` }, "relative path"},
+		"windows absolute path":  {func(m *Manifest) { m.Sessions[0].Transcript = `C:\etc\x.jsonl` }, "relative path"},
+		"duplicate":              {func(m *Manifest) { m.Sessions[1] = m.Sessions[2] }, "duplicate"},
 	} {
 		_, err := Ingest(copyFixture(t, tc.edit), "2026-01-02T00:00:00Z", "")
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

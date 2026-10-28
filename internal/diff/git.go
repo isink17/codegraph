@@ -84,7 +84,18 @@ func CompareCommits(ctx context.Context, repoRoot, baseRef, headRef string, regi
 		return Result{}, fmt.Errorf("head revision: %w", err)
 	}
 	defer head.blobs.close()
-	return compareSnapshots(ctx, base, head, offset, limit)
+	res, err := compareSnapshots(ctx, base, head, offset, limit)
+	base.blobs.close()
+	head.blobs.close()
+	if err != nil {
+		return Result{}, err
+	}
+	for _, b := range []*blobReader{base.blobs, head.blobs} {
+		if b.err != nil {
+			return Result{}, fmt.Errorf("read Git blob: %w", b.err)
+		}
+	}
+	return res, nil
 }
 
 // compareSnapshots fails rather than report a file that could not be read
@@ -215,6 +226,12 @@ func (b *blobReader) read(object string, limit int64) ([]byte, bool) {
 			}
 		}
 		if err != nil {
+			if in != nil {
+				_ = in.Close()
+			}
+			if b.stdout != nil {
+				_ = b.stdout.Close()
+			}
 			b.err = err
 			return nil, false
 		}
@@ -264,7 +281,9 @@ func (b *blobReader) close() {
 		return
 	}
 	_ = b.in.Close()
-	_ = b.cmd.Wait()
+	if err := b.cmd.Wait(); err != nil && b.err == nil {
+		b.err = err
+	}
 	_ = b.stdout.Close()
 	b.cmd = nil
 	b.stdout = nil
