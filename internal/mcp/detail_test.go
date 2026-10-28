@@ -21,6 +21,11 @@ import (
 // production serialization path emits, so nothing here is synthesized.
 func detailFixture(t *testing.T) (*Server, context.Context) {
 	t.Helper()
+	return detailFixtureWithStableIDs(t, false)
+}
+
+func detailFixtureWithStableIDs(t *testing.T, stable bool) (*Server, context.Context) {
+	t.Helper()
 	ctx := context.Background()
 	repoRoot := t.TempDir()
 
@@ -28,7 +33,7 @@ func detailFixture(t *testing.T) (*Server, context.Context) {
 	for i := 1; i <= 120; i++ {
 		fmt.Fprintf(&body, "\ttotal += %d\n", i)
 	}
-	writeRepoFile(t, repoRoot, "lib/widget.go", `package lib
+	widgetSource := `package lib
 
 // Widget is a thing with a size.
 type Widget struct {
@@ -44,9 +49,12 @@ func (w *Widget) Area() int {
 // Accumulate sums a long series of constants.
 func Accumulate() int {
 	total := 0
-`+body.String()+`	return total
+` + body.String() + `	return total
 }
-`)
+`
+	if !stable {
+		writeRepoFile(t, repoRoot, "lib/widget.go", widgetSource)
+	}
 	writeRepoFile(t, repoRoot, "lib/caller.go", `package lib
 
 // Report prints an area.
@@ -86,6 +94,13 @@ func AlsoUseHelper() int {
 	}
 	if _, err := idx.Index(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
 		t.Fatalf("Index() error = %v", err)
+	}
+	if stable {
+		// Create the second file only after the first full scan fixes its IDs.
+		writeRepoFile(t, repoRoot, "lib/widget.go", widgetSource)
+		if _, err := idx.Update(ctx, indexer.Options{RepoRoot: repoRoot}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return NewServer(repoRoot, repo.ID, s, idx, query.New(s, nil), io.Discard), ctx
 }

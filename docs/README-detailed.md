@@ -255,7 +255,8 @@ and adding `detail` to them could only make a response larger.
 | `format` | Encoding |
 |---|---|
 | `json` (default) | the ordinary `{"ok":true,"data":...}` envelope |
-| `compact` | a tabular text document that states the columns once instead of repeating a key on every row |
+| `compact` | the unchanged v1 tabular document |
+| `compact-v2` | an opt-in typed table with reversible string-array cells; [exact grammar and bounds](compact-v2.md) |
 
 `format` is optional and defaults to JSON. The JSON form remains the standard
 response format, but newer releases may add presence, uncertainty, or pagination
@@ -280,6 +281,12 @@ a list), so a fixed-column table would have to drop or nest a field.
 `context_for_task` stays JSON-only because its `estimated_tokens`/`max_tokens`
 contract budgets the exact JSON document it returns; compacting after budgeting
 would make the reported estimate describe a payload the caller never received.
+
+**Compatibility.** JSON remains the default. `compact` retains v1 bytes, including
+its ambiguous comma-joined presence lists. Select `compact-v2` explicitly for
+lossless arrays; it declares `scalar`/`string[]` columns with `@types` under
+`@codegraph.compact/v2`. V1 decoders reject v2; use the dedicated typed decoder.
+See [compact v2](compact-v2.md) for supported schemas, strict errors and limits.
 
 **compact/v1 grammar.** The format identifier is `codegraph.compact/v1`, and it is
 versioned independently of the CodeGraph release version.

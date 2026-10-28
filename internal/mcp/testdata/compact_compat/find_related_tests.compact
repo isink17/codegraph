@@ -1,0 +1,7 @@
+@codegraph.compact/v1
+@tool find_related_tests
+@section tests
+@columns file	symbol	reason	score
+@section presence
+@columns matched	target_found	requested	found	missing	total	offset	truncated
+		3	1	missing,a,missing,b			

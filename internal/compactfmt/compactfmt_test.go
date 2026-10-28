@@ -16,6 +16,8 @@ func TestParseFormat(t *testing.T) {
 		{raw: "   ", want: FormatJSON},
 		{raw: "json", want: FormatJSON},
 		{raw: "compact", want: FormatCompact},
+		{raw: "compact-v2", want: FormatCompactV2},
+		{raw: " compact-v2 ", want: FormatCompactV2},
 		{raw: " compact ", want: FormatCompact},
 		{raw: "Compact", wantErr: true},
 		{raw: "toon", wantErr: true},
@@ -39,7 +41,7 @@ func TestParseFormat(t *testing.T) {
 }
 
 func TestNamesIsTheWireVocabulary(t *testing.T) {
-	if got, want := Names(), []string{"json", "compact"}; !reflect.DeepEqual(got, want) {
+	if got, want := Names(), []string{"json", "compact", "compact-v2"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
 	}
 }

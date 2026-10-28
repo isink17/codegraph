@@ -1,0 +1,1 @@
+{"data":{"dependencies":[{"depth":0,"direction":"downstream","file":"lib/caller.go","kind":"function","name":"Helper","symbol":"lib.Helper"}],"offset":0,"target_found":true,"total":1,"truncated":false},"ok":true}

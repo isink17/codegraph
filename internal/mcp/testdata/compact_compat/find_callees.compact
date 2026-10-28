@@ -1,0 +1,9 @@
+@codegraph.compact/v1
+@tool find_callees
+@section callees
+@columns symbol_id	stable_key	name	qualified_name	kind	language	file	line
+3	func:lib::Helper	Helper	lib.Helper	function	go	lib/caller.go	15
+8	func:lib::Accumulate	Accumulate	lib.Accumulate	function	go	lib/widget.go	15
+@section presence
+@columns matched	target_found	requested	found	missing	total	offset	truncated
+	true						

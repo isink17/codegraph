@@ -1,0 +1,6 @@
+@codegraph.compact/v1
+@tool list_files
+@section files
+@columns path	language	size_bytes
+lib/caller.go	go	507
+lib/widget.go	go	1861

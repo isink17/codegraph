@@ -105,7 +105,7 @@ func (s *Server) callToolContent(ctx context.Context, name string, raw json.RawM
 		return "", err
 	}
 	rec.observeDimensions(meterDimensions(desc, string(format), rawDetail))
-	if format == compactfmt.FormatCompact {
+	if format == compactfmt.FormatCompact || format == compactfmt.FormatCompactV2 {
 		return s.callToolCompact(ctx, name, raw)
 	}
 	result, err := s.dispatchTool(ctx, name, raw)
@@ -126,7 +126,14 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		// tools above, and validateToolArguments rejects unknown arguments.
 		return "", fmt.Errorf("tool %q does not support format %q", name, compactfmt.FormatCompact)
 	}
+	format, err := formatArgument(raw)
+	if err != nil {
+		return "", err
+	}
 	doc := compactfmt.NewDocument(name)
+	if format == compactfmt.FormatCompactV2 {
+		doc = compactfmt.NewDocumentV2(name)
+	}
 	switch name {
 	case "find_symbol", "search_symbols":
 		matched, cards, err := s.symbolMatches(ctx, raw, name == "search_symbols")
@@ -246,8 +253,15 @@ func writeLimitations(doc *compactfmt.Document, limitations []store.GraphLimitat
 var presenceSchema = compactfmt.Schema{Section: "presence", Columns: []string{"matched", "target_found", "requested", "found", "missing", "total", "offset", "truncated"}}
 
 func writePresence(doc *compactfmt.Document, values map[string]any) {
-	sec := doc.Section(presenceSchema)
-	cells := make([]compactfmt.Cell, len(presenceSchema.Columns))
+	schema := presenceSchema
+	cells := make([]compactfmt.Cell, len(schema.Columns))
+	if doc.IsV2() {
+		schema.Columns = append([]string(nil), schema.Columns...)
+		schema.Columns[4] = "missing_json"
+		schema.Types = []compactfmt.ColumnType{compactfmt.Scalar, compactfmt.Scalar, compactfmt.Scalar, compactfmt.Scalar, compactfmt.StringArray, compactfmt.Scalar, compactfmt.Scalar, compactfmt.Scalar}
+		cells[4] = compactfmt.Strings(nil)
+	}
+	sec := doc.Section(schema)
 	for i, col := range presenceSchema.Columns {
 		switch v := values[col].(type) {
 		case bool:
@@ -255,7 +269,11 @@ func writePresence(doc *compactfmt.Document, values map[string]any) {
 		case int:
 			cells[i] = compactfmt.Int(v)
 		case []string:
-			cells[i] = compactfmt.Str(strings.Join(v, ","))
+			if doc.IsV2() {
+				cells[i] = compactfmt.Strings(v)
+			} else {
+				cells[i] = compactfmt.Str(strings.Join(v, ","))
+			}
 		}
 	}
 	sec.Row(cells)
@@ -364,7 +382,7 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 		compactfmt.Bool(truncated),
 	})
 	if presence, ok := data["seed_presence"].(store.ImpactSeedPresence); ok {
-		doc.Section(impactPresenceSchema).Row([]compactfmt.Cell{compactfmt.Int64(int64(presence.Requested)), compactfmt.Int64(int64(presence.Found)), compactfmt.Str(strings.Join(presence.Missing, ","))})
+		writeImpactPresence(doc, int64(presence.Requested), int64(presence.Found), presence.Missing)
 	} else if presence, ok := data["seed_presence"].(map[string]any); ok {
 		requested, err := intFromAny(presence["requested"])
 		if err != nil {
@@ -374,10 +392,24 @@ func writeImpactSections(doc *compactfmt.Document, data map[string]any) error {
 		if err != nil {
 			return err
 		}
-		missing, _ := presence["missing"].([]string)
-		doc.Section(impactPresenceSchema).Row([]compactfmt.Cell{compactfmt.Int64(requested), compactfmt.Int64(found), compactfmt.Str(strings.Join(missing, ","))})
+		missing, ok := presence["missing"].([]string)
+		if doc.IsV2() && !ok && presence["missing"] != nil {
+			return fmt.Errorf("impact radius: invalid missing array")
+		}
+		writeImpactPresence(doc, requested, found, missing)
 	}
 	return nil
+}
+
+func writeImpactPresence(doc *compactfmt.Document, requested, found int64, missing []string) {
+	schema := impactPresenceSchema
+	cell := compactfmt.Str(strings.Join(missing, ","))
+	if doc.IsV2() {
+		schema.Columns = []string{"requested", "found", "missing_json"}
+		schema.Types = []compactfmt.ColumnType{compactfmt.Scalar, compactfmt.Scalar, compactfmt.StringArray}
+		cell = compactfmt.Strings(missing)
+	}
+	doc.Section(schema).Row([]compactfmt.Cell{compactfmt.Int64(requested), compactfmt.Int64(found), cell})
 }
 
 // column is one column of a schema over a store result that is a map rather

@@ -1,0 +1,8 @@
+@codegraph.compact/v1
+@tool trace_dependencies
+@section dependencies
+@columns symbol	kind	name	file	depth	direction
+lib.Helper	function	Helper	lib/caller.go	0	downstream
+@section presence
+@columns matched	target_found	requested	found	missing	total	offset	truncated
+	true				1	0	false
