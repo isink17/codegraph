@@ -142,11 +142,14 @@ jobs:
           done
 
   packed-install:
+    # Pause routine Windows install tests during development (CG-117).
+    # Run Windows validation during explicit release preparation, not every npm PR.
+    # Release-shaped Windows jobs remain opt-in; release-tag builds are unchanged.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
