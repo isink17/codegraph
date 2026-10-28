@@ -19,6 +19,9 @@ change lists but never change `risk`.
 - No assessment proves a change safe. Only resolved edges are cited, so an
   unresolved, dynamic, reflective or cross-language dependent can still break.
   `risk.coverage` is therefore never `complete`.
+- A changed Go import binding is reported as `go_import_change_unmodeled`
+  uncertainty. Import order and literal quoting alone do not trigger it; the
+  numerical score remains based on resolved edges.
 - Both Go parsers (`treesitter:go:v6`, and `go-ast:go:v6` with
   `CGO_ENABLED=0`) store a function's signature as its source text: receiver,
   type parameter list, parameters and results. A generic type's signature

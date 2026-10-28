@@ -151,6 +151,34 @@ func TestGoUnmodeledSkipsModeledChange(t *testing.T) {
 	}
 }
 
+func TestGoImportChangeIsUncertain(t *testing.T) {
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.22\n", "p/lib.go": "package p\n\nimport \"fmt\"\n\nfunc Print() { fmt.Println(1) }\n"}
+	for name, adapter := range testGoAdapters {
+		t.Run(name, func(t *testing.T) {
+			d := editScenario(t, adapter, files, func(r *gittest.Repo) {
+				r.Write("p/lib.go", "package p\n\nimport f \"fmt\"\n\nfunc Print() { fmt.Println(1) }\n")
+			}).Diff
+			if !hasUncertainty(d.Risk, "go_import_change_unmodeled", "p/lib.go") {
+				t.Fatalf("import binding change is silent: %s", canonical(d.Risk))
+			}
+			if d.Risk.Assessment != "limited_evidence" || d.Risk.Score == nil || *d.Risk.Score != 0 {
+				t.Fatalf("risk changed: %s", canonical(d.Risk))
+			}
+		})
+	}
+}
+
+func TestGoImportOrderAndQuotingAreEquivalent(t *testing.T) {
+	a := []byte("package p\nimport (\"fmt\"; x `example.com/x`)\n")
+	b := []byte("package p\nimport (x \"example.com/x\"; \"fmt\")\n")
+	if !sameGoImports(a, b) {
+		t.Fatal("equivalent import bindings differ")
+	}
+	if sameGoImports(a, []byte("package p\nimport (x \"example.com/y\"; \"fmt\")\n")) {
+		t.Fatal("changed import path compared equal")
+	}
+}
+
 func TestGoShapesKeysAndNormalization(t *testing.T) {
 	a, ok := goShapes([]byte("package p\n\nimport \"fmt\"\n\n// T doc.\ntype T struct {\n\tA int // a\n\tB []int\n}\n\nfunc (t *T) M(x int) { fmt.Println(x) }\n\nconst (\n\tX K = iota\n\tY\n)\n\nvar V = []int{\n\t1,\n\t2,\n}\n"))
 	if !ok {
