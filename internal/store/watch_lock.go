@@ -223,12 +223,14 @@ func (s *Store) watcherStatus(repoID int64) (live string, unverified bool) {
 		}
 	}
 	if first != scanLockHeld {
-		return liveProbeState(first), false
+		state := liveProbeState(first)
+		return state, state == freshnessUnknown
 	}
 	// Probed again: a watcher that exited after the first probe released
 	// its unverified lock, which would otherwise read as reconciled.
 	if again := probeLock(livePath, false, 1); again != scanLockHeld {
-		return liveProbeState(again), false
+		state := liveProbeState(again)
+		return state, state == freshnessUnknown
 	}
 	return LiveWatcherWatching, false
 }
