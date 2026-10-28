@@ -1480,6 +1480,51 @@ class Units(unittest.TestCase):
             self.c.sandbox_available = real
 
 
+class ShellFixtures(unittest.TestCase):
+    setUp = Units.setUp
+
+    commands = [
+        ["/bin/bash", "scripts/agent-pool/pool_test.sh"],
+        ["/bin/sh", "scripts/release-bench/run_test.sh"],
+        ["/bin/bash", ".github/scripts/install-test.sh"],
+        ["/bin/bash", ".github/scripts/verify-release-assets_test.sh"],
+    ]
+
+    def test_failed_mktemp_keeps_callers_files(self):
+        root = HERE.parent.parent
+        for shell, script in self.commands:
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                stub = tmp / "bin"
+                stub.mkdir()
+                (stub / "mktemp").write_text("#!/bin/sh\nexit 1\n")
+                (stub / "mktemp").chmod(0o755)
+                caller = tmp / "caller"
+                caller.mkdir()
+                sentinel = caller / "keep"
+                sentinel.write_text("unchanged")
+                env = {**os.environ, "PATH": str(stub) + os.pathsep + os.environ["PATH"]}
+                p = subprocess.run([shell, str(root / script)], cwd=caller, env=env,
+                                   capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertTrue(sentinel.exists(), p.stdout + p.stderr)
+                self.assertEqual(sentinel.read_text(), "unchanged")
+                self.assertEqual(list(caller.iterdir()), [sentinel])
+
+    @unittest.skipUnless(sys.platform == "darwin", "strict sandbox requires macOS")
+    def test_shell_fixtures_in_strict_readonly_sandbox(self):
+        root = HERE.parent.parent
+        for cmd in self.commands:
+            with self.subTest(script=cmd[-1]):
+                argv, scratch = self.c.sandboxed(cmd, slot=root, readonly=True, cwd=root)
+                try:
+                    p = subprocess.run(argv, cwd=root, capture_output=True, text=True,
+                                       pass_fds=self.c.scratch_fds(scratch), timeout=240)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                finally:
+                    self.c.release_scratch(scratch)
+
+
 class ScratchSweep(unittest.TestCase):
     """Restart-time removal of abandoned scratch (copied logins), with
     synthetic credentials and real killed processes."""

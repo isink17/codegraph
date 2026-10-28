@@ -3,23 +3,18 @@
 # uname, sysctl and ldd are stubbed so every platform branch runs on any host.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/install-test.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
 rel="$tmp/rel" dest="$tmp/bin" stubs="$tmp/stubs"
 mkdir -p "$rel" "$stubs"
 
-cat >"$stubs/uname" <<'SH'
-#!/bin/sh
-case "$1" in -s) echo "$STUB_OS";; -m) echo "$STUB_ARCH";; esac
-SH
-cat >"$stubs/sysctl" <<'SH'
-#!/bin/sh
+printf '%s\n' '#!/bin/sh
+case "$1" in -s) echo "$STUB_OS";; -m) echo "$STUB_ARCH";; esac' >"$stubs/uname"
+printf '%s\n' '#!/bin/sh
 [ -n "${STUB_TRANSLATED:-}" ] || exit 1
-echo "$STUB_TRANSLATED"
-SH
-cat >"$stubs/ldd" <<'SH'
-#!/bin/sh
-echo "${STUB_LDD:-ldd (GNU libc) 2.39}" >&2
-SH
+echo "$STUB_TRANSLATED"' >"$stubs/sysctl"
+printf '%s\n' '#!/bin/sh
+echo "${STUB_LDD:-ldd (GNU libc) 2.39}" >&2' >"$stubs/ldd"
 chmod +x "$stubs"/*
 
 # publish VERSION TARGET [REPORTED_VERSION]: adds a fixture asset and its sidecar.
@@ -137,12 +132,10 @@ echo 'ok PATH shadow warning'
 cp "$dest/codegraph" "$tmp/before"
 shells="bash /bin/sh"; ! command -v dash >/dev/null || shells="$shells dash"
 mkdir "$tmp/slow"
-cat >"$tmp/slow/curl" <<'SH'
-#!/bin/sh
+printf '%s\n' '#!/bin/sh
 while [ "$#" -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; *) shift;; esac; done
 echo partial >"$out"
-exec sleep 30
-SH
+exec sleep 30' >"$tmp/slow/curl"
 chmod +x "$tmp/slow/curl"
 for shell in $shells; do
   STUB_OS=Linux STUB_ARCH=x86_64 PATH="$tmp/slow:$stubs:$PATH" $shell "$root/install.sh" v2.0.1 >"$tmp/out" 2>&1 &
