@@ -1,0 +1,18 @@
+@codegraph.compact/v1
+@tool get_impact_radius
+@section symbols
+@columns symbol_id	stable_key	name	qualified_name	kind	language	file	line
+5	func:lib::AlsoUseHelper	AlsoUseHelper	lib.AlsoUseHelper	function	go	lib/caller.go	25
+3	func:lib::Helper	Helper	lib.Helper	function	go	lib/caller.go	15
+4	func:lib::UseHelper	UseHelper	lib.UseHelper	function	go	lib/caller.go	20
+8	func:lib::Accumulate	Accumulate	lib.Accumulate	function	go	lib/widget.go	15
+@section files
+@columns file
+lib/caller.go
+lib/widget.go
+@section summary
+@columns affected_symbols	affected_files	returned_symbols	returned_files	unresolved_edges	unresolved_names	offset	truncated
+4	2	4	2	0	0	0	false
+@section presence
+@columns requested	found	missing
+2	1	missing,a

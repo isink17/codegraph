@@ -1,0 +1,9 @@
+@codegraph.compact/v1
+@tool find_dead_code
+@section dead_code
+@columns symbol	kind	name	file	language	start_line	end_line
+lib.Report	function	Report	lib/caller.go	go	4	6
+lib.Twice	function	Twice	lib/caller.go	go	9	11
+lib.UseHelper	function	UseHelper	lib/caller.go	go	20	22
+lib.AlsoUseHelper	function	AlsoUseHelper	lib/caller.go	go	25	27
+lib.Widget	type	Widget	lib/widget.go	go	4	7

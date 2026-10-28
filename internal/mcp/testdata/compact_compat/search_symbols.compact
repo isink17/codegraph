@@ -1,0 +1,10 @@
+@codegraph.compact/v1
+@tool search_symbols
+@section matches
+@columns symbol_id	stable_key	name	qualified_name	kind	language	file	line
+5	func:lib::AlsoUseHelper	AlsoUseHelper	lib.AlsoUseHelper	function	go	lib/caller.go	25
+3	func:lib::Helper	Helper	lib.Helper	function	go	lib/caller.go	15
+4	func:lib::UseHelper	UseHelper	lib.UseHelper	function	go	lib/caller.go	20
+@section presence
+@columns matched	target_found	requested	found	missing	total	offset	truncated
+true							

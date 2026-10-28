@@ -1199,7 +1199,7 @@ func formatProperty() map[string]any {
 		"type":        "string",
 		"enum":        compactfmt.Names(),
 		"default":     string(defaultToolFormat),
-		"description": "Output encoding. compact: tabular, no repeated keys; best for bulk (detail=card).",
+		"description": "Output encoding. compact: v1 tables; compact-v2: typed tables. Both require detail=card.",
 	}
 }
 
@@ -1388,7 +1388,7 @@ func validateToolArguments(name string, raw json.RawMessage) error {
 		// A detail level compact cannot represent is refused before the query runs,
 		// so the caller gets one clear error instead of a document that quietly
 		// answers a cheaper question than the one asked.
-		if format == compactfmt.FormatCompact {
+		if format == compactfmt.FormatCompact || format == compactfmt.FormatCompactV2 {
 			if err := detail.CompactSupported(level); err != nil {
 				return err
 			}

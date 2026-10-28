@@ -323,15 +323,16 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // safe_to_edit is listed in full mode: 13448 -> 13761 bytes (+313 bytes, +79
 // estimated tokens). It is not gateway core, so the gateway payload is
 // unchanged; gateway clients reach it through tool_search and tool_call.
+// CG-120 adds compact-v2: full +180 bytes/+45 estimated tokens; gateway +60/+15.
 const (
-	fullToolsListBytes  = 13761
-	fullToolsListTokens = 3441
+	fullToolsListBytes  = 13941
+	fullToolsListTokens = 3486
 	// The gateway payload is pinned for the same reason, and became load-bearing
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name
 	// nobody happened to assert on.
-	gatewayToolsListBytes  = 4151
-	gatewayToolsListTokens = 1038
+	gatewayToolsListBytes  = 4211
+	gatewayToolsListTokens = 1053
 )
 
 // TestGatewayToolsListIsByteIdentical pins the reduced surface's exact size.

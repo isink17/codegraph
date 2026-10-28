@@ -1,0 +1,10 @@
+@codegraph.compact/v1
+@tool find_symbol
+@section matches
+@columns symbol_id	stable_key	name	qualified_name	kind	language	file	line
+1	func:lib::Report	Report	lib.Report	function	go	lib/caller.go	4
+2	func:lib::Twice	Twice	lib.Twice	function	go	lib/caller.go	9
+7	func:lib:Widget:Area	Area	lib.Widget.Area	method	go	lib/widget.go	10
+@section presence
+@columns matched	target_found	requested	found	missing	total	offset	truncated
+true							

@@ -58,12 +58,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Version is the compact format identifier. It is versioned independently of
 // the CodeGraph release version: the wire contract changes when the grammar
 // changes, not when the binary ships.
 const Version = "codegraph.compact/v1"
+
+// VersionV2 declares typed columns; Decode remains a v1-only API.
+const VersionV2 = "codegraph.compact/v2"
 
 // Separator is the field separator inside a row.
 const Separator = "\t"
@@ -75,12 +79,13 @@ const (
 	// FormatJSON is the default encoding: the ordinary JSON success envelope.
 	FormatJSON Format = "json"
 	// FormatCompact is this package's tabular encoding.
-	FormatCompact Format = "compact"
+	FormatCompact   Format = "compact"
+	FormatCompactV2 Format = "compact-v2"
 )
 
 // Formats lists the encoding vocabulary. It is the single source of truth for
 // MCP tool schemas, so the wire vocabulary cannot drift from the code.
-var Formats = []Format{FormatJSON, FormatCompact}
+var Formats = []Format{FormatJSON, FormatCompact, FormatCompactV2}
 
 // Names returns the encoding vocabulary as strings, for schemas and flag help.
 func Names() []string {
@@ -117,6 +122,8 @@ func ParseFormat(raw string, fallback Format) (Format, error) {
 type Schema struct {
 	Section string
 	Columns []string
+	// Types is used only by v2. Omitted types declare scalar columns.
+	Types []ColumnType
 }
 
 // Document is one compact result under construction.
@@ -131,18 +138,38 @@ type Document struct {
 	// still the open one. Comparing column counts would not: two sections of the
 	// same width are indistinguishable that way, and a row appended to the
 	// earlier one would land silently under the later header.
-	seq int
-	err error
+	seq  int
+	err  error
+	v2   bool
+	rows int
 }
 
 // NewDocument starts a compact document for one tool.
 func NewDocument(tool string) *Document {
-	d := &Document{sections: map[string]bool{}}
+	return newDocument(tool, false)
+}
+
+// NewDocumentV2 starts a typed document with the v2 wire identifier.
+func NewDocumentV2(tool string) *Document { return newDocument(tool, true) }
+
+// IsV2 lets serializers select the declared schema without inspecting values.
+func (d *Document) IsV2() bool { return d.v2 }
+
+func newDocument(tool string, v2 bool) *Document {
+	d := &Document{sections: map[string]bool{}, v2: v2}
+	if v2 && (!utf8.ValidString(tool) || len(tool) > MaxV2Bytes/6) {
+		d.err = fmt.Errorf("compactfmt: invalid v2 tool name")
+		return d
+	}
 	if strings.TrimSpace(tool) == "" {
 		d.err = fmt.Errorf("compactfmt: empty tool name")
 		return d
 	}
-	d.buf.WriteString("@" + Version + "\n@tool ")
+	version := Version
+	if v2 {
+		version = VersionV2
+	}
+	d.buf.WriteString("@" + version + "\n@tool ")
 	d.writeDirectiveValue(tool)
 	d.buf.WriteString("\n")
 	return d
@@ -152,6 +179,9 @@ func NewDocument(tool string) *Document {
 // caller that knows its row count avoids the repeated doubling a growing buffer
 // would otherwise pay for a hundred-row page.
 func (d *Document) Grow(n int) {
+	if d.v2 {
+		n = min(n, MaxV2Bytes-d.buf.Len())
+	}
 	if n > 0 {
 		d.buf.Grow(n)
 	}
@@ -162,6 +192,19 @@ func (d *Document) Grow(n int) {
 func (d *Document) Section(schema Schema) *Section {
 	if d.err != nil {
 		return &Section{doc: d}
+	}
+	types := schema.Types
+	if d.v2 {
+		var err error
+		types, err = columnTypes(schema)
+		if err != nil {
+			d.err = err
+			return &Section{doc: d}
+		}
+		if len(d.sections) >= maxV2Sections {
+			d.err = fmt.Errorf("compactfmt: too many sections")
+			return &Section{doc: d}
+		}
 	}
 	switch {
 	case strings.TrimSpace(schema.Section) == "":
@@ -199,8 +242,22 @@ func (d *Document) Section(schema Schema) *Section {
 		d.writeDirectiveValue(col)
 	}
 	d.buf.WriteString("\n")
+	if d.v2 {
+		d.buf.WriteString("@types ")
+		for i, kind := range types {
+			if i > 0 {
+				d.buf.WriteString(Separator)
+			}
+			d.buf.WriteString(string(kind))
+		}
+		d.buf.WriteByte('\n')
+	}
+	if d.v2 && d.buf.Len() > MaxV2Bytes {
+		d.err = fmt.Errorf("compactfmt: document exceeds byte limit")
+		return &Section{doc: d}
+	}
 	d.seq++
-	return &Section{doc: d, columns: len(schema.Columns), seq: d.seq}
+	return &Section{doc: d, columns: len(schema.Columns), seq: d.seq, types: types}
 }
 
 // Section is a handle for appending rows to the section that opened it.
@@ -208,6 +265,7 @@ type Section struct {
 	doc     *Document
 	columns int
 	seq     int
+	types   []ColumnType
 }
 
 // Row appends one row. The cell count must equal the section's column count; a
@@ -226,13 +284,45 @@ func (s *Section) Row(cells []Cell) {
 		d.err = fmt.Errorf("compactfmt: row has %d cells, section has %d columns", len(cells), s.columns)
 		return
 	}
+	if !d.v2 {
+		for _, c := range cells {
+			if c.kind == cellStrings {
+				d.err = fmt.Errorf("compactfmt: array requires v2")
+				return
+			}
+		}
+	}
+	if d.v2 {
+		if d.rows >= maxV2Rows {
+			d.err = fmt.Errorf("compactfmt: too many rows")
+			return
+		}
+		for i := range cells {
+			if err := validateTypedCell(cells[i], s.types[i]); err != nil {
+				d.err = err
+				return
+			}
+		}
+		d.rows++
+	}
 	for i := range cells {
 		if i > 0 {
 			d.buf.WriteString(Separator)
 		}
-		cells[i].writeTo(&d.buf)
+		if d.v2 && cells[i].kind == cellStrings {
+			writeEscaped(&d.buf, arrayJSON(cells[i].list))
+		} else {
+			cells[i].writeTo(&d.buf)
+		}
+		if d.v2 && d.buf.Len() > MaxV2Bytes {
+			d.err = fmt.Errorf("compactfmt: document exceeds byte limit")
+			return
+		}
 	}
 	d.buf.WriteString("\n")
+	if d.v2 && d.buf.Len() > MaxV2Bytes {
+		d.err = fmt.Errorf("compactfmt: document exceeds byte limit")
+	}
 }
 
 // Encode returns the document text, or the first error recorded while building
@@ -241,6 +331,9 @@ func (s *Section) Row(cells []Cell) {
 func (d *Document) Encode() (string, error) {
 	if d.err != nil {
 		return "", d.err
+	}
+	if d.v2 && d.buf.Len() > MaxV2Bytes {
+		return "", fmt.Errorf("compactfmt: document exceeds byte limit")
 	}
 	if len(d.sections) == 0 {
 		return "", fmt.Errorf("compactfmt: document has no sections")
@@ -262,12 +355,14 @@ const (
 	cellInt
 	cellFloat
 	cellBool
+	cellStrings
 )
 
 // Cell is one encoded value. Numbers and booleans are held in their own form
 // rather than pre-formatted, so a row of integers costs no intermediate strings.
 type Cell struct {
 	str  string
+	list []string
 	num  int64
 	flt  float64
 	bit  bool

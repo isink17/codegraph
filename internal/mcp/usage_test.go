@@ -664,7 +664,7 @@ func TestUsageReportRetainsNoPayloads(t *testing.T) {
 			t.Fatalf("row via %q is not an invocation path", row.Via)
 		}
 		switch row.Format {
-		case "", "json", "compact":
+		case "", "json", "compact", "compact-v2":
 		default:
 			t.Fatalf("row format %q is not a known encoding", row.Format)
 		}
