@@ -3,7 +3,8 @@
 set -euo pipefail
 
 POOL=$(cd "$(dirname "$0")" && pwd)/pool.sh
-T=$(cd "$(mktemp -d)" && pwd -P)
+T=$(mktemp -d "${TMPDIR:-/tmp}/pool-test.XXXXXX") || exit 1
+T=$(cd "$T" && pwd -P) || exit 1
 trap 'rm -rf "$T"' EXIT
 export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds CG_POOL_REPO=$T/seed
 : >"$T/cwds"
@@ -98,11 +99,11 @@ echo dirty >"$CG_POOL_ROOT/$R/dirty.txt"
 expect 1 "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
 rm "$CG_POOL_ROOT/$R/dirty.txt"
 mkdir "$T/fail-checkout"
-cat >"$T/fail-checkout/git" <<EOF
-#!/bin/sh
-for arg in "\$@"; do [ "\$arg" = checkout ] && { echo injected checkout failure >&2; exit 128; }; done
-exec $(command -v git) "\$@"
-EOF
+{
+	printf '%s\n' '#!/bin/sh
+for arg in "$@"; do [ "$arg" = checkout ] && { echo injected checkout failure >&2; exit 128; }; done'
+	printf 'exec "%s" "$@"\n' "$(command -v git)"
+} >"$T/fail-checkout/git"
 chmod +x "$T/fail-checkout/git"
 RBEFORE=$(git -C "$CG_POOL_ROOT/$R" rev-parse HEAD)
 expect 1 env PATH="$T/fail-checkout:$PATH" "$POOL" review-checkout --slot $R --token "$RR_TOKEN" --branch review-head --head "$RHEAD"
@@ -249,11 +250,11 @@ nolsof_state=$(env -u CG_POOL_CWD_FILE PATH="$T/nolsof" "$BASH" "$POOL" status $
 
 # Git that fails for one subcommand, for failure injection.
 mkdir "$T/failgit"
-cat >"$T/failgit/git" <<EOF
-#!/bin/sh
-for a in "\$@"; do [ "\$a" = "\$CG_FAIL_GIT" ] && { echo "injected \$a failure" >&2; exit 128; }; done
-exec $(command -v git) "\$@"
-EOF
+{
+	printf '%s\n' '#!/bin/sh
+for a in "$@"; do [ "$a" = "$CG_FAIL_GIT" ] && { echo "injected $a failure" >&2; exit 128; }; done'
+	printf 'exec "%s" "$@"\n' "$(command -v git)"
+} >"$T/failgit/git"
 chmod +x "$T/failgit/git"
 failgit() { CG_FAIL_GIT=$1 PATH="$T/failgit:$PATH" "${@:2}"; }
 lease_exists() { [[ -e $CG_POOL_LEASES/$1.lease ]]; }

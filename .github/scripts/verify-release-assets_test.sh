@@ -2,15 +2,13 @@
 set -euo pipefail
 
 script="$(cd "$(dirname "$0")" && pwd)/verify-release-assets.sh"
-tmp=$(mktemp -d)
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/release-assets-test.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/assets"
 sha256() {
   node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$1"
 }
-cat >"$tmp/package.json" <<'EOF'
-{"version":"2.0.0"}
-EOF
+printf '%s\n' '{"version":"2.0.0"}' >"$tmp/package.json"
 
 for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64; do
   asset="codegraph-v2.0.0-${target}"

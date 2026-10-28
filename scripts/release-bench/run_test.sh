@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-dir=$(mktemp -d "${TMPDIR:-/tmp}/release-bench-test.XXXXXX")
+dir=$(mktemp -d "${TMPDIR:-/tmp}/release-bench-test.XXXXXX") || exit 1
 trap 'rm -rf "$dir"' EXIT
 t=$(printf '\t')
 for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -26,16 +26,14 @@ printf 'existing index\n' >"$dir/corpus/.codegraph/codegraph.v2.sqlite"
 cp "$dir/corpus/a.go" "$dir/a.before"
 cp "$dir/corpus/b.go" "$dir/b.before"
 cp "$dir/corpus/.codegraph/codegraph.v2.sqlite" "$dir/index.before"
-cat >"$dir/fake-codegraph" <<'EOF'
-#!/bin/sh
+printf '%s\n' '#!/bin/sh
 set -eu
 cmd=$1 repo=$2
 case "$cmd" in
 	index) mkdir -p "$repo/.codegraph"; : >"$repo/.codegraph/codegraph.v2.sqlite" ;;
 	update) : ;;
-	stats|bench-queries) cat >/dev/null; printf '{}\n' ;;
-esac
-EOF
+	stats|bench-queries) cat >/dev/null; printf "{}\n" ;;
+esac' >"$dir/fake-codegraph"
 chmod +x "$dir/fake-codegraph"
 ln -s "$dir/corpus/a.go" "$dir/corpus/absolute-link.go"
 ln -s parent "$dir/corpus/linked-parent"
@@ -53,8 +51,8 @@ cmp "$dir/a.before" "$dir/corpus/a.go"
 cmp "$dir/b.before" "$dir/corpus/b.go"
 cmp "$dir/index.before" "$dir/corpus/.codegraph/codegraph.v2.sqlite"
 [ -n "$(git -C "$dir/corpus" status --porcelain)" ]
-[ -f "$dir/out/raw/edit_update_a_go.1.json" ]
-[ -f "$dir/out/raw/edit_update_b_go.1.json" ]
+[ -f "$dir/out/raw/edit_update_go_a_go.1.json" ]
+[ -f "$dir/out/raw/edit_update_go_b_go.1.json" ]
 
 ln -s "$dir/corpus" "$dir/corpus-link"
 sh "$(dirname "$0")/run.sh" "$dir/fake-codegraph" "$dir/corpus-link" "$dir/symlink-root-out" 1 1 a.go
