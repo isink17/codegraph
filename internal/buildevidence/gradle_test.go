@@ -103,6 +103,40 @@ func TestCurrentFingerprintChangesWithRepositoryInputs(t *testing.T) {
 	}
 }
 
+func TestRepositoryFingerprintDistinguishesFileBoundaries(t *testing.T) {
+	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileA := filepath.Join(root, "a")
+	fileB := filepath.Join(root, "b")
+	if err := os.WriteFile(fileA, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := testArtifact()
+	a.Repository.Identity = "sha256:" + hashString(root)
+	a.Repository.RootMarker = a.Repository.Identity
+	a.Evidence.SourceRoots = []string{}
+	before, err := CurrentFingerprint(root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.InputFingerprint = before
+	if err := os.Remove(fileB); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileA, []byte("x\x00b\x00600\x00y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("different repository inputs accepted as current: %v", err)
+	}
+}
+
 func TestCanonicalRepoRootsRefusesSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
