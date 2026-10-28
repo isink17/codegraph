@@ -80,6 +80,11 @@ Kotlin source-set roots. It never discovers or launches a project wrapper
 implicitly. The integration fixture pins Kotlin Gradle Plugin 2.3.20 and asserts
 Gradle 9.3.1.
 
+The producer records the selected Kotlin compile task path and its configured
+compiler version from that task. The pinned fixture verifies `:app:compileKotlin`
+and Kotlin 2.3.20; changing either field makes the artifact stale. This is
+configuration evidence, not proof of the compiler binary or executed task.
+
 The producer deliberately reports source and dependency dimensions as
 `incomplete`; generated/excluded roots and external metadata as `unknown`; and
 compiler identity as `incomplete`. It observes the Gradle runtime JDK, not a

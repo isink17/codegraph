@@ -234,8 +234,11 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 	if a.Evidence.Dimensions.Source.State != Incomplete || a.Evidence.Dimensions.Dependency.State != Incomplete {
 		t.Fatalf("producer overstated dimensions: %+v", a.Evidence.Dimensions)
 	}
-	if a.Tools.GradleVersion != "9.3.1" || a.Tools.KotlinPluginVersion == "" {
+	if a.Tools.GradleVersion != "9.3.1" || a.Tools.KotlinPluginVersion == "" || a.Tools.KotlinCompilerVersion != "2.3.20" || a.Compilation.GradleTask != ":app:compileKotlin" {
 		t.Fatalf("fixture tool identity = %+v; want Gradle 9.3.1 and pinned Kotlin plugin", a.Tools)
+	}
+	if a.Evidence.Dimensions.CompilerIdentity.State != Incomplete {
+		t.Fatalf("compiler identity overstated: %+v", a.Evidence.Dimensions.CompilerIdentity)
 	}
 	if len(a.Evidence.Dependencies) == 0 {
 		t.Fatal("Gradle classpath observations are empty")
@@ -255,6 +258,16 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 	}
 	if err := a.ValidateCurrentInRepository(root); err != nil {
 		t.Fatalf("fresh generated artifact rejected: %v", err)
+	}
+	changed := a
+	changed.Tools.KotlinCompilerVersion = "2.3.19"
+	if err := changed.ValidateCurrentInRepository(root); err == nil {
+		t.Fatal("mismatched Kotlin compiler version accepted as fresh")
+	}
+	changed = a
+	changed.Compilation.GradleTask = ":app:compileTestKotlin"
+	if err := changed.ValidateCurrentInRepository(root); err == nil {
+		t.Fatal("mismatched Kotlin compile task accepted as fresh")
 	}
 	if err := os.WriteFile(filepath.Join(root, "app", "src", "main", "kotlin", "Hello.kt"), []byte("class Changed\n"), 0o600); err != nil {
 		t.Fatal(err)

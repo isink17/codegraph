@@ -53,6 +53,7 @@ type Repository struct {
 type Compilation struct {
 	GradleProject     string `json:"gradle_project"`
 	KotlinCompilation string `json:"kotlin_compilation"`
+	GradleTask        string `json:"gradle_task,omitempty"`
 }
 
 type Tools struct {

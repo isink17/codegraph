@@ -24,6 +24,21 @@ gradle.projectsEvaluated {
             if (compilation == null) {
                 throw new GradleException("Selected Kotlin/JVM compilation does not exist: ${compilationName}")
             }
+            def compileTask = project.tasks.findByName(compilation.compileKotlinTaskName)
+            if (compileTask == null) {
+                throw new GradleException('Selected Kotlin/JVM compilation has no compile task')
+            }
+            // shortcut: Kotlin Gradle Plugin 2.3 exposes this task property; update the pinned fixture before changing plugin versions.
+            def compilerVersionProperties = compileTask.properties.findAll {
+                it.key.startsWith('kotlinCompilerVersion$')
+            }
+            if (compilerVersionProperties.size() != 1) {
+                throw new GradleException('Selected Kotlin compiler version is unavailable or ambiguous')
+            }
+            def compilerVersion = compilerVersionProperties.values().first().get()?.toString()
+            if (!compilerVersion) {
+                throw new GradleException('Selected Kotlin compiler version is empty')
+            }
 
             def sourceRoots = compilation.allKotlinSourceSets
                 .collectMany { it.kotlin.sourceDirectories.files }
@@ -41,6 +56,8 @@ gradle.projectsEvaluated {
             def model = [
                 gradle_version: gradle.gradleVersion,
                 kotlin_plugin_version: kotlinPlugin?.class?.package?.implementationVersion ?: '',
+                kotlin_compiler_version: compilerVersion,
+                compile_task: compileTask.path,
                 jdk_vendor: System.getProperty('java.vendor') ?: '',
                 jdk_version: System.getProperty('java.version') ?: '',
                 project: projectPath,
