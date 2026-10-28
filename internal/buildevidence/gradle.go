@@ -35,14 +35,16 @@ type GradleRequest struct {
 }
 
 type gradleModel struct {
-	GradleVersion       string   `json:"gradle_version"`
-	KotlinPluginVersion string   `json:"kotlin_plugin_version"`
-	JDKVendor           string   `json:"jdk_vendor"`
-	JDKVersion          string   `json:"jdk_version"`
-	Project             string   `json:"project"`
-	Compilation         string   `json:"compilation"`
-	SourceRoots         []string `json:"source_roots"`
-	Dependencies        []string `json:"dependencies"`
+	GradleVersion         string   `json:"gradle_version"`
+	KotlinPluginVersion   string   `json:"kotlin_plugin_version"`
+	KotlinCompilerVersion string   `json:"kotlin_compiler_version,omitempty"`
+	CompileTask           string   `json:"compile_task,omitempty"`
+	JDKVendor             string   `json:"jdk_vendor"`
+	JDKVersion            string   `json:"jdk_version"`
+	Project               string   `json:"project"`
+	Compilation           string   `json:"compilation"`
+	SourceRoots           []string `json:"source_roots"`
+	Dependencies          []string `json:"dependencies"`
 }
 
 // ExportGradle invokes Gradle only at this explicit call site and writes a
@@ -135,14 +137,14 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if err := dec.Decode(&extra); err != io.EOF {
 		return Artifact{}, errors.New("Gradle model output has trailing JSON")
 	}
-	if model.Project != req.Project || model.Compilation != req.Compilation || model.GradleVersion == "" {
+	if model.Project != req.Project || model.Compilation != req.Compilation || model.GradleVersion == "" || model.CompileTask == "" || !validGradleProject(model.CompileTask) || (req.Project != ":" && !strings.HasPrefix(model.CompileTask, req.Project+":")) {
 		return Artifact{}, errors.New("Gradle model did not match the requested project and compilation")
 	}
 	if model.SourceRoots == nil {
 		return Artifact{}, errors.New("Gradle model omitted Kotlin source roots")
 	}
 	sort.Strings(model.Dependencies)
-	if !safeToolIdentity(model.GradleVersion) || !safeToolIdentity(model.KotlinPluginVersion) || !safeToolIdentity(model.JDKVersion) || !safeToolIdentity(model.JDKVendor) {
+	if !safeToolIdentity(model.GradleVersion) || !safeToolIdentity(model.KotlinPluginVersion) || !safeToolIdentity(model.KotlinCompilerVersion) || model.KotlinCompilerVersion == "" || !safeToolIdentity(model.JDKVersion) || !safeToolIdentity(model.JDKVendor) {
 		return Artifact{}, errors.New("Gradle reported unsupported tool identity text")
 	}
 	for _, dependency := range model.Dependencies {
@@ -173,23 +175,24 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		Excluded:         Dimension{State: Unknown, Provenance: []string{"first producer does not observe excluded source rules"}},
 		Dependency:       Dimension{State: Incomplete, Provenance: []string{"Gradle resolved compilation artifacts observed; file dependencies and artifact content freshness are not proven"}},
 		ExternalMetadata: Dimension{State: Unknown, Provenance: []string{"external metadata is not captured"}},
-		CompilerIdentity: Dimension{State: Incomplete, Provenance: []string{"Gradle and Kotlin plugin versions observed; Kotlin compiler and selected toolchain identity are not proven"}},
+		CompilerIdentity: Dimension{State: Incomplete, Provenance: []string{"Gradle and selected Kotlin compile task versions observed; compiler binary and selected toolchain identity are not proven"}},
 	}
 	fingerprint := hashFingerprint(root, model, roots, inputs, dimensions)
 	artifact := Artifact{
 		Schema:   Schema,
-		Producer: Producer{Name: "codegraph-gradle-exporter", Version: "1"},
+		Producer: Producer{Name: "codegraph-gradle-exporter", Version: "2"},
 		Repository: Repository{
 			Identity:   "sha256:" + hex.EncodeToString(identity[:]),
 			RootMarker: "sha256:" + hex.EncodeToString(identity[:]),
 			BuildRoot:  ".",
 		},
-		Compilation: Compilation{GradleProject: req.Project, KotlinCompilation: req.Compilation},
+		Compilation: Compilation{GradleProject: req.Project, KotlinCompilation: req.Compilation, GradleTask: model.CompileTask},
 		Tools: Tools{
-			GradleVersion:       model.GradleVersion,
-			KotlinPluginVersion: model.KotlinPluginVersion,
-			JDKVendor:           model.JDKVendor,
-			JDKVersion:          model.JDKVersion,
+			GradleVersion:         model.GradleVersion,
+			KotlinPluginVersion:   model.KotlinPluginVersion,
+			KotlinCompilerVersion: model.KotlinCompilerVersion,
+			JDKVendor:             model.JDKVendor,
+			JDKVersion:            model.JDKVersion,
 		},
 		InputFingerprint: fingerprint,
 		Evidence: Evidence{
@@ -238,13 +241,15 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 	}
 	roots := artifact.Evidence.SourceRoots
 	model := gradleModel{
-		GradleVersion:       artifact.Tools.GradleVersion,
-		KotlinPluginVersion: artifact.Tools.KotlinPluginVersion,
-		JDKVendor:           artifact.Tools.JDKVendor,
-		JDKVersion:          artifact.Tools.JDKVersion,
-		Project:             artifact.Compilation.GradleProject,
-		Compilation:         artifact.Compilation.KotlinCompilation,
-		SourceRoots:         roots,
+		GradleVersion:         artifact.Tools.GradleVersion,
+		KotlinPluginVersion:   artifact.Tools.KotlinPluginVersion,
+		KotlinCompilerVersion: artifact.Tools.KotlinCompilerVersion,
+		CompileTask:           artifact.Compilation.GradleTask,
+		JDKVendor:             artifact.Tools.JDKVendor,
+		JDKVersion:            artifact.Tools.JDKVersion,
+		Project:               artifact.Compilation.GradleProject,
+		Compilation:           artifact.Compilation.KotlinCompilation,
+		SourceRoots:           roots,
 	}
 	for _, dependency := range artifact.Evidence.Dependencies {
 		model.Dependencies = append(model.Dependencies, dependency.Coordinate)
