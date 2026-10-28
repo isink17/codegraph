@@ -13,11 +13,10 @@ import (
 	"github.com/isink17/codegraph/internal/githistory/gittest"
 )
 
-// TestGoUnmodeledDeclarationChangeMatrix pins that a Go declaration change the
-// graph has no declaration for (a struct field, an interface method, a
-// constant's value or type) is never a silent no_risk_evidence, while
-// comments, formatting and function bodies add no uncertainty. The score
-// stays evidence-only: such a change is limited_evidence at score 0.
+// TestGoUnmodeledDeclarationChangeMatrix pins that Go changes the graph does
+// not model (declaration internals and function bodies) are never silent
+// no_risk_evidence, while comments and formatting remain quiet. The score
+// stays evidence-only: these changes are limited_evidence at score 0.
 func TestGoUnmodeledDeclarationChangeMatrix(t *testing.T) {
 	const lib = `package p
 
@@ -66,6 +65,7 @@ func Main() {
 	cases := []struct {
 		name, from, to string
 		unmodeled      string
+		body           string
 	}{
 		{name: "field removed", from: "\tY int\n", to: "", unmodeled: "type Base"},
 		{name: "field type changed", from: "\tY int\n", to: "\tY string\n", unmodeled: "type Base"},
@@ -85,7 +85,10 @@ func Main() {
 		{name: "reformatted", from: "type Base struct {\n\tX int\n\tY int\n}", to: "type Base struct{ X int; Y int }"},
 		{name: "trailing comma", from: "[]int{1, 2}", to: "[]int{\n\t1,\n\t2,\n}"},
 		{name: "var value changed", from: "[]int{1, 2}", to: "[]int{1, 3}", unmodeled: "var Defaults"},
-		{name: "body only", from: "return b.X + b.Y + Limit", to: "return b.Y + b.X + Limit"},
+		{name: "body only", from: "return b.X + b.Y + Limit", to: "return b.Y + b.X + Limit", body: "func Use"},
+		{name: "body compile break", from: "return b.X + b.Y + Limit", to: `return "broken"`, body: "func Use"},
+		{name: "body comment only", from: "return b.X + b.Y + Limit", to: "return b.X /* harmless */ + b.Y + Limit"},
+		{name: "body formatting only", from: "return b.X + b.Y + Limit", to: "return b.X +\n\t\tb.Y + Limit"},
 	}
 	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.22\n", "p/lib.go": lib, "p/use.go": caller}
 	docs := map[string]map[string]string{}
@@ -101,20 +104,30 @@ func Main() {
 						r.Write("p/lib.go", strings.Replace(lib, tc.from, tc.to, 1))
 					}).Diff
 					var got []string
+					var body []string
 					for _, u := range d.Risk.Uncertainty {
 						if u.Reason == "go_declaration_change_unmodeled" && u.Identity == "p/lib.go" {
 							got = append(got, u.Detail)
+						}
+						if u.Reason == "go_function_body_change_unmodeled" && u.Identity == "p/lib.go" {
+							body = append(body, u.Detail)
 						}
 					}
 					if strings.Join(got, "|") != tc.unmodeled {
 						t.Fatalf("unmodeled = %v, want %q; risk %s", got, tc.unmodeled, canonical(d.Risk))
 					}
+					if strings.Join(body, "|") != tc.body {
+						t.Fatalf("body uncertainty = %v, want %q; risk %s", body, tc.body, canonical(d.Risk))
+					}
 					want := "no_risk_evidence"
-					if tc.unmodeled != "" {
+					if tc.unmodeled != "" || tc.body != "" {
 						want = "limited_evidence"
 					}
 					if d.Risk.Assessment != want || d.Risk.Score == nil || *d.Risk.Score != 0 {
 						t.Fatalf("assessment %s score %v, want %s at 0: %s", d.Risk.Assessment, d.Risk.Score, want, canonical(d.Risk))
+					}
+					if tc.name == "body compile break" && (d.Total != 1 || d.Summary["files_modified"] != 1) {
+						t.Fatalf("body compile break unexpectedly changed semantic graph: total=%d summary=%v", d.Total, d.Summary)
 					}
 					docs[name][tc.name] = canonical(d)
 				})
@@ -127,6 +140,23 @@ func Main() {
 				t.Errorf("%s: adapters disagree:\n go/ast:      %s\n tree-sitter: %s", tc.name, a, b)
 			}
 		}
+	}
+}
+
+func TestGoShapesKeepFunctionBodySeparateFromDeclarationShape(t *testing.T) {
+	base, ok := goShapes([]byte("package p\nfunc F() int { return 1 }\n"))
+	if !ok {
+		t.Fatal("base parse failed")
+	}
+	head, ok := goShapes([]byte("package p\nfunc F() int { /* comment */ return \"broken\" }\n"))
+	if !ok {
+		t.Fatal("head parse failed")
+	}
+	if !sameShapes(base["func F"], head["func F"]) {
+		t.Fatal("function body entered declaration shape")
+	}
+	if base["func F"][0].body == head["func F"][0].body {
+		t.Fatal("function body change was not retained for uncertainty analysis")
 	}
 }
 

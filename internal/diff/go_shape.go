@@ -24,6 +24,8 @@ type goShape struct {
 	name               string
 	startLine, endLine int
 	tokens             string
+	body               string
+	hasBody            bool
 }
 
 // goShapes keys every top-level declaration of a Go file except imports:
@@ -46,8 +48,8 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 		return goTokens(content[tf.Offset(n.Pos()):tf.Offset(n.End())])
 	}
 	out := map[string][]goShape{}
-	add := func(key, name string, from, to token.Pos, tokens string) {
-		out[key] = append(out[key], goShape{name: name, startLine: fset.Position(from).Line, endLine: fset.Position(to).Line, tokens: tokens})
+	add := func(key, name string, from, to token.Pos, tokens, body string, hasBody bool) {
+		out[key] = append(out[key], goShape{name: name, startLine: fset.Position(from).Line, endLine: fset.Position(to).Line, tokens: tokens, body: body, hasBody: hasBody})
 	}
 	for _, d := range f.Decls {
 		switch d := d.(type) {
@@ -59,7 +61,12 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 			if d.Body != nil {
 				end = d.Body.Pos()
 			}
-			add(key, d.Name.Name, d.Pos(), end, goTokens(content[tf.Offset(d.Pos()):tf.Offset(end)]))
+			body := ""
+			hasBody := d.Body != nil
+			if hasBody {
+				body = goTokens(content[tf.Offset(d.Body.Pos()):tf.Offset(d.Body.End())])
+			}
+			add(key, d.Name.Name, d.Pos(), end, goTokens(content[tf.Offset(d.Pos()):tf.Offset(end)]), body, hasBody)
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				continue
@@ -69,7 +76,7 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 			for index, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
-					add("type "+s.Name.Name, s.Name.Name, s.Pos(), s.End(), src(s))
+					add("type "+s.Name.Name, s.Name.Name, s.Pos(), s.End(), src(s), "", false)
 				case *ast.ValueSpec:
 					if d.Tok == token.VAR || s.Type != nil || len(s.Values) > 0 {
 						typ, values = s.Type, s.Values
@@ -90,7 +97,7 @@ func goShapes(content []byte) (map[string][]goShape, bool) {
 						if d.Tok == token.CONST && strings.Contains(" "+value+" ", " iota ") {
 							shape = "iota#" + strconv.Itoa(index) + " " + shape
 						}
-						add(d.Tok.String()+" "+n.Name, n.Name, s.Pos(), s.End(), shape)
+						add(d.Tok.String()+" "+n.Name, n.Name, s.Pos(), s.End(), shape, "", false)
 					}
 				}
 			}
@@ -130,12 +137,10 @@ func goTokens(src []byte) string {
 	return strings.Join(toks, " ")
 }
 
-// goUnmodeledUncertainty reports Go declarations whose shape changed in a
-// modified file while no base declaration of the same name inside them was
-// removed or changed: struct fields, interface methods, constant values and
-// types are no declarations of their own, so such a change would otherwise
-// look like no change at all. An added declaration models nothing about the
-// base one. Bodies of func declarations are left to the edge comparison.
+// goUnmodeledUncertainty reports Go source changes the graph does not model.
+// Declaration shape changes cover struct fields, interface methods and
+// constants; function bodies need their own uncertainty because edges do not
+// describe type checking or execution inside a body.
 func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete map[string]bool) []RiskUncertainty {
 	var modeled []store.SemanticDeclaration
 	for _, c := range changes {
@@ -188,6 +193,15 @@ func goUnmodeledUncertainty(changes []Change, base, head Revision, incomplete ma
 		}
 		if !sameGoImports(bb, hb) {
 			out = append(out, RiskUncertainty{Reason: "go_import_change_unmodeled", Identity: c.Identity})
+		}
+		for key, x := range bs {
+			if !strings.HasPrefix(key, "func ") || len(x) != 1 {
+				continue
+			}
+			y := hs[key]
+			if len(y) == 1 && (x[0].hasBody != y[0].hasBody || x[0].body != y[0].body) {
+				out = append(out, RiskUncertainty{Reason: "go_function_body_change_unmodeled", Identity: c.Identity, Detail: key})
+			}
 		}
 		for key, x := range bs {
 			y, ok := hs[key]

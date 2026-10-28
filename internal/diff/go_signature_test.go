@@ -44,8 +44,9 @@ func Use() {
 		newCaller      string
 		before, after  string
 		dependent      bool
+		bodyChange     bool
 	}{
-		{name: "body only", from: "return a, nil", to: "return a + 1, nil"},
+		{name: "body only", from: "return a, nil", to: "return a + 1, nil", bodyChange: true},
 		{name: "param added", from: "Target(a int, s string)", to: "Target(a int, s string, upper bool)",
 			before: "func Target(a int, s string) (int, error)", after: "func Target(a int, s string, upper bool) (int, error)", dependent: true},
 		{name: "param removed", from: "Target(a int, s string)", to: "Target(a int)",
@@ -84,7 +85,14 @@ func Use() {
 					d := got.Diff
 					removed, added := signatures(t, d.Symbols.Removed, "before"), signatures(t, d.Symbols.Added, "after")
 					if tc.before == "" {
-						if len(removed)+len(added)+len(d.Symbols.Changed) != 0 || d.Risk.Assessment != "no_risk_evidence" {
+						want := AssessmentNoRiskEvidence
+						if tc.bodyChange {
+							want = AssessmentLimitedEvidence
+							if !hasUncertainty(d.Risk, "go_function_body_change_unmodeled", "p/lib.go") {
+								t.Fatalf("body-only edit omitted uncertainty: %s", canonical(d.Risk))
+							}
+						}
+						if len(removed)+len(added)+len(d.Symbols.Changed) != 0 || d.Risk.Assessment != want {
 							t.Fatalf("unchanged signature: removed %v, added %v, risk %s", removed, added, canonical(d.Risk))
 						}
 					} else if strings.Join(removed, "|") != tc.before || strings.Join(added, "|") != tc.after {
@@ -141,8 +149,9 @@ func Use() {
 		callerTo       string
 		before, after  string
 		unscored       bool
+		bodyChange     bool
 	}{
-		{name: "body only", from: "return x }", to: "return (x) }"},
+		{name: "body only", from: "return x }", to: "return (x) }", bodyChange: true},
 		{name: "constraint changed", from: "Id[T any]", to: "Id[T ~int]",
 			before: "func Id[T any](x T) T", after: "func Id[T ~int](x T) T"},
 		{name: "parameter added", from: "Id[T any](x T) T", to: "Id[T any, U any](x T) T",
@@ -183,7 +192,14 @@ func Use() {
 					d := editScenario(t, adapter, files, edit).Diff
 					removed, added := signatures(t, d.Symbols.Removed, "before"), signatures(t, d.Symbols.Added, "after")
 					if tc.before == "" {
-						if len(removed)+len(added)+len(d.Symbols.Changed) != 0 || d.Risk.Assessment != "no_risk_evidence" {
+						want := AssessmentNoRiskEvidence
+						if tc.bodyChange {
+							want = AssessmentLimitedEvidence
+							if !hasUncertainty(d.Risk, "go_function_body_change_unmodeled", "p/lib.go") {
+								t.Fatalf("body-only edit omitted uncertainty: %s", canonical(d.Risk))
+							}
+						}
+						if len(removed)+len(added)+len(d.Symbols.Changed) != 0 || d.Risk.Assessment != want {
 							t.Fatalf("unchanged signature: removed %v, added %v, risk %s", removed, added, canonical(d.Risk))
 						}
 					} else {

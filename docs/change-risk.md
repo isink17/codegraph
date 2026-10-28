@@ -22,6 +22,12 @@ change lists but never change `risk`.
 - A changed Go import binding is reported as `go_import_change_unmodeled`
   uncertainty. Import order and literal quoting alone do not trigger it; the
   numerical score remains based on resolved edges.
+- A changed Go function or method body is reported as
+  `go_function_body_change_unmodeled` uncertainty when its declaration remains
+  uniquely pairable. Diff does not type-check or execute Go bodies; a body edit
+  can break compilation without changing the declaration or recorded call
+  edges. Comments and formatting alone do not trigger this uncertainty, and
+  the numerical score remains based on resolved edges.
 - Both Go parsers (`treesitter:go:v6`, and `go-ast:go:v6` with
   `CGO_ENABLED=0`) store a function's signature as its source text: receiver,
   type parameter list, parameters and results. A generic type's signature
