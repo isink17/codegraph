@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -44,6 +45,65 @@ func TestDefaultRegistryProfilesAreDeterministic(t *testing.T) {
 			first[i].ParserProfile != second[i].ParserProfile ||
 			first[i].CallEdges != second[i].CallEdges {
 			t.Fatalf("profile %d not deterministic: %#v vs %#v", i, first[i], second[i])
+		}
+	}
+}
+
+func TestDefaultRegistrySnapshotsAreDeterministicAndImmutable(t *testing.T) {
+	registry := newDefaultRegistry()
+	first := registry.Capabilities()
+	second := registry.Capabilities()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("capability snapshots differ:\n%+v\n%+v", first, second)
+	}
+	if len(first) == 0 {
+		t.Fatal("empty production registry")
+	}
+	first[0].ID = "changed"
+	if len(first[0].Extensions) == 0 {
+		t.Fatal("first capability has no extensions")
+	}
+	first[0].Extensions[0] = ".changed"
+	for _, value := range []*bool{
+		first[0].NoCGOParser, first[0].NoCGOCallGraph, first[0].Symbols,
+		first[0].Calls, first[0].CallResolution, first[0].ImportResolution,
+		first[0].TypeResolution,
+	} {
+		if value != nil {
+			*value = !*value
+		}
+	}
+	if again := registry.Capabilities(); !reflect.DeepEqual(second, again) {
+		t.Fatal("mutating snapshot changed registry state")
+	}
+}
+
+func TestProductionRegistryExtensionsAreNormalizedAndDeterministic(t *testing.T) {
+	first := newDefaultRegistry().SupportedLanguages()
+	second := newDefaultRegistry().SupportedLanguages()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("SupportedLanguages() is not deterministic")
+	}
+	registry := newDefaultRegistry()
+	for _, language := range first {
+		if language.Language == "" || language.Language != strings.ToLower(language.Language) ||
+			strings.Trim(language.Language, "abcdefghijklmnopqrstuvwxyz0123456789_-") != "" ||
+			language.Language[0] < 'a' || language.Language[0] > 'z' {
+			t.Errorf("non-normalized language identifier %q", language.Language)
+		}
+		if len(language.Extensions) == 0 {
+			t.Errorf("%s has no registered extensions", language.Language)
+			continue
+		}
+		for _, extension := range language.Extensions {
+			if extension == "" || extension[0] != '.' || extension != strings.ToLower(extension) {
+				t.Errorf("%s has non-normalized extension %q", language.Language, extension)
+			}
+		}
+		for _, extension := range language.Extensions {
+			if got := registry.AdapterFor("fixture" + extension); got == nil || got.Language() != language.Language {
+				t.Errorf("extension %s for %s selected %v", extension, language.Language, got)
+			}
 		}
 	}
 }

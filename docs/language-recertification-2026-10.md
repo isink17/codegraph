@@ -14,6 +14,12 @@ tree-sitter graph is refused when it would discard semantic edges. Resolver and
 type-resolution are not blanket language capabilities: the registry leaves
 those dimensions unknown where it has no explicit proof.
 
+The registry contract tests pin immutable capability snapshots (including
+pointer fields and extension slices), routing for every declared extension,
+normalized language IDs, and the previously supported no-CGO language set.
+Additional languages remain allowed; no-CGO availability is checked against
+the profiles and call-edge behavior of the registered fallback adapters.
+
 | Language | CGO parser profile | CGO capability | no-CGO parser profile | no-CGO capability | Known limits |
 | --- | --- | --- | --- | --- | --- |
 | Go | `treesitter:go:v2` | symbols, calls, imports; bounded lexical/type evidence | `go-ast:go:v2` | symbols and calls | interface dispatch, ambiguous or unsupported return types, and shadowed constructors remain unresolved |

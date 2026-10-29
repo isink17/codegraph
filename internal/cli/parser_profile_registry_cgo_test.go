@@ -15,7 +15,8 @@ var symbolsOnlyCgoLanguages = map[string]bool{}
 // The cgo build parses every supported language with tree-sitter, and all of
 // those adapters except symbolsOnlyCgoLanguages build a call graph.
 func TestCgoRegistryProfiles(t *testing.T) {
-	for _, lang := range newDefaultRegistry().SupportedLanguages() {
+	registry := newDefaultRegistry()
+	for _, lang := range registry.SupportedLanguages() {
 		want := "treesitter:" + lang.Language + ":v1"
 		if lang.Language == "csharp" {
 			want = "treesitter:csharp:v6"
@@ -70,16 +71,23 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		}
 	}
 	want := slices.Sorted(maps.Keys(symbolsOnlyCgoLanguages))
-	if degraded := newDefaultRegistry().DegradedLanguages(); !slices.Equal(degraded, want) {
+	if degraded := registry.DegradedLanguages(); !slices.Equal(degraded, want) {
 		t.Fatalf("DegradedLanguages() = %v, want %v in the cgo build", degraded, want)
 	}
-	for _, capability := range newDefaultRegistry().Capabilities() {
-		if capability.NoCGOParser == nil || !*capability.NoCGOParser {
-			t.Errorf("%s no_cgo_parser = %v, want true", capability.ID, capability.NoCGOParser)
+	availability := noCGOCapabilities()
+	for _, capability := range registry.Capabilities() {
+		available, ok := availability[capability.ID]
+		if !ok {
+			if capability.NoCGOParser != nil || capability.NoCGOCallGraph != nil {
+				t.Errorf("%s unknown no-CGO availability became known", capability.ID)
+			}
+			continue
 		}
-		wantCallGraph := capability.ID == "go" || capability.ID == "python"
-		if capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph != wantCallGraph {
-			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, wantCallGraph)
+		if capability.NoCGOParser == nil || *capability.NoCGOParser != available.Parser {
+			t.Errorf("%s no_cgo_parser = %v, want %v", capability.ID, capability.NoCGOParser, available.Parser)
+		}
+		if capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph != (available.Parser && available.CallGraph) {
+			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, available.Parser && available.CallGraph)
 		}
 	}
 }
