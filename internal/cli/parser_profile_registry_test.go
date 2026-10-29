@@ -60,10 +60,20 @@ func TestDefaultRegistrySnapshotsAreDeterministicAndImmutable(t *testing.T) {
 		t.Fatal("empty production registry")
 	}
 	first[0].ID = "changed"
-	if first[0].Symbols != nil {
-		*first[0].Symbols = false
+	if len(first[0].Extensions) == 0 {
+		t.Fatal("first capability has no extensions")
 	}
-	if again := registry.Capabilities(); reflect.DeepEqual(first, again) {
+	first[0].Extensions[0] = ".changed"
+	for _, value := range []*bool{
+		first[0].NoCGOParser, first[0].NoCGOCallGraph, first[0].Symbols,
+		first[0].Calls, first[0].CallResolution, first[0].ImportResolution,
+		first[0].TypeResolution,
+	} {
+		if value != nil {
+			*value = !*value
+		}
+	}
+	if again := registry.Capabilities(); !reflect.DeepEqual(second, again) {
 		t.Fatal("mutating snapshot changed registry state")
 	}
 }
@@ -76,8 +86,10 @@ func TestProductionRegistryExtensionsAreNormalizedAndDeterministic(t *testing.T)
 	}
 	registry := newDefaultRegistry()
 	for _, language := range first {
-		if language.Language == "" {
-			t.Fatal("empty language identifier")
+		if language.Language == "" || language.Language != strings.ToLower(language.Language) ||
+			strings.Trim(language.Language, "abcdefghijklmnopqrstuvwxyz0123456789_-") != "" ||
+			language.Language[0] < 'a' || language.Language[0] > 'z' {
+			t.Errorf("non-normalized language identifier %q", language.Language)
 		}
 		if len(language.Extensions) == 0 {
 			t.Errorf("%s has no registered extensions", language.Language)
@@ -88,8 +100,10 @@ func TestProductionRegistryExtensionsAreNormalizedAndDeterministic(t *testing.T)
 				t.Errorf("%s has non-normalized extension %q", language.Language, extension)
 			}
 		}
-		if got := registry.AdapterFor("fixture" + language.Extensions[0]); got == nil || got.Language() != language.Language {
-			t.Errorf("extension selection for %s yielded %v", language.Language, got)
+		for _, extension := range language.Extensions {
+			if got := registry.AdapterFor("fixture" + extension); got == nil || got.Language() != language.Language {
+				t.Errorf("extension %s for %s selected %v", extension, language.Language, got)
+			}
 		}
 	}
 }
