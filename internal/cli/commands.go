@@ -84,13 +84,13 @@ func newCommandList() []*command {
 	return []*command{
 		{
 			name:        "export-gradle-evidence",
-			description: "explicitly inspect one Kotlin/JVM Gradle compilation",
+			description: "explicitly run and inspect one Kotlin/JVM Gradle compilation; existing build outputs are not cleaned",
 			usageLines:  []string{"  export-gradle-evidence --repo-root PATH --gradle PATH --project :path --compilation main --output FILE"},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "Gradle repository root"},
 				{name: "--gradle PATH", description: "explicit Gradle executable to run"},
 				{name: "--project PATH", description: "selected Gradle project path, such as :app"},
-				{name: "--compilation NAME", description: "selected Kotlin/JVM compilation"},
+				{name: "--compilation NAME", description: "selected Kotlin/JVM compilation task to run and inspect"},
 				{name: "--output FILE", description: "new artifact path outside the repository (parent directory must exist)"},
 			},
 			examples: []string{"codegraph export-gradle-evidence --repo-root . --gradle /opt/gradle/bin/gradle --project :app --compilation main --output /tmp/kotlin-evidence.json"},

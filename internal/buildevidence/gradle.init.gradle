@@ -1,44 +1,204 @@
 import groovy.json.JsonOutput
+import java.security.MessageDigest
+
+def digestFile = { File file ->
+    def digest = MessageDigest.getInstance('SHA-256')
+    file.withInputStream { input ->
+        byte[] buffer = new byte[65536]
+        int count
+        while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count)
+    }
+    digest.digest().encodeHex().toString()
+}
+
+def inputInventory = { org.gradle.api.Task task ->
+    def hashes = []
+    def candidates = []
+    long totalBytes = 0
+    boolean complete = true
+    def files = task.inputs.files.asFileTree.files.findAll { it.isFile() }.sort { a, b -> a.path <=> b.path }
+    if (files.size() > 10000) complete = false
+    files.take(10000).each { File file ->
+        totalBytes += file.length()
+        if (totalBytes > (1024L * 1024L * 1024L)) {
+            complete = false
+            return
+        }
+        try {
+            def sha = digestFile(file)
+            hashes.add(sha)
+            if (file.name ==~ /(?i)kotlin-(compiler|daemon|build-tools|scripting|reflect|stdlib)(-.+)?\.jar/) {
+                candidates.add([name: file.name, sha256: sha])
+            }
+        } catch (Throwable ignored) {
+            complete = false
+        }
+    }
+    hashes.sort()
+    candidates.sort { a, b -> a.name == b.name ? a.sha256 <=> b.sha256 : a.name <=> b.name }
+    [sha256: hashes, compiler_artifacts: candidates, complete: complete]
+}
+
+def outputRootState = { org.gradle.api.Task task ->
+    def root = gradle.rootProject.projectDir.canonicalFile.toPath()
+    def roots = [] as Set
+    boolean contained = true
+    boolean clean = true
+    task.outputs.files.files.each { File output ->
+        def canonical = output.canonicalFile.toPath()
+        if (!canonical.startsWith(root)) {
+            contained = false
+            clean = false
+            return
+        }
+        roots.add(root.relativize(canonical).toString().replace(File.separator, '/'))
+        if (output.isFile()) {
+            clean = false
+        } else if (output.isDirectory()) {
+            output.eachFileRecurse(groovy.io.FileType.FILES) { File file -> clean = false }
+        }
+    }
+    [roots: roots.toList().sort(), contained: contained, clean: clean && !roots.isEmpty()]
+}
+
+gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
+    void beforeExecute(org.gradle.api.Task task) {
+        def selectedPath = gradle.rootProject.extensions.extraProperties.has('cg35.selected.task') ?
+            gradle.rootProject.extensions.extraProperties.get('cg35.selected.task') : ''
+        if (task.path == selectedPath) {
+            gradle.rootProject.extensions.extraProperties.set('cg35.task.inputs.before', inputInventory(task))
+            gradle.rootProject.extensions.extraProperties.set('cg35.task.outputs.before', outputRootState(task))
+        }
+    }
+    void afterExecute(org.gradle.api.Task task, org.gradle.api.tasks.TaskState state) {
+        def selectedPath = gradle.rootProject.extensions.extraProperties.has('cg35.selected.task') ?
+            gradle.rootProject.extensions.extraProperties.get('cg35.selected.task') : ''
+        if (task.path != selectedPath) return
+
+        def skipReason = ''
+        def outcome
+        if (state.failure != null) {
+            outcome = 'FAILED'
+        } else if (state.skipped) {
+            def raw = state.skipMessage ?: ''
+            if (raw.contains('FROM-CACHE')) { outcome = 'FROM_CACHE'; skipReason = 'FROM_CACHE' }
+            else if (raw.contains('UP-TO-DATE')) { outcome = 'UP_TO_DATE'; skipReason = 'UP_TO_DATE' }
+            else if (raw.contains('NO-SOURCE')) { outcome = 'NO_SOURCE'; skipReason = 'NO_SOURCE' }
+            else { outcome = 'SKIPPED'; skipReason = 'SKIPPED' }
+        } else if (state.didWork) {
+            outcome = 'TASK_REPORTED_WORK'
+        } else {
+            outcome = 'COMPLETED_NO_WORK'
+        }
+
+        def root = gradle.rootProject.projectDir.canonicalFile.toPath()
+        def outputFiles = []
+        def outputRoots = [] as Set
+        def outputsContained = true
+        boolean outputsComplete = true
+        def classFiles = [] as Set
+        task.outputs.files.files.each { File output ->
+            def canonical = output.canonicalFile.toPath()
+            if (!canonical.startsWith(root)) {
+                outputsContained = false
+                return
+            }
+            outputRoots.add(root.relativize(canonical).toString().replace(File.separator, '/'))
+            if (output.isDirectory()) {
+                output.eachFileRecurse(groovy.io.FileType.FILES) { File file ->
+                    if (file.name.endsWith('.class')) classFiles.add(file.canonicalFile)
+                }
+            } else if (output.isFile() && output.name.endsWith('.class')) {
+                classFiles.add(output.canonicalFile)
+            }
+        }
+        long outputBytes = 0
+        if (classFiles.size() > 10000) outputsComplete = false
+        classFiles.take(10000).each { File file ->
+            outputBytes += file.length()
+            if (outputBytes > (1024L * 1024L * 1024L)) {
+                outputsComplete = false
+                return
+            }
+            def canonical = file.toPath()
+            if (!canonical.startsWith(root)) {
+                outputsContained = false
+            } else {
+                outputFiles.add([path: root.relativize(canonical).toString().replace(File.separator, '/'), sha256: digestFile(file)])
+            }
+        }
+        outputFiles.sort { a, b -> a.path <=> b.path }
+
+        def inputBefore = gradle.rootProject.extensions.extraProperties.has('cg35.task.inputs.before') ?
+            gradle.rootProject.extensions.extraProperties.get('cg35.task.inputs.before') : [sha256: [], compiler_artifacts: [], complete: false]
+        def inputAfter = inputInventory(task)
+        boolean taskInputsStable = inputBefore.complete && inputAfter.complete &&
+            inputBefore.sha256 == inputAfter.sha256 &&
+            JsonOutput.toJson(inputBefore.compiler_artifacts) == JsonOutput.toJson(inputAfter.compiler_artifacts)
+        def outputBefore = gradle.rootProject.extensions.extraProperties.has('cg35.task.outputs.before') ?
+            gradle.rootProject.extensions.extraProperties.get('cg35.task.outputs.before') : [roots: [], contained: false, clean: false]
+        boolean outputRootsClean = outputBefore.clean && outputBefore.contained && outputsContained &&
+            JsonOutput.toJson(outputBefore.roots) == JsonOutput.toJson(outputRoots.toList().sort())
+        def jvmTarget = ''
+        try { jvmTarget = task.compilerOptions.jvmTarget.orNull?.toString() ?: '' } catch (Throwable ignored) {}
+        def selectedToolchainVersion = ''
+        try {
+            def candidate = task.kotlinJavaToolchain.javaVersion?.toString() ?: ''
+            if (candidate ==~ /\d+(\.\d+)*/) selectedToolchainVersion = candidate
+        } catch (Throwable ignored) {}
+        def observation = [
+            task_outcome: outcome,
+            task_did_work: state.didWork,
+            task_skipped: state.skipped,
+            skip_reason_code: skipReason,
+            task_input_sha256: inputBefore.sha256,
+            compiler_artifact_candidates: inputBefore.compiler_artifacts,
+            output_files: outputFiles,
+            output_roots: outputRoots.toList().sort(),
+            output_roots_clean_before_task: outputRootsClean,
+            outputs_complete: outputsComplete,
+            jvm_target: jvmTarget,
+            selected_toolchain_version: selectedToolchainVersion,
+            task_inputs_complete: inputBefore.complete && inputAfter.complete,
+            task_inputs_stable: taskInputsStable,
+            outputs_contained: outputsContained
+        ]
+        gradle.rootProject.extensions.extraProperties.set('cg35.task.observation', observation)
+    }
+})
 
 gradle.projectsEvaluated {
-    gradle.rootProject.tasks.register('codegraphExportEvidence') {
-        doLast {
-            def props = gradle.startParameter.projectProperties
-            def projectPath = props.get('cg35.project')
-            def compilationName = props.get('cg35.compilation')
-            def outputPath = props.get('cg35.output')
-            if (!projectPath || !compilationName || !outputPath) {
-                throw new GradleException('CodeGraph evidence selection is incomplete')
-            }
+    def props = gradle.startParameter.projectProperties
+    def projectPath = props.get('cg35.project')
+    def compilationName = props.get('cg35.compilation')
+    def outputPath = props.get('cg35.output')
+    if (!projectPath || !compilationName || !outputPath) {
+        throw new GradleException('CodeGraph evidence selection is incomplete')
+    }
 
-            def project = gradle.rootProject.findProject(projectPath)
-            if (project == null) {
-                throw new GradleException("Selected Gradle project does not exist: ${projectPath}")
-            }
-            def kotlin = project.extensions.findByName('kotlin')
-            def target = kotlin?.target
-            if (target == null || !target.hasProperty('compilations')) {
-                throw new GradleException('This producer currently supports Kotlin/JVM projects only')
-            }
-            def compilation = target.compilations.findByName(compilationName)
-            if (compilation == null) {
-                throw new GradleException("Selected Kotlin/JVM compilation does not exist: ${compilationName}")
-            }
-            def compileTask = project.tasks.findByName(compilation.compileKotlinTaskName)
-            if (compileTask == null) {
-                throw new GradleException('Selected Kotlin/JVM compilation has no compile task')
-            }
+    def project = gradle.rootProject.findProject(projectPath)
+    if (project == null) throw new GradleException("Selected Gradle project does not exist: ${projectPath}")
+    def kotlin = project.extensions.findByName('kotlin')
+    def target = kotlin?.target
+    if (target == null || !target.hasProperty('compilations')) {
+        throw new GradleException('This producer currently supports Kotlin/JVM projects only')
+    }
+    def compilation = target.compilations.findByName(compilationName)
+    if (compilation == null) throw new GradleException("Selected Kotlin/JVM compilation does not exist: ${compilationName}")
+    def compileTask = project.tasks.findByName(compilation.compileKotlinTaskName)
+    if (compileTask == null) throw new GradleException('Selected Kotlin/JVM compilation has no compile task')
+    gradle.rootProject.extensions.extraProperties.set('cg35.selected.task', compileTask.path)
+
+    gradle.rootProject.tasks.register('codegraphExportEvidence') { exportTask ->
+        exportTask.dependsOn(compileTask)
+        exportTask.doLast {
             // shortcut: Kotlin Gradle Plugin 2.3 exposes this task property; update the pinned fixture before changing plugin versions.
-            def compilerVersionProperties = compileTask.properties.findAll {
-                it.key.startsWith('kotlinCompilerVersion$')
-            }
+            def compilerVersionProperties = compileTask.properties.findAll { it.key.startsWith('kotlinCompilerVersion$') }
             if (compilerVersionProperties.size() != 1) {
                 throw new GradleException('Selected Kotlin compiler version is unavailable or ambiguous')
             }
             def compilerVersion = compilerVersionProperties.values().first().get()?.toString()
-            if (!compilerVersion) {
-                throw new GradleException('Selected Kotlin compiler version is empty')
-            }
+            if (!compilerVersion) throw new GradleException('Selected Kotlin compiler version is empty')
 
             def sourceRoots = compilation.allKotlinSourceSets
                 .collectMany { it.kotlin.sourceDirectories.files }
@@ -53,18 +213,22 @@ gradle.projectsEvaluated {
             def kotlinPlugin = project.plugins.find {
                 it.class.name == 'org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper'
             }
+            def observation = gradle.rootProject.extensions.extraProperties.has('cg35.task.observation') ?
+                gradle.rootProject.extensions.extraProperties.get('cg35.task.observation') : [:]
+            if (!observation) throw new GradleException('Selected Kotlin compile task outcome was not observed')
             def model = [
                 gradle_version: gradle.gradleVersion,
                 kotlin_plugin_version: kotlinPlugin?.class?.package?.implementationVersion ?: '',
                 kotlin_compiler_version: compilerVersion,
                 compile_task: compileTask.path,
-                jdk_vendor: System.getProperty('java.vendor') ?: '',
-                jdk_version: System.getProperty('java.version') ?: '',
+                gradle_runtime_jdk_vendor: System.getProperty('java.vendor') ?: '',
+                gradle_runtime_jdk_version: System.getProperty('java.version') ?: '',
+                selected_toolchain_vendor: '',
                 project: projectPath,
                 compilation: compilationName,
                 source_roots: sourceRoots,
                 dependencies: dependencies
-            ]
+            ] + observation
             new File(outputPath).setText(JsonOutput.toJson(model), 'UTF-8')
         }
     }
