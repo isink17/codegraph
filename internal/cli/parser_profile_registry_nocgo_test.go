@@ -33,6 +33,17 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"cpp":        {"heuristic:cpp:v1", false},
 	}
 	registry := newDefaultRegistry()
+	if availability, ok := noCGOCapabilities()["solidity"]; !ok || availability.Parser || availability.CallGraph {
+		t.Fatalf("no-CGO Solidity availability = %+v, registered = %v; want explicitly unavailable", availability, ok)
+	}
+	if adapter := registry.AdapterFor("contracts/Token.sol"); adapter != nil {
+		t.Fatalf("no-CGO .sol adapter = %v, want unavailable", adapter)
+	}
+	for _, capability := range registry.Capabilities() {
+		if capability.ID == "solidity" {
+			t.Fatalf("no-CGO registry advertised Solidity: %+v", capability)
+		}
+	}
 	got := registry.SupportedLanguages()
 	seen := make(map[string]bool, len(got))
 	for _, lang := range got {
@@ -59,6 +70,12 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 	}
 	availability := noCGOCapabilities()
 	for language, available := range availability {
+		if language == "solidity" {
+			if available.Parser || available.CallGraph || registry.AdapterFor("contracts/Token.sol") != nil {
+				t.Errorf("Solidity no-CGO state = %+v, adapter = %v; want explicitly unavailable", available, registry.AdapterFor("contracts/Token.sol"))
+			}
+			continue
+		}
 		profile, registered := registry.ProfileForLanguage(language)
 		if !registered || !available.Parser || available.CallGraph != profile.EmitsCallEdges {
 			t.Errorf("no-CGO availability for %s = %+v, registered profile = %+v (%v)", language, available, profile, registered)

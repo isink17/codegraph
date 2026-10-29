@@ -13,5 +13,6 @@ func noCGOCapabilities() map[string]parser.NoCGOCapability {
 		"java": {Parser: true}, "kotlin": {Parser: true}, "php": {Parser: true},
 		"python": {Parser: true, CallGraph: true}, "ruby": {Parser: true},
 		"rust": {Parser: true}, "scala": {Parser: true}, "swift": {Parser: true}, "typescript": {Parser: true},
+		"solidity": {Parser: false, CallGraph: false},
 	}
 }

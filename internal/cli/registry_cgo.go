@@ -24,6 +24,7 @@ func newDefaultRegistry() *parser.Registry {
 		tsparser.NewScala(),
 		tsparser.NewHCL(),
 		tsparser.NewDart(),
+		tsparser.NewSolidity(),
 	)
 	r.SetNoCGOCapabilities(noCGOCapabilities())
 	return r

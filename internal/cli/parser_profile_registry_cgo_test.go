@@ -10,7 +10,7 @@ import (
 
 // symbolsOnlyCgoLanguages are the tree-sitter adapters that deliberately build
 // no call graph; every other cgo adapter does.
-var symbolsOnlyCgoLanguages = map[string]bool{}
+var symbolsOnlyCgoLanguages = map[string]bool{"solidity": true}
 
 // The cgo build parses every supported language with tree-sitter, and all of
 // those adapters except symbolsOnlyCgoLanguages build a call graph.
@@ -60,6 +60,9 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		if lang.Language == "scala" {
 			want = "treesitter:scala:v4"
 		}
+		if lang.Language == "solidity" {
+			want = "treesitter:solidity:v1"
+		}
 		if lang.Language == "swift" {
 			want = "treesitter:swift:v7"
 		}
@@ -75,6 +78,27 @@ func TestCgoRegistryProfiles(t *testing.T) {
 		t.Fatalf("DegradedLanguages() = %v, want %v in the cgo build", degraded, want)
 	}
 	availability := noCGOCapabilities()
+	if adapter := registry.AdapterFor("contracts/Token.sol"); adapter == nil || adapter.Language() != "solidity" {
+		t.Fatalf(".sol adapter = %v, want Solidity", adapter)
+	}
+	capabilityFound := false
+	for _, capability := range registry.Capabilities() {
+		if capability.ID != "solidity" {
+			continue
+		}
+		capabilityFound = true
+		if capability.DisplayName != "Solidity" || !slices.Contains(capability.Extensions, ".sol") || capability.ParserProfile != "treesitter:solidity:v1" || capability.Calls == nil || *capability.Calls || capability.Symbols == nil || !*capability.Symbols || capability.NoCGOParser == nil || *capability.NoCGOParser || capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph {
+			t.Fatalf("Solidity capability = %+v", capability)
+		}
+	}
+	if !capabilityFound {
+		t.Fatal("Solidity capability was not reported")
+	}
+	for _, collision := range registry.ExtensionCollisions() {
+		if collision.Extension == ".sol" {
+			t.Fatalf(".sol extension collision = %+v", collision)
+		}
+	}
 	for _, capability := range registry.Capabilities() {
 		available, ok := availability[capability.ID]
 		if !ok {

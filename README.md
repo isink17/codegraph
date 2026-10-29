@@ -58,7 +58,7 @@ git diff --name-only | codegraph find_related_tests --stdin
 
 ## Supported languages
 
-Go, Python, TypeScript, JavaScript, Java, Kotlin, Rust, C#, Ruby, Swift, PHP and C/C++, with conservative support for Dart, Scala, Lua and HCL/Terraform. Call resolution uses partial static models per language; [language scope models](docs/scope-models.md) list what each resolves and leaves unresolved. Builds without CGO keep call edges only for Go and Python.
+Go, Python, TypeScript, JavaScript, Java, Kotlin, Rust, C#, Ruby, Swift, PHP and C/C++, with conservative support for Dart, Scala, Lua and HCL/Terraform. CGO builds also provide Solidity syntax indexing: declarations and unbound syntax references, with no call resolution; Solidity is unavailable without CGO. Call resolution uses partial static models per language; [language scope models](docs/scope-models.md) list what each resolves and leaves unresolved. Builds without CGO keep call edges only for Go and Python.
 
 ## Documentation
 
