@@ -175,6 +175,22 @@ func TestSolidityImportPathsAcceptBothQuoteStyles(t *testing.T) {
 	}
 }
 
+func TestSolidityStringLiteralEscapes(t *testing.T) {
+	for literal, want := range map[string]string{
+		`'./Token\x2esol'`:   `./Token.sol`,
+		`"./Vault\u002esol"`: `./Vault.sol`,
+	} {
+		if got, ok := solidityStringLiteral(literal); !ok || got != want {
+			t.Errorf("solidityStringLiteral(%q) = %q, %v; want %q, true", literal, got, ok, want)
+		}
+	}
+	for _, literal := range []string{`'./Token\q.sol'`, `"./Vault\x2.sol"`, `'./Token\uD800.sol'`} {
+		if got, ok := solidityStringLiteral(literal); ok {
+			t.Errorf("solidityStringLiteral(%q) = %q, true; want undecodable", literal, got)
+		}
+	}
+}
+
 func TestSolidityCallsStayUnresolvedAndMalformedSourceRecovers(t *testing.T) {
 	adapter := NewSolidity()
 	parsed, err := adapter.Parse(context.Background(), "contracts/Caller.sol", []byte(`contract Caller {
