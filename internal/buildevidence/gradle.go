@@ -319,7 +319,9 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 }
 
 func validateOutputContent(root string, proof Proof) error {
+	expected := make(map[string]struct{}, len(proof.OutputFiles))
 	for _, output := range proof.OutputFiles {
+		expected[filepath.Clean(filepath.FromSlash(output.Path))] = struct{}{}
 		abs := filepath.Join(root, filepath.FromSlash(output.Path))
 		if _, inside := relativeWithin(root, abs); !inside {
 			return fmt.Errorf("selected output escapes repository: %q", output.Path)
@@ -346,6 +348,63 @@ func validateOutputContent(root string, proof Proof) error {
 		}
 		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
 			return fmt.Errorf("build evidence is stale: selected output content changed: %q", output.Path)
+		}
+	}
+	observed := make(map[string]struct{}, len(expected))
+	for _, outputRoot := range proof.OutputRoots {
+		absRoot := filepath.Join(root, filepath.FromSlash(outputRoot))
+		resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+		if err != nil {
+			return fmt.Errorf("build evidence is stale: selected output root is unavailable: %q: %w", outputRoot, err)
+		}
+		if _, inside := relativeWithin(root, resolvedRoot); !inside {
+			return fmt.Errorf("build evidence is stale: selected output root symlink escapes repository: %q", outputRoot)
+		}
+		err = filepath.WalkDir(resolvedRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				target, err := filepath.EvalSymlinks(name)
+				if err != nil {
+					return fmt.Errorf("resolve selected output symlink %q: %w", name, err)
+				}
+				if _, inside := relativeWithin(root, target); !inside {
+					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", name)
+				}
+				info, err := os.Stat(target)
+				if err != nil {
+					return err
+				}
+				if !info.Mode().IsRegular() || !strings.HasSuffix(name, ".class") {
+					return nil
+				}
+			} else if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".class") {
+				return nil
+			}
+			rel, err := filepath.Rel(root, name)
+			if err != nil {
+				return err
+			}
+			key := filepath.Clean(rel)
+			observed[key] = struct{}{}
+			if _, ok := expected[key]; !ok {
+				return fmt.Errorf("build evidence is stale: unrecorded class output exists: %q", filepath.ToSlash(rel))
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if len(observed) != len(expected) {
+		for output := range expected {
+			if _, ok := observed[output]; !ok {
+				return fmt.Errorf("build evidence is stale: recorded class output is no longer under an output root: %q", filepath.ToSlash(output))
+			}
 		}
 	}
 	return nil

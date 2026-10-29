@@ -158,6 +158,15 @@ func TestV2FingerprintBindsTaskProofAndOutputBytes(t *testing.T) {
 		t.Fatalf("changed compiler artifact identity accepted: %v", err)
 	}
 
+	if err := os.WriteFile(filepath.Join(filepath.Dir(outputPath), "Added.class"), []byte("new-class-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "unrecorded class output") {
+		t.Fatalf("added class output was not detected: %v", err)
+	}
+	if err := os.Remove(filepath.Join(filepath.Dir(outputPath), "Added.class")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(outputPath, []byte("tampered-class-bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
