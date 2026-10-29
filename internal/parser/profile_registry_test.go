@@ -33,6 +33,56 @@ func profiled(language, ext, id string) Adapter {
 	return &profiledStub{stubAdapter{language: language, ext: ext, profile: Profile{ID: id, EmitsCallEdges: true}}}
 }
 
+// syntheticAdapter is a complete test-only adapter used to pin the public
+// registry contract without registering a production language.
+type syntheticAdapter struct{}
+
+func (syntheticAdapter) Language() string { return "lp2synthetic" }
+func (syntheticAdapter) Supports(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".syn")
+}
+func (syntheticAdapter) Extensions() []string { return []string{" SYN ", ".syn"} }
+func (syntheticAdapter) Profile() Profile {
+	return Profile{ID: "synthetic:lp2synthetic:v1", SemanticEpoch: 1}
+}
+func (a syntheticAdapter) Parse(_ context.Context, path string, _ []byte) (graph.ParsedFile, error) {
+	return graph.ParsedFile{Language: a.Language(), Symbols: []graph.Symbol{{
+		Language: a.Language(), Kind: "function", Name: "entry", QualifiedName: "entry",
+		Range:     graph.Position{StartLine: 1, StartCol: 1, EndLine: 1, EndCol: 6},
+		StableKey: "func:lp2synthetic:entry",
+	}}, References: []graph.Reference{{Kind: "calls", Name: "external"}}}, nil
+}
+
+func TestSyntheticAdapterExercisesRegistryContract(t *testing.T) {
+	registry := NewRegistry(syntheticAdapter{})
+	adapter := registry.AdapterFor("EXAMPLE.SYN")
+	if adapter == nil || adapter.Language() != "lp2synthetic" {
+		t.Fatalf("AdapterFor() = %v, want synthetic adapter", adapter)
+	}
+	if got := registry.ExtensionCollisions(); len(got) != 0 {
+		t.Fatalf("ExtensionCollisions() = %v", got)
+	}
+	profile, ok := registry.ProfileForLanguage(adapter.Language())
+	if !ok || profile.ID != "synthetic:lp2synthetic:v1" || profile.SemanticEpoch != 1 || profile.EmitsCallEdges {
+		t.Fatalf("profile = %+v, %v", profile, ok)
+	}
+	parsed, err := adapter.Parse(context.Background(), "EXAMPLE.SYN", nil)
+	if err != nil || parsed.Language != adapter.Language() || len(parsed.Symbols) != 1 {
+		t.Fatalf("Parse() = %+v, %v", parsed, err)
+	}
+	symbol := parsed.Symbols[0]
+	if symbol.StableKey != "func:lp2synthetic:entry" || symbol.Range.StartLine < 1 || symbol.Range.StartCol < 1 || symbol.Range.EndLine < symbol.Range.StartLine || symbol.Range.EndCol < 1 {
+		t.Fatalf("invalid normalized symbol: %+v", symbol)
+	}
+	if len(parsed.References) != 1 || parsed.References[0].SymbolID != nil {
+		t.Fatalf("unresolved reference fabricated a target: %+v", parsed.References)
+	}
+	capabilities := registry.Capabilities()
+	if len(capabilities) != 1 || capabilities[0].CallResolution != nil || capabilities[0].ImportResolution != nil || capabilities[0].TypeResolution != nil {
+		t.Fatalf("unknown capability dimensions were asserted: %+v", capabilities)
+	}
+}
+
 func TestRegistryAdapterWithoutProfileIsReported(t *testing.T) {
 	registry := NewRegistry(&stubAdapter{language: "java", ext: ".java"})
 	if got := registry.LanguagesMissingProfile(); len(got) != 1 || got[0] != "java" {

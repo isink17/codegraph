@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -44,6 +45,51 @@ func TestDefaultRegistryProfilesAreDeterministic(t *testing.T) {
 			first[i].ParserProfile != second[i].ParserProfile ||
 			first[i].CallEdges != second[i].CallEdges {
 			t.Fatalf("profile %d not deterministic: %#v vs %#v", i, first[i], second[i])
+		}
+	}
+}
+
+func TestDefaultRegistrySnapshotsAreDeterministicAndImmutable(t *testing.T) {
+	registry := newDefaultRegistry()
+	first := registry.Capabilities()
+	second := registry.Capabilities()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("capability snapshots differ:\n%+v\n%+v", first, second)
+	}
+	if len(first) == 0 {
+		t.Fatal("empty production registry")
+	}
+	first[0].ID = "changed"
+	if first[0].Symbols != nil {
+		*first[0].Symbols = false
+	}
+	if again := registry.Capabilities(); reflect.DeepEqual(first, again) {
+		t.Fatal("mutating snapshot changed registry state")
+	}
+}
+
+func TestProductionRegistryExtensionsAreNormalizedAndDeterministic(t *testing.T) {
+	first := newDefaultRegistry().SupportedLanguages()
+	second := newDefaultRegistry().SupportedLanguages()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("SupportedLanguages() is not deterministic")
+	}
+	registry := newDefaultRegistry()
+	for _, language := range first {
+		if language.Language == "" {
+			t.Fatal("empty language identifier")
+		}
+		if len(language.Extensions) == 0 {
+			t.Errorf("%s has no registered extensions", language.Language)
+			continue
+		}
+		for _, extension := range language.Extensions {
+			if extension == "" || extension[0] != '.' || extension != strings.ToLower(extension) {
+				t.Errorf("%s has non-normalized extension %q", language.Language, extension)
+			}
+		}
+		if got := registry.AdapterFor("fixture" + language.Extensions[0]); got == nil || got.Language() != language.Language {
+			t.Errorf("extension selection for %s yielded %v", language.Language, got)
 		}
 	}
 }

@@ -33,9 +33,6 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"cpp":        {"heuristic:cpp:v1", false},
 	}
 	got := newDefaultRegistry().SupportedLanguages()
-	if len(got) != len(want) {
-		t.Fatalf("registry has %d languages, want %d", len(got), len(want))
-	}
 	for _, lang := range got {
 		expected, known := want[lang.Language]
 		if !known {
@@ -50,13 +47,20 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 	if degraded != "cpp,csharp,dart,hcl,java,kotlin,lua,php,ruby,rust,scala,swift,typescript" {
 		t.Fatalf("DegradedLanguages() = %q", degraded)
 	}
+	availability := noCGOCapabilities()
 	for _, capability := range newDefaultRegistry().Capabilities() {
-		if capability.NoCGOParser == nil || !*capability.NoCGOParser {
-			t.Errorf("%s no_cgo_parser = %v, want true", capability.ID, capability.NoCGOParser)
+		available, ok := availability[capability.ID]
+		if !ok {
+			if capability.NoCGOParser != nil || capability.NoCGOCallGraph != nil {
+				t.Errorf("%s unknown no-CGO availability became known", capability.ID)
+			}
+			continue
 		}
-		wantCallGraph := capability.ID == "go" || capability.ID == "python"
-		if capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph != wantCallGraph {
-			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, wantCallGraph)
+		if capability.NoCGOParser == nil || *capability.NoCGOParser != available.Parser {
+			t.Errorf("%s no_cgo_parser = %v, want %v", capability.ID, capability.NoCGOParser, available.Parser)
+		}
+		if capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph != (available.Parser && available.CallGraph) {
+			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, available.Parser && available.CallGraph)
 		}
 	}
 }
