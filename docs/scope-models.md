@@ -436,6 +436,10 @@ Not modelled:
 
 A Swift call never binds a symbol in another language. A change to any Swift file re-decides the repository's `self`, `Self`, initializer and `super` bindings, and a `Package.swift` change triggers a full scan.
 
+## Solidity
+
+The CGO Tree-sitter adapter extracts contracts, interfaces, libraries, functions, constructors, modifiers, events, custom errors, structs, enums and user-defined value types. It records import paths, modifier invocations and grammar call-expression syntax as unbound references. Calls, imports, inheritance, overloads, library dispatch, modifier execution and dynamic dispatch are not resolved; it emits no edges or generic file-import rows. Solidity is unavailable in no-CGO builds. The parser does not claim compiler or EVM parity. See [Solidity parser provenance and validation](solidity-lp2-validation.md).
+
 ## Ruby
 
 See [Ruby scope and limitations](ruby-scope.md).

@@ -50,6 +50,12 @@ func (a *DartAdapter) Profile() parser.Profile {
 	return parser.NewProfile("dart", "treesitter:dart:v3", true)
 }
 
+// Solidity v1 records syntax-proven declarations, imports and call references.
+// Calls remain references only: this adapter emits no call edges or resolutions.
+func (a *SolidityAdapter) Profile() parser.Profile {
+	return parser.NewProfile("solidity", "treesitter:solidity:v1", false)
+}
+
 // Python v2 reads Unicode names (PEP 3131) in the import and local-binding
 // evidence it shares with the non-cgo adapter: Unicode imports now bind, Unicode
 // locals now shadow, and a nested `def café` no longer binds the fragment `caf`.

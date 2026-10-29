@@ -33,6 +33,17 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"cpp":        {"heuristic:cpp:v1", false},
 	}
 	registry := newDefaultRegistry()
+	if _, ok := noCGOCapabilities()["solidity"]; ok {
+		t.Fatal("no-CGO availability includes unregistered Solidity")
+	}
+	if adapter := registry.AdapterFor("contracts/Token.sol"); adapter != nil {
+		t.Fatalf("no-CGO .sol adapter = %v, want unavailable", adapter)
+	}
+	for _, capability := range registry.Capabilities() {
+		if capability.ID == "solidity" {
+			t.Fatalf("no-CGO registry advertised Solidity: %+v", capability)
+		}
+	}
 	got := registry.SupportedLanguages()
 	seen := make(map[string]bool, len(got))
 	for _, lang := range got {

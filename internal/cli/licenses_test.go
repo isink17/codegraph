@@ -31,7 +31,7 @@ func TestRunLicensesPrintsEmbeddedNoticesOffline(t *testing.T) {
 	if want := codegraph.License + "\n" + codegraph.ThirdPartyNotices; got != want {
 		t.Fatal("licenses output is not LICENSE followed by THIRD_PARTY_NOTICES")
 	}
-	for _, s := range []string{"THIRD-PARTY SOFTWARE NOTICES", "Tree-sitter Lua grammar", "Unicode, Inc."} {
+	for _, s := range []string{"THIRD-PARTY SOFTWARE NOTICES", "Tree-sitter Lua grammar", "Tree-sitter Solidity grammar (vendored)", "Joran Honig", "Unicode, Inc."} {
 		if !strings.Contains(got, s) {
 			t.Errorf("licenses output lacks %q", s)
 		}
