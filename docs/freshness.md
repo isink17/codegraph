@@ -1,5 +1,61 @@
 # Graph freshness status
 
+## CG-105 bounded acceptance record (29-10-2026)
+
+Task `c28-cg105-freshness-acceptance` evaluated merged head
+`783d1222ecdbfb8fec6b54090f34678c58e6a368` (also the local `origin/v2.0`),
+tree `5c7f420df0576f637d7707e61099fb8806c1785c`, on macOS arm64,
+Go 1.26.1, CGO enabled. This record changes documentation only; the tested
+production and regression-test files remain exactly those of that tree.
+It is a bounded local acceptance record, not ticket closure or independent
+review of a subsequent PR head.
+
+| Acceptance area | Local classification and existing evidence |
+| --- | --- |
+| HEAD anchoring | Pass: `TestFreshnessHead*` covers path-scoped scans, full scans, detached/reverted HEAD, history absence/watermark fallback and unavailable Git. |
+| Scan evidence and coverage | Pass: `TestFreshnessCoverage*`, `TestFreshnessRunningScan`, `TestFreshnessReconcilePendingUntilLaterFullScan`; failed, overlapping, legacy and incomplete scans retain conservative status. |
+| Writer liveness | Pass: `TestFreshness*Lock*`, `TestFreshness*Probe*`, `TestFreshness*Writer*`; pre-insert writers, other repositories and probe failures do not claim consistency. |
+| Snapshot and read-only status | Pass: `TestSnapshot*`, `TestFreshnessStatusIsReadOnly`, `TestLiveWatcherSeenByReadOnlyStore`; live locks and post-snapshot changes remain visible without status writes. |
+| Watcher lock protocol | Pass: `TestWatcherLock*`, `TestLiveWatcher*`; startup/recovery, missing/erroring locks, concurrent readers, second watchers, takeover and killed subprocesses. |
+| Reconciliation and event loss | Pass: watcher tests for offline changes, interrupted startup, overflow, moved-in/out and removed directories, vanished registration targets, and stop-before-flush/restart. Overflow and resource failures use injected errors; directory events use the native macOS watcher. |
+| Recovery and config changes | Pass: watcher registration/flush/queue-write retries, malformed config across event/flush/startup paths, retry-attempt accounting, invalid values, and degraded state surviving another process's full scan. |
+| Parser provenance | Pass: profile convergence, compatibility classification and obsolete-profile freshness propagation in store/watcher and cross-surface parity tests. |
+| Consumer parity | Pass: `TestFreshnessParityAcrossSurfaces` exercises CLI stats, MCP `graph_stats` through `serve`, strict constraints and edit safety for obsolete parsers, watcher lifecycle and moved HEAD/full update. `TestFreshnessParityWithScanLockedBeforeRow` checks a subprocess lock holder. |
+| Watch lifecycle and MCP bootstrap | Pass: `TestRunWatchJSONL*`, `TestWatchStopsGracefullyOnSignal`, `TestServe*`; readiness/cancellation, signal shutdown, `tools/list` and `tools/call` on the production serve path. |
+| Active-write snapshot/open refusal | Preserved, not newly exercised: active-scan exit 2 with no verdict remains an acceptable fail-closed result. A successfully opened read with a held scan lock instead reaches freshness-unknown (exit 4); the pre-insert lock parity test covers that separate path. No attempt was made to turn an open failure into a verdict. |
+| Native Windows runtime | Deferred to release preparation, as requested. Neither cross-compilation nor this macOS run establishes Windows lock, watcher, path or file-handle behavior. Native Linux was not run here either. |
+| Original Plane acceptance (retrieved from Plane Cloud, 2026-10-29) | CG-105 asks for the smallest read-only status contract covering last successful scan, dirty/pending work, active watcher/writer ownership, worktree identity, and scan failure; unknown dimensions stay unknown. It also requires local-first behavior, no unmanaged daemon or build execution, no perfect-freshness claim, and separate compatibility/multi-writer proof for any durable lifecycle redesign. The rows above map existing local evidence to these dimensions; they do not claim a durable status for process-local facts or ticket completion. |
+| Independent exact-head review | This matrix was first committed at `f2eb1d13452d452c162252b04db56b5ab59735b1`; that head's review does not cover a later amendment. Any amendment requires a fresh review naming its exact final SHA. |
+
+Reproduction commands (each test invocation has an explicit timeout):
+
+```sh
+go test -count=1 -timeout 5m ./internal/store ./internal/watcher -run 'Test(Freshness|Snapshot|LiveWatcher|Watcher|ParserProfile|Unconverged|Health|Degraded|RelPath|Run)'
+go test -count=3 -timeout 5m ./internal/store ./internal/watcher -run 'Test(Freshness.*(Lock|Probe|Writer)|LiveWatcher|WatcherLock|SnapshotFreshness|Watcher(ReconcilesAfterEventOverflow|RetriesTransientFlushFailure|RetriesMalformedConfigSeenByFlush|Liveness|ConfigPause|StartupFlush))'
+go test -count=1 -timeout 5m ./internal/cli ./internal/mcp ./internal/constraints ./internal/editsafety -run 'Test(FreshnessParity|CheckConstraintsCLIStrict|CheckConstraintsToolStrictRunningScan|SafeToEditCLIConstraintsAndFreshness|SafeToEditCLIFreshnessUnknownOutsideGit|SafeToEditTool|StrictFreshness|DecideOrder)'
+go test -count=1 -timeout 5m ./internal/cli -run 'Test(ReadOnlyCommandsOnUnindexedRepoCreateNothing|SafeToEditCLIDeterministicAndReadOnly|RecoverScansCommand|RunWatchJSONL|WatchStopsGracefullyOnSignal|Serve)'
+go vet ./internal/store ./internal/watcher
+go build -o /dev/null ./cmd/codegraph
+```
+
+The full focused-package gate also passed:
+
+```sh
+PATH=/opt/homebrew/bin:$PATH go test -count=1 -timeout 20m ./internal/store ./internal/watcher
+```
+
+Store completed in 204.941 s and watcher in 11.640 s. `git diff --check`
+passed. All commands above passed. `/dev/null` is only the build output sink used
+on this macOS host. The first command and the final consumer-parity rerun
+used `PATH=/opt/homebrew/bin:$PATH` to select installed Homebrew Git.
+With Apple's `/usr/bin/git`, the HEAD tests failed because denied `xcrun`
+cache writes emitted warnings which the shared `gittest` fixture's combined
+output included in its returned commit ID. Re-running `TestFreshnessHead*`
+with Homebrew Git passed all seven tests. This is classified as an
+environment/fixture limitation, not a newly reproduced freshness defect;
+the shared fixture is outside this task's edit scope. No production or
+regression-test correction is proposed.
+
 `codegraph stats` and the MCP tool `graph_stats` return the same read-only
 `freshness` object, built by one function (`Store.FreshnessStatus`). It reports
 what the stored graph and the host can prove about the graph's staleness. It
