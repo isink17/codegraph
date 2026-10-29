@@ -3,7 +3,7 @@
 package cli
 
 import (
-	"strings"
+	"slices"
 	"testing"
 )
 
@@ -48,9 +48,14 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 			t.Errorf("required non-cgo language %q is missing", language)
 		}
 	}
-	degraded := strings.Join(newDefaultRegistry().DegradedLanguages(), ",")
-	if degraded != "cpp,csharp,dart,hcl,java,kotlin,lua,php,ruby,rust,scala,swift,typescript" {
-		t.Fatalf("DegradedLanguages() = %q", degraded)
+	wantDegraded := make([]string, 0, len(got))
+	for _, language := range got {
+		if !language.CallEdges {
+			wantDegraded = append(wantDegraded, language.Language)
+		}
+	}
+	if degraded := registry.DegradedLanguages(); !slices.Equal(degraded, wantDegraded) {
+		t.Fatalf("DegradedLanguages() = %v, want %v", degraded, wantDegraded)
 	}
 	availability := noCGOCapabilities()
 	for language, available := range availability {
@@ -74,7 +79,22 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 			t.Errorf("%s no_cgo_call_graph = %v, want %v", capability.ID, capability.NoCGOCallGraph, available.Parser && available.CallGraph)
 		}
 	}
+	fixtures := make(map[string]struct {
+		file string
+		src  string
+	}, len(callFixtures)+len(noCgoCallFixtures))
 	for language, fixture := range callFixtures {
+		fixtures[language] = fixture
+	}
+	for language, fixture := range noCgoCallFixtures {
+		fixtures[language] = fixture
+	}
+	for language := range want {
+		if _, ok := fixtures[language]; !ok {
+			t.Errorf("required no-CGO call-edge probe missing for %q", language)
+		}
+	}
+	for language, fixture := range fixtures {
 		profile, ok := registry.ProfileForLanguage(language)
 		if !ok {
 			t.Fatalf("no registered parser profile for call fixture %q", language)
@@ -98,4 +118,19 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 			t.Errorf("%s profile call-edge claim = %v, parsed fixture emitted calls = %v", language, profile.EmitsCallEdges, observed)
 		}
 	}
+}
+
+// noCgoCallFixtures cover the fallback adapters that are not in callFixtures,
+// which also exercises their symbols-only claim against an actual parse.
+var noCgoCallFixtures = map[string]struct {
+	file string
+	src  string
+}{
+	"csharp": {"cg_probe.cs", "class CgProbe {\nvoid Callee() {}\nvoid Caller() { Callee(); }\n}"},
+	"hcl":    {"cg_probe.tf", "locals {\n value = module.example.output\n}"},
+	"kotlin": {"cg_probe.kt", "fun callee() {}\nfun caller() { callee() }\n"},
+	"php":    {"cg_probe.php", "<?php\nfunction callee() {}\nfunction caller() { callee(); }\n"},
+	"ruby":   {"cg_probe.rb", "def callee; end\ndef caller; callee; end\n"},
+	"rust":   {"cg_probe.rs", "fn callee() {}\nfn caller() { callee(); }\n"},
+	"swift":  {"cg_probe.swift", "func callee() {}\nfunc caller() { callee() }\n"},
 }
