@@ -156,6 +156,25 @@ func TestSolidityStableIdentityIncludesScopeAndSignature(t *testing.T) {
 	}
 }
 
+func TestSolidityImportPathsAcceptBothQuoteStyles(t *testing.T) {
+	parsed, err := NewSolidity().Parse(context.Background(), "imports.sol", []byte("import './Token.sol';\nimport \"./Vault.sol\";\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, ref := range parsed.References {
+		if ref.Kind == "import" {
+			paths = append(paths, ref.Name)
+			if ref.SymbolID != nil || ref.ContextSymbolID != nil {
+				t.Errorf("import reference was bound: %+v", ref)
+			}
+		}
+	}
+	if !reflect.DeepEqual(paths, []string{"./Token.sol", "./Vault.sol"}) {
+		t.Fatalf("import paths = %v, want both source paths unbound", paths)
+	}
+}
+
 func TestSolidityCallsStayUnresolvedAndMalformedSourceRecovers(t *testing.T) {
 	adapter := NewSolidity()
 	parsed, err := adapter.Parse(context.Background(), "contracts/Caller.sol", []byte(`contract Caller {

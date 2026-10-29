@@ -87,7 +87,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			continue
 		}
 		capabilityFound = true
-		if capability.DisplayName != "Solidity" || !slices.Contains(capability.Extensions, ".sol") || capability.ParserProfile != "treesitter:solidity:v1" || capability.Calls == nil || *capability.Calls || capability.Symbols == nil || !*capability.Symbols || capability.NoCGOParser != nil || capability.NoCGOCallGraph != nil {
+		if capability.DisplayName != "Solidity" || !slices.Contains(capability.Extensions, ".sol") || capability.ParserProfile != "treesitter:solidity:v1" || capability.Calls == nil || *capability.Calls || capability.Symbols == nil || !*capability.Symbols || capability.NoCGOParser == nil || *capability.NoCGOParser || capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph {
 			t.Fatalf("Solidity capability = %+v", capability)
 		}
 	}

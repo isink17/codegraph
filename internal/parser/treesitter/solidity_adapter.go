@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser/treesitter/soliditygrammar"
@@ -199,8 +200,7 @@ func solidityReferences(root *sitter.Node, content []byte) []graph.Reference {
 		if source == nil {
 			continue
 		}
-		path, err := strconv.Unquote(nodeText(source, content))
-		if err == nil && path != "" {
+		if path, ok := solidityStringLiteral(nodeText(source, content)); ok && path != "" {
 			references = append(references, graph.Reference{Kind: "import", Name: path, QualifiedName: path, Range: nodeRange(source)})
 		}
 	}
@@ -239,6 +239,62 @@ func solidityReferences(root *sitter.Node, content []byte) []graph.Reference {
 		return a.QualifiedName < b.QualifiedName
 	})
 	return references
+}
+
+func solidityStringLiteral(literal string) (string, bool) {
+	if len(literal) < 2 || (literal[0] != '\'' && literal[0] != '"') || literal[len(literal)-1] != literal[0] {
+		return "", false
+	}
+	var decoded strings.Builder
+	for i := 1; i < len(literal)-1; i++ {
+		c := literal[i]
+		if c == literal[0] || c == '\n' || c == '\r' {
+			return "", false
+		}
+		if c != '\\' {
+			if c < 0x20 {
+				return "", false
+			}
+			decoded.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(literal)-1 {
+			return "", false
+		}
+		switch literal[i] {
+		case 'n':
+			decoded.WriteByte('\n')
+		case 'r':
+			decoded.WriteByte('\r')
+		case 't':
+			decoded.WriteByte('\t')
+		case '\\', '\'', '"':
+			decoded.WriteByte(literal[i])
+		case 'x', 'u':
+			n := 2
+			if literal[i] == 'u' {
+				n = 4
+			}
+			if i+n >= len(literal) {
+				return "", false
+			}
+			value, err := strconv.ParseUint(literal[i+1:i+1+n], 16, 32)
+			if err != nil || (n == 4 && value >= 0xd800 && value <= 0xdfff) {
+				return "", false
+			}
+			if literal[i] == 'x' {
+				decoded.WriteByte(byte(value))
+			} else {
+				decoded.WriteRune(rune(value))
+			}
+			i += n
+		default:
+			return "", false
+		}
+	}
+	value := decoded.String()
+	return value, utf8.ValidString(value)
 }
 
 func solidityCallName(node *sitter.Node, content []byte) string {
