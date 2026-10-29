@@ -42,7 +42,7 @@ func TestCurrentFingerprintChangesWithRepositoryInputs(t *testing.T) {
 	}
 	identity := "sha256:" + hashString(root)
 	a := Artifact{
-		Schema:           Schema,
+		Schema:           SchemaV1,
 		Producer:         Producer{Name: "test", Version: "1"},
 		Repository:       Repository{Identity: identity, RootMarker: identity, BuildRoot: "."},
 		Compilation:      Compilation{GradleProject: ":app", KotlinCompilation: "main"},
@@ -103,6 +103,84 @@ func TestCurrentFingerprintChangesWithRepositoryInputs(t *testing.T) {
 	}
 }
 
+func TestV2FingerprintBindsTaskProofAndOutputBytes(t *testing.T) {
+	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputRel := "app/build/classes/kotlin/main/Hello.class"
+	outputPath := filepath.Join(root, filepath.FromSlash(outputRel))
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("class-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outputHash := hashString("class-bytes")
+	a := testArtifact()
+	a.Schema = Schema
+	a.Repository.Identity = "sha256:" + hashString(root)
+	a.Repository.RootMarker = a.Repository.Identity
+	a.Evidence.SourceRoots = []string{}
+	a.Evidence.Dimensions = Dimensions{
+		Source:           Dimension{State: Incomplete, Provenance: []string{"source scope incomplete"}},
+		Generated:        Dimension{State: Unknown, Provenance: []string{"not observed"}},
+		Excluded:         Dimension{State: Unknown, Provenance: []string{"not observed"}},
+		Dependency:       Dimension{State: Incomplete, Provenance: []string{"dependency content freshness incomplete"}},
+		ExternalMetadata: Dimension{State: Unknown, Provenance: []string{"not observed"}},
+		CompilerIdentity: Dimension{State: Incomplete, Provenance: []string{"compiler implementation incomplete"}},
+	}
+	a.Tools = Tools{GradleVersion: "9.3.1", KotlinPluginVersion: "2.3.20", KotlinCompilerVersion: "2.3.20", GradleRuntimeJDKVendor: "Eclipse Adoptium", GradleRuntimeJDKVersion: "17.0.9"}
+	a.Compilation.GradleTask = ":app:compileKotlin"
+	a.Proof = testProof()
+	a.Proof.OutputFiles = []OutputFile{{Path: outputRel, SHA256: outputHash}}
+	a.Proof.TaskInputSHA256 = []string{hashString("compiler-input")}
+	a.Proof.CompilerArtifacts = []FileIdentity{{Name: "kotlin-compiler-embeddable-2.3.20.jar", SHA256: hashString("compiler-jar")}}
+	a.Proof.TaskInputsComplete = true
+	a.Proof.OutputsContained = true
+	a.InputFingerprint = strings.Repeat("0", 64)
+	fingerprint, err := CurrentFingerprint(root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.InputFingerprint = fingerprint
+	if err := a.ValidateCurrentInRepository(root); err != nil {
+		t.Fatalf("fresh v2 artifact rejected: %v", err)
+	}
+
+	changed := a
+	proof := *a.Proof
+	proof.CompilerArtifacts = append([]FileIdentity(nil), a.Proof.CompilerArtifacts...)
+	proof.CompilerArtifacts[0].SHA256 = hashString("changed compiler bytes")
+	changed.Proof = &proof
+	if err := changed.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("changed compiler artifact identity accepted: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(filepath.Dir(outputPath), "Added.class"), []byte("new-class-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "unrecorded class output") {
+		t.Fatalf("added class output was not detected: %v", err)
+	}
+	if err := os.Remove(filepath.Join(filepath.Dir(outputPath), "Added.class")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("tampered-class-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("modified class output accepted: %v", err)
+	}
+	if err := os.Remove(outputPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("deleted class output accepted: %v", err)
+	}
+}
+
 func TestRepositoryFingerprintDistinguishesFileBoundaries(t *testing.T) {
 	root := t.TempDir()
 	root, err := filepath.EvalSymlinks(root)
@@ -134,6 +212,25 @@ func TestRepositoryFingerprintDistinguishesFileBoundaries(t *testing.T) {
 	}
 	if err := a.ValidateCurrentInRepository(root); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("different repository inputs accepted as current: %v", err)
+	}
+}
+
+func TestV1FingerprintSemanticsIgnoreV2Fields(t *testing.T) {
+	model := gradleModel{
+		GradleVersion: "8.10", KotlinPluginVersion: "2.0.20", KotlinCompilerVersion: "2.0.20",
+		CompileTask: ":app:compileKotlin", JDKVendor: "Temurin", JDKVersion: "21",
+		Project: ":app", Compilation: "main", SourceRoots: []string{"app/src/main/kotlin"},
+		Dependencies: []string{"org.example:lib:1.0"},
+	}
+	dimensions := Dimensions{Source: Dimension{State: Incomplete, Provenance: []string{"v1"}}}
+	before := hashFingerprint("/repo", model, model.SourceRoots, strings.Repeat("a", 64), dimensions)
+	model.TaskOutcome = "TASK_REPORTED_WORK"
+	model.TaskInputSHA256 = []string{strings.Repeat("b", 64)}
+	model.OutputFiles = []OutputFile{{Path: "app/build/Hello.class", SHA256: strings.Repeat("c", 64)}}
+	model.GradleRuntimeJDKVersion = "99"
+	after := hashFingerprint("/repo", model, model.SourceRoots, strings.Repeat("a", 64), dimensions)
+	if before != after {
+		t.Fatal("adding v2 observations changed the legacy v1 fingerprint semantics")
 	}
 }
 
@@ -218,6 +315,9 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 		t.Skip("pinned Gradle fixture currently uses Unix-style paths")
 	}
 	root := copyGradleFixture(t)
+	if _, err := os.Stat(filepath.Join(root, "app", "build")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fixture output root is not clean before selected compilation: stat error = %v", err)
+	}
 	output := filepath.Join(filepath.Dir(root), "evidence.json")
 	var stderr strings.Builder
 	a, err := ExportGradle(context.Background(), GradleRequest{
@@ -230,6 +330,24 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ExportGradle(): %v\nGradle output:\n%s", err, stderr.String())
+	}
+	if a.Schema != Schema || a.Proof == nil || a.Proof.TaskOutcome != "TASK_REPORTED_WORK" || !a.Proof.TaskDidWork {
+		t.Fatalf("selected compile task observation = %+v", a.Proof)
+	}
+	if len(a.Proof.OutputFiles) == 0 || len(a.Proof.TaskInputSHA256) == 0 || len(a.Proof.CompilerArtifacts) == 0 {
+		t.Fatalf("selected task input/output hash evidence is empty: %+v", a.Proof)
+	}
+	if !a.Proof.TaskInputsComplete || !a.Proof.TaskInputsStable {
+		t.Fatalf("clean fixture selected-task inputs were incomplete or changed during compilation: %+v", a.Proof)
+	}
+	if !a.Proof.OutputRootsClean {
+		t.Fatalf("clean fixture outputs were not proven empty before compilation: %+v", a.Proof)
+	}
+	if a.Tools.GradleRuntimeJDKVersion == "" || a.Tools.JDKVersion != "" {
+		t.Fatalf("Gradle runtime JDK was not represented separately: %+v", a.Tools)
+	}
+	if a.Proof.Dimensions.TaskExecution.State != Incomplete || a.Proof.Dimensions.CompilerRuntime.State != Unknown || a.Proof.Dimensions.SelectedToolchain.State != Unknown || a.Proof.Dimensions.OutputProvenance.State != Incomplete || a.Proof.Dimensions.ABIInputs.State != Incomplete {
+		t.Fatalf("producer overstated trust dimensions: %+v", a.Proof.Dimensions)
 	}
 	if a.Evidence.Dimensions.Source.State != Incomplete || a.Evidence.Dimensions.Dependency.State != Incomplete {
 		t.Fatalf("producer overstated dimensions: %+v", a.Evidence.Dimensions)
@@ -258,6 +376,22 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 	}
 	if err := a.ValidateCurrentInRepository(root); err != nil {
 		t.Fatalf("fresh generated artifact rejected: %v", err)
+	}
+	secondOutput := filepath.Join(filepath.Dir(root), "evidence-second.json")
+	second, err := ExportGradle(context.Background(), GradleRequest{
+		RepositoryRoot: root, GradleCommand: gradle, Project: ":app", Compilation: "main", OutputPath: secondOutput,
+	})
+	if err != nil {
+		t.Fatalf("repeat ExportGradle(): %v", err)
+	}
+	if second.Proof.TaskOutcome != "UP_TO_DATE" || second.Proof.TaskDidWork || !second.Proof.TaskSkipped || second.Proof.SkipReasonCode != "UP_TO_DATE" {
+		t.Fatalf("unchanged compile outcome = %+v, want UP_TO_DATE", second.Proof)
+	}
+	if second.Proof.Dimensions.OutputProvenance.State != Incomplete {
+		t.Fatalf("up-to-date output promoted to trusted provenance: %+v", second.Proof.Dimensions.OutputProvenance)
+	}
+	if second.Proof.OutputRootsClean {
+		t.Fatal("pre-existing outputs were incorrectly reported clean on the repeated invocation")
 	}
 	changed := a
 	changed.Tools.KotlinCompilerVersion = "2.3.19"

@@ -34,6 +34,10 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "Wrote Kotlin Gradle evidence for %s/%s (%s)\n", artifact.Compilation.GradleProject, artifact.Compilation.KotlinCompilation, artifact.InputFingerprint)
+	outcome := "unknown"
+	if artifact.Proof != nil {
+		outcome = artifact.Proof.TaskOutcome
+	}
+	_, err = fmt.Fprintf(stdout, "Wrote diagnostic Kotlin Gradle evidence for %s/%s, task %s (%s; input fingerprint %s; trust remains incomplete)\n", artifact.Compilation.GradleProject, artifact.Compilation.KotlinCompilation, artifact.Compilation.GradleTask, outcome, artifact.InputFingerprint)
 	return err
 }

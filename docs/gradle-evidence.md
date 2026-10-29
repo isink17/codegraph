@@ -18,11 +18,13 @@ whole-repository completeness, or automatic compilation selection.
 ## Versioned artifact
 
 `internal/buildevidence.Artifact` uses schema
-`codegraph.gradle_kotlin_evidence/v1`. It identifies producer name/version,
+`codegraph.gradle_kotlin_evidence/v2`. It identifies producer name/version,
 opaque repository identity and canonical root marker, repository-relative build
 root, selected Gradle project and Kotlin compilation, and observable Gradle,
-Kotlin plugin/compiler, and JDK versions. Tool values may be absent only when
-the compiler-identity dimension is incomplete or unknown.
+Kotlin plugin/compiler, Gradle runtime JDK, and selected Kotlin toolchain
+version configuration. Tool values may be absent only when the corresponding
+identity dimension is incomplete or unknown. Runtime and selected toolchain
+configuration remain separate; neither version string identifies JDK contents.
 
 The artifact carries one SHA-256 input fingerprint. The producer computes it
 deterministically from all relevant inputs used for this selected compilation:
@@ -33,7 +35,7 @@ identity. Unknown inputs and their states are part of the fingerprint. A
 timestamp is never a freshness key. An importer must compare against a
 fingerprint recomputed for current inputs and refuse a mismatch as stale.
 
-The six evidence dimensions are independent: `source`, `generated`, `excluded`,
+The six v1 evidence dimensions are independent: `source`, `generated`, `excluded`,
 `dependency`, `external_metadata`, and `compiler_identity`. Each records
 `complete`, `incomplete`, or `unknown` plus provenance. Producer execution does
 not promote a dimension. Complete source/generated/excluded evidence means the
@@ -80,20 +82,49 @@ Kotlin source-set roots. It never discovers or launches a project wrapper
 implicitly. The integration fixture pins Kotlin Gradle Plugin 2.3.20 and asserts
 Gradle 9.3.1.
 
-The producer records the selected Kotlin compile task path and its configured
-compiler version from that task. The pinned fixture verifies `:app:compileKotlin`
-and Kotlin 2.3.20; changing either field makes the artifact stale. This is
-configuration evidence, not proof of the compiler binary or executed task.
+The v2 producer records the selected Kotlin compile task path and configured
+compiler version, then makes the evidence task depend on that selected compile
+task. It disables Gradle build-cache reuse, observes the selected task through a
+Gradle task listener, hashes bounded declared task inputs and declared `.class`
+outputs both immediately before and after the selected task, and records whether
+the input hashes stayed stable. It records repository-relative output roots and
+class hashes, and does not clean or overwrite existing build outputs. The
+producer records whether the declared output roots were empty before the task;
+nonempty roots remain untouched and keep output trust incomplete. The pinned
+fixture verifies
+Gradle 9.3.1, `:app:compileKotlin`, and Kotlin 2.3.20. `TASK_REPORTED_WORK`
+means only Gradle reported work for that task. `UP_TO_DATE`, `FROM_CACHE`,
+`NO_SOURCE`, skipped, and no-work outcomes retain their observations without
+promoting execution or output trust. Raw skip text and machine paths are not
+serialized.
+
+Gradle's project/task history is kept in a per-repository CodeGraph directory
+under the user's cache directory so repeat explicit exports can report
+`UP_TO_DATE`; this is distinct from Gradle build-cache reuse, which remains
+disabled. The cache contains Gradle's local project state, not evidence or a
+compiler cache attestation.
 
 The producer deliberately reports source and dependency dimensions as
 `incomplete`; generated/excluded roots and external metadata as `unknown`; and
-compiler identity as `incomplete`. It observes the Gradle runtime JDK, not a
-selected Kotlin compiler toolchain. Classpath file dependencies and artifact
-content freshness are not proven. `CurrentFingerprint` covers the local
-repository file tree and reported source roots. It is not freshness evidence
-for external dependency artifacts or environment-driven Gradle model changes;
-those dimensions remain incomplete/unknown. The artifact is not imported into
-Store, and the classifier remains disabled.
+compiler identity as `incomplete`. The v2 tool fields explicitly call out the
+Gradle runtime JDK. Selected Kotlin toolchain and compiler runtime remain
+unknown. Compiler artifact candidates are task-input file names and byte hashes;
+they do not prove which artifacts were loaded. The v2 proof dimensions for task
+execution, ABI input closure, and output provenance remain `incomplete`, even
+when the task reported work and output hashes exist: clean output state,
+generated/excluded inputs, full compiler/plugin/options/toolchain closure, and
+external dependency freshness are not established. `CurrentFingerprint`
+covers the local repository file tree and reported source roots; v2 also checks
+each listed class output against its recorded hash. It cannot
+revalidate external dependency artifacts or environment-driven Gradle model
+changes. The artifact is not imported into Store, and the classifier remains
+disabled.
+
+The decoder continues to accept `codegraph.gradle_kotlin_evidence/v1` as its
+original diagnostic format. V1 artifacts cannot contain the v2 proof section,
+and v1 evidence is never promoted based on fields added in v2. Re-export is
+required to obtain v2 observations; even v2 does not authorize resolver
+bindings while its required trust dimensions are incomplete or unknown.
 
 The artifact contains no arbitrary environment variables, credentials, build
 logs, or absolute machine paths. Source roots are canonical repository-relative

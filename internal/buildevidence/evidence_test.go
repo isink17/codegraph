@@ -11,7 +11,7 @@ func testArtifact() Artifact {
 	sha := strings.Repeat("a", 64)
 	dimension := func() Dimension { return Dimension{State: Complete, Provenance: []string{"gradle-model:v1"}} }
 	return Artifact{
-		Schema:           Schema,
+		Schema:           SchemaV1,
 		Producer:         Producer{Name: "codegraph-gradle-exporter", Version: "0.1.0"},
 		Repository:       Repository{Identity: "repo-identity", RootMarker: "logical-slash-v1", BuildRoot: "."},
 		Compilation:      Compilation{GradleProject: ":app", KotlinCompilation: "main"},
@@ -24,6 +24,23 @@ func testArtifact() Artifact {
 			ExcludedRoots:    []string{},
 			Dependencies:     []Dependency{{Coordinate: "org.example:lib:1.0", State: "positive", Provenance: "resolved compile classpath"}},
 			ExternalMetadata: []Metadata{{Identity: "org.example:lib:1.0", SHA256: sha, Provenance: "artifact metadata"}},
+		},
+	}
+}
+
+func testProof() *Proof {
+	return &Proof{
+		TaskOutcome: "TASK_REPORTED_WORK", TaskDidWork: true,
+		TaskInputSHA256: []string{}, CompilerArtifacts: []FileIdentity{},
+		OutputFiles: []OutputFile{{Path: "app/build/classes/kotlin/main/Hello.class", SHA256: strings.Repeat("b", 64)}},
+		OutputRoots: []string{"app/build/classes/kotlin/main"}, TaskInputsComplete: true, TaskInputsStable: true, OutputsComplete: true, OutputsContained: true,
+		Dimensions: ProofDimensions{
+			GradleRuntimeJDK:  Dimension{State: Incomplete, Provenance: []string{"runtime JDK content identity incomplete"}},
+			TaskExecution:     Dimension{State: Incomplete, Provenance: []string{"Gradle task outcome only"}},
+			CompilerRuntime:   Dimension{State: Unknown, Provenance: []string{"not observed"}},
+			SelectedToolchain: Dimension{State: Unknown, Provenance: []string{"not observed"}},
+			ABIInputs:         Dimension{State: Incomplete, Provenance: []string{"input closure incomplete"}},
+			OutputProvenance:  Dimension{State: Incomplete, Provenance: []string{"clean output state unknown"}},
 		},
 	}
 }
@@ -132,6 +149,69 @@ func TestCompleteCompilerIdentityRequiresToolVersions(t *testing.T) {
 	a.Tools.KotlinCompilerVersion = ""
 	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "compiler versions") {
 		t.Fatalf("Validate() = %v", err)
+	}
+}
+
+func TestV1ArtifactsRemainDiagnosticAndCannotCarryV2Proof(t *testing.T) {
+	a := testArtifact()
+	if a.Schema != SchemaV1 || a.Proof != nil {
+		t.Fatal("legacy fixture no longer represents v1")
+	}
+	if _, err := a.Marshal(); err != nil {
+		t.Fatalf("v1 artifact rejected: %v", err)
+	}
+	a.Proof = testProof()
+	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "v1") {
+		t.Fatalf("v1 artifact accepted v2 proof fields: %v", err)
+	}
+}
+
+func TestV2ProofRequiresExplicitIncompleteTrustDimensions(t *testing.T) {
+	a := testArtifact()
+	a.Schema = Schema
+	a.Proof = testProof()
+	if _, err := a.Marshal(); err != nil {
+		t.Fatalf("valid diagnostic v2 artifact rejected: %v", err)
+	}
+	a.Proof.Dimensions.OutputProvenance.State = Complete
+	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "remain incomplete") {
+		t.Fatalf("unproven output provenance was promoted: %v", err)
+	}
+}
+
+func TestV2CacheOutcomeCannotAuthorizeFreshExecution(t *testing.T) {
+	p := testProof()
+	p.TaskOutcome = "FROM_CACHE"
+	p.TaskDidWork = false
+	p.TaskSkipped = true
+	p.SkipReasonCode = "FROM_CACHE"
+	if err := validateProof(*p); err != nil {
+		t.Fatalf("cache diagnostic proof rejected: %v", err)
+	}
+	p.Dimensions.TaskExecution.State = Complete
+	if err := validateProof(*p); err == nil {
+		t.Fatal("cache-restored output accepted as new compiler execution")
+	}
+}
+
+func TestV2NonFreshTaskOutcomesRemainIncomplete(t *testing.T) {
+	for _, outcome := range []string{"UP_TO_DATE", "FROM_CACHE", "NO_SOURCE", "SKIPPED", "COMPLETED_NO_WORK"} {
+		t.Run(outcome, func(t *testing.T) {
+			p := testProof()
+			p.TaskOutcome = outcome
+			p.TaskDidWork = false
+			p.TaskSkipped = outcome != "COMPLETED_NO_WORK"
+			p.SkipReasonCode = ""
+			if p.TaskSkipped {
+				p.SkipReasonCode = outcome
+			}
+			if err := validateProof(*p); err != nil {
+				t.Fatalf("diagnostic task outcome rejected: %v", err)
+			}
+			if p.Dimensions.TaskExecution.State == Complete || p.Dimensions.OutputProvenance.State == Complete {
+				t.Fatal("non-fresh outcome promoted execution or output trust")
+			}
+		})
 	}
 }
 

@@ -35,16 +35,34 @@ type GradleRequest struct {
 }
 
 type gradleModel struct {
-	GradleVersion         string   `json:"gradle_version"`
-	KotlinPluginVersion   string   `json:"kotlin_plugin_version"`
-	KotlinCompilerVersion string   `json:"kotlin_compiler_version,omitempty"`
-	CompileTask           string   `json:"compile_task,omitempty"`
-	JDKVendor             string   `json:"jdk_vendor"`
-	JDKVersion            string   `json:"jdk_version"`
-	Project               string   `json:"project"`
-	Compilation           string   `json:"compilation"`
-	SourceRoots           []string `json:"source_roots"`
-	Dependencies          []string `json:"dependencies"`
+	GradleVersion            string         `json:"gradle_version"`
+	KotlinPluginVersion      string         `json:"kotlin_plugin_version"`
+	KotlinCompilerVersion    string         `json:"kotlin_compiler_version,omitempty"`
+	CompileTask              string         `json:"compile_task,omitempty"`
+	JDKVendor                string         `json:"jdk_vendor"`
+	JDKVersion               string         `json:"jdk_version"`
+	GradleRuntimeJDKVendor   string         `json:"gradle_runtime_jdk_vendor"`
+	GradleRuntimeJDKVersion  string         `json:"gradle_runtime_jdk_version"`
+	SelectedToolchainVendor  string         `json:"selected_toolchain_vendor"`
+	SelectedToolchainVersion string         `json:"selected_toolchain_version"`
+	Project                  string         `json:"project"`
+	Compilation              string         `json:"compilation"`
+	SourceRoots              []string       `json:"source_roots"`
+	Dependencies             []string       `json:"dependencies"`
+	TaskOutcome              string         `json:"task_outcome"`
+	TaskDidWork              bool           `json:"task_did_work"`
+	TaskSkipped              bool           `json:"task_skipped"`
+	SkipReasonCode           string         `json:"skip_reason_code"`
+	TaskInputSHA256          []string       `json:"task_input_sha256"`
+	CompilerArtifacts        []FileIdentity `json:"compiler_artifact_candidates"`
+	OutputFiles              []OutputFile   `json:"output_files"`
+	OutputRoots              []string       `json:"output_roots"`
+	JVMTarget                string         `json:"jvm_target"`
+	TaskInputsComplete       bool           `json:"task_inputs_complete"`
+	TaskInputsStable         bool           `json:"task_inputs_stable"`
+	OutputsComplete          bool           `json:"outputs_complete"`
+	OutputRootsClean         bool           `json:"output_roots_clean_before_task"`
+	OutputsContained         bool           `json:"outputs_contained"`
 }
 
 // ExportGradle invokes Gradle only at this explicit call site and writes a
@@ -86,15 +104,20 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		return Artifact{}, errors.New("artifact output must be outside the repository")
 	}
 
-	before, err := repositoryFingerprint(root, nil)
-	if err != nil {
-		return Artifact{}, fmt.Errorf("fingerprint repository before Gradle: %w", err)
-	}
 	tmpDir, err := os.MkdirTemp("", "codegraph-gradle-evidence-")
 	if err != nil {
 		return Artifact{}, err
 	}
 	defer os.RemoveAll(tmpDir)
+	identity := sha256.Sum256([]byte(root))
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return Artifact{}, fmt.Errorf("resolve user cache directory: %w", err)
+	}
+	projectCacheDir := filepath.Join(cacheRoot, "codegraph", "gradle-project-cache", hex.EncodeToString(identity[:]))
+	if err := os.MkdirAll(projectCacheDir, 0o700); err != nil {
+		return Artifact{}, fmt.Errorf("create isolated Gradle project cache: %w", err)
+	}
 	initPath := filepath.Join(tmpDir, "evidence.init.gradle")
 	script, err := gradleInitScript.ReadFile("gradle.init.gradle")
 	if err != nil {
@@ -105,14 +128,15 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	}
 	modelPath := filepath.Join(tmpDir, "model.json")
 	args := []string{
-		"--no-daemon", "--project-cache-dir", filepath.Join(tmpDir, "gradle-project-cache"), "--init-script", initPath,
+		"--no-daemon", "--project-cache-dir", projectCacheDir, "--init-script", initPath,
+		"--no-build-cache",
 		"-Pcg35.project=" + req.Project,
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
 		":codegraphExportEvidence",
 	}
 	if req.Stderr != nil {
-		if _, err := fmt.Fprintf(req.Stderr, "Running explicitly selected Gradle executable for %s/%s\n", req.Project, req.Compilation); err != nil {
+		if _, err := fmt.Fprintf(req.Stderr, "Running explicitly selected Gradle executable and selected compilation task for %s/%s; build-cache reuse is disabled, existing build outputs are not cleaned\n", req.Project, req.Compilation); err != nil {
 			return Artifact{}, err
 		}
 	}
@@ -143,9 +167,19 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if model.SourceRoots == nil {
 		return Artifact{}, errors.New("Gradle model omitted Kotlin source roots")
 	}
+	if model.TaskOutcome == "" || model.TaskInputSHA256 == nil || model.CompilerArtifacts == nil || model.OutputFiles == nil || model.OutputRoots == nil {
+		return Artifact{}, errors.New("Gradle model omitted selected-task execution or output observations")
+	}
 	sort.Strings(model.Dependencies)
-	if !safeToolIdentity(model.GradleVersion) || !safeToolIdentity(model.KotlinPluginVersion) || !safeToolIdentity(model.KotlinCompilerVersion) || model.KotlinCompilerVersion == "" || !safeToolIdentity(model.JDKVersion) || !safeToolIdentity(model.JDKVendor) {
-		return Artifact{}, errors.New("Gradle reported unsupported tool identity text")
+	for _, item := range []struct{ name, value string }{
+		{"Gradle version", model.GradleVersion}, {"Kotlin plugin version", model.KotlinPluginVersion},
+		{"Kotlin compiler version", model.KotlinCompilerVersion}, {"Gradle runtime JDK version", model.GradleRuntimeJDKVersion},
+		{"Gradle runtime JDK vendor", model.GradleRuntimeJDKVendor}, {"selected toolchain version", model.SelectedToolchainVersion},
+		{"selected toolchain vendor", model.SelectedToolchainVendor},
+	} {
+		if !safeToolIdentity(item.value) || (item.name == "Kotlin compiler version" && item.value == "") {
+			return Artifact{}, fmt.Errorf("Gradle reported unsupported %s identity text", item.name)
+		}
 	}
 	for _, dependency := range model.Dependencies {
 		if !safeDependencyCoordinate(dependency) {
@@ -157,27 +191,20 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		return Artifact{}, err
 	}
 	model.SourceRoots = roots
-	after, err := repositoryFingerprint(root, nil)
-	if err != nil {
-		return Artifact{}, fmt.Errorf("fingerprint repository after Gradle: %w", err)
-	}
-	if before != after {
-		return Artifact{}, errors.New("repository inputs changed while Gradle was producing evidence; rerun against a stable tree")
-	}
 	inputs, err := repositoryFingerprint(root, roots)
 	if err != nil {
 		return Artifact{}, fmt.Errorf("fingerprint selected Kotlin source roots: %w", err)
 	}
-	identity := sha256.Sum256([]byte(root))
 	dimensions := Dimensions{
 		Source:           Dimension{State: Incomplete, Provenance: []string{"Gradle Kotlin/JVM compilation source-set roots; generated inputs are not proven"}},
 		Generated:        Dimension{State: Unknown, Provenance: []string{"first producer does not enumerate generated source ownership"}},
 		Excluded:         Dimension{State: Unknown, Provenance: []string{"first producer does not observe excluded source rules"}},
 		Dependency:       Dimension{State: Incomplete, Provenance: []string{"Gradle resolved compilation artifacts observed; file dependencies and artifact content freshness are not proven"}},
 		ExternalMetadata: Dimension{State: Unknown, Provenance: []string{"external metadata is not captured"}},
-		CompilerIdentity: Dimension{State: Incomplete, Provenance: []string{"Gradle and selected Kotlin compile task versions observed; compiler binary and selected toolchain identity are not proven"}},
+		CompilerIdentity: Dimension{State: Incomplete, Provenance: []string{"configured Gradle/KGP/compiler versions and candidate compiler task-input hashes observed; loaded compiler implementation identity and selected toolchain content are not proven"}},
 	}
-	fingerprint := hashFingerprint(root, model, roots, inputs, dimensions)
+	proof := proofFromModel(model)
+	fingerprint := hashFingerprintV2(root, model, roots, inputs, dimensions, proof)
 	artifact := Artifact{
 		Schema:   Schema,
 		Producer: Producer{Name: "codegraph-gradle-exporter", Version: "2"},
@@ -188,11 +215,13 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		},
 		Compilation: Compilation{GradleProject: req.Project, KotlinCompilation: req.Compilation, GradleTask: model.CompileTask},
 		Tools: Tools{
-			GradleVersion:         model.GradleVersion,
-			KotlinPluginVersion:   model.KotlinPluginVersion,
-			KotlinCompilerVersion: model.KotlinCompilerVersion,
-			JDKVendor:             model.JDKVendor,
-			JDKVersion:            model.JDKVersion,
+			GradleVersion:            model.GradleVersion,
+			KotlinPluginVersion:      model.KotlinPluginVersion,
+			KotlinCompilerVersion:    model.KotlinCompilerVersion,
+			GradleRuntimeJDKVendor:   model.GradleRuntimeJDKVendor,
+			GradleRuntimeJDKVersion:  model.GradleRuntimeJDKVersion,
+			SelectedToolchainVendor:  model.SelectedToolchainVendor,
+			SelectedToolchainVersion: model.SelectedToolchainVersion,
 		},
 		InputFingerprint: fingerprint,
 		Evidence: Evidence{
@@ -206,6 +235,7 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 				return out
 			}(),
 		},
+		Proof: &proof,
 	}
 	data, err := artifact.Marshal()
 	if err != nil {
@@ -241,15 +271,35 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 	}
 	roots := artifact.Evidence.SourceRoots
 	model := gradleModel{
-		GradleVersion:         artifact.Tools.GradleVersion,
-		KotlinPluginVersion:   artifact.Tools.KotlinPluginVersion,
-		KotlinCompilerVersion: artifact.Tools.KotlinCompilerVersion,
-		CompileTask:           artifact.Compilation.GradleTask,
-		JDKVendor:             artifact.Tools.JDKVendor,
-		JDKVersion:            artifact.Tools.JDKVersion,
-		Project:               artifact.Compilation.GradleProject,
-		Compilation:           artifact.Compilation.KotlinCompilation,
-		SourceRoots:           roots,
+		GradleVersion:            artifact.Tools.GradleVersion,
+		KotlinPluginVersion:      artifact.Tools.KotlinPluginVersion,
+		KotlinCompilerVersion:    artifact.Tools.KotlinCompilerVersion,
+		CompileTask:              artifact.Compilation.GradleTask,
+		JDKVendor:                artifact.Tools.JDKVendor,
+		JDKVersion:               artifact.Tools.JDKVersion,
+		GradleRuntimeJDKVendor:   artifact.Tools.GradleRuntimeJDKVendor,
+		GradleRuntimeJDKVersion:  artifact.Tools.GradleRuntimeJDKVersion,
+		SelectedToolchainVendor:  artifact.Tools.SelectedToolchainVendor,
+		SelectedToolchainVersion: artifact.Tools.SelectedToolchainVersion,
+		Project:                  artifact.Compilation.GradleProject,
+		Compilation:              artifact.Compilation.KotlinCompilation,
+		SourceRoots:              roots,
+	}
+	if artifact.Proof != nil {
+		model.TaskOutcome = artifact.Proof.TaskOutcome
+		model.TaskDidWork = artifact.Proof.TaskDidWork
+		model.TaskSkipped = artifact.Proof.TaskSkipped
+		model.SkipReasonCode = artifact.Proof.SkipReasonCode
+		model.TaskInputSHA256 = artifact.Proof.TaskInputSHA256
+		model.CompilerArtifacts = artifact.Proof.CompilerArtifacts
+		model.OutputFiles = artifact.Proof.OutputFiles
+		model.OutputRoots = artifact.Proof.OutputRoots
+		model.JVMTarget = artifact.Proof.JVMTarget
+		model.TaskInputsComplete = artifact.Proof.TaskInputsComplete
+		model.TaskInputsStable = artifact.Proof.TaskInputsStable
+		model.OutputsComplete = artifact.Proof.OutputsComplete
+		model.OutputRootsClean = artifact.Proof.OutputRootsClean
+		model.OutputsContained = artifact.Proof.OutputsContained
 	}
 	for _, dependency := range artifact.Evidence.Dependencies {
 		model.Dependencies = append(model.Dependencies, dependency.Coordinate)
@@ -259,7 +309,164 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 	if err != nil {
 		return "", err
 	}
-	return hashFingerprint(root, model, roots, current, artifact.Evidence.Dimensions), nil
+	if artifact.Proof == nil {
+		return hashFingerprint(root, model, roots, current, artifact.Evidence.Dimensions), nil
+	}
+	if err := validateOutputContent(root, *artifact.Proof); err != nil {
+		return "", err
+	}
+	return hashFingerprintV2(root, model, roots, current, artifact.Evidence.Dimensions, *artifact.Proof), nil
+}
+
+func validateOutputContent(root string, proof Proof) error {
+	expected := make(map[string]struct{}, len(proof.OutputFiles))
+	for _, output := range proof.OutputFiles {
+		expected[filepath.Clean(filepath.FromSlash(output.Path))] = struct{}{}
+		abs := filepath.Join(root, filepath.FromSlash(output.Path))
+		if _, inside := relativeWithin(root, abs); !inside {
+			return fmt.Errorf("selected output escapes repository: %q", output.Path)
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return fmt.Errorf("build evidence is stale: selected output is unavailable: %q: %w", output.Path, err)
+		}
+		if _, inside := relativeWithin(root, resolved); !inside {
+			return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", output.Path)
+		}
+		file, err := os.Open(resolved)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		_, copyErr := io.Copy(h, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
+			return fmt.Errorf("build evidence is stale: selected output content changed: %q", output.Path)
+		}
+	}
+	observed := make(map[string]struct{}, len(expected))
+	for _, outputRoot := range proof.OutputRoots {
+		absRoot := filepath.Join(root, filepath.FromSlash(outputRoot))
+		resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+		if err != nil {
+			return fmt.Errorf("build evidence is stale: selected output root is unavailable: %q: %w", outputRoot, err)
+		}
+		if _, inside := relativeWithin(root, resolvedRoot); !inside {
+			return fmt.Errorf("build evidence is stale: selected output root symlink escapes repository: %q", outputRoot)
+		}
+		err = filepath.WalkDir(resolvedRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				target, err := filepath.EvalSymlinks(name)
+				if err != nil {
+					return fmt.Errorf("resolve selected output symlink %q: %w", name, err)
+				}
+				if _, inside := relativeWithin(root, target); !inside {
+					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", name)
+				}
+				info, err := os.Stat(target)
+				if err != nil {
+					return err
+				}
+				if !info.Mode().IsRegular() || !strings.HasSuffix(name, ".class") {
+					return nil
+				}
+			} else if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".class") {
+				return nil
+			}
+			rel, err := filepath.Rel(root, name)
+			if err != nil {
+				return err
+			}
+			key := filepath.Clean(rel)
+			observed[key] = struct{}{}
+			if _, ok := expected[key]; !ok {
+				return fmt.Errorf("build evidence is stale: unrecorded class output exists: %q", filepath.ToSlash(rel))
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if len(observed) != len(expected) {
+		for output := range expected {
+			if _, ok := observed[output]; !ok {
+				return fmt.Errorf("build evidence is stale: recorded class output is no longer under an output root: %q", filepath.ToSlash(output))
+			}
+		}
+	}
+	return nil
+}
+
+func proofFromModel(model gradleModel) Proof {
+	inputs := append([]string{}, model.TaskInputSHA256...)
+	sort.Strings(inputs)
+	candidates := append([]FileIdentity{}, model.CompilerArtifacts...)
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Name == candidates[j].Name {
+			return candidates[i].SHA256 < candidates[j].SHA256
+		}
+		return candidates[i].Name < candidates[j].Name
+	})
+	outputs := append([]OutputFile{}, model.OutputFiles...)
+	sort.Slice(outputs, func(i, j int) bool { return outputs[i].Path < outputs[j].Path })
+	roots := append([]string{}, model.OutputRoots...)
+	sort.Strings(roots)
+	inputsWhy := "selected task's declared input files were content hashed; this is not proof of complete ABI-affecting input closure"
+	if !model.TaskInputsComplete {
+		inputsWhy = "selected task input inventory exceeded supported observation bounds"
+	} else if !model.TaskInputsStable {
+		inputsWhy = "selected task declared input files changed during task execution"
+	}
+	toolchainProvenance := "selected Kotlin toolchain identity is not exposed through a supported API in this producer"
+	if model.SelectedToolchainVersion != "" {
+		toolchainProvenance = "selected Kotlin toolchain version configuration observed; toolchain artifact identity is not proven"
+	}
+	return Proof{
+		TaskOutcome: model.TaskOutcome, TaskDidWork: model.TaskDidWork, TaskSkipped: model.TaskSkipped,
+		SkipReasonCode: model.SkipReasonCode, TaskInputSHA256: inputs,
+		CompilerArtifacts: candidates, OutputFiles: outputs, OutputRoots: roots, JVMTarget: model.JVMTarget,
+		TaskInputsComplete: model.TaskInputsComplete, TaskInputsStable: model.TaskInputsStable, OutputsComplete: model.OutputsComplete, OutputRootsClean: model.OutputRootsClean, OutputsContained: model.OutputsContained,
+		Dimensions: ProofDimensions{
+			GradleRuntimeJDK:  Dimension{State: Incomplete, Provenance: []string{"Gradle runtime vendor/version observed; runtime JDK content identity is not proven"}},
+			TaskExecution:     Dimension{State: Incomplete, Provenance: []string{"Gradle TaskExecutionListener outcome observed; compiler process and loaded implementation are not observed"}},
+			CompilerRuntime:   Dimension{State: Unknown, Provenance: []string{"compiler runtime identity is not exposed through a supported execution-level observation"}},
+			SelectedToolchain: Dimension{State: Unknown, Provenance: []string{toolchainProvenance}},
+			ABIInputs:         Dimension{State: Incomplete, Provenance: []string{inputsWhy, "generated/excluded sources, dependencies, compiler/plugin closure, toolchain, and full ABI options are not proven complete"}},
+			OutputProvenance:  Dimension{State: Incomplete, Provenance: []string{outputProvenanceReason(model)}},
+		},
+	}
+}
+
+func outputProvenanceReason(model gradleModel) string {
+	if model.TaskOutcome == "FROM_CACHE" {
+		return "outputs were restored from build cache; no new compiler execution or cache provenance recovery is claimed"
+	}
+	if model.TaskOutcome == "UP_TO_DATE" || model.TaskOutcome == "NO_SOURCE" || model.TaskOutcome == "SKIPPED" {
+		return "selected task did not report fresh work; output attribution to a new compilation is incomplete"
+	}
+	if !model.OutputsContained {
+		return "one or more selected task outputs were outside the repository-relative observation boundary"
+	}
+	if !model.OutputsComplete {
+		return "selected task output inventory exceeded supported observation bounds"
+	}
+	if !model.OutputRootsClean {
+		return "selected task output roots were not empty before the task; existing user outputs were preserved"
+	}
+	return "clean selected-task output roots and declared class hashes were observed, but complete ABI input closure and compiler execution provenance were not established"
 }
 
 // ValidateCurrentInRepository recomputes local inputs from the artifact and
@@ -502,13 +709,38 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 }
 
 func hashFingerprint(root string, model gradleModel, roots []string, repositoryHash string, dimensions Dimensions) string {
+	legacyModel := struct {
+		GradleVersion         string   `json:"gradle_version"`
+		KotlinPluginVersion   string   `json:"kotlin_plugin_version"`
+		KotlinCompilerVersion string   `json:"kotlin_compiler_version,omitempty"`
+		CompileTask           string   `json:"compile_task,omitempty"`
+		JDKVendor             string   `json:"jdk_vendor"`
+		JDKVersion            string   `json:"jdk_version"`
+		Project               string   `json:"project"`
+		Compilation           string   `json:"compilation"`
+		SourceRoots           []string `json:"source_roots"`
+		Dependencies          []string `json:"dependencies"`
+	}{model.GradleVersion, model.KotlinPluginVersion, model.KotlinCompilerVersion, model.CompileTask, model.JDKVendor, model.JDKVersion, model.Project, model.Compilation, model.SourceRoots, model.Dependencies}
+	data, _ := json.Marshal(struct {
+		Repository string     `json:"repository"`
+		Model      any        `json:"model"`
+		Roots      []string   `json:"roots"`
+		Inputs     string     `json:"inputs"`
+		Dimensions Dimensions `json:"dimensions"`
+	}{root, legacyModel, roots, repositoryHash, dimensions})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func hashFingerprintV2(root string, model gradleModel, roots []string, repositoryHash string, dimensions Dimensions, proof Proof) string {
 	data, _ := json.Marshal(struct {
 		Repository string      `json:"repository"`
 		Model      gradleModel `json:"model"`
 		Roots      []string    `json:"roots"`
 		Inputs     string      `json:"inputs"`
 		Dimensions Dimensions  `json:"dimensions"`
-	}{root, model, roots, repositoryHash, dimensions})
+		Proof      Proof       `json:"proof"`
+	}{root, model, roots, repositoryHash, dimensions, proof})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
