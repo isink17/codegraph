@@ -110,6 +110,127 @@ func TestClasspathSnapshotTracksContentOrderDuplicatesAndFreshness(t *testing.T)
 	}
 }
 
+func TestClasspathSnapshotRevalidationAggregateBudgetAndDuplicateReuse(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	first := filepath.Join(root, "first.jar")
+	second := filepath.Join(root, "second.jar")
+	for path, value := range map[string]string{first: "1234", second: "5678"} {
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	artifact := snapshotTestArtifact(root)
+	provenance := []string{"KotlinCompile.libraries FileCollection rendered through Gradle asPath in iteration order"}
+	makeSnapshot := func(entries ...rawClasspathEntry) ClasspathSnapshot {
+		t.Helper()
+		snapshot, err := buildClasspathSnapshot(root, home, artifact, entries, Complete, provenance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	validate := func(snapshot ClasspathSnapshot, limits classpathRevalidationLimits) SnapshotFreshness {
+		t.Helper()
+		status, err := validateClasspathSnapshotCurrentContextWithLimits(context.Background(), root, home, artifact, snapshot, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+
+	unique := makeSnapshot(rawClasspathEntry{Path: first}, rawClasspathEntry{Path: second})
+	partial := validate(unique, classpathRevalidationLimits{bytes: 6, files: 10, entries: 100})
+	if partial.RecordedContent != Incomplete || !containsString(partial.Reasons, "entry 1 cannot be revalidated: classpath revalidation budget exceeded") {
+		t.Fatalf("aggregate byte budget exhaustion was not incomplete after partial validation: %+v", partial)
+	}
+
+	duplicates := makeSnapshot(rawClasspathEntry{Path: first}, rawClasspathEntry{Path: first})
+	if len(duplicates.Entries) != 2 || duplicates.Entries[0].Order != 0 || duplicates.Entries[1].Order != 1 {
+		t.Fatalf("duplicate classpath entries/order were not retained: %+v", duplicates.Entries)
+	}
+	duplicateStatus := validate(duplicates, classpathRevalidationLimits{bytes: 4, files: 1, entries: 100})
+	if duplicateStatus.RecordedContent != Complete {
+		t.Fatalf("identical scoped paths were hashed more than once or lost freshness: %+v", duplicateStatus)
+	}
+
+	growing := makeSnapshot(rawClasspathEntry{Path: first})
+	if err := os.WriteFile(first, []byte("123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	growingStatus := validate(growing, classpathRevalidationLimits{bytes: 6, files: 10, entries: 100})
+	if growingStatus.RecordedContent != Incomplete || !strings.Contains(strings.Join(growingStatus.Reasons, "\n"), "classpath revalidation budget exceeded") {
+		t.Fatalf("grown file exceeded the aggregate budget without failing closed: %+v", growingStatus)
+	}
+	staleStatus, err := ValidateClasspathSnapshotCurrent(root, home, artifact, growing)
+	if err != nil || staleStatus.RecordedContent != Incomplete || !containsString(staleStatus.Reasons, "entry 0 content changed") {
+		t.Fatalf("grown file was not rejected as stale under the default budget: %+v, err %v", staleStatus, err)
+	}
+}
+
+func TestClasspathSnapshotRevalidationDirectoryGrowthAndFileCountBudget(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	dir := filepath.Join(root, "classes")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initial := filepath.Join(dir, "A.class")
+	if err := os.WriteFile(initial, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact := snapshotTestArtifact(root)
+	provenance := []string{"KotlinCompile.libraries FileCollection rendered through Gradle asPath in iteration order"}
+	snapshot, err := buildClasspathSnapshot(root, home, artifact, []rawClasspathEntry{{Path: dir, Identity: "project::dep"}}, Complete, provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "B.class"), []byte("growing directory member"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalStatus, err := ValidateClasspathSnapshotCurrent(root, home, artifact, snapshot)
+	if err != nil || normalStatus.RecordedContent != Incomplete || !containsString(normalStatus.Reasons, "entry 0 content changed") {
+		t.Fatalf("grown directory was not rejected under the default budget: %+v, err %v", normalStatus, err)
+	}
+	status, err := validateClasspathSnapshotCurrentContextWithLimits(context.Background(), root, home, artifact, snapshot, classpathRevalidationLimits{bytes: 10, files: 10, entries: 100})
+	if err != nil || status.RecordedContent != Incomplete || !strings.Contains(strings.Join(status.Reasons, "\n"), "classpath revalidation budget exceeded") {
+		t.Fatalf("grown directory exceeded the aggregate budget without failing closed: %+v, err %v", status, err)
+	}
+	fileLimited, err := validateClasspathSnapshotCurrentContextWithLimits(context.Background(), root, home, artifact, snapshot, classpathRevalidationLimits{bytes: 100, files: 1, entries: 100})
+	if err != nil || fileLimited.RecordedContent != Incomplete || !strings.Contains(strings.Join(fileLimited.Reasons, "\n"), "classpath revalidation budget exceeded") {
+		t.Fatalf("aggregate file-hash operation budget was not enforced: %+v, err %v", fileLimited, err)
+	}
+	entryLimited, err := validateClasspathSnapshotCurrentContextWithLimits(context.Background(), root, home, artifact, snapshot, classpathRevalidationLimits{bytes: 100, files: 100, entries: 1})
+	if err != nil || entryLimited.RecordedContent != Incomplete || !strings.Contains(strings.Join(entryLimited.Reasons, "\n"), "classpath revalidation budget exceeded") {
+		t.Fatalf("aggregate directory-entry traversal budget was not enforced: %+v, err %v", entryLimited, err)
+	}
+}
+
+func TestClasspathSnapshotRevalidationBoundsZeroByteFiles(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	dir := filepath.Join(root, "empty-classes")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(dir, "A.class")
+	second := filepath.Join(dir, "B.class")
+	for _, path := range []string{first, second} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	artifact := snapshotTestArtifact(root)
+	snapshot, err := buildClasspathSnapshot(root, home, artifact, []rawClasspathEntry{{Path: dir}}, Complete, []string{"KotlinCompile.libraries FileCollection rendered through Gradle asPath in iteration order"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := validateClasspathSnapshotCurrentContextWithLimits(context.Background(), root, home, artifact, snapshot, classpathRevalidationLimits{bytes: 0, files: 1, entries: 10})
+	if err != nil || status.RecordedContent != Incomplete || !strings.Contains(strings.Join(status.Reasons, "\n"), "classpath revalidation budget exceeded") {
+		t.Fatalf("zero-byte file hash operations bypassed the aggregate count budget: %+v, err %v", status, err)
+	}
+}
+
 func TestClasspathSnapshotBoundsAndCancellation(t *testing.T) {
 	root := t.TempDir()
 	home := t.TempDir()

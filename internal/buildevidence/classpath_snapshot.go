@@ -23,6 +23,12 @@ const (
 	MaxClasspathFiles       = 50000
 	MaxClasspathBytes       = int64(1 << 30)
 	MaxClasspathFileBytes   = int64(256 << 20)
+	// Directory content is hashed twice during validation. The aggregate
+	// validator budget allows that work for one maximum-size snapshot while
+	// retaining a finite cap for both bytes and zero-byte file operations.
+	MaxClasspathRevalidationBytes   = 2 * MaxClasspathBytes
+	MaxClasspathRevalidationFiles   = 2*MaxClasspathFiles + MaxClasspathEntries
+	MaxClasspathRevalidationEntries = 2*MaxClasspathFiles + MaxClasspathEntries
 )
 
 type ClasspathEntry struct {
@@ -77,6 +83,46 @@ type SnapshotFreshness struct {
 	Selection       State    `json:"dependency_selection_freshness"`
 	CompilerClosure State    `json:"compiler_consumed_classpath"`
 	Reasons         []string `json:"reasons"`
+}
+
+type classpathRevalidationLimits struct {
+	bytes   int64
+	files   int
+	entries int
+}
+
+type classpathReadBudget struct {
+	limits    classpathRevalidationLimits
+	bytes     int64
+	files     int
+	entries   int
+	exhausted bool
+}
+
+func (b *classpathReadBudget) beginEntry() error {
+	if b.exhausted || b.entries >= b.limits.entries {
+		b.exhausted = true
+		return errors.New("classpath revalidation budget exceeded")
+	}
+	b.entries++
+	return nil
+}
+
+func (b *classpathReadBudget) beginFile(size int64) error {
+	if b.exhausted || b.files >= b.limits.files || size > b.limits.bytes-b.bytes {
+		b.exhausted = true
+		return errors.New("classpath revalidation budget exceeded")
+	}
+	b.files++
+	return nil
+}
+
+func (b *classpathReadBudget) remainingBytes() int64 {
+	return b.limits.bytes - b.bytes
+}
+
+func (b *classpathReadBudget) recordBytes(size int64) {
+	b.bytes += size
 }
 
 func buildClasspathSnapshot(root, gradleHome string, artifact Artifact, raw []rawClasspathEntry, observationState State, provenance []string) (ClasspathSnapshot, error) {
@@ -409,8 +455,19 @@ func ValidateClasspathSnapshotCurrent(repositoryRoot, gradleUserHome string, art
 }
 
 func ValidateClasspathSnapshotCurrentContext(ctx context.Context, repositoryRoot, gradleUserHome string, artifact Artifact, snapshot ClasspathSnapshot) (SnapshotFreshness, error) {
+	return validateClasspathSnapshotCurrentContextWithLimits(ctx, repositoryRoot, gradleUserHome, artifact, snapshot, classpathRevalidationLimits{
+		bytes:   MaxClasspathRevalidationBytes,
+		files:   MaxClasspathRevalidationFiles,
+		entries: MaxClasspathRevalidationEntries,
+	})
+}
+
+func validateClasspathSnapshotCurrentContextWithLimits(ctx context.Context, repositoryRoot, gradleUserHome string, artifact Artifact, snapshot ClasspathSnapshot, limits classpathRevalidationLimits) (SnapshotFreshness, error) {
 	if err := ctx.Err(); err != nil {
 		return SnapshotFreshness{}, err
+	}
+	if limits.bytes < 0 || limits.files < 0 || limits.entries < 0 {
+		return SnapshotFreshness{}, errors.New("invalid classpath revalidation limits")
 	}
 	if err := artifact.Validate(); err != nil {
 		return SnapshotFreshness{}, fmt.Errorf("validate related v2 evidence: %w", err)
@@ -466,6 +523,12 @@ func ValidateClasspathSnapshotCurrentContext(ctx context.Context, repositoryRoot
 		result.RecordedContent = Incomplete
 		result.Reasons = append(result.Reasons, "original classpath observation was incomplete")
 	}
+	budget := classpathReadBudget{limits: limits}
+	type cachedObservation struct {
+		digest string
+		err    error
+	}
+	observations := make(map[string]cachedObservation)
 	for _, entry := range snapshot.Entries {
 		if err := ctx.Err(); err != nil {
 			return SnapshotFreshness{}, err
@@ -479,16 +542,23 @@ func ValidateClasspathSnapshotCurrentContext(ctx context.Context, repositoryRoot
 		if entry.Scope == "gradle_user_home" {
 			base = gradleRootFS
 		}
-		digest, _, err := digestEntryRootContext(ctx, base, filepath.FromSlash(entry.Path), entry.Kind)
+		key := entry.Scope + "\x00" + filepath.Clean(filepath.FromSlash(entry.Path)) + "\x00" + entry.Kind
+		observation, observed := observations[key]
+		if !observed {
+			var digest string
+			digest, _, observation.err = digestEntryRootBudgetedContext(ctx, base, filepath.FromSlash(entry.Path), entry.Kind, &budget)
+			observation.digest = digest
+			observations[key] = observation
+		}
 		if ctx.Err() != nil {
 			return SnapshotFreshness{}, ctx.Err()
 		}
-		if err != nil {
+		if observation.err != nil {
 			result.RecordedContent = Incomplete
-			result.Reasons = append(result.Reasons, fmt.Sprintf("entry %d cannot be revalidated: %s", entry.Order, safeReason(err.Error())))
+			result.Reasons = append(result.Reasons, fmt.Sprintf("entry %d cannot be revalidated: %s", entry.Order, safeReason(observation.err.Error())))
 			continue
 		}
-		if digest != entry.SHA256 {
+		if observation.digest != entry.SHA256 {
 			result.RecordedContent = Incomplete
 			result.Reasons = append(result.Reasons, fmt.Sprintf("entry %d content changed", entry.Order))
 		}
@@ -634,6 +704,10 @@ func stableFileDigestContext(ctx context.Context, path string, limit int64) (str
 // on the approved repository or Gradle home. Root.Open prevents a concurrent
 // parent symlink swap from redirecting the read outside that approved tree.
 func stableFileDigestRootContext(ctx context.Context, root *os.Root, path string, limit int64) (string, int64, error) {
+	return stableFileDigestRootBudgetedContext(ctx, root, path, limit, nil)
+}
+
+func stableFileDigestRootBudgetedContext(ctx context.Context, root *os.Root, path string, limit int64, budget *classpathReadBudget) (string, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return "", 0, err
 	}
@@ -647,19 +721,40 @@ func stableFileDigestRootContext(ctx context.Context, root *os.Root, path string
 	if before.Size() > limit {
 		return "", 0, errors.New("classpath file exceeds per-file size limit")
 	}
+	readLimit := limit
+	if budget != nil {
+		if err := budget.beginFile(before.Size()); err != nil {
+			return "", 0, err
+		}
+		if remaining := budget.remainingBytes(); readLimit > remaining {
+			readLimit = remaining
+		}
+	}
 	f, err := root.Open(path)
 	if err != nil {
 		return "", 0, classifyPathReadError(err)
 	}
 	defer f.Close()
 	opened, err := f.Stat()
-	if err != nil || !os.SameFile(before, opened) {
+	if err != nil || !os.SameFile(before, opened) || before.Size() != opened.Size() {
 		return "", 0, errors.New("classpath file changed before hashing")
 	}
 	digest := sha256.New()
-	written, err := io.Copy(digest, io.LimitReader(contextReader{ctx: ctx, r: f}, limit+1))
+	written, err := io.Copy(digest, io.LimitReader(contextReader{ctx: ctx, r: f}, readLimit))
+	if budget != nil {
+		budget.recordBytes(written)
+	}
 	if err != nil {
 		return "", 0, errors.New("classpath file hashing failed")
+	}
+	if written > readLimit || written != before.Size() {
+		if budget != nil && budget.remainingBytes() == 0 && before.Size() > written {
+			budget.exhausted = true
+			return "", 0, errors.New("classpath revalidation budget exceeded")
+		}
+		if written < before.Size() {
+			return "", 0, errors.New("classpath file changed while hashing")
+		}
 	}
 	if written > limit {
 		return "", 0, errors.New("classpath file exceeds per-file size limit")
@@ -811,6 +906,10 @@ func stableDirectoryDigestContext(ctx context.Context, root string, maxFiles int
 }
 
 func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path string, maxFiles int, maxBytes int64) (string, int64, error) {
+	return stableDirectoryDigestRootBudgetedContext(ctx, root, path, maxFiles, maxBytes, nil)
+}
+
+func stableDirectoryDigestRootBudgetedContext(ctx context.Context, root *os.Root, path string, maxFiles int, maxBytes int64, budget *classpathReadBudget) (string, int64, error) {
 	rootInfo, err := root.Lstat(path)
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
 		return "", 0, errors.New("classpath directory cannot be identified safely")
@@ -836,6 +935,11 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 		if path == "." {
 			return nil
 		}
+		if budget != nil {
+			if err := budget.beginEntry(); err != nil {
+				return err
+			}
+		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return errors.New("classpath directory contains a symlink")
 		}
@@ -849,7 +953,7 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 		if len(items) >= maxFiles {
 			return errors.New("classpath directory file-count limit exceeded")
 		}
-		digest, size, err := stableFileDigestRootContext(ctx, dir, path, MaxClasspathFileBytes)
+		digest, size, err := stableFileDigestRootBudgetedContext(ctx, dir, path, MaxClasspathFileBytes, budget)
 		if err != nil {
 			return err
 		}
@@ -864,8 +968,11 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 		return "", 0, err
 	}
 	for _, item := range items {
-		digest, size, err := stableFileDigestRootContext(ctx, dir, filepath.FromSlash(item.path), MaxClasspathFileBytes)
-		if err != nil || size != item.size || digest != item.digest {
+		digest, size, err := stableFileDigestRootBudgetedContext(ctx, dir, filepath.FromSlash(item.path), MaxClasspathFileBytes, budget)
+		if err != nil {
+			return "", 0, err
+		}
+		if size != item.size || digest != item.digest {
 			return "", 0, errors.New("classpath directory content changed while hashing")
 		}
 	}
@@ -881,6 +988,11 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 			return errors.New("classpath directory changed while hashing")
 		}
 		if path != "." {
+			if budget != nil {
+				if err := budget.beginEntry(); err != nil {
+					return err
+				}
+			}
 			if entry.Type()&os.ModeSymlink != 0 {
 				return errors.New("classpath directory changed to contain a symlink")
 			}
@@ -949,13 +1061,17 @@ func digestEntryContext(ctx context.Context, path, kind string) (string, int64, 
 }
 
 func digestEntryRootContext(ctx context.Context, root *os.Root, path, kind string) (string, int64, error) {
+	return digestEntryRootBudgetedContext(ctx, root, path, kind, nil)
+}
+
+func digestEntryRootBudgetedContext(ctx context.Context, root *os.Root, path, kind string, budget *classpathReadBudget) (string, int64, error) {
 	if kind == "file" {
-		return stableFileDigestRootContext(ctx, root, path, MaxClasspathFileBytes)
+		return stableFileDigestRootBudgetedContext(ctx, root, path, MaxClasspathFileBytes, budget)
 	}
 	if kind != "directory" {
 		return "", 0, errors.New("unsupported recorded classpath entry type")
 	}
-	return stableDirectoryDigestRootContext(ctx, root, path, MaxClasspathFiles, MaxClasspathBytes)
+	return stableDirectoryDigestRootBudgetedContext(ctx, root, path, MaxClasspathFiles, MaxClasspathBytes, budget)
 }
 
 func snapshotDigest(snapshot ClasspathSnapshot) (string, error) {
@@ -988,6 +1104,8 @@ func safeReason(reason string) string {
 	// Reasons are stable classifications. Never persist host paths or arbitrary
 	// file-system error strings supplied by the operating system.
 	switch {
+	case strings.Contains(reason, "revalidation budget"):
+		return "classpath revalidation budget exceeded"
 	case strings.Contains(reason, "outside the repository"):
 		return "classpath path is outside allowed roots"
 	case strings.Contains(reason, "symlink"):
