@@ -462,7 +462,7 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 			budget.recordBytes(read)
 		}
 		after, statErr := file.Stat()
-		pathAfter, pathErr := rootFS.Stat(filepath.FromSlash(rel))
+		pathAfter, pathErr := rootFS.Lstat(filepath.FromSlash(rel))
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
@@ -473,7 +473,7 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 		if read != info.Size() {
 			return errors.New("classpath revalidation budget exceeded or output changed while hashing")
 		}
-		if statErr != nil || pathErr != nil || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
+		if statErr != nil || pathErr != nil || pathAfter.Mode()&os.ModeSymlink != 0 || !pathAfter.Mode().IsRegular() || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
 			return errors.New("repository output changed while hashing")
 		}
 		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
@@ -772,9 +772,23 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		h.Write(size[:])
 		h.Write(data)
 	}
-	writeFile := func(name, path string) error {
+	type observedRepositoryPath struct {
+		info       fs.FileInfo
+		linkTarget string
+	}
+	writeFile := func(name, path string, observed observedRepositoryPath) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		pathBefore, err := rootFS.Lstat(filepath.FromSlash(path))
+		if err != nil || !os.SameFile(observed.info, pathBefore) || (pathBefore.Mode()&os.ModeSymlink != 0) != (observed.info.Mode()&os.ModeSymlink != 0) {
+			return errors.New("repository path changed before hashing")
+		}
+		if observed.info.Mode()&os.ModeSymlink != 0 {
+			linkBefore, err := rootFS.Readlink(filepath.FromSlash(path))
+			if err != nil || linkBefore != observed.linkTarget {
+				return errors.New("repository symlink changed before hashing")
+			}
 		}
 		f, err := rootFS.Open(filepath.FromSlash(path))
 		if err != nil {
@@ -798,7 +812,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			budget.recordBytes(read)
 		}
 		after, statErr := f.Stat()
-		pathAfter, pathErr := rootFS.Stat(filepath.FromSlash(path))
+		pathAfter, pathErr := rootFS.Lstat(filepath.FromSlash(path))
 		closeErr := f.Close()
 		if copyErr != nil {
 			return copyErr
@@ -809,8 +823,18 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		if read != info.Size() {
 			return errors.New("classpath revalidation budget exceeded or repository file changed while hashing")
 		}
-		if statErr != nil || pathErr != nil || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
+		if statErr != nil || pathErr != nil || !os.SameFile(observed.info, pathAfter) || (pathAfter.Mode()&os.ModeSymlink != 0) != (observed.info.Mode()&os.ModeSymlink != 0) || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
 			return errors.New("repository file changed while hashing")
+		}
+		if observed.info.Mode()&os.ModeSymlink != 0 {
+			linkAfter, err := rootFS.Readlink(filepath.FromSlash(path))
+			if err != nil || linkAfter != observed.linkTarget {
+				return errors.New("repository symlink changed while hashing")
+			}
+		}
+		pathTarget, targetErr := rootFS.Stat(filepath.FromSlash(path))
+		if targetErr != nil || !os.SameFile(info, pathTarget) || info.Size() != pathTarget.Size() || !info.ModTime().Equal(pathTarget.ModTime()) {
+			return errors.New("repository file path changed while hashing")
 		}
 		write("file:"+name, []byte(fmt.Sprintf("%o", info.Mode().Perm())))
 		write("content:"+name, content.Sum(nil))
@@ -828,9 +852,13 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 				return err
 			}
 		}
-		var info fs.FileInfo
-		var err error
+		pathInfo, err := rootFS.Lstat(filepath.FromSlash(name))
+		if err != nil {
+			return err
+		}
+		info := pathInfo
 		linkTarget := ""
+		linkText := ""
 		if entry.Type()&os.ModeSymlink != 0 {
 			fullName := filepath.Join(root, filepath.FromSlash(name))
 			target, err := filepath.EvalSymlinks(fullName)
@@ -844,17 +872,16 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			if err != nil {
 				return err
 			}
+			linkText, err = rootFS.Readlink(filepath.FromSlash(name))
+			if err != nil {
+				return err
+			}
 			info, err = rootFS.Stat(filepath.FromSlash(name))
 			if err != nil {
 				return err
 			}
 			if info.IsDir() {
 				return fmt.Errorf("directory symlink prevents a complete local fingerprint: %s", name)
-			}
-		} else {
-			info, err = entry.Info()
-			if err != nil {
-				return err
 			}
 		}
 		if !info.Mode().IsRegular() {
@@ -864,7 +891,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		if linkTarget != "" {
 			write("symlink:"+filepath.ToSlash(rel), []byte(filepath.ToSlash(linkTarget)))
 		}
-		return writeFile(filepath.ToSlash(rel), filepath.ToSlash(rel))
+		return writeFile(filepath.ToSlash(rel), filepath.ToSlash(rel), observedRepositoryPath{info: pathInfo, linkTarget: linkText})
 	})
 	if err != nil {
 		return "", err
@@ -890,7 +917,11 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			if entry.IsDir() || !entry.Type().IsRegular() {
 				return nil
 			}
-			return writeFile("source:"+filepath.ToSlash(name), filepath.ToSlash(name))
+			pathInfo, err := rootFS.Lstat(filepath.ToSlash(name))
+			if err != nil {
+				return err
+			}
+			return writeFile("source:"+filepath.ToSlash(name), filepath.ToSlash(name), observedRepositoryPath{info: pathInfo})
 		})
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
