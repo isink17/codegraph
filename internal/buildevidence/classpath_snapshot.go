@@ -863,6 +863,15 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 	if err != nil {
 		return "", 0, err
 	}
+	for _, item := range items {
+		digest, size, err := stableFileDigestRootContext(ctx, dir, filepath.FromSlash(item.path), MaxClasspathFileBytes)
+		if err != nil || size != item.size || digest != item.digest {
+			return "", 0, errors.New("classpath directory content changed while hashing")
+		}
+	}
+	// The final membership pass follows the second content pass so a file
+	// added or removed during either digest pass cannot receive a complete
+	// directory identity without an explicit observation.
 	var current []string
 	err = fs.WalkDir(dir.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
@@ -891,12 +900,6 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 	for i := range items {
 		if current[i] != items[i].path {
 			return "", 0, errors.New("classpath directory changed while hashing")
-		}
-	}
-	for _, item := range items {
-		digest, size, err := stableFileDigestRootContext(ctx, dir, filepath.FromSlash(item.path), MaxClasspathFileBytes)
-		if err != nil || size != item.size || digest != item.digest {
-			return "", 0, errors.New("classpath directory content changed while hashing")
 		}
 	}
 	after, err := root.Lstat(path)
