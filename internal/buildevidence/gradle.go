@@ -462,6 +462,7 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 			budget.recordBytes(read)
 		}
 		after, statErr := file.Stat()
+		pathAfter, pathErr := rootFS.Stat(filepath.FromSlash(rel))
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
@@ -472,7 +473,7 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 		if read != info.Size() {
 			return errors.New("classpath revalidation budget exceeded or output changed while hashing")
 		}
-		if statErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+		if statErr != nil || pathErr != nil || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
 			return errors.New("repository output changed while hashing")
 		}
 		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
@@ -797,6 +798,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			budget.recordBytes(read)
 		}
 		after, statErr := f.Stat()
+		pathAfter, pathErr := rootFS.Stat(filepath.FromSlash(path))
 		closeErr := f.Close()
 		if copyErr != nil {
 			return copyErr
@@ -807,7 +809,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		if read != info.Size() {
 			return errors.New("classpath revalidation budget exceeded or repository file changed while hashing")
 		}
-		if statErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+		if statErr != nil || pathErr != nil || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
 			return errors.New("repository file changed while hashing")
 		}
 		write("file:"+name, []byte(fmt.Sprintf("%o", info.Mode().Perm())))
