@@ -33,39 +33,44 @@ type GradleRequest struct {
 	OutputPath                string
 	CompilerProbeJar          string
 	CompilerExecutionStrategy string
+	DependencySnapshot        bool
 	Stderr                    io.Writer
 }
 
 type gradleModel struct {
-	GradleVersion            string         `json:"gradle_version"`
-	KotlinPluginVersion      string         `json:"kotlin_plugin_version"`
-	KotlinCompilerVersion    string         `json:"kotlin_compiler_version,omitempty"`
-	CompileTask              string         `json:"compile_task,omitempty"`
-	JDKVendor                string         `json:"jdk_vendor"`
-	JDKVersion               string         `json:"jdk_version"`
-	GradleRuntimeJDKVendor   string         `json:"gradle_runtime_jdk_vendor"`
-	GradleRuntimeJDKVersion  string         `json:"gradle_runtime_jdk_version"`
-	SelectedToolchainVendor  string         `json:"selected_toolchain_vendor"`
-	SelectedToolchainVersion string         `json:"selected_toolchain_version"`
-	Project                  string         `json:"project"`
-	Compilation              string         `json:"compilation"`
-	SourceRoots              []string       `json:"source_roots"`
-	Dependencies             []string       `json:"dependencies"`
-	TaskOutcome              string         `json:"task_outcome"`
-	TaskDidWork              bool           `json:"task_did_work"`
-	TaskSkipped              bool           `json:"task_skipped"`
-	SkipReasonCode           string         `json:"skip_reason_code"`
-	TaskInputSHA256          []string       `json:"task_input_sha256"`
-	CompilerArtifacts        []FileIdentity `json:"compiler_artifact_candidates"`
-	GradleProcessID          int64          `json:"gradle_process_id,omitempty"`
-	OutputFiles              []OutputFile   `json:"output_files"`
-	OutputRoots              []string       `json:"output_roots"`
-	JVMTarget                string         `json:"jvm_target"`
-	TaskInputsComplete       bool           `json:"task_inputs_complete"`
-	TaskInputsStable         bool           `json:"task_inputs_stable"`
-	OutputsComplete          bool           `json:"outputs_complete"`
-	OutputRootsClean         bool           `json:"output_roots_clean_before_task"`
-	OutputsContained         bool           `json:"outputs_contained"`
+	GradleVersion            string              `json:"gradle_version"`
+	KotlinPluginVersion      string              `json:"kotlin_plugin_version"`
+	KotlinCompilerVersion    string              `json:"kotlin_compiler_version,omitempty"`
+	CompileTask              string              `json:"compile_task,omitempty"`
+	JDKVendor                string              `json:"jdk_vendor"`
+	JDKVersion               string              `json:"jdk_version"`
+	GradleRuntimeJDKVendor   string              `json:"gradle_runtime_jdk_vendor"`
+	GradleRuntimeJDKVersion  string              `json:"gradle_runtime_jdk_version"`
+	SelectedToolchainVendor  string              `json:"selected_toolchain_vendor"`
+	SelectedToolchainVersion string              `json:"selected_toolchain_version"`
+	Project                  string              `json:"project"`
+	Compilation              string              `json:"compilation"`
+	SourceRoots              []string            `json:"source_roots"`
+	Dependencies             []string            `json:"dependencies"`
+	ClasspathObservation     string              `json:"classpath_observation,omitempty"`
+	ClasspathState           State               `json:"classpath_state,omitempty"`
+	ClasspathProvenance      []string            `json:"classpath_provenance,omitempty"`
+	ClasspathEntries         []rawClasspathEntry `json:"classpath_entries,omitempty"`
+	TaskOutcome              string              `json:"task_outcome"`
+	TaskDidWork              bool                `json:"task_did_work"`
+	TaskSkipped              bool                `json:"task_skipped"`
+	SkipReasonCode           string              `json:"skip_reason_code"`
+	TaskInputSHA256          []string            `json:"task_input_sha256"`
+	CompilerArtifacts        []FileIdentity      `json:"compiler_artifact_candidates"`
+	GradleProcessID          int64               `json:"gradle_process_id,omitempty"`
+	OutputFiles              []OutputFile        `json:"output_files"`
+	OutputRoots              []string            `json:"output_roots"`
+	JVMTarget                string              `json:"jvm_target"`
+	TaskInputsComplete       bool                `json:"task_inputs_complete"`
+	TaskInputsStable         bool                `json:"task_inputs_stable"`
+	OutputsComplete          bool                `json:"outputs_complete"`
+	OutputRootsClean         bool                `json:"output_roots_clean_before_task"`
+	OutputsContained         bool                `json:"outputs_contained"`
 }
 
 // ExportGradle invokes Gradle only at this explicit call site and writes a
@@ -157,6 +162,12 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
 		":codegraphExportEvidence",
+	}
+	if req.DependencySnapshot {
+		if err := requireAbsent(output + ".classpath.json"); err != nil {
+			return Artifact{}, fmt.Errorf("dependency snapshot output is unavailable: %w", err)
+		}
+		args = append(args, "-Pcg35.dependency.snapshot=true")
 	}
 	if probe != nil {
 		args = append(args,
@@ -284,6 +295,25 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		}
 		probeOutput = output + ".compiler-probe.json"
 	}
+	var dependencyOutput string
+	var dependencyData []byte
+	if req.DependencySnapshot {
+		if model.ClasspathObservation != "KotlinCompile.libraries" || model.ClasspathState == "" || model.ClasspathEntries == nil || model.ClasspathProvenance == nil {
+			return Artifact{}, errors.New("Gradle model omitted the selected task classpath observation")
+		}
+		snapshot, err := buildClasspathSnapshotContext(ctx, root, gradleUserHome(), artifact, model.ClasspathEntries, model.ClasspathState, model.ClasspathProvenance)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("snapshot selected Kotlin task classpath: %w", err)
+		}
+		dependencyData, err = snapshot.Marshal()
+		if err != nil {
+			return Artifact{}, err
+		}
+		if len(dependencyData) > MaxArtifactSize {
+			return Artifact{}, fmt.Errorf("dependency classpath snapshot exceeds %d bytes", MaxArtifactSize)
+		}
+		dependencyOutput = output + ".classpath.json"
+	}
 	data, err := artifact.Marshal()
 	if err != nil {
 		return Artifact{}, err
@@ -291,7 +321,14 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if len(data) > MaxArtifactSize {
 		return Artifact{}, fmt.Errorf("generated build evidence exceeds %d bytes", MaxArtifactSize)
 	}
-	if err := publishEvidenceArtifacts(output, data, probeOutput, probeData, writeNewFile); err != nil {
+	sidecars := make([]evidenceSidecar, 0, 2)
+	if probeOutput != "" {
+		sidecars = append(sidecars, evidenceSidecar{path: probeOutput, data: probeData, label: "compiler probe"})
+	}
+	if dependencyOutput != "" {
+		sidecars = append(sidecars, evidenceSidecar{path: dependencyOutput, data: dependencyData, label: "dependency classpath snapshot"})
+	}
+	if err := publishEvidenceBundle(output, data, sidecars, writeNewFile); err != nil {
 		return Artifact{}, err
 	}
 	return artifact, nil
@@ -300,6 +337,13 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 // CurrentFingerprint recomputes the locally available inputs for stale-artifact
 // checks. It cannot attest Gradle-resolved dependencies, which remain unknown.
 func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error) {
+	return currentFingerprintContext(context.Background(), repositoryRoot, artifact, nil)
+}
+
+func currentFingerprintContext(ctx context.Context, repositoryRoot string, artifact Artifact, budget *classpathReadBudget) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := artifact.Validate(); err != nil {
 		return "", err
 	}
@@ -352,22 +396,34 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 		model.Dependencies = append(model.Dependencies, dependency.Coordinate)
 	}
 	sort.Strings(model.Dependencies)
-	current, err := repositoryFingerprint(root, roots)
+	current, err := repositoryFingerprintContext(ctx, root, roots, budget)
 	if err != nil {
 		return "", err
 	}
 	if artifact.Proof == nil {
 		return hashFingerprint(root, model, roots, current, artifact.Evidence.Dimensions), nil
 	}
-	if err := validateOutputContent(root, *artifact.Proof); err != nil {
+	if err := validateOutputContentContext(ctx, root, *artifact.Proof, budget); err != nil {
 		return "", err
 	}
 	return hashFingerprintV2(root, model, roots, current, artifact.Evidence.Dimensions, *artifact.Proof), nil
 }
 
 func validateOutputContent(root string, proof Proof) error {
+	return validateOutputContentContext(context.Background(), root, proof, nil)
+}
+
+func validateOutputContentContext(ctx context.Context, root string, proof Proof, budget *classpathReadBudget) error {
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return errors.New("repository root cannot be opened safely")
+	}
+	defer rootFS.Close()
 	expected := make(map[string]struct{}, len(proof.OutputFiles))
 	for _, output := range proof.OutputFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		expected[filepath.Clean(filepath.FromSlash(output.Path))] = struct{}{}
 		abs := filepath.Join(root, filepath.FromSlash(output.Path))
 		if _, inside := relativeWithin(root, abs); !inside {
@@ -380,18 +436,45 @@ func validateOutputContent(root string, proof Proof) error {
 		if _, inside := relativeWithin(root, resolved); !inside {
 			return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", output.Path)
 		}
-		file, err := os.Open(resolved)
+		rel, err := filepath.Rel(root, resolved)
 		if err != nil {
 			return err
 		}
+		file, err := rootFS.Open(rel)
+		if err != nil {
+			return err
+		}
+		info, statErr := file.Stat()
+		if statErr != nil {
+			file.Close()
+			return statErr
+		}
+		if budget != nil {
+			if err := budget.beginFile(info.Size()); err != nil {
+				file.Close()
+				return err
+			}
+		}
 		h := sha256.New()
-		_, copyErr := io.Copy(h, file)
+		readLimit := info.Size()
+		read, copyErr := io.Copy(h, io.LimitReader(contextReader{ctx: ctx, r: file}, readLimit))
+		if budget != nil {
+			budget.recordBytes(read)
+		}
+		after, statErr := file.Stat()
+		pathAfter, pathErr := rootFS.Lstat(filepath.FromSlash(rel))
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+		if read != info.Size() {
+			return errors.New("classpath revalidation budget exceeded or output changed while hashing")
+		}
+		if statErr != nil || pathErr != nil || pathAfter.Mode()&os.ModeSymlink != 0 || !pathAfter.Mode().IsRegular() || !os.SameFile(info, after) || !os.SameFile(info, pathAfter) || info.Size() != after.Size() || info.Size() != pathAfter.Size() || !info.ModTime().Equal(after.ModTime()) || !info.ModTime().Equal(pathAfter.ModTime()) {
+			return errors.New("repository output changed while hashing")
 		}
 		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
 			return fmt.Errorf("build evidence is stale: selected output content changed: %q", output.Path)
@@ -407,22 +490,39 @@ func validateOutputContent(root string, proof Proof) error {
 		if _, inside := relativeWithin(root, resolvedRoot); !inside {
 			return fmt.Errorf("build evidence is stale: selected output root symlink escapes repository: %q", outputRoot)
 		}
-		err = filepath.WalkDir(resolvedRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+		outputRootRel, err := filepath.Rel(root, resolvedRoot)
+		if err != nil {
+			return err
+		}
+		outputFS, err := rootFS.OpenRoot(outputRootRel)
+		if err != nil {
+			return fmt.Errorf("build evidence is stale: selected output root cannot be opened safely: %q", outputRoot)
+		}
+		err = fs.WalkDir(outputFS.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				return walkErr
+			}
+			if budget != nil {
+				if err := budget.beginEntry(); err != nil {
+					return err
+				}
 			}
 			if entry.IsDir() {
 				return nil
 			}
 			if entry.Type()&os.ModeSymlink != 0 {
-				target, err := filepath.EvalSymlinks(name)
+				fullName := filepath.Join(resolvedRoot, filepath.FromSlash(name))
+				target, err := filepath.EvalSymlinks(fullName)
 				if err != nil {
-					return fmt.Errorf("resolve selected output symlink %q: %w", name, err)
+					return fmt.Errorf("resolve selected output symlink %q: %w", fullName, err)
 				}
 				if _, inside := relativeWithin(root, target); !inside {
-					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", name)
+					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", fullName)
 				}
-				info, err := os.Stat(target)
+				info, err := rootFS.Stat(filepath.Join(outputRootRel, filepath.FromSlash(name)))
 				if err != nil {
 					return err
 				}
@@ -432,7 +532,7 @@ func validateOutputContent(root string, proof Proof) error {
 			} else if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".class") {
 				return nil
 			}
-			rel, err := filepath.Rel(root, name)
+			rel, err := filepath.Rel(root, filepath.Join(resolvedRoot, filepath.FromSlash(name)))
 			if err != nil {
 				return err
 			}
@@ -443,8 +543,12 @@ func validateOutputContent(root string, proof Proof) error {
 			}
 			return nil
 		})
+		closeErr := outputFS.Close()
 		if err != nil {
 			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	if len(observed) != len(expected) {
@@ -649,6 +753,15 @@ func canonicalRepoPath(root, abs string) (string, error) {
 // ponytail: hashes the full tree in O(repository bytes); use a Gradle-proven
 // input manifest if explicit freshness checks become costly.
 func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
+	return repositoryFingerprintContext(context.Background(), root, sourceRoots, nil)
+}
+
+func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots []string, budget *classpathReadBudget) (string, error) {
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return "", errors.New("repository root cannot be opened safely")
+	}
+	defer rootFS.Close()
 	h := sha256.New()
 	write := func(name string, data []byte) {
 		var size [8]byte
@@ -659,8 +772,25 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 		h.Write(size[:])
 		h.Write(data)
 	}
-	writeFile := func(name, path string) error {
-		f, err := os.Open(path)
+	type observedRepositoryPath struct {
+		info       fs.FileInfo
+		linkTarget string
+	}
+	writeFile := func(name, path string, observed observedRepositoryPath) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pathBefore, err := rootFS.Lstat(filepath.FromSlash(path))
+		if err != nil || !os.SameFile(observed.info, pathBefore) || (pathBefore.Mode()&os.ModeSymlink != 0) != (observed.info.Mode()&os.ModeSymlink != 0) {
+			return errors.New("repository path changed before hashing")
+		}
+		if observed.info.Mode()&os.ModeSymlink != 0 {
+			linkBefore, err := rootFS.Readlink(filepath.FromSlash(path))
+			if err != nil || linkBefore != observed.linkTarget {
+				return errors.New("repository symlink changed before hashing")
+			}
+		}
+		f, err := rootFS.Open(filepath.FromSlash(path))
 		if err != nil {
 			return err
 		}
@@ -669,8 +799,20 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 			f.Close()
 			return err
 		}
+		if budget != nil {
+			if err := budget.beginFile(info.Size()); err != nil {
+				f.Close()
+				return err
+			}
+		}
 		content := sha256.New()
-		_, copyErr := io.Copy(content, f)
+		readLimit := info.Size()
+		read, copyErr := io.Copy(content, io.LimitReader(contextReader{ctx: ctx, r: f}, readLimit))
+		if budget != nil {
+			budget.recordBytes(read)
+		}
+		after, statErr := f.Stat()
+		pathAfter, pathErr := rootFS.Lstat(filepath.FromSlash(path))
 		closeErr := f.Close()
 		if copyErr != nil {
 			return copyErr
@@ -678,19 +820,48 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 		if closeErr != nil {
 			return closeErr
 		}
+		if read != info.Size() {
+			return errors.New("classpath revalidation budget exceeded or repository file changed while hashing")
+		}
+		if statErr != nil || pathErr != nil || !os.SameFile(observed.info, pathAfter) || (pathAfter.Mode()&os.ModeSymlink != 0) != (observed.info.Mode()&os.ModeSymlink != 0) || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+			return errors.New("repository file changed while hashing")
+		}
+		if observed.info.Mode()&os.ModeSymlink != 0 {
+			linkAfter, err := rootFS.Readlink(filepath.FromSlash(path))
+			if err != nil || linkAfter != observed.linkTarget {
+				return errors.New("repository symlink changed while hashing")
+			}
+		}
+		pathTarget, targetErr := rootFS.Stat(filepath.FromSlash(path))
+		if targetErr != nil || !os.SameFile(info, pathTarget) || info.Size() != pathTarget.Size() || !info.ModTime().Equal(pathTarget.ModTime()) {
+			return errors.New("repository file path changed while hashing")
+		}
 		write("file:"+name, []byte(fmt.Sprintf("%o", info.Mode().Perm())))
 		write("content:"+name, content.Sum(nil))
 		return nil
 	}
-	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
+	err = fs.WalkDir(rootFS.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
-		var info fs.FileInfo
-		var err error
+		if budget != nil {
+			if err := budget.beginEntry(); err != nil {
+				return err
+			}
+		}
+		pathInfo, err := rootFS.Lstat(filepath.FromSlash(name))
+		if err != nil {
+			return err
+		}
+		info := pathInfo
 		linkTarget := ""
+		linkText := ""
 		if entry.Type()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(name)
+			fullName := filepath.Join(root, filepath.FromSlash(name))
+			target, err := filepath.EvalSymlinks(fullName)
 			if err != nil {
 				return fmt.Errorf("resolve repository symlink %s: %w", name, err)
 			}
@@ -701,52 +872,56 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 			if err != nil {
 				return err
 			}
-			info, err = os.Stat(name)
+			linkText, err = rootFS.Readlink(filepath.FromSlash(name))
+			if err != nil {
+				return err
+			}
+			info, err = rootFS.Stat(filepath.FromSlash(name))
 			if err != nil {
 				return err
 			}
 			if info.IsDir() {
 				return fmt.Errorf("directory symlink prevents a complete local fingerprint: %s", name)
 			}
-		} else {
-			info, err = entry.Info()
-			if err != nil {
-				return err
-			}
 		}
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		rel, err := filepath.Rel(root, name)
-		if err != nil {
-			return err
-		}
+		rel := filepath.ToSlash(name)
 		if linkTarget != "" {
 			write("symlink:"+filepath.ToSlash(rel), []byte(filepath.ToSlash(linkTarget)))
 		}
-		return writeFile(filepath.ToSlash(rel), name)
+		return writeFile(filepath.ToSlash(rel), filepath.ToSlash(rel), observedRepositoryPath{info: pathInfo, linkTarget: linkText})
 	})
 	if err != nil {
 		return "", err
 	}
 	for _, sourceRoot := range sourceRoots {
-		abs := filepath.Join(root, filepath.FromSlash(sourceRoot))
 		write("source-root:"+sourceRoot, nil)
-		err := filepath.WalkDir(abs, func(name string, entry fs.DirEntry, walkErr error) error {
-			if errors.Is(walkErr, os.ErrNotExist) && name == abs {
+		walkRoot := filepath.ToSlash(filepath.Clean(sourceRoot))
+		err := fs.WalkDir(rootFS.FS(), walkRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if errors.Is(walkErr, os.ErrNotExist) && name == walkRoot {
 				return nil
 			}
 			if walkErr != nil {
 				return walkErr
 			}
+			if budget != nil {
+				if err := budget.beginEntry(); err != nil {
+					return err
+				}
+			}
 			if entry.IsDir() || !entry.Type().IsRegular() {
 				return nil
 			}
-			rel, err := filepath.Rel(root, name)
+			pathInfo, err := rootFS.Lstat(filepath.ToSlash(name))
 			if err != nil {
 				return err
 			}
-			return writeFile("source:"+filepath.ToSlash(rel), name)
+			return writeFile("source:"+filepath.ToSlash(name), filepath.ToSlash(name), observedRepositoryPath{info: pathInfo})
 		})
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
@@ -783,6 +958,13 @@ func hashFingerprintV2(root string, model gradleModel, roots []string, repositor
 	// Process IDs are ephemeral callback-correlation diagnostics, not v2
 	// evidence inputs. Keep them out of the stable v2 fingerprint contract.
 	model.GradleProcessID = 0
+	// The opt-in classpath sidecar is independently versioned. Its fields must
+	// not alter the established v2 fingerprint contract or make existing v2
+	// artifacts fail read-only currentness checks.
+	model.ClasspathObservation = ""
+	model.ClasspathState = ""
+	model.ClasspathProvenance = nil
+	model.ClasspathEntries = nil
 	data, _ := json.Marshal(struct {
 		Repository string      `json:"repository"`
 		Model      gradleModel `json:"model"`
@@ -875,6 +1057,48 @@ func publishEvidenceArtifacts(primaryPath string, primaryData []byte, probePath 
 				return fmt.Errorf("primary evidence artifact is published at %q and compiler probe sidecar was published at %q, but sidecar staging cleanup failed: %w", primaryPath, probePath, err)
 			}
 			return fmt.Errorf("primary evidence artifact was published at %q, but compiler probe sidecar publication failed; the primary artifact remains in place: %w", primaryPath, err)
+		}
+	}
+	return nil
+}
+
+type evidenceSidecar struct {
+	path  string
+	data  []byte
+	label string
+}
+
+func publishEvidenceBundle(primaryPath string, primaryData []byte, sidecars []evidenceSidecar, publish func(string, []byte) error) error {
+	if err := requireAbsent(primaryPath); err != nil {
+		return fmt.Errorf("primary evidence output is unavailable: %w", err)
+	}
+	seen := map[string]struct{}{filepath.Clean(primaryPath): {}}
+	for _, sidecar := range sidecars {
+		if sidecar.path == "" || sidecar.label == "" {
+			return errors.New("evidence sidecar path and label are required")
+		}
+		if _, duplicate := seen[filepath.Clean(sidecar.path)]; duplicate {
+			return fmt.Errorf("duplicate evidence sidecar output path %q", sidecar.path)
+		}
+		seen[filepath.Clean(sidecar.path)] = struct{}{}
+		if err := requireAbsent(sidecar.path); err != nil {
+			return fmt.Errorf("%s output is unavailable: %w", sidecar.label, err)
+		}
+	}
+	if err := publish(primaryPath, primaryData); err != nil {
+		var publishedErr *artifactPublishedError
+		if errors.As(err, &publishedErr) {
+			return fmt.Errorf("primary evidence artifact was published at %q but staging cleanup failed; sidecars were not published: %w", primaryPath, err)
+		}
+		return fmt.Errorf("publish primary evidence artifact: %w", err)
+	}
+	for _, sidecar := range sidecars {
+		if err := publish(sidecar.path, sidecar.data); err != nil {
+			var publishedErr *artifactPublishedError
+			if errors.As(err, &publishedErr) {
+				return fmt.Errorf("primary evidence artifact is published at %q and %s is published at %q, but sidecar staging cleanup failed: %w", primaryPath, sidecar.label, sidecar.path, err)
+			}
+			return fmt.Errorf("primary evidence artifact was published at %q, but %s publication failed; prior outputs remain in place: %w", primaryPath, sidecar.label, err)
 		}
 	}
 	return nil

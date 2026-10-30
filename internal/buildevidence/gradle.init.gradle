@@ -244,6 +244,71 @@ gradle.projectsEvaluated {
             def observation = gradle.rootProject.extensions.extraProperties.has('cg35.task.observation') ?
                 gradle.rootProject.extensions.extraProperties.get('cg35.task.observation') : [:]
             if (!observation) throw new GradleException('Selected Kotlin compile task outcome was not observed')
+            def dependencyObservation = [:]
+            if (props.get('cg35.dependency.snapshot') == 'true') {
+                def entries = []
+                def state = 'complete'
+                def provenance = ['KotlinCompile.libraries FileCollection rendered through Gradle asPath in iteration order']
+                try {
+                    def libraries = compileTask.property('libraries')
+                    if (!(libraries instanceof org.gradle.api.file.FileCollection)) {
+                        throw new GradleException('Selected Kotlin task libraries is not a Gradle FileCollection')
+                    }
+                    def rendered = libraries.asPath
+                    def orderedPaths = rendered ? rendered.split(java.util.regex.Pattern.quote(File.pathSeparator), -1).toList() : []
+                    def expectedPaths = libraries.files.collect { it.canonicalPath }
+                    def observedPaths = orderedPaths.collect { new File(it).canonicalPath }
+                    if (observedPaths.size() != expectedPaths.size() || observedPaths.toSet() != expectedPaths.toSet()) {
+                        state = 'incomplete'
+                        provenance.add('Gradle classpath rendering did not match the Kotlin task FileCollection membership')
+                    }
+                    def maxEntries = 10000
+                    def maxPathBytes = 8 * 1024 * 1024
+                    long pathBytes = 0
+                    def retainedPaths = []
+                    orderedPaths.each { path ->
+                        if (retainedPaths.size() < maxEntries && pathBytes + path.length() <= maxPathBytes) {
+                            retainedPaths.add(path)
+                            pathBytes += path.length()
+                        }
+                    }
+                    if (retainedPaths.size() != orderedPaths.size()) {
+                        state = 'incomplete'
+                        provenance.add('classpath path or model size limit exceeded; remaining entries omitted')
+                    }
+
+                    def componentByFile = [:]
+                    try {
+                        def configuration = project.configurations.getByName(compilation.compileDependencyConfigurationName)
+                        configuration.incoming.artifacts.artifacts.each { artifactResult ->
+                            def component = artifactResult.id.componentIdentifier
+                            def identity = ''
+                            if (component.hasProperty('group') && component.hasProperty('module') && component.hasProperty('version')) {
+                                identity = 'module:' + component.group + ':' + component.module + ':' + component.version
+                            } else if (component.hasProperty('projectPath')) {
+                                identity = 'project:' + component.projectPath
+                            } else if (component.class.simpleName == 'OpaqueComponentIdentifier') {
+                                identity = 'file'
+                            }
+                            if (identity == 'file' || identity ==~ /(?:module:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:[A-Za-z0-9_.+-]+|project::?[A-Za-z0-9_:.+-]*)/) {
+                                componentByFile[artifactResult.file.canonicalPath] = identity
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                        provenance.add('resolved component identity mapping unavailable; task classpath files remain observable')
+                    }
+                    retainedPaths.each { path -> entries.add([path: path, identity: componentByFile[new File(path).canonicalPath] ?: '']) }
+                } catch (Throwable ignored) {
+                    state = 'incomplete'
+                    provenance.add('selected Kotlin task libraries could not be enumerated safely')
+                }
+                dependencyObservation = [
+                    classpath_observation: 'KotlinCompile.libraries',
+                    classpath_state: state,
+                    classpath_provenance: provenance,
+                    classpath_entries: entries
+                ]
+            }
             def model = [
                 gradle_version: gradle.gradleVersion,
                 kotlin_plugin_version: kotlinPlugin?.pluginVersion ?: '',
@@ -256,7 +321,7 @@ gradle.projectsEvaluated {
                 compilation: compilationName,
                 source_roots: sourceRoots,
                 dependencies: dependencies
-            ] + observation
+            ] + observation + dependencyObservation
             new File(outputPath).setText(JsonOutput.toJson(model), 'UTF-8')
         }
     }

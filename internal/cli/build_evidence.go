@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/isink17/codegraph/internal/buildevidence"
 )
@@ -19,6 +22,7 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 	output := fs.String("output", "", "new artifact path outside the repository")
 	probeJar := fs.String("compiler-probe-jar", "", "optional prebuilt Kotlin 2.3.20 diagnostic probe JAR (writes a separate .compiler-probe.json artifact)")
 	probeStrategy := fs.String("compiler-execution-strategy", "", "optional compiler strategy for probe experiments: daemon or in-process")
+	dependencySnapshot := fs.Bool("dependency-snapshot", false, "write a separate content-addressed snapshot of selected KotlinCompile.libraries")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -33,6 +37,7 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 		OutputPath:                *output,
 		CompilerProbeJar:          *probeJar,
 		CompilerExecutionStrategy: *probeStrategy,
+		DependencySnapshot:        *dependencySnapshot,
 		Stderr:                    stderr,
 	})
 	if err != nil {
@@ -49,5 +54,82 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 	if *probeJar != "" {
 		_, err = fmt.Fprintf(stdout, "Wrote opt-in compiler callback diagnostic to %s.compiler-probe.json\n", *output)
 	}
+	if err == nil && *dependencySnapshot {
+		_, err = fmt.Fprintf(stdout, "Wrote opt-in Kotlin task classpath content snapshot to %s.classpath.json (Gradle selection and compiler-consumed completeness remain unknown)\n", *output)
+	}
 	return err
+}
+
+func runValidateGradleClasspath(ctx context.Context, stdout, stderr io.Writer, args []string) error {
+	fs := flag.NewFlagSet("validate-gradle-dependency-snapshot", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	root := fs.String("repo-root", "", "repository root used by the related Gradle evidence")
+	evidencePath := fs.String("evidence", "", "related codegraph.gradle_kotlin_evidence/v2 artifact")
+	snapshotPath := fs.String("snapshot", "", "codegraph.kotlin_task_classpath_snapshot/v1 sidecar")
+	gradleHome := fs.String("gradle-user-home", "", "Gradle user home (defaults to GRADLE_USER_HOME or ~/.gradle)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+	if *root == "" || *evidencePath == "" || *snapshotPath == "" {
+		return fmt.Errorf("--repo-root, --evidence, and --snapshot are required")
+	}
+	read := func(path string) ([]byte, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		data, err := io.ReadAll(io.LimitReader(file, buildevidence.MaxArtifactSize+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > buildevidence.MaxArtifactSize {
+			return nil, fmt.Errorf("artifact exceeds %d bytes", buildevidence.MaxArtifactSize)
+		}
+		return data, nil
+	}
+	evidenceBytes, err := read(*evidencePath)
+	if err != nil {
+		return fmt.Errorf("read related build evidence: %w", err)
+	}
+	evidence, err := buildevidence.Decode(evidenceBytes)
+	if err != nil {
+		return err
+	}
+	snapshotBytes, err := read(*snapshotPath)
+	if err != nil {
+		return fmt.Errorf("read dependency snapshot: %w", err)
+	}
+	snapshot, err := buildevidence.DecodeClasspathSnapshot(snapshotBytes)
+	if err != nil {
+		return err
+	}
+	if *gradleHome == "" {
+		*gradleHome = os.Getenv("GRADLE_USER_HOME")
+		if *gradleHome == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			*gradleHome = filepath.Join(home, ".gradle")
+		}
+	}
+	status, err := buildevidence.ValidateClasspathSnapshotCurrentContext(ctx, *root, *gradleHome, evidence, snapshot)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(stdout, string(data)); err != nil {
+		return err
+	}
+	if status.BuildEvidence != buildevidence.Complete || status.RecordedContent != buildevidence.Complete {
+		return fmt.Errorf("recorded dependency content or related build evidence is stale or incomplete; selection freshness and compiler-consumed completeness remain UNKNOWN")
+	}
+	return nil
 }

@@ -131,6 +131,86 @@ logs, or absolute machine paths. Source roots are canonical repository-relative
 paths, and escaping symlinks fail closed. The output must be outside the
 repository and is never overwritten. Ordinary index/update/watch/serve/MCP
 paths do not call the producer.
+
+## Opt-in Kotlin task classpath snapshot
+
+`export-gradle-evidence --dependency-snapshot` writes a separate
+`<output>.classpath.json` sidecar using schema
+`codegraph.kotlin_task_classpath_snapshot/v1`. The v2 artifact contract and
+fingerprint remain unchanged. The sidecar identifies the same repository,
+project, Kotlin compilation, exact compile task, and v2 input fingerprint.
+
+The observation source is the selected KGP task's public
+`KotlinCompile.libraries` Gradle `FileCollection`. The exporter records its
+Gradle `asPath` rendering order and checks its members against the FileCollection.
+For the pinned fixture, that task collection matched the selected compilation's
+`compileClasspath` file collection. This records the selected task's declared
+classpath files. It does not prove that the compiler consumed every entry or
+establish complete compiler input closure. The names in the sidecar are
+`RESOLVED_TASK_CLASSPATH_CONTENT_SNAPSHOT` (observable task files) and
+`COMPILER_CONSUMED_CLASSPATH_COMPLETE` (always `unknown` here).
+
+Each observable entry preserves its position and duplicate record, uses a
+repository-relative or Gradle-user-home-relative locator, and hashes file bytes
+or a deterministic directory listing of relative file paths, sizes, and file
+SHA-256 values. Entry roles identify matched external JARs, project outputs,
+local files, directories, or an unknown role. Component coordinates are
+metadata only; they never substitute for byte identity. When Gradle exposes a
+transformed output through `KotlinCompile.libraries`, the bytes at that actual
+observed path are hashed. The sidecar does not claim that a transformation
+occurred unless the available component/file mapping proves the identity.
+In the pinned Gradle 9.3.1 / KGP 2.3.20 fixture, a `files(...)` dependency is
+present in `KotlinCompile.libraries` and its bytes are hashed, but the resolved
+artifact mapping supplies no component identity for that path. It therefore
+stays role `unknown` with incomplete provenance. Unclassified provenance
+remains incomplete even if the observed bytes hash.
+
+The producer bounds classpath entry count (10,000), directory file count
+(50,000), total bytes (1 GiB), and individual files (256 MiB). Unsupported
+locations, missing/unreadable files, symlinks, unstable content, and exceeded
+limits produce explicit incomplete entries. No truncated snapshot is marked
+complete. Files outside the repository and Gradle user home are not recorded by
+absolute path. Hashing and read-only validation use Go root-scoped filesystem
+handles anchored to the canonical repository or Gradle home, so a parent
+symlink swap cannot redirect an opened file outside that root. Detected file or
+directory replacement during hashing is incomplete; the snapshot is not a
+defense against a malicious same-user process that can mutate and restore file
+contents and metadata between observations. Publication preflights the primary artifact and all requested
+sidecars, publishes the primary first, and reports a later partial sidecar
+failure without overwriting existing files.
+
+`validate-gradle-dependency-snapshot --repo-root PATH --evidence FILE
+--snapshot FILE [--gradle-user-home PATH]` is read-only and invokes no Gradle.
+It verifies that the sidecar belongs to the supplied v2 artifact, recomputes
+the current v2 local fingerprint, and rehashes every previously recorded path.
+One aggregate budget covers that fingerprint, selected output checks, and
+classpath entry revalidation: 2 GiB of file bytes read, 110,000 file-hash
+operations, and 110,000 directory-entry visits, in addition to the per-file,
+per-directory, and classpath-entry limits. A directory's content pass hashes
+each file twice, so that work counts twice. The scan observes context
+cancellation between directory entries and during file reads.
+Repeated entries with the same scope, relative path, and kind reuse one
+verified observation while remaining duplicated and ordered in the sidecar.
+If an aggregate budget is exhausted, build-evidence freshness or affected and
+subsequent unverified classpath entries stay incomplete; validation cannot
+report complete byte freshness.
+`recorded_content_freshness=complete` means those recorded paths still have the
+same bytes. The validator does not enumerate today's Kotlin task classpath,
+re-resolve Gradle, or detect a newly selected dependency that was not in the
+old snapshot. Therefore `dependency_selection_freshness` and compiler-consumed
+completeness remain `unknown`; a fresh byte check is not proof that the resolved
+dependency selection is still current.
+
+A Gradle compile task may be `UP_TO_DATE` after a dependency JAR's non-ABI bytes
+change because Gradle/KGP may normalize classpath inputs by ABI. The sidecar
+still records and validates the bytes at the task's declared classpath paths,
+while the existing v2 output-provenance state remains incomplete for the
+up-to-date task. This observation makes no ABI or semantic-change claim.
+
+The sidecar has no compiler, resolver, importer, Store classifier, or JVM ABI
+consumer. The existing v2 `dependency` dimension remains incomplete, and no
+trust state is promoted from a successful export or hash.
+
 Directory symlinks in the scanned repository currently refuse fingerprinting.
 The output parent must already exist; its canonical path is checked before
 Gradle starts, including symlinked parents.
