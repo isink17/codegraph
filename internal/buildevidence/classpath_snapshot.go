@@ -893,6 +893,12 @@ func stableDirectoryDigestRootContext(ctx context.Context, root *os.Root, path s
 			return "", 0, errors.New("classpath directory changed while hashing")
 		}
 	}
+	for _, item := range items {
+		digest, size, err := stableFileDigestRootContext(ctx, dir, filepath.FromSlash(item.path), MaxClasspathFileBytes)
+		if err != nil || size != item.size || digest != item.digest {
+			return "", 0, errors.New("classpath directory content changed while hashing")
+		}
+	}
 	after, err := root.Lstat(path)
 	openedAfter, openedErr := dir.Stat(".")
 	if err != nil || openedErr != nil || !os.SameFile(rootInfo, after) || !os.SameFile(openedInfo, openedAfter) {
