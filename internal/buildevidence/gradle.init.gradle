@@ -61,6 +61,26 @@ def outputRootState = { org.gradle.api.Task task ->
     [roots: roots.toList().sort(), contained: contained, clean: clean && !roots.isEmpty()]
 }
 
+def sourceInventory = { org.gradle.api.Task task, def compilation ->
+	def kotlinCompileTool = task.class.classLoader.loadClass('org.jetbrains.kotlin.gradle.tasks.KotlinCompileTool')
+	if (!kotlinCompileTool.isInstance(task)) {
+        throw new GradleException('Selected task does not expose KotlinCompileTool.sources')
+    }
+    def sourceSets = compilation.allKotlinSourceSets
+    def selectedFiles = task.sources.files.findAll { it.isFile() }.collect { it.absolutePath }.unique().sort()
+    def candidates = sourceSets.collectMany { it.allKotlinSources.files }
+        .findAll { it.isFile() }.collect { it.absolutePath }.unique().sort()
+    def generated = sourceSets.collectMany { it.generatedKotlin.asFileTree.files }
+        .findAll { it.isFile() }.collect { it.absolutePath }.unique().sort()
+    def sourceRoots = sourceSets.collectMany { it.kotlin.sourceDirectories.files }
+        .collect { it.absolutePath }.unique().sort()
+    def generatedRoots = sourceSets.collectMany { it.generatedKotlin.srcDirs }
+        .collect { it.absolutePath }.unique().sort()
+    [task_files: selectedFiles, candidate_files: candidates, generated_files: generated,
+        source_roots: sourceRoots, generated_roots: generatedRoots,
+        includes: task.includes.toList().sort(), excludes: task.excludes.toList().sort()]
+}
+
 gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
     void beforeExecute(org.gradle.api.Task task) {
         def selectedPath = gradle.rootProject.extensions.extraProperties.has('cg35.selected.task') ?
@@ -68,6 +88,10 @@ gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
         if (task.path == selectedPath) {
             gradle.rootProject.extensions.extraProperties.set('cg35.task.inputs.before', inputInventory(task))
             gradle.rootProject.extensions.extraProperties.set('cg35.task.outputs.before', outputRootState(task))
+            if (gradle.rootProject.extensions.extraProperties.has('cg35.source.snapshot.enabled')) {
+                def compilation = gradle.rootProject.extensions.extraProperties.get('cg35.source.compilation')
+                gradle.rootProject.extensions.extraProperties.set('cg35.task.sources.before', sourceInventory(task, compilation))
+            }
         }
     }
     void afterExecute(org.gradle.api.Task task, org.gradle.api.tasks.TaskState state) {
@@ -164,6 +188,38 @@ gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
             outputs_contained: outputsContained,
             gradle_process_id: ProcessHandle.current().pid()
         ]
+        if (gradle.rootProject.extensions.extraProperties.has('cg35.source.snapshot.enabled')) {
+            def compilation = gradle.rootProject.extensions.extraProperties.get('cg35.source.compilation')
+            def sourceBefore = gradle.rootProject.extensions.extraProperties.has('cg35.task.sources.before') ?
+                gradle.rootProject.extensions.extraProperties.get('cg35.task.sources.before') : [:]
+            if (!sourceBefore) {
+                sourceBefore = [
+                    task_files: [], candidate_files: [], generated_files: [],
+                    source_roots: [], generated_roots: [], observation_missing: true
+                ]
+            }
+            def sourceAfter = sourceInventory(task, compilation)
+            observation.source_observation = [
+                api: 'org.jetbrains.kotlin.gradle.tasks.KotlinCompileTool.sources',
+                candidate_api: 'KotlinSourceSet.allKotlinSources',
+                generated_api: 'KotlinSourceSet.generatedKotlin',
+                phase: 'beforeExecute_and_afterExecute',
+                kotlin_plugin_version: gradle.rootProject.extensions.extraProperties.get('cg35.source.plugin.version'),
+                task_files_before: sourceBefore.task_files ?: [],
+                task_files_after: sourceAfter.task_files,
+                candidate_files_before: sourceBefore.candidate_files ?: [],
+                candidate_files_after: sourceAfter.candidate_files,
+                generated_files_before: sourceBefore.generated_files ?: [],
+                generated_files_after: sourceAfter.generated_files,
+                source_roots_before: sourceBefore.source_roots ?: [],
+                source_roots_after: sourceAfter.source_roots,
+                generated_roots_before: sourceBefore.generated_roots ?: [],
+                generated_roots_after: sourceAfter.generated_roots,
+                includes: sourceAfter.includes,
+                excludes: sourceAfter.excludes,
+                observation_missing: sourceBefore.observation_missing ?: false
+            ]
+        }
         gradle.rootProject.extensions.extraProperties.set('cg35.task.observation', observation)
     }
 })
@@ -189,6 +245,16 @@ gradle.projectsEvaluated {
     def compileTask = project.tasks.findByName(compilation.compileKotlinTaskName)
     if (compileTask == null) throw new GradleException('Selected Kotlin/JVM compilation has no compile task')
     gradle.rootProject.extensions.extraProperties.set('cg35.selected.task', compileTask.path)
+
+    if (props.get('cg35.source.snapshot') == 'true') {
+        def kotlinPlugin = project.plugins.find { it.class.name == 'org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper' }
+        if (kotlinPlugin?.pluginVersion != '2.3.20') {
+            throw new GradleException('Kotlin task source snapshot only supports Kotlin Gradle Plugin 2.3.20')
+        }
+        gradle.rootProject.extensions.extraProperties.set('cg35.source.snapshot.enabled', true)
+        gradle.rootProject.extensions.extraProperties.set('cg35.source.compilation', compilation)
+        gradle.rootProject.extensions.extraProperties.set('cg35.source.plugin.version', kotlinPlugin.pluginVersion)
+    }
 
     def probeJar = props.get('cg35.probe.jar')
     def probeRecord = props.get('cg35.probe.record')

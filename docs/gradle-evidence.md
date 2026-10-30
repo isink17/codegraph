@@ -211,6 +211,44 @@ The sidecar has no compiler, resolver, importer, Store classifier, or JVM ABI
 consumer. The existing v2 `dependency` dimension remains incomplete, and no
 trust state is promoted from a successful export or hash.
 
+## Opt-in Kotlin task source snapshot
+
+`export-gradle-evidence --source-snapshot` writes a separate
+`<output>.sources.json` sidecar with schema
+`codegraph.kotlin_task_source_snapshot/v1`. It preserves the v2 artifact and
+fingerprint semantics. This first implementation supports Gradle 9.3.1 with
+Kotlin Gradle Plugin 2.3.20 and one selected Kotlin/JVM compilation.
+
+The selected Kotlin file membership comes from the public KGP
+`KotlinCompileTool.sources` FileCollection, observed immediately before and
+after the selected compile task using a Gradle task execution listener. The
+source file collection is lazy and includes KGP source extension and
+include/exclude pattern filtering. This is declared selected-task membership;
+it is not a proof of compiler-consumed files. Java and script inputs handled
+separately by KGP are outside this Kotlin-source sidecar.
+
+For explanation, the exporter records KotlinSourceSet.allKotlinSources
+candidates and experimental KotlinSourceSet.generatedKotlin membership.
+Generated-set membership may label an entry as registered-generated-set, but
+producer task ownership remains unknown. The exporter does not infer generated
+origin from paths or names. Exclusion coverage is incomplete: arbitrary
+Gradle predicates are not enumerable, and the finite source-set candidate list
+does not establish every file considered or rejected by the build.
+
+Selected source bytes are SHA-256 hashed through the existing rooted,
+bounded filesystem reader. Paths outside the repository, symlinks, missing or
+unstable files, and budget exhaustion fail closed. The sidecar has explicit
+membership, recorded-byte, candidate, generated-set, exclusion, generated
+ownership, and compiler-consumption states. The last three trust boundaries
+remain incomplete/unknown as appropriate and never promote resolver evidence.
+
+`validate-gradle-source-snapshot --repo-root PATH --evidence FILE --snapshot
+FILE` is read-only and never invokes Gradle. It checks the related v2
+fingerprint and rehashes only recorded source paths. Therefore its recorded
+byte freshness does not prove current task membership: newly selected paths
+and today's Gradle filters remain unknown. Compiler-consumed source
+completeness and generated producer ownership also remain unknown.
+
 Directory symlinks in the scanned repository currently refuse fingerprinting.
 The output parent must already exist; its canonical path is checked before
 Gradle starts, including symlinked parents.

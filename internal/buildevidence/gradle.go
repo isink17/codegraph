@@ -34,43 +34,45 @@ type GradleRequest struct {
 	CompilerProbeJar          string
 	CompilerExecutionStrategy string
 	DependencySnapshot        bool
+	SourceSnapshot            bool
 	Stderr                    io.Writer
 }
 
 type gradleModel struct {
-	GradleVersion            string              `json:"gradle_version"`
-	KotlinPluginVersion      string              `json:"kotlin_plugin_version"`
-	KotlinCompilerVersion    string              `json:"kotlin_compiler_version,omitempty"`
-	CompileTask              string              `json:"compile_task,omitempty"`
-	JDKVendor                string              `json:"jdk_vendor"`
-	JDKVersion               string              `json:"jdk_version"`
-	GradleRuntimeJDKVendor   string              `json:"gradle_runtime_jdk_vendor"`
-	GradleRuntimeJDKVersion  string              `json:"gradle_runtime_jdk_version"`
-	SelectedToolchainVendor  string              `json:"selected_toolchain_vendor"`
-	SelectedToolchainVersion string              `json:"selected_toolchain_version"`
-	Project                  string              `json:"project"`
-	Compilation              string              `json:"compilation"`
-	SourceRoots              []string            `json:"source_roots"`
-	Dependencies             []string            `json:"dependencies"`
-	ClasspathObservation     string              `json:"classpath_observation,omitempty"`
-	ClasspathState           State               `json:"classpath_state,omitempty"`
-	ClasspathProvenance      []string            `json:"classpath_provenance,omitempty"`
-	ClasspathEntries         []rawClasspathEntry `json:"classpath_entries,omitempty"`
-	TaskOutcome              string              `json:"task_outcome"`
-	TaskDidWork              bool                `json:"task_did_work"`
-	TaskSkipped              bool                `json:"task_skipped"`
-	SkipReasonCode           string              `json:"skip_reason_code"`
-	TaskInputSHA256          []string            `json:"task_input_sha256"`
-	CompilerArtifacts        []FileIdentity      `json:"compiler_artifact_candidates"`
-	GradleProcessID          int64               `json:"gradle_process_id,omitempty"`
-	OutputFiles              []OutputFile        `json:"output_files"`
-	OutputRoots              []string            `json:"output_roots"`
-	JVMTarget                string              `json:"jvm_target"`
-	TaskInputsComplete       bool                `json:"task_inputs_complete"`
-	TaskInputsStable         bool                `json:"task_inputs_stable"`
-	OutputsComplete          bool                `json:"outputs_complete"`
-	OutputRootsClean         bool                `json:"output_roots_clean_before_task"`
-	OutputsContained         bool                `json:"outputs_contained"`
+	GradleVersion            string                `json:"gradle_version"`
+	KotlinPluginVersion      string                `json:"kotlin_plugin_version"`
+	KotlinCompilerVersion    string                `json:"kotlin_compiler_version,omitempty"`
+	CompileTask              string                `json:"compile_task,omitempty"`
+	JDKVendor                string                `json:"jdk_vendor"`
+	JDKVersion               string                `json:"jdk_version"`
+	GradleRuntimeJDKVendor   string                `json:"gradle_runtime_jdk_vendor"`
+	GradleRuntimeJDKVersion  string                `json:"gradle_runtime_jdk_version"`
+	SelectedToolchainVendor  string                `json:"selected_toolchain_vendor"`
+	SelectedToolchainVersion string                `json:"selected_toolchain_version"`
+	Project                  string                `json:"project"`
+	Compilation              string                `json:"compilation"`
+	SourceRoots              []string              `json:"source_roots"`
+	Dependencies             []string              `json:"dependencies"`
+	ClasspathObservation     string                `json:"classpath_observation,omitempty"`
+	ClasspathState           State                 `json:"classpath_state,omitempty"`
+	ClasspathProvenance      []string              `json:"classpath_provenance,omitempty"`
+	ClasspathEntries         []rawClasspathEntry   `json:"classpath_entries,omitempty"`
+	SourceObservation        *rawSourceObservation `json:"source_observation,omitempty"`
+	TaskOutcome              string                `json:"task_outcome"`
+	TaskDidWork              bool                  `json:"task_did_work"`
+	TaskSkipped              bool                  `json:"task_skipped"`
+	SkipReasonCode           string                `json:"skip_reason_code"`
+	TaskInputSHA256          []string              `json:"task_input_sha256"`
+	CompilerArtifacts        []FileIdentity        `json:"compiler_artifact_candidates"`
+	GradleProcessID          int64                 `json:"gradle_process_id,omitempty"`
+	OutputFiles              []OutputFile          `json:"output_files"`
+	OutputRoots              []string              `json:"output_roots"`
+	JVMTarget                string                `json:"jvm_target"`
+	TaskInputsComplete       bool                  `json:"task_inputs_complete"`
+	TaskInputsStable         bool                  `json:"task_inputs_stable"`
+	OutputsComplete          bool                  `json:"outputs_complete"`
+	OutputRootsClean         bool                  `json:"output_roots_clean_before_task"`
+	OutputsContained         bool                  `json:"outputs_contained"`
 }
 
 // ExportGradle invokes Gradle only at this explicit call site and writes a
@@ -169,6 +171,12 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		}
 		args = append(args, "-Pcg35.dependency.snapshot=true")
 	}
+	if req.SourceSnapshot {
+		if err := requireAbsent(output + ".sources.json"); err != nil {
+			return Artifact{}, fmt.Errorf("source snapshot output is unavailable: %w", err)
+		}
+		args = append(args, "-Pcg35.source.snapshot=true")
+	}
 	if probe != nil {
 		args = append(args,
 			"-Pcg35.probe.jar="+probe.jarPath,
@@ -208,6 +216,9 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	}
 	if model.Project != req.Project || model.Compilation != req.Compilation || model.GradleVersion == "" || model.CompileTask == "" || !validGradleProject(model.CompileTask) || (req.Project != ":" && !strings.HasPrefix(model.CompileTask, req.Project+":")) {
 		return Artifact{}, errors.New("Gradle model did not match the requested project and compilation")
+	}
+	if req.SourceSnapshot && (model.KotlinPluginVersion != SupportedSourceSnapshotKGP || model.SourceObservation == nil) {
+		return Artifact{}, fmt.Errorf("source snapshot requires Kotlin Gradle Plugin %s and a complete task observation", SupportedSourceSnapshotKGP)
 	}
 	if model.SourceRoots == nil {
 		return Artifact{}, errors.New("Gradle model omitted Kotlin source roots")
@@ -314,6 +325,22 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		}
 		dependencyOutput = output + ".classpath.json"
 	}
+	var sourceOutput string
+	var sourceData []byte
+	if req.SourceSnapshot {
+		snapshot, err := buildSourceSnapshotContext(ctx, root, artifact, *model.SourceObservation, model)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("build selected Kotlin source snapshot: %w", err)
+		}
+		sourceData, err = snapshot.Marshal()
+		if err != nil {
+			return Artifact{}, err
+		}
+		if len(sourceData) > MaxArtifactSize {
+			return Artifact{}, fmt.Errorf("generated Kotlin source snapshot exceeds %d bytes", MaxArtifactSize)
+		}
+		sourceOutput = output + ".sources.json"
+	}
 	data, err := artifact.Marshal()
 	if err != nil {
 		return Artifact{}, err
@@ -321,12 +348,15 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if len(data) > MaxArtifactSize {
 		return Artifact{}, fmt.Errorf("generated build evidence exceeds %d bytes", MaxArtifactSize)
 	}
-	sidecars := make([]evidenceSidecar, 0, 2)
+	sidecars := make([]evidenceSidecar, 0, 3)
 	if probeOutput != "" {
 		sidecars = append(sidecars, evidenceSidecar{path: probeOutput, data: probeData, label: "compiler probe"})
 	}
 	if dependencyOutput != "" {
 		sidecars = append(sidecars, evidenceSidecar{path: dependencyOutput, data: dependencyData, label: "dependency classpath snapshot"})
+	}
+	if sourceOutput != "" {
+		sidecars = append(sidecars, evidenceSidecar{path: sourceOutput, data: sourceData, label: "Kotlin task source snapshot"})
 	}
 	if err := publishEvidenceBundle(output, data, sidecars, writeNewFile); err != nil {
 		return Artifact{}, err
