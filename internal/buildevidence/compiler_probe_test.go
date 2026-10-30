@@ -82,6 +82,55 @@ func TestExportGradleCompilerProbePinnedFixture(t *testing.T) {
 			}
 		})
 	}
+	t.Run("distinct tokens invalidate opted-in compile task", func(t *testing.T) {
+		root := copyGradleFixture(t)
+		firstOutput := filepath.Join(t.TempDir(), "first.json")
+		first, err := ExportGradle(context.Background(), GradleRequest{
+			RepositoryRoot: root, GradleCommand: gradle, Project: ":app", Compilation: "main",
+			OutputPath: firstOutput, CompilerProbeJar: probeJar, CompilerExecutionStrategy: "daemon",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstProbe, err := readCompilerProbeArtifact(firstOutput + ".compiler-probe.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Proof == nil || first.Proof.TaskOutcome != "TASK_REPORTED_WORK" || !firstProbe.CallbackExecuted {
+			t.Fatalf("first opt-in invocation did not compile and observe callback: outcome=%+v probe=%+v", first.Proof, firstProbe)
+		}
+
+		secondOutput := filepath.Join(t.TempDir(), "second.json")
+		second, err := ExportGradle(context.Background(), GradleRequest{
+			RepositoryRoot: root, GradleCommand: gradle, Project: ":app", Compilation: "main",
+			OutputPath: secondOutput, CompilerProbeJar: probeJar, CompilerExecutionStrategy: "daemon",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondProbe, err := readCompilerProbeArtifact(secondOutput + ".compiler-probe.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if firstProbe.InvocationToken == secondProbe.InvocationToken {
+			t.Fatal("repeated opt-in invocations reused a compiler probe token")
+		}
+		if second.Proof == nil || second.Proof.TaskOutcome != "TASK_REPORTED_WORK" || !secondProbe.CallbackExecuted {
+			t.Fatalf("distinct token did not invalidate opt-in task inputs: outcome=%+v probe=%+v", second.Proof, secondProbe)
+		}
+	})
+}
+
+func readCompilerProbeArtifact(path string) (CompilerProbe, error) {
+	data, err := readBoundedFile(path, MaxCompilerProbeRecord)
+	if err != nil {
+		return CompilerProbe{}, err
+	}
+	var probe CompilerProbe
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return CompilerProbe{}, err
+	}
+	return probe, nil
 }
 
 func normalizedOutputFiles(in []OutputFile) []OutputFile {

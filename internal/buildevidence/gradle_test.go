@@ -306,6 +306,116 @@ func TestProducerIdentityAllowsKnownValuesAndRejectsFreeFormText(t *testing.T) {
 	}
 }
 
+func TestPublishEvidenceArtifactsRejectsExistingPrimaryWithoutPublishingSidecar(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "evidence.json")
+	sidecar := primary + ".compiler-probe.json"
+	original := []byte("user-owned primary")
+	if err := os.WriteFile(primary, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := publishEvidenceArtifacts(primary, []byte("new primary"), sidecar, []byte("new sidecar"), func(path string, data []byte) error {
+		called = true
+		return writeNewFile(path, data)
+	})
+	if err == nil || !strings.Contains(err.Error(), "primary evidence output is unavailable") {
+		t.Fatalf("publish error = %v", err)
+	}
+	if called {
+		t.Fatal("publisher ran despite pre-existing primary output")
+	}
+	got, err := os.ReadFile(primary)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("pre-existing primary changed: data=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(sidecar); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sidecar was published or stat failed: %v", err)
+	}
+}
+
+func TestPublishEvidenceArtifactsRejectsExistingSidecarWithoutPublishingPrimary(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "evidence.json")
+	sidecar := primary + ".compiler-probe.json"
+	original := []byte("user-owned sidecar")
+	if err := os.WriteFile(sidecar, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := publishEvidenceArtifacts(primary, []byte("new primary"), sidecar, []byte("new sidecar"), func(path string, data []byte) error {
+		called = true
+		return writeNewFile(path, data)
+	})
+	if err == nil || !strings.Contains(err.Error(), "compiler probe sidecar output is unavailable") {
+		t.Fatalf("publish error = %v", err)
+	}
+	if called {
+		t.Fatal("publisher ran despite pre-existing sidecar")
+	}
+	if _, err := os.Lstat(primary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("primary was published or stat failed: %v", err)
+	}
+	got, err := os.ReadFile(sidecar)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("pre-existing sidecar changed: data=%q err=%v", got, err)
+	}
+}
+
+func TestPublishEvidenceArtifactsDoesNotPublishSidecarWhenPrimaryPublicationFails(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "evidence.json")
+	sidecar := primary + ".compiler-probe.json"
+	primaryFailure := errors.New("injected primary publication failure")
+	calls := 0
+	err := publishEvidenceArtifacts(primary, []byte("primary bytes"), sidecar, []byte("sidecar bytes"), func(path string, data []byte) error {
+		calls++
+		if path == primary {
+			return primaryFailure
+		}
+		return writeNewFile(path, data)
+	})
+	if !errors.Is(err, primaryFailure) || !strings.Contains(err.Error(), "publish primary evidence artifact") {
+		t.Fatalf("primary publication error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("publisher calls = %d, want only primary", calls)
+	}
+	for _, path := range []string{primary, sidecar} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("artifact unexpectedly exists at %s: %v", path, err)
+		}
+	}
+}
+
+func TestPublishEvidenceArtifactsReportsPrimaryWhenSidecarPublicationFails(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "evidence.json")
+	sidecar := primary + ".compiler-probe.json"
+	sidecarFailure := errors.New("injected sidecar publication failure")
+	calls := 0
+	err := publishEvidenceArtifacts(primary, []byte("primary bytes"), sidecar, []byte("sidecar bytes"), func(path string, data []byte) error {
+		calls++
+		if path == sidecar {
+			return sidecarFailure
+		}
+		return writeNewFile(path, data)
+	})
+	if !errors.Is(err, sidecarFailure) || !strings.Contains(err.Error(), "primary evidence artifact was published") || !strings.Contains(err.Error(), "remains in place") {
+		t.Fatalf("publication error does not describe the partial pair: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("publisher calls = %d, want primary then sidecar", calls)
+	}
+	got, err := os.ReadFile(primary)
+	if err != nil || string(got) != "primary bytes" {
+		t.Fatalf("published primary = %q, err %v", got, err)
+	}
+	if _, err := os.Lstat(sidecar); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed sidecar unexpectedly exists: %v", err)
+	}
+}
+
 func TestExportGradlePinnedFixture(t *testing.T) {
 	gradle := os.Getenv("CODEGRAPH_TEST_GRADLE")
 	if gradle == "" {

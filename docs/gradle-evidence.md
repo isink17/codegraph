@@ -98,11 +98,11 @@ means only Gradle reported work for that task. `UP_TO_DATE`, `FROM_CACHE`,
 promoting execution or output trust. Raw skip text and machine paths are not
 serialized.
 
-Gradle's project/task history is kept in a per-repository CodeGraph directory
-under the user's cache directory so repeat explicit exports can report
-`UP_TO_DATE`; this is distinct from Gradle build-cache reuse, which remains
-disabled. The cache contains Gradle's local project state, not evidence or a
-compiler cache attestation.
+For ordinary exports without the opt-in compiler probe, Gradle's project/task
+history is kept in a per-repository CodeGraph directory under the user's cache
+directory so repeat explicit exports can report `UP_TO_DATE`; this is distinct
+from Gradle build-cache reuse, which remains disabled. The cache contains
+Gradle's local project state, not evidence or a compiler cache attestation.
 
 The producer deliberately reports source and dependency dimensions as
 `incomplete`; generated/excluded roots and external metadata as `unknown`; and
@@ -165,6 +165,17 @@ callback reads and echoes that token, selected project/compilation/task, and
 probe identity. Exporter validation requires exact equality and links the
 separate record to the v2 input fingerprint. It does not consume a callback
 from another task or invocation. No process-global token state is used.
+
+The fresh token is passed in `KotlinCompile.compilerOptions.freeCompilerArgs`,
+which Gradle treats as a selected-task input. Consequently, repeated opt-in
+exports with distinct tokens force that task to run again even when source and
+toolchain inputs are otherwise unchanged; this differs from an ordinary
+no-probe repeat, which can be `UP_TO_DATE`. The pinned fixture verifies that a
+second opt-in export has a distinct token, runs the selected task, and receives
+a fresh callback. If Gradle reports a skipped task for another reason, the
+exporter records `UNKNOWN` rather than reusing an observation. The pinned
+same-token lifecycle experiment separately reproduced `UP_TO_DATE` with no new
+callback; fail-closed unit coverage also exercises skipped outcomes.
 
 `--compiler-execution-strategy daemon` and `in-process` optionally select the
 matching KGP 2.3.20 execution strategy for controlled experiments. Omitting it
