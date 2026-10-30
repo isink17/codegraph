@@ -33,39 +33,44 @@ type GradleRequest struct {
 	OutputPath                string
 	CompilerProbeJar          string
 	CompilerExecutionStrategy string
+	DependencySnapshot        bool
 	Stderr                    io.Writer
 }
 
 type gradleModel struct {
-	GradleVersion            string         `json:"gradle_version"`
-	KotlinPluginVersion      string         `json:"kotlin_plugin_version"`
-	KotlinCompilerVersion    string         `json:"kotlin_compiler_version,omitempty"`
-	CompileTask              string         `json:"compile_task,omitempty"`
-	JDKVendor                string         `json:"jdk_vendor"`
-	JDKVersion               string         `json:"jdk_version"`
-	GradleRuntimeJDKVendor   string         `json:"gradle_runtime_jdk_vendor"`
-	GradleRuntimeJDKVersion  string         `json:"gradle_runtime_jdk_version"`
-	SelectedToolchainVendor  string         `json:"selected_toolchain_vendor"`
-	SelectedToolchainVersion string         `json:"selected_toolchain_version"`
-	Project                  string         `json:"project"`
-	Compilation              string         `json:"compilation"`
-	SourceRoots              []string       `json:"source_roots"`
-	Dependencies             []string       `json:"dependencies"`
-	TaskOutcome              string         `json:"task_outcome"`
-	TaskDidWork              bool           `json:"task_did_work"`
-	TaskSkipped              bool           `json:"task_skipped"`
-	SkipReasonCode           string         `json:"skip_reason_code"`
-	TaskInputSHA256          []string       `json:"task_input_sha256"`
-	CompilerArtifacts        []FileIdentity `json:"compiler_artifact_candidates"`
-	GradleProcessID          int64          `json:"gradle_process_id,omitempty"`
-	OutputFiles              []OutputFile   `json:"output_files"`
-	OutputRoots              []string       `json:"output_roots"`
-	JVMTarget                string         `json:"jvm_target"`
-	TaskInputsComplete       bool           `json:"task_inputs_complete"`
-	TaskInputsStable         bool           `json:"task_inputs_stable"`
-	OutputsComplete          bool           `json:"outputs_complete"`
-	OutputRootsClean         bool           `json:"output_roots_clean_before_task"`
-	OutputsContained         bool           `json:"outputs_contained"`
+	GradleVersion            string              `json:"gradle_version"`
+	KotlinPluginVersion      string              `json:"kotlin_plugin_version"`
+	KotlinCompilerVersion    string              `json:"kotlin_compiler_version,omitempty"`
+	CompileTask              string              `json:"compile_task,omitempty"`
+	JDKVendor                string              `json:"jdk_vendor"`
+	JDKVersion               string              `json:"jdk_version"`
+	GradleRuntimeJDKVendor   string              `json:"gradle_runtime_jdk_vendor"`
+	GradleRuntimeJDKVersion  string              `json:"gradle_runtime_jdk_version"`
+	SelectedToolchainVendor  string              `json:"selected_toolchain_vendor"`
+	SelectedToolchainVersion string              `json:"selected_toolchain_version"`
+	Project                  string              `json:"project"`
+	Compilation              string              `json:"compilation"`
+	SourceRoots              []string            `json:"source_roots"`
+	Dependencies             []string            `json:"dependencies"`
+	ClasspathObservation     string              `json:"classpath_observation,omitempty"`
+	ClasspathState           State               `json:"classpath_state,omitempty"`
+	ClasspathProvenance      []string            `json:"classpath_provenance,omitempty"`
+	ClasspathEntries         []rawClasspathEntry `json:"classpath_entries,omitempty"`
+	TaskOutcome              string              `json:"task_outcome"`
+	TaskDidWork              bool                `json:"task_did_work"`
+	TaskSkipped              bool                `json:"task_skipped"`
+	SkipReasonCode           string              `json:"skip_reason_code"`
+	TaskInputSHA256          []string            `json:"task_input_sha256"`
+	CompilerArtifacts        []FileIdentity      `json:"compiler_artifact_candidates"`
+	GradleProcessID          int64               `json:"gradle_process_id,omitempty"`
+	OutputFiles              []OutputFile        `json:"output_files"`
+	OutputRoots              []string            `json:"output_roots"`
+	JVMTarget                string              `json:"jvm_target"`
+	TaskInputsComplete       bool                `json:"task_inputs_complete"`
+	TaskInputsStable         bool                `json:"task_inputs_stable"`
+	OutputsComplete          bool                `json:"outputs_complete"`
+	OutputRootsClean         bool                `json:"output_roots_clean_before_task"`
+	OutputsContained         bool                `json:"outputs_contained"`
 }
 
 // ExportGradle invokes Gradle only at this explicit call site and writes a
@@ -157,6 +162,12 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
 		":codegraphExportEvidence",
+	}
+	if req.DependencySnapshot {
+		if err := requireAbsent(output + ".classpath.json"); err != nil {
+			return Artifact{}, fmt.Errorf("dependency snapshot output is unavailable: %w", err)
+		}
+		args = append(args, "-Pcg35.dependency.snapshot=true")
 	}
 	if probe != nil {
 		args = append(args,
@@ -284,6 +295,25 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		}
 		probeOutput = output + ".compiler-probe.json"
 	}
+	var dependencyOutput string
+	var dependencyData []byte
+	if req.DependencySnapshot {
+		if model.ClasspathObservation != "KotlinCompile.libraries" || model.ClasspathState == "" || model.ClasspathEntries == nil || model.ClasspathProvenance == nil {
+			return Artifact{}, errors.New("Gradle model omitted the selected task classpath observation")
+		}
+		snapshot, err := buildClasspathSnapshotContext(ctx, root, gradleUserHome(), artifact, model.ClasspathEntries, model.ClasspathState, model.ClasspathProvenance)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("snapshot selected Kotlin task classpath: %w", err)
+		}
+		dependencyData, err = snapshot.Marshal()
+		if err != nil {
+			return Artifact{}, err
+		}
+		if len(dependencyData) > MaxArtifactSize {
+			return Artifact{}, fmt.Errorf("dependency classpath snapshot exceeds %d bytes", MaxArtifactSize)
+		}
+		dependencyOutput = output + ".classpath.json"
+	}
 	data, err := artifact.Marshal()
 	if err != nil {
 		return Artifact{}, err
@@ -291,7 +321,14 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if len(data) > MaxArtifactSize {
 		return Artifact{}, fmt.Errorf("generated build evidence exceeds %d bytes", MaxArtifactSize)
 	}
-	if err := publishEvidenceArtifacts(output, data, probeOutput, probeData, writeNewFile); err != nil {
+	sidecars := make([]evidenceSidecar, 0, 2)
+	if probeOutput != "" {
+		sidecars = append(sidecars, evidenceSidecar{path: probeOutput, data: probeData, label: "compiler probe"})
+	}
+	if dependencyOutput != "" {
+		sidecars = append(sidecars, evidenceSidecar{path: dependencyOutput, data: dependencyData, label: "dependency classpath snapshot"})
+	}
+	if err := publishEvidenceBundle(output, data, sidecars, writeNewFile); err != nil {
 		return Artifact{}, err
 	}
 	return artifact, nil
@@ -783,6 +820,13 @@ func hashFingerprintV2(root string, model gradleModel, roots []string, repositor
 	// Process IDs are ephemeral callback-correlation diagnostics, not v2
 	// evidence inputs. Keep them out of the stable v2 fingerprint contract.
 	model.GradleProcessID = 0
+	// The opt-in classpath sidecar is independently versioned. Its fields must
+	// not alter the established v2 fingerprint contract or make existing v2
+	// artifacts fail read-only currentness checks.
+	model.ClasspathObservation = ""
+	model.ClasspathState = ""
+	model.ClasspathProvenance = nil
+	model.ClasspathEntries = nil
 	data, _ := json.Marshal(struct {
 		Repository string      `json:"repository"`
 		Model      gradleModel `json:"model"`
@@ -875,6 +919,48 @@ func publishEvidenceArtifacts(primaryPath string, primaryData []byte, probePath 
 				return fmt.Errorf("primary evidence artifact is published at %q and compiler probe sidecar was published at %q, but sidecar staging cleanup failed: %w", primaryPath, probePath, err)
 			}
 			return fmt.Errorf("primary evidence artifact was published at %q, but compiler probe sidecar publication failed; the primary artifact remains in place: %w", primaryPath, err)
+		}
+	}
+	return nil
+}
+
+type evidenceSidecar struct {
+	path  string
+	data  []byte
+	label string
+}
+
+func publishEvidenceBundle(primaryPath string, primaryData []byte, sidecars []evidenceSidecar, publish func(string, []byte) error) error {
+	if err := requireAbsent(primaryPath); err != nil {
+		return fmt.Errorf("primary evidence output is unavailable: %w", err)
+	}
+	seen := map[string]struct{}{filepath.Clean(primaryPath): {}}
+	for _, sidecar := range sidecars {
+		if sidecar.path == "" || sidecar.label == "" {
+			return errors.New("evidence sidecar path and label are required")
+		}
+		if _, duplicate := seen[filepath.Clean(sidecar.path)]; duplicate {
+			return fmt.Errorf("duplicate evidence sidecar output path %q", sidecar.path)
+		}
+		seen[filepath.Clean(sidecar.path)] = struct{}{}
+		if err := requireAbsent(sidecar.path); err != nil {
+			return fmt.Errorf("%s output is unavailable: %w", sidecar.label, err)
+		}
+	}
+	if err := publish(primaryPath, primaryData); err != nil {
+		var publishedErr *artifactPublishedError
+		if errors.As(err, &publishedErr) {
+			return fmt.Errorf("primary evidence artifact was published at %q but staging cleanup failed; sidecars were not published: %w", primaryPath, err)
+		}
+		return fmt.Errorf("publish primary evidence artifact: %w", err)
+	}
+	for _, sidecar := range sidecars {
+		if err := publish(sidecar.path, sidecar.data); err != nil {
+			var publishedErr *artifactPublishedError
+			if errors.As(err, &publishedErr) {
+				return fmt.Errorf("primary evidence artifact is published at %q and %s is published at %q, but sidecar staging cleanup failed: %w", primaryPath, sidecar.label, sidecar.path, err)
+			}
+			return fmt.Errorf("primary evidence artifact was published at %q, but %s publication failed; prior outputs remain in place: %w", primaryPath, sidecar.label, err)
 		}
 	}
 	return nil
