@@ -26,12 +26,14 @@ var gradleInitScript embed.FS
 // compilation. GradleCommand must name the executable selected by the user;
 // this function never searches for or invokes a project wrapper.
 type GradleRequest struct {
-	RepositoryRoot string
-	GradleCommand  string
-	Project        string
-	Compilation    string
-	OutputPath     string
-	Stderr         io.Writer
+	RepositoryRoot            string
+	GradleCommand             string
+	Project                   string
+	Compilation               string
+	OutputPath                string
+	CompilerProbeJar          string
+	CompilerExecutionStrategy string
+	Stderr                    io.Writer
 }
 
 type gradleModel struct {
@@ -55,6 +57,7 @@ type gradleModel struct {
 	SkipReasonCode           string         `json:"skip_reason_code"`
 	TaskInputSHA256          []string       `json:"task_input_sha256"`
 	CompilerArtifacts        []FileIdentity `json:"compiler_artifact_candidates"`
+	GradleProcessID          int64          `json:"gradle_process_id,omitempty"`
 	OutputFiles              []OutputFile   `json:"output_files"`
 	OutputRoots              []string       `json:"output_roots"`
 	JVMTarget                string         `json:"jvm_target"`
@@ -103,6 +106,17 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if _, inside := relativeWithin(root, output); inside {
 		return Artifact{}, errors.New("artifact output must be outside the repository")
 	}
+	var probe *probeInvocation
+	if req.CompilerProbeJar != "" {
+		var err error
+		probe, err = prepareCompilerProbe(root, req.CompilerProbeJar, output, req.Project, req.Compilation, req.CompilerExecutionStrategy)
+		if err != nil {
+			return Artifact{}, err
+		}
+	}
+	if req.CompilerExecutionStrategy != "" && (probe == nil || (req.CompilerExecutionStrategy != "daemon" && req.CompilerExecutionStrategy != "in-process")) {
+		return Artifact{}, errors.New("compiler execution strategy requires the opt-in probe and must be daemon or in-process")
+	}
 
 	tmpDir, err := os.MkdirTemp("", "codegraph-gradle-evidence-")
 	if err != nil {
@@ -126,6 +140,9 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if err := os.WriteFile(initPath, script, 0o600); err != nil {
 		return Artifact{}, err
 	}
+	if probe != nil {
+		probe.recordPath = filepath.Join(tmpDir, "compiler-probe.json")
+	}
 	modelPath := filepath.Join(tmpDir, "model.json")
 	args := []string{
 		"--no-daemon", "--project-cache-dir", projectCacheDir, "--init-script", initPath,
@@ -134,6 +151,17 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
 		":codegraphExportEvidence",
+	}
+	if probe != nil {
+		args = append(args,
+			"-Pcg35.probe.jar="+probe.jarPath,
+			"-Pcg35.probe.record="+probe.recordPath,
+			"-Pcg35.probe.token="+probe.token,
+			"-Pcg35.probe.strategy="+probe.strategy,
+		)
+		if req.CompilerExecutionStrategy != "" {
+			args = append(args, "-Pkotlin.compiler.execution.strategy="+req.CompilerExecutionStrategy)
+		}
 	}
 	if req.Stderr != nil {
 		if _, err := fmt.Fprintf(req.Stderr, "Running explicitly selected Gradle executable and selected compilation task for %s/%s; build-cache reuse is disabled, existing build outputs are not cleaned\n", req.Project, req.Compilation); err != nil {
@@ -236,6 +264,20 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 			}(),
 		},
 		Proof: &proof,
+	}
+	if probe != nil {
+		observation, err := readCompilerProbe(probe, model, artifact)
+		if err != nil {
+			return Artifact{}, err
+		}
+		observationData, err := observation.Marshal()
+		if err != nil {
+			return Artifact{}, err
+		}
+		probeOutput := output + ".compiler-probe.json"
+		if err := writeNewFile(probeOutput, observationData); err != nil {
+			return Artifact{}, err
+		}
 	}
 	data, err := artifact.Marshal()
 	if err != nil {
@@ -733,6 +775,9 @@ func hashFingerprint(root string, model gradleModel, roots []string, repositoryH
 }
 
 func hashFingerprintV2(root string, model gradleModel, roots []string, repositoryHash string, dimensions Dimensions, proof Proof) string {
+	// Process IDs are ephemeral callback-correlation diagnostics, not v2
+	// evidence inputs. Keep them out of the stable v2 fingerprint contract.
+	model.GradleProcessID = 0
 	data, _ := json.Marshal(struct {
 		Repository string      `json:"repository"`
 		Model      gradleModel `json:"model"`

@@ -143,6 +143,64 @@ Local fingerprint records use length framing and per-file content hashes. Artifa
 created with the earlier delimiter-only fingerprint must be explicitly re-exported;
 their old fingerprints fail the current freshness check.
 
+## Optional compiler callback probe
+
+The exporter also accepts `--compiler-probe-jar <path>` as an explicit
+diagnostic opt-in. This writes `<output>.compiler-probe.json` using the
+separately versioned `codegraph.kotlin_compiler_probe/v1` schema; the v2
+artifact remains unchanged. The supplied probe must be built from
+`internal/buildevidence/compilerprobe` against `kotlin-compiler-embeddable`
+2.3.20. The JAR is external to the target repository, bounded to 64 MiB, and
+hashed before Gradle starts. Its manifest must identify probe version 1.0.0,
+protocol 1, and Kotlin compiler 2.3.20. The plugin reports its own JAR hash,
+which must match that supplied identity.
+
+For this pinned integration only, the generated init script finds the exact
+Kotlin compile task for the selected project/compilation and adds
+`-Xplugin` plus bounded plugin options to that task's public
+`KotlinCompile.compilerOptions.freeCompilerArgs` API. The exporter creates a
+cryptographically random 256-bit token for each invocation and a fresh
+private record location. The Kotlin compiler's `CompilerPluginRegistrar`
+callback reads and echoes that token, selected project/compilation/task, and
+probe identity. Exporter validation requires exact equality and links the
+separate record to the v2 input fingerprint. It does not consume a callback
+from another task or invocation. No process-global token state is used.
+
+`--compiler-execution-strategy daemon` and `in-process` optionally select the
+matching KGP 2.3.20 execution strategy for controlled experiments. Omitting it
+leaves the build's configured default intact. Other strategies and KGP
+versions are unsupported by this probe. Unsupported or incomplete class
+identity, missing callback, skipped task, or unavailable CodeSource is
+`UNKNOWN`; malformed, duplicate, mismatched, or oversized records are rejected.
+The exporter does not infer a callback from Gradle success. The plugin record
+is bounded, written to a fresh private directory through a temporary file and
+atomic no-replace publication, and contains no full command line, environment,
+credentials, or absolute machine paths. A same-user build script can forge a
+local record; this is a diagnostic for an explicitly authorized local build,
+not protection against a malicious build.
+
+The strongest status is `CORRELATED_COMPILER_CLASS_OBSERVATION`. It records
+the `K2JVMCompiler` class name, classloader type, CodeSource artifact filename
+and SHA-256 when available, class-resource SHA-256, process ID/start time, and
+runtime version. These are observations made during a compiler callback.
+CodeSource and class-resource hashes do not prove post-transformation bytes
+defined by the JVM, all compiler/plugin classes in that process, or output
+attribution. They are not a full loaded-bytecode attestation and never mean
+`COMPILER_TRUST_COMPLETE`. No resolver, classifier, or ABI-family behavior
+consumes this diagnostic record. Old v1/v2 artifacts retain their original
+meaning.
+
+Build the optional JAR with a cached Gradle 9.3.1 executable and an external
+build directory, for example:
+
+```sh
+gradle --no-daemon --project-cache-dir /tmp/cg35-gradle-cache \
+  -PprobeBuildDir=/tmp/cg35-probe-build \
+  -p internal/buildevidence/compilerprobe jar
+codegraph export-gradle-evidence ... \
+  --compiler-probe-jar /tmp/cg35-probe-build/libs/codegraph-kotlin-compiler-probe-1.0.0-kotlin-2.3.20.jar
+```
+
 ## Stored JVM type evidence
 
 Independently of this artifact, the index stores JVM source facts (migrations

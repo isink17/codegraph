@@ -161,7 +161,8 @@ gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
             selected_toolchain_version: selectedToolchainVersion,
             task_inputs_complete: inputBefore.complete && inputAfter.complete,
             task_inputs_stable: taskInputsStable,
-            outputs_contained: outputsContained
+            outputs_contained: outputsContained,
+            gradle_process_id: ProcessHandle.current().pid()
         ]
         gradle.rootProject.extensions.extraProperties.set('cg35.task.observation', observation)
     }
@@ -188,6 +189,33 @@ gradle.projectsEvaluated {
     def compileTask = project.tasks.findByName(compilation.compileKotlinTaskName)
     if (compileTask == null) throw new GradleException('Selected Kotlin/JVM compilation has no compile task')
     gradle.rootProject.extensions.extraProperties.set('cg35.selected.task', compileTask.path)
+
+    def probeJar = props.get('cg35.probe.jar')
+    def probeRecord = props.get('cg35.probe.record')
+    def probeToken = props.get('cg35.probe.token')
+    def probeStrategy = props.get('cg35.probe.strategy')
+    if (probeJar || probeRecord || probeToken) {
+        if (!probeJar || !probeRecord || !(probeToken ==~ /[0-9a-f]{64}/) || !(probeStrategy in ['default', 'daemon', 'in-process'])) {
+            throw new GradleException('Compiler probe invocation parameters are incomplete')
+        }
+        def plugin = project.plugins.find { it.class.name == 'org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper' }
+        def pluginVersion = plugin?.pluginVersion
+        if (pluginVersion != '2.3.20') {
+            throw new GradleException('Compiler probe only supports Kotlin Gradle Plugin 2.3.20')
+        }
+        if (!compileTask.hasProperty('compilerOptions') || !compileTask.compilerOptions.hasProperty('freeCompilerArgs')) {
+            throw new GradleException('Selected KGP task does not expose compilerOptions.freeCompilerArgs')
+        }
+        compileTask.compilerOptions.freeCompilerArgs.addAll([
+            '-Xplugin=' + probeJar,
+            '-P', 'plugin:codegraph.compiler.identity:token=' + probeToken,
+            '-P', 'plugin:codegraph.compiler.identity:record=' + probeRecord,
+            '-P', 'plugin:codegraph.compiler.identity:project=' + projectPath,
+            '-P', 'plugin:codegraph.compiler.identity:compilation=' + compilationName,
+            '-P', 'plugin:codegraph.compiler.identity:task=' + compileTask.path,
+            '-P', 'plugin:codegraph.compiler.identity:strategy=' + probeStrategy
+        ])
+    }
 
     gradle.rootProject.tasks.register('codegraphExportEvidence') { exportTask ->
         exportTask.dependsOn(compileTask)
@@ -218,7 +246,7 @@ gradle.projectsEvaluated {
             if (!observation) throw new GradleException('Selected Kotlin compile task outcome was not observed')
             def model = [
                 gradle_version: gradle.gradleVersion,
-                kotlin_plugin_version: kotlinPlugin?.class?.package?.implementationVersion ?: '',
+                kotlin_plugin_version: kotlinPlugin?.pluginVersion ?: '',
                 kotlin_compiler_version: compilerVersion,
                 compile_task: compileTask.path,
                 gradle_runtime_jdk_vendor: System.getProperty('java.vendor') ?: '',
