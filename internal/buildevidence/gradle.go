@@ -414,6 +414,11 @@ func validateOutputContent(root string, proof Proof) error {
 }
 
 func validateOutputContentContext(ctx context.Context, root string, proof Proof, budget *classpathReadBudget) error {
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return errors.New("repository root cannot be opened safely")
+	}
+	defer rootFS.Close()
 	expected := make(map[string]struct{}, len(proof.OutputFiles))
 	for _, output := range proof.OutputFiles {
 		if err := ctx.Err(); err != nil {
@@ -431,7 +436,11 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 		if _, inside := relativeWithin(root, resolved); !inside {
 			return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", output.Path)
 		}
-		file, err := os.Open(resolved)
+		rel, err := filepath.Rel(root, resolved)
+		if err != nil {
+			return err
+		}
+		file, err := rootFS.Open(rel)
 		if err != nil {
 			return err
 		}
@@ -480,7 +489,15 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 		if _, inside := relativeWithin(root, resolvedRoot); !inside {
 			return fmt.Errorf("build evidence is stale: selected output root symlink escapes repository: %q", outputRoot)
 		}
-		err = filepath.WalkDir(resolvedRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+		outputRootRel, err := filepath.Rel(root, resolvedRoot)
+		if err != nil {
+			return err
+		}
+		outputFS, err := rootFS.OpenRoot(outputRootRel)
+		if err != nil {
+			return fmt.Errorf("build evidence is stale: selected output root cannot be opened safely: %q", outputRoot)
+		}
+		err = fs.WalkDir(outputFS.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -496,14 +513,15 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 				return nil
 			}
 			if entry.Type()&os.ModeSymlink != 0 {
-				target, err := filepath.EvalSymlinks(name)
+				fullName := filepath.Join(resolvedRoot, filepath.FromSlash(name))
+				target, err := filepath.EvalSymlinks(fullName)
 				if err != nil {
-					return fmt.Errorf("resolve selected output symlink %q: %w", name, err)
+					return fmt.Errorf("resolve selected output symlink %q: %w", fullName, err)
 				}
 				if _, inside := relativeWithin(root, target); !inside {
-					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", name)
+					return fmt.Errorf("build evidence is stale: selected output symlink escapes repository: %q", fullName)
 				}
-				info, err := os.Stat(target)
+				info, err := rootFS.Stat(filepath.Join(outputRootRel, filepath.FromSlash(name)))
 				if err != nil {
 					return err
 				}
@@ -513,7 +531,7 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 			} else if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".class") {
 				return nil
 			}
-			rel, err := filepath.Rel(root, name)
+			rel, err := filepath.Rel(root, filepath.Join(resolvedRoot, filepath.FromSlash(name)))
 			if err != nil {
 				return err
 			}
@@ -524,8 +542,12 @@ func validateOutputContentContext(ctx context.Context, root string, proof Proof,
 			}
 			return nil
 		})
+		closeErr := outputFS.Close()
 		if err != nil {
 			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	if len(observed) != len(expected) {
@@ -734,6 +756,11 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 }
 
 func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots []string, budget *classpathReadBudget) (string, error) {
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return "", errors.New("repository root cannot be opened safely")
+	}
+	defer rootFS.Close()
 	h := sha256.New()
 	write := func(name string, data []byte) {
 		var size [8]byte
@@ -748,7 +775,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		f, err := os.Open(path)
+		f, err := rootFS.Open(filepath.FromSlash(path))
 		if err != nil {
 			return err
 		}
@@ -787,7 +814,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		write("content:"+name, content.Sum(nil))
 		return nil
 	}
-	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
+	err = fs.WalkDir(rootFS.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -803,7 +830,8 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		var err error
 		linkTarget := ""
 		if entry.Type()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(name)
+			fullName := filepath.Join(root, filepath.FromSlash(name))
+			target, err := filepath.EvalSymlinks(fullName)
 			if err != nil {
 				return fmt.Errorf("resolve repository symlink %s: %w", name, err)
 			}
@@ -814,7 +842,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			if err != nil {
 				return err
 			}
-			info, err = os.Stat(name)
+			info, err = rootFS.Stat(filepath.FromSlash(name))
 			if err != nil {
 				return err
 			}
@@ -830,26 +858,23 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		rel, err := filepath.Rel(root, name)
-		if err != nil {
-			return err
-		}
+		rel := filepath.ToSlash(name)
 		if linkTarget != "" {
 			write("symlink:"+filepath.ToSlash(rel), []byte(filepath.ToSlash(linkTarget)))
 		}
-		return writeFile(filepath.ToSlash(rel), name)
+		return writeFile(filepath.ToSlash(rel), filepath.ToSlash(rel))
 	})
 	if err != nil {
 		return "", err
 	}
 	for _, sourceRoot := range sourceRoots {
-		abs := filepath.Join(root, filepath.FromSlash(sourceRoot))
 		write("source-root:"+sourceRoot, nil)
-		err := filepath.WalkDir(abs, func(name string, entry fs.DirEntry, walkErr error) error {
+		walkRoot := filepath.ToSlash(filepath.Clean(sourceRoot))
+		err := fs.WalkDir(rootFS.FS(), walkRoot, func(name string, entry fs.DirEntry, walkErr error) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if errors.Is(walkErr, os.ErrNotExist) && name == abs {
+			if errors.Is(walkErr, os.ErrNotExist) && name == walkRoot {
 				return nil
 			}
 			if walkErr != nil {
@@ -863,11 +888,7 @@ func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots 
 			if entry.IsDir() || !entry.Type().IsRegular() {
 				return nil
 			}
-			rel, err := filepath.Rel(root, name)
-			if err != nil {
-				return err
-			}
-			return writeFile("source:"+filepath.ToSlash(rel), name)
+			return writeFile("source:"+filepath.ToSlash(name), filepath.ToSlash(name))
 		})
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
