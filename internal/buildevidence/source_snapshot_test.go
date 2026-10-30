@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,6 +238,23 @@ func TestSourceSnapshotRejectsSymlinksAndAggregateBudgetExhaustion(t *testing.T)
 		if strings.Contains(entry.Path, "Escape.kt") && entry.State == Complete {
 			t.Fatal("symlink source was accepted")
 		}
+	}
+}
+
+func TestSourceSnapshotCancellationDuringFingerprinting(t *testing.T) {
+	root, artifact, raw, model := sourceSnapshotFixture(t)
+	selected := raw.TaskFilesAfter[0]
+	if err := os.WriteFile(selected, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canceling := &cancelAfterContextChecks{Context: context.Background(), cancelAt: 5}
+
+	_, err := buildSourceSnapshotContext(canceling, root, artifact, raw, model)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-fingerprint cancellation error = %v, want context.Canceled", err)
+	}
+	if checks := canceling.checks; checks < canceling.cancelAt {
+		t.Fatalf("context was canceled before the hashing read path: checks=%d", checks)
 	}
 }
 
