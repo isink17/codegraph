@@ -23,6 +23,7 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 	probeJar := fs.String("compiler-probe-jar", "", "optional prebuilt Kotlin 2.3.20 diagnostic probe JAR (writes a separate .compiler-probe.json artifact)")
 	probeStrategy := fs.String("compiler-execution-strategy", "", "optional compiler strategy for probe experiments: daemon or in-process")
 	dependencySnapshot := fs.Bool("dependency-snapshot", false, "write a separate content-addressed snapshot of selected KotlinCompile.libraries")
+	sourceSnapshot := fs.Bool("source-snapshot", false, "write a separate content-addressed snapshot of selected KotlinCompile.sources")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -38,6 +39,7 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 		CompilerProbeJar:          *probeJar,
 		CompilerExecutionStrategy: *probeStrategy,
 		DependencySnapshot:        *dependencySnapshot,
+		SourceSnapshot:            *sourceSnapshot,
 		Stderr:                    stderr,
 	})
 	if err != nil {
@@ -57,7 +59,73 @@ func runExportGradleEvidence(ctx context.Context, stdout, stderr io.Writer, args
 	if err == nil && *dependencySnapshot {
 		_, err = fmt.Fprintf(stdout, "Wrote opt-in Kotlin task classpath content snapshot to %s.classpath.json (Gradle selection and compiler-consumed completeness remain unknown)\n", *output)
 	}
+	if err == nil && *sourceSnapshot {
+		_, err = fmt.Fprintf(stdout, "Wrote opt-in selected Kotlin task source snapshot to %s.sources.json (current selection and compiler consumption remain unknown)\n", *output)
+	}
 	return err
+}
+
+func runValidateGradleSourceSnapshot(ctx context.Context, stdout, stderr io.Writer, args []string) error {
+	fs := flag.NewFlagSet("validate-gradle-source-snapshot", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	root := fs.String("repo-root", "", "repository root used by the related Gradle evidence")
+	evidencePath := fs.String("evidence", "", "related codegraph.gradle_kotlin_evidence/v2 artifact")
+	snapshotPath := fs.String("snapshot", "", "codegraph.kotlin_task_source_snapshot/v1 sidecar")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+	if *root == "" || *evidencePath == "" || *snapshotPath == "" {
+		return fmt.Errorf("--repo-root, --evidence, and --snapshot are required")
+	}
+	read := func(path string) ([]byte, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		data, err := io.ReadAll(io.LimitReader(file, buildevidence.MaxArtifactSize+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > buildevidence.MaxArtifactSize {
+			return nil, fmt.Errorf("artifact exceeds %d bytes", buildevidence.MaxArtifactSize)
+		}
+		return data, nil
+	}
+	evidenceBytes, err := read(*evidencePath)
+	if err != nil {
+		return fmt.Errorf("read related build evidence: %w", err)
+	}
+	evidence, err := buildevidence.Decode(evidenceBytes)
+	if err != nil {
+		return err
+	}
+	snapshotBytes, err := read(*snapshotPath)
+	if err != nil {
+		return fmt.Errorf("read source snapshot: %w", err)
+	}
+	snapshot, err := buildevidence.DecodeSourceSnapshot(snapshotBytes)
+	if err != nil {
+		return err
+	}
+	status, err := buildevidence.ValidateSourceSnapshotCurrentContext(ctx, *root, evidence, snapshot)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(stdout, string(data)); err != nil {
+		return err
+	}
+	if status.RecordedContent != buildevidence.Complete || status.BuildEvidence != buildevidence.Complete {
+		return fmt.Errorf("recorded source bytes or related build evidence are stale or incomplete; current task selection and compiler-consumed sources remain UNKNOWN")
+	}
+	return nil
 }
 
 func runValidateGradleClasspath(ctx context.Context, stdout, stderr io.Writer, args []string) error {

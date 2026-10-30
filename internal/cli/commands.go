@@ -85,7 +85,7 @@ func newCommandList() []*command {
 		{
 			name:        "export-gradle-evidence",
 			description: "explicitly run and inspect one Kotlin/JVM Gradle compilation; existing build outputs are not cleaned",
-			usageLines:  []string{"  export-gradle-evidence --repo-root PATH --gradle PATH --project :path --compilation main --output FILE [--dependency-snapshot]"},
+			usageLines:  []string{"  export-gradle-evidence --repo-root PATH --gradle PATH --project :path --compilation main --output FILE [--dependency-snapshot] [--source-snapshot]"},
 			flags: []commandFlag{
 				{name: "--repo-root PATH", description: "Gradle repository root"},
 				{name: "--gradle PATH", description: "explicit Gradle executable to run"},
@@ -93,6 +93,7 @@ func newCommandList() []*command {
 				{name: "--compilation NAME", description: "selected Kotlin/JVM compilation task to run and inspect"},
 				{name: "--output FILE", description: "new artifact path outside the repository (parent directory must exist)"},
 				{name: "--dependency-snapshot", description: "write an opt-in content snapshot sidecar from the selected KotlinCompile task's libraries"},
+				{name: "--source-snapshot", description: "write an opt-in content snapshot sidecar from selected KotlinCompileTool.sources (KGP 2.3.20)"},
 			},
 			examples: []string{"codegraph export-gradle-evidence --repo-root . --gradle /opt/gradle/bin/gradle --project :app --compilation main --output /tmp/kotlin-evidence.json"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
@@ -112,6 +113,20 @@ func newCommandList() []*command {
 			examples: []string{"codegraph validate-gradle-dependency-snapshot --repo-root . --evidence /tmp/evidence.json --snapshot /tmp/evidence.json.classpath.json"},
 			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
 				return runValidateGradleClasspath(ctx, stdout, stderr, args)
+			},
+		},
+		{
+			name:        "validate-gradle-source-snapshot",
+			description: "read-only byte validation for recorded selected Kotlin source files; current task selection remains unknown",
+			usageLines:  []string{"  validate-gradle-source-snapshot --repo-root PATH --evidence FILE --snapshot FILE"},
+			flags: []commandFlag{
+				{name: "--repo-root PATH", description: "repository root used by the related build evidence"},
+				{name: "--evidence FILE", description: "related v2 Gradle evidence artifact"},
+				{name: "--snapshot FILE", description: "Kotlin source snapshot sidecar"},
+			},
+			examples: []string{"codegraph validate-gradle-source-snapshot --repo-root . --evidence /tmp/evidence.json --snapshot /tmp/evidence.json.sources.json"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runValidateGradleSourceSnapshot(ctx, stdout, stderr, args)
 			},
 		},
 		{
