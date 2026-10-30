@@ -20,8 +20,8 @@ import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar;
 import org.jetbrains.kotlin.config.CompilerConfiguration;
 
 public final class CompilerIdentityProbe extends CompilerPluginRegistrar {
-    public static final String VERSION = "1.0.0";
-    public static final int PROTOCOL = 1;
+    public static final String VERSION = "2.0.0";
+    public static final int PROTOCOL = 2;
     private static final String COMPILER_CLASS = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler";
     private static final Pattern TOKEN = Pattern.compile("[0-9a-f]{64}");
     private static final Pattern PROJECT = Pattern.compile("(?::[A-Za-z0-9_.-]+)*:?");
@@ -80,9 +80,11 @@ public final class CompilerIdentityProbe extends CompilerPluginRegistrar {
                 pluginJarHash = hashSource(pluginSource, MAX_JAR_BYTES);
             } catch (Exception unavailable) { }
 
+            String runtimeVendor = safeRuntimeProperty("java.vendor");
+
             Path record = Path.of(recordText).toAbsolutePath().normalize();
             String json = "{"
-                    + field("schema", "codegraph.kotlin_compiler_probe/v1") + ","
+                    + field("schema", "codegraph.kotlin_compiler_probe/v2") + ","
                     + "\"protocol_version\":" + PROTOCOL + ","
                     + field("status", "CALLBACK_OBSERVED") + ","
                     + field("invocation_token", token) + ","
@@ -101,6 +103,7 @@ public final class CompilerIdentityProbe extends CompilerPluginRegistrar {
                     + "\"process_id\":" + ProcessHandle.current().pid() + ","
                     + field("process_start", ProcessHandle.current().info().startInstant().map(Instant::toString).orElse("unavailable")) + ","
                     + field("runtime_version", boundedRuntimeVersion())
+                    + "," + field("runtime_vendor", runtimeVendor)
                     + "}";
             writeAtomicNew(record, json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         } catch (Exception failure) {
@@ -117,7 +120,11 @@ public final class CompilerIdentityProbe extends CompilerPluginRegistrar {
     }
 
     private static String boundedRuntimeVersion() {
-        String value = System.getProperty("java.version", "");
+        return safeRuntimeProperty("java.version");
+    }
+
+    private static String safeRuntimeProperty(String name) {
+        String value = System.getProperty(name, "");
         return value.matches("[A-Za-z0-9._+ -]{1,64}") ? value : "unknown";
     }
 

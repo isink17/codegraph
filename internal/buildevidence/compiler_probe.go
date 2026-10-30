@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	CompilerProbeSchema    = "codegraph.kotlin_compiler_probe/v1"
-	CompilerProbeProtocol  = 1
+	CompilerProbeSchema    = "codegraph.kotlin_compiler_probe/v2"
+	CompilerProbeProtocol  = 2
 	CompilerProbeStatus    = "CORRELATED_COMPILER_CLASS_OBSERVATION"
 	MaxCompilerProbeRecord = 64 << 10
 	maxCompilerProbeJar    = 64 << 20
@@ -53,6 +53,8 @@ type CompilerProbe struct {
 	ProcessID                  int64  `json:"process_id,omitempty"`
 	ProcessStart               string `json:"process_start,omitempty"`
 	RuntimeVersion             string `json:"runtime_version,omitempty"`
+	RuntimeVendor              string `json:"runtime_vendor,omitempty"`
+	SelectedToolchainVersion   string `json:"selected_toolchain_version,omitempty"`
 	RequestedExecutionStrategy string `json:"requested_execution_strategy"`
 	GradleProcessID            int64  `json:"gradle_process_id,omitempty"`
 	ProcessRelationship        string `json:"process_relationship"`
@@ -78,6 +80,7 @@ type compilerProbeRecord struct {
 	ProcessID                  int64  `json:"process_id"`
 	ProcessStart               string `json:"process_start"`
 	RuntimeVersion             string `json:"runtime_version"`
+	RuntimeVendor              string `json:"runtime_vendor"`
 	RequestedExecutionStrategy string `json:"requested_execution_strategy"`
 }
 
@@ -197,8 +200,8 @@ func validateCompilerProbeManifest(path string, size int64) error {
 		return fmt.Errorf("read compiler probe JAR manifest: %w", err)
 	}
 	for key, want := range map[string]string{
-		"Implementation-Version":  "1.0.0",
-		"Cg35-Protocol-Version":   "1",
+		"Implementation-Version":  "2.0.0",
+		"Cg35-Protocol-Version":   "2",
 		"Kotlin-Compiler-Version": "2.3.20",
 	} {
 		values := header.Values(key)
@@ -293,7 +296,7 @@ func readCompilerProbe(invocation *probeInvocation, model gradleModel, artifact 
 	if record.RequestedExecutionStrategy != invocation.strategy {
 		return out, errors.New("compiler probe execution strategy mismatch")
 	}
-	if record.ProbeVersion != "1.0.0" {
+	if record.ProbeVersion != "2.0.0" {
 		return out, errors.New("compiler probe implementation identity mismatch")
 	}
 	if record.ProbeJARSHA256 != "" && (!probeHashPattern.MatchString(record.ProbeJARSHA256) || record.ProbeJARSHA256 != invocation.jarSHA256) {
@@ -303,7 +306,8 @@ func readCompilerProbe(invocation *probeInvocation, model gradleModel, artifact 
 		(record.CompilerClassSHA256 != "" && !probeHashPattern.MatchString(record.CompilerClassSHA256)) ||
 		!probeClassloaderPattern.MatchString(record.CompilerClassloader) || !probeCompilerClassPattern.MatchString(record.CompilerClass) ||
 		!probeSourceNamePattern.MatchString(record.CompilerCodeSourceName) ||
-		!validProbeRuntime(record.RuntimeVersion) || !validProbeText(record.ProcessStart, 64) {
+		!validProbeRuntime(record.RuntimeVersion) || !validOptionalProbeRuntime(record.RuntimeVendor) ||
+		!validProbeText(record.ProcessStart, 64) {
 		return out, errors.New("compiler probe contains malformed identity fields")
 	}
 	if !record.CallbackExecuted || record.Status != "CALLBACK_OBSERVED" {
@@ -315,6 +319,8 @@ func readCompilerProbe(invocation *probeInvocation, model gradleModel, artifact 
 	out.CompilerCodeSourceSHA256, out.CompilerClassSHA256 = record.CompilerCodeSourceSHA256, record.CompilerClassSHA256
 	out.CallbackExecuted, out.ProcessID = true, record.ProcessID
 	out.ProcessStart, out.RuntimeVersion = record.ProcessStart, record.RuntimeVersion
+	out.RuntimeVendor = record.RuntimeVendor
+	out.SelectedToolchainVersion = model.SelectedToolchainVersion
 	out.RequestedExecutionStrategy = record.RequestedExecutionStrategy
 	if model.GradleProcessID > 0 {
 		out.ProcessRelationship = "SEPARATE_PROCESS"
@@ -353,6 +359,8 @@ var (
 
 func validProbeRuntime(value string) bool { return probeRuntimePattern.MatchString(value) }
 
+func validOptionalProbeRuntime(value string) bool { return value == "" || validProbeRuntime(value) }
+
 func (p CompilerProbe) Marshal() ([]byte, error) {
 	if p.Schema != CompilerProbeSchema || (p.Status != "UNKNOWN" && p.Status != CompilerProbeStatus) ||
 		p.ProtocolVersion != CompilerProbeProtocol || !probeTokenPattern.MatchString(p.InvocationToken) ||
@@ -361,6 +369,9 @@ func (p CompilerProbe) Marshal() ([]byte, error) {
 	}
 	if p.Status == CompilerProbeStatus && p.ProcessRelationship != "SAME_PROCESS" && p.ProcessRelationship != "SEPARATE_PROCESS" && p.ProcessRelationship != "UNKNOWN" {
 		return nil, errors.New("invalid compiler probe process relationship")
+	}
+	if !validOptionalProbeRuntime(p.RuntimeVendor) || !validOptionalProbeRuntime(p.SelectedToolchainVersion) {
+		return nil, errors.New("invalid compiler probe runtime identity text")
 	}
 	data, err := json.Marshal(p)
 	if err != nil {

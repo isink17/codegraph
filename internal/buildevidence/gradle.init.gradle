@@ -167,7 +167,7 @@ gradle.addListener(new org.gradle.api.execution.TaskExecutionListener() {
         try { jvmTarget = task.compilerOptions.jvmTarget.orNull?.toString() ?: '' } catch (Throwable ignored) {}
         def selectedToolchainVersion = ''
         try {
-            def candidate = task.kotlinJavaToolchain.javaVersion?.toString() ?: ''
+            def candidate = task.kotlinJavaToolchain.javaVersion.getOrNull()?.toString() ?: ''
             if (candidate ==~ /\d+(\.\d+)*/) selectedToolchainVersion = candidate
         } catch (Throwable ignored) {}
         def observation = [

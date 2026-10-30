@@ -265,12 +265,12 @@ their old fingerprints fail the current freshness check.
 
 The exporter also accepts `--compiler-probe-jar <path>` as an explicit
 diagnostic opt-in. This writes `<output>.compiler-probe.json` using the
-separately versioned `codegraph.kotlin_compiler_probe/v1` schema; the v2
-artifact remains unchanged. The supplied probe must be built from
+separately versioned `codegraph.kotlin_compiler_probe/v2` schema; the v2
+build-evidence artifact remains unchanged. The supplied probe must be built from
 `internal/buildevidence/compilerprobe` against `kotlin-compiler-embeddable`
 2.3.20. The JAR is external to the target repository, bounded to 64 MiB, and
-hashed before Gradle starts. Its manifest must identify probe version 1.0.0,
-protocol 1, and Kotlin compiler 2.3.20. The plugin reports its own JAR hash,
+hashed before Gradle starts. Its manifest must identify probe version 2.0.0,
+protocol 2, and Kotlin compiler 2.3.20. The plugin reports its own JAR hash,
 which must match that supplied identity.
 
 For this pinned integration only, the generated init script finds the exact
@@ -311,7 +311,13 @@ not protection against a malicious build.
 The strongest status is `CORRELATED_COMPILER_CLASS_OBSERVATION`. It records
 the `K2JVMCompiler` class name, classloader type, CodeSource artifact filename
 and SHA-256 when available, class-resource SHA-256, process ID/start time, and
-runtime version. These are observations made during a compiler callback.
+runtime version. Protocol v2 also records the callback JVM's vendor and the
+selected task's Kotlin toolchain Java version when the public
+`kotlinJavaToolchain.javaVersion` provider exposes it. These are separate
+observations: the toolchain version does not identify its vendor or installation,
+and no API in this probe proves that the selected toolchain is the compiler JVM.
+Same-version JDK installations therefore remain indistinguishable. These are
+observations made during a compiler callback.
 CodeSource and class-resource hashes do not prove post-transformation bytes
 defined by the JVM, all compiler/plugin classes in that process, or output
 attribution. They are not a full loaded-bytecode attestation and never mean
@@ -327,7 +333,7 @@ gradle --no-daemon --project-cache-dir /tmp/cg35-gradle-cache \
   -PprobeBuildDir=/tmp/cg35-probe-build \
   -p internal/buildevidence/compilerprobe jar
 codegraph export-gradle-evidence ... \
-  --compiler-probe-jar /tmp/cg35-probe-build/libs/codegraph-kotlin-compiler-probe-1.0.0-kotlin-2.3.20.jar
+  --compiler-probe-jar /tmp/cg35-probe-build/libs/codegraph-kotlin-compiler-probe-2.0.0-kotlin-2.3.20.jar
 ```
 
 ## Stored JVM type evidence
