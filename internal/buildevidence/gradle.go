@@ -26,12 +26,14 @@ var gradleInitScript embed.FS
 // compilation. GradleCommand must name the executable selected by the user;
 // this function never searches for or invokes a project wrapper.
 type GradleRequest struct {
-	RepositoryRoot string
-	GradleCommand  string
-	Project        string
-	Compilation    string
-	OutputPath     string
-	Stderr         io.Writer
+	RepositoryRoot            string
+	GradleCommand             string
+	Project                   string
+	Compilation               string
+	OutputPath                string
+	CompilerProbeJar          string
+	CompilerExecutionStrategy string
+	Stderr                    io.Writer
 }
 
 type gradleModel struct {
@@ -55,6 +57,7 @@ type gradleModel struct {
 	SkipReasonCode           string         `json:"skip_reason_code"`
 	TaskInputSHA256          []string       `json:"task_input_sha256"`
 	CompilerArtifacts        []FileIdentity `json:"compiler_artifact_candidates"`
+	GradleProcessID          int64          `json:"gradle_process_id,omitempty"`
 	OutputFiles              []OutputFile   `json:"output_files"`
 	OutputRoots              []string       `json:"output_roots"`
 	JVMTarget                string         `json:"jvm_target"`
@@ -103,6 +106,23 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if _, inside := relativeWithin(root, output); inside {
 		return Artifact{}, errors.New("artifact output must be outside the repository")
 	}
+	if err := requireAbsent(output); err != nil {
+		return Artifact{}, fmt.Errorf("primary evidence output is unavailable: %w", err)
+	}
+	var probe *probeInvocation
+	if req.CompilerProbeJar != "" {
+		var err error
+		probe, err = prepareCompilerProbe(root, req.CompilerProbeJar, output, req.Project, req.Compilation, req.CompilerExecutionStrategy)
+		if err != nil {
+			return Artifact{}, err
+		}
+		if err := requireAbsent(output + ".compiler-probe.json"); err != nil {
+			return Artifact{}, fmt.Errorf("compiler probe sidecar output is unavailable: %w", err)
+		}
+	}
+	if req.CompilerExecutionStrategy != "" && (probe == nil || (req.CompilerExecutionStrategy != "daemon" && req.CompilerExecutionStrategy != "in-process")) {
+		return Artifact{}, errors.New("compiler execution strategy requires the opt-in probe and must be daemon or in-process")
+	}
 
 	tmpDir, err := os.MkdirTemp("", "codegraph-gradle-evidence-")
 	if err != nil {
@@ -126,6 +146,9 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if err := os.WriteFile(initPath, script, 0o600); err != nil {
 		return Artifact{}, err
 	}
+	if probe != nil {
+		probe.recordPath = filepath.Join(tmpDir, "compiler-probe.json")
+	}
 	modelPath := filepath.Join(tmpDir, "model.json")
 	args := []string{
 		"--no-daemon", "--project-cache-dir", projectCacheDir, "--init-script", initPath,
@@ -134,6 +157,17 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		"-Pcg35.compilation=" + req.Compilation,
 		"-Pcg35.output=" + modelPath,
 		":codegraphExportEvidence",
+	}
+	if probe != nil {
+		args = append(args,
+			"-Pcg35.probe.jar="+probe.jarPath,
+			"-Pcg35.probe.record="+probe.recordPath,
+			"-Pcg35.probe.token="+probe.token,
+			"-Pcg35.probe.strategy="+probe.strategy,
+		)
+		if req.CompilerExecutionStrategy != "" {
+			args = append(args, "-Pkotlin.compiler.execution.strategy="+req.CompilerExecutionStrategy)
+		}
 	}
 	if req.Stderr != nil {
 		if _, err := fmt.Fprintf(req.Stderr, "Running explicitly selected Gradle executable and selected compilation task for %s/%s; build-cache reuse is disabled, existing build outputs are not cleaned\n", req.Project, req.Compilation); err != nil {
@@ -237,6 +271,19 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 		},
 		Proof: &proof,
 	}
+	var probeOutput string
+	var probeData []byte
+	if probe != nil {
+		observation, err := readCompilerProbe(probe, model, artifact)
+		if err != nil {
+			return Artifact{}, err
+		}
+		probeData, err = observation.Marshal()
+		if err != nil {
+			return Artifact{}, err
+		}
+		probeOutput = output + ".compiler-probe.json"
+	}
 	data, err := artifact.Marshal()
 	if err != nil {
 		return Artifact{}, err
@@ -244,7 +291,7 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 	if len(data) > MaxArtifactSize {
 		return Artifact{}, fmt.Errorf("generated build evidence exceeds %d bytes", MaxArtifactSize)
 	}
-	if err := writeNewFile(output, data); err != nil {
+	if err := publishEvidenceArtifacts(output, data, probeOutput, probeData, writeNewFile); err != nil {
 		return Artifact{}, err
 	}
 	return artifact, nil
@@ -733,6 +780,9 @@ func hashFingerprint(root string, model gradleModel, roots []string, repositoryH
 }
 
 func hashFingerprintV2(root string, model gradleModel, roots []string, repositoryHash string, dimensions Dimensions, proof Proof) string {
+	// Process IDs are ephemeral callback-correlation diagnostics, not v2
+	// evidence inputs. Keep them out of the stable v2 fingerprint contract.
+	model.GradleProcessID = 0
 	data, _ := json.Marshal(struct {
 		Repository string      `json:"repository"`
 		Model      gradleModel `json:"model"`
@@ -754,20 +804,88 @@ func relativeWithin(root, path string) (string, bool) {
 }
 
 func writeNewFile(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".codegraph-evidence-*")
 	if err != nil {
-		return fmt.Errorf("create evidence artifact without replacing existing files: %w", err)
+		return fmt.Errorf("create evidence staging file: %w", err)
+	}
+	staging := f.Name()
+	published := false
+	defer func() {
+		if !published {
+			_ = os.Remove(staging)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("secure evidence staging file: %w", err)
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		os.Remove(path)
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync evidence staging file: %w", err)
+	}
 	if err := f.Close(); err != nil {
-		os.Remove(path)
+		return fmt.Errorf("close evidence staging file: %w", err)
+	}
+	// A hard link publishes the complete file atomically and fails if path
+	// already exists. Unlike rename, it cannot replace a user-owned artifact.
+	if err := os.Link(staging, path); err != nil {
+		return fmt.Errorf("publish evidence artifact without replacing existing files: %w", err)
+	}
+	published = true
+	if err := os.Remove(staging); err != nil {
+		return &artifactPublishedError{err: err}
+	}
+	return nil
+}
+
+type artifactPublishedError struct{ err error }
+
+func (e *artifactPublishedError) Error() string {
+	return "artifact published but staging cleanup failed: " + e.err.Error()
+}
+func (e *artifactPublishedError) Unwrap() error { return e.err }
+
+func publishEvidenceArtifacts(primaryPath string, primaryData []byte, probePath string, probeData []byte, publish func(string, []byte) error) error {
+	if err := requireAbsent(primaryPath); err != nil {
+		return fmt.Errorf("primary evidence output is unavailable: %w", err)
+	}
+	if probePath != "" {
+		if err := requireAbsent(probePath); err != nil {
+			return fmt.Errorf("compiler probe sidecar output is unavailable: %w", err)
+		}
+	}
+	// The primary goes first so its publication failure cannot leave a new
+	// diagnostic sidecar behind. The pair itself is not a two-file transaction.
+	if err := publish(primaryPath, primaryData); err != nil {
+		var publishedErr *artifactPublishedError
+		if errors.As(err, &publishedErr) {
+			return fmt.Errorf("primary evidence artifact was published at %q but staging cleanup failed; compiler probe sidecar was not published: %w", primaryPath, err)
+		}
+		return fmt.Errorf("publish primary evidence artifact: %w", err)
+	}
+	if probePath != "" {
+		if err := publish(probePath, probeData); err != nil {
+			var publishedErr *artifactPublishedError
+			if errors.As(err, &publishedErr) {
+				return fmt.Errorf("primary evidence artifact is published at %q and compiler probe sidecar was published at %q, but sidecar staging cleanup failed: %w", primaryPath, probePath, err)
+			}
+			return fmt.Errorf("primary evidence artifact was published at %q, but compiler probe sidecar publication failed; the primary artifact remains in place: %w", primaryPath, err)
+		}
+	}
+	return nil
+}
+
+func requireAbsent(path string) error {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return fmt.Errorf("path already exists: %s", path)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
