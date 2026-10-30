@@ -183,14 +183,17 @@ failure without overwriting existing files.
 --snapshot FILE [--gradle-user-home PATH]` is read-only and invokes no Gradle.
 It verifies that the sidecar belongs to the supplied v2 artifact, recomputes
 the current v2 local fingerprint, and rehashes every previously recorded path.
-Classpath entry revalidation is capped at 2 GiB of file bytes read, 110,000
-file-hash operations, and 110,000 directory-entry visits, in addition to the
-per-file, per-directory, and classpath-entry limits. A directory's content
-pass hashes each file twice, so that work counts twice.
+One aggregate budget covers that fingerprint, selected output checks, and
+classpath entry revalidation: 2 GiB of file bytes read, 110,000 file-hash
+operations, and 110,000 directory-entry visits, in addition to the per-file,
+per-directory, and classpath-entry limits. A directory's content pass hashes
+each file twice, so that work counts twice. The scan observes context
+cancellation between directory entries and during file reads.
 Repeated entries with the same scope, relative path, and kind reuse one
 verified observation while remaining duplicated and ordered in the sidecar.
-If either aggregate budget is exhausted, affected and subsequent unverified
-entries stay incomplete; validation cannot report complete byte freshness.
+If an aggregate budget is exhausted, build-evidence freshness or affected and
+subsequent unverified classpath entries stay incomplete; validation cannot
+report complete byte freshness.
 `recorded_content_freshness=complete` means those recorded paths still have the
 same bytes. The validator does not enumerate today's Kotlin task classpath,
 re-resolve Gradle, or detect a newly selected dependency that was not in the

@@ -337,6 +337,13 @@ func ExportGradle(ctx context.Context, req GradleRequest) (Artifact, error) {
 // CurrentFingerprint recomputes the locally available inputs for stale-artifact
 // checks. It cannot attest Gradle-resolved dependencies, which remain unknown.
 func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error) {
+	return currentFingerprintContext(context.Background(), repositoryRoot, artifact, nil)
+}
+
+func currentFingerprintContext(ctx context.Context, repositoryRoot string, artifact Artifact, budget *classpathReadBudget) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := artifact.Validate(); err != nil {
 		return "", err
 	}
@@ -389,22 +396,29 @@ func CurrentFingerprint(repositoryRoot string, artifact Artifact) (string, error
 		model.Dependencies = append(model.Dependencies, dependency.Coordinate)
 	}
 	sort.Strings(model.Dependencies)
-	current, err := repositoryFingerprint(root, roots)
+	current, err := repositoryFingerprintContext(ctx, root, roots, budget)
 	if err != nil {
 		return "", err
 	}
 	if artifact.Proof == nil {
 		return hashFingerprint(root, model, roots, current, artifact.Evidence.Dimensions), nil
 	}
-	if err := validateOutputContent(root, *artifact.Proof); err != nil {
+	if err := validateOutputContentContext(ctx, root, *artifact.Proof, budget); err != nil {
 		return "", err
 	}
 	return hashFingerprintV2(root, model, roots, current, artifact.Evidence.Dimensions, *artifact.Proof), nil
 }
 
 func validateOutputContent(root string, proof Proof) error {
+	return validateOutputContentContext(context.Background(), root, proof, nil)
+}
+
+func validateOutputContentContext(ctx context.Context, root string, proof Proof, budget *classpathReadBudget) error {
 	expected := make(map[string]struct{}, len(proof.OutputFiles))
 	for _, output := range proof.OutputFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		expected[filepath.Clean(filepath.FromSlash(output.Path))] = struct{}{}
 		abs := filepath.Join(root, filepath.FromSlash(output.Path))
 		if _, inside := relativeWithin(root, abs); !inside {
@@ -421,14 +435,36 @@ func validateOutputContent(root string, proof Proof) error {
 		if err != nil {
 			return err
 		}
+		info, statErr := file.Stat()
+		if statErr != nil {
+			file.Close()
+			return statErr
+		}
+		if budget != nil {
+			if err := budget.beginFile(info.Size()); err != nil {
+				file.Close()
+				return err
+			}
+		}
 		h := sha256.New()
-		_, copyErr := io.Copy(h, file)
+		readLimit := info.Size()
+		read, copyErr := io.Copy(h, io.LimitReader(contextReader{ctx: ctx, r: file}, readLimit))
+		if budget != nil {
+			budget.recordBytes(read)
+		}
+		after, statErr := file.Stat()
 		closeErr := file.Close()
 		if copyErr != nil {
 			return copyErr
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+		if read != info.Size() {
+			return errors.New("classpath revalidation budget exceeded or output changed while hashing")
+		}
+		if statErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+			return errors.New("repository output changed while hashing")
 		}
 		if hex.EncodeToString(h.Sum(nil)) != output.SHA256 {
 			return fmt.Errorf("build evidence is stale: selected output content changed: %q", output.Path)
@@ -445,8 +481,16 @@ func validateOutputContent(root string, proof Proof) error {
 			return fmt.Errorf("build evidence is stale: selected output root symlink escapes repository: %q", outputRoot)
 		}
 		err = filepath.WalkDir(resolvedRoot, func(name string, entry fs.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				return walkErr
+			}
+			if budget != nil {
+				if err := budget.beginEntry(); err != nil {
+					return err
+				}
 			}
 			if entry.IsDir() {
 				return nil
@@ -686,6 +730,10 @@ func canonicalRepoPath(root, abs string) (string, error) {
 // ponytail: hashes the full tree in O(repository bytes); use a Gradle-proven
 // input manifest if explicit freshness checks become costly.
 func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
+	return repositoryFingerprintContext(context.Background(), root, sourceRoots, nil)
+}
+
+func repositoryFingerprintContext(ctx context.Context, root string, sourceRoots []string, budget *classpathReadBudget) (string, error) {
 	h := sha256.New()
 	write := func(name string, data []byte) {
 		var size [8]byte
@@ -697,6 +745,9 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 		h.Write(data)
 	}
 	writeFile := func(name, path string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -706,8 +757,19 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 			f.Close()
 			return err
 		}
+		if budget != nil {
+			if err := budget.beginFile(info.Size()); err != nil {
+				f.Close()
+				return err
+			}
+		}
 		content := sha256.New()
-		_, copyErr := io.Copy(content, f)
+		readLimit := info.Size()
+		read, copyErr := io.Copy(content, io.LimitReader(contextReader{ctx: ctx, r: f}, readLimit))
+		if budget != nil {
+			budget.recordBytes(read)
+		}
+		after, statErr := f.Stat()
 		closeErr := f.Close()
 		if copyErr != nil {
 			return copyErr
@@ -715,13 +777,27 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 		if closeErr != nil {
 			return closeErr
 		}
+		if read != info.Size() {
+			return errors.New("classpath revalidation budget exceeded or repository file changed while hashing")
+		}
+		if statErr != nil || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+			return errors.New("repository file changed while hashing")
+		}
 		write("file:"+name, []byte(fmt.Sprintf("%o", info.Mode().Perm())))
 		write("content:"+name, content.Sum(nil))
 		return nil
 	}
 	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
+		}
+		if budget != nil {
+			if err := budget.beginEntry(); err != nil {
+				return err
+			}
 		}
 		var info fs.FileInfo
 		var err error
@@ -770,11 +846,19 @@ func repositoryFingerprint(root string, sourceRoots []string) (string, error) {
 		abs := filepath.Join(root, filepath.FromSlash(sourceRoot))
 		write("source-root:"+sourceRoot, nil)
 		err := filepath.WalkDir(abs, func(name string, entry fs.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if errors.Is(walkErr, os.ErrNotExist) && name == abs {
 				return nil
 			}
 			if walkErr != nil {
 				return walkErr
+			}
+			if budget != nil {
+				if err := budget.beginEntry(); err != nil {
+					return err
+				}
 			}
 			if entry.IsDir() || !entry.Type().IsRegular() {
 				return nil

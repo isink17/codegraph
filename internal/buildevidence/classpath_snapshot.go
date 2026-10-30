@@ -512,8 +512,17 @@ func validateClasspathSnapshotCurrentContextWithLimits(ctx context.Context, repo
 	if err := ctx.Err(); err != nil {
 		return SnapshotFreshness{}, err
 	}
-	if fingerprint, err := CurrentFingerprint(root, artifact); err != nil {
-		result.Reasons = append(result.Reasons, "related v2 build evidence could not be revalidated")
+	budget := classpathReadBudget{limits: limits}
+	if fingerprint, err := currentFingerprintContext(ctx, root, artifact, &budget); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return SnapshotFreshness{}, ctxErr
+		}
+		if budget.exhausted {
+			result.Reasons = append(result.Reasons, "related v2 evidence revalidation exceeded the aggregate classpath budget")
+			result.RecordedContent = Incomplete
+		} else {
+			result.Reasons = append(result.Reasons, "related v2 build evidence could not be revalidated")
+		}
 	} else if fingerprint != artifact.InputFingerprint {
 		result.Reasons = append(result.Reasons, "related v2 build evidence is stale")
 	} else {
@@ -523,7 +532,6 @@ func validateClasspathSnapshotCurrentContextWithLimits(ctx context.Context, repo
 		result.RecordedContent = Incomplete
 		result.Reasons = append(result.Reasons, "original classpath observation was incomplete")
 	}
-	budget := classpathReadBudget{limits: limits}
 	type cachedObservation struct {
 		digest string
 		err    error

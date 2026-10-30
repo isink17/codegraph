@@ -113,8 +113,8 @@ func TestClasspathSnapshotTracksContentOrderDuplicatesAndFreshness(t *testing.T)
 func TestClasspathSnapshotRevalidationAggregateBudgetAndDuplicateReuse(t *testing.T) {
 	root := t.TempDir()
 	home := t.TempDir()
-	first := filepath.Join(root, "first.jar")
-	second := filepath.Join(root, "second.jar")
+	first := filepath.Join(home, "first.jar")
+	second := filepath.Join(home, "second.jar")
 	for path, value := range map[string]string{first: "1234", second: "5678"} {
 		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
 			t.Fatal(err)
@@ -168,10 +168,45 @@ func TestClasspathSnapshotRevalidationAggregateBudgetAndDuplicateReuse(t *testin
 	}
 }
 
+type cancelAfterContextChecks struct {
+	context.Context
+	checks   int
+	cancelAt int
+}
+
+func (c *cancelAfterContextChecks) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestClasspathSnapshotRevalidationCancellationDuringWork(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	dependency := filepath.Join(home, "dep.jar")
+	if err := os.WriteFile(dependency, []byte("dependency bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact := snapshotTestArtifact(root)
+	snapshot, err := buildClasspathSnapshot(root, home, artifact, []rawClasspathEntry{{Path: dependency}}, Complete, []string{"KotlinCompile.libraries FileCollection rendered through Gradle asPath in iteration order"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := &cancelAfterContextChecks{Context: context.Background(), cancelAt: 7}
+	limits := classpathRevalidationLimits{bytes: MaxClasspathRevalidationBytes, files: MaxClasspathRevalidationFiles, entries: MaxClasspathRevalidationEntries}
+	if _, err := validateClasspathSnapshotCurrentContextWithLimits(ctx, root, home, artifact, snapshot, limits); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-validation cancellation returned %v, want context.Canceled (checks=%d)", err, ctx.checks)
+	}
+	if ctx.checks < ctx.cancelAt {
+		t.Fatalf("validation did not reach its cancellation point: %d checks", ctx.checks)
+	}
+}
+
 func TestClasspathSnapshotRevalidationDirectoryGrowthAndFileCountBudget(t *testing.T) {
 	root := t.TempDir()
 	home := t.TempDir()
-	dir := filepath.Join(root, "classes")
+	dir := filepath.Join(home, "classes")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
