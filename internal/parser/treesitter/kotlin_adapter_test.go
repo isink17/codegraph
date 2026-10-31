@@ -103,17 +103,103 @@ func TestKotlinJVMCallableArityEvidence(t *testing.T) {
 }
 
 func TestKotlinCallableShadowEvidence(t *testing.T) {
-	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(`class Target
+	const source = `class Target
 fun local() { val Target = {}; Target() }
 fun parameter(Target: () -> Unit) { Target() }
 fun typed(callback: () -> Unit) { val Target: () -> Unit = callback; Target() }
+fun blockLocal() { run { val Target = {}; Target() } }
+fun afterBlock() { run { val Other = {}; Other() }; Target() }
+fun nestedShadow() { val Target = {}; run { val Target: () -> Unit = {}; Target() } }
+fun nestedAfter() { run { val Other = {}; Other() }; Target() }
+fun localClassMember() {
+    class Inner {
+        val Target = {}
+    }
+    Target()
+}
+fun localObjectMember() {
+    val inner = object { val Target = {} }
+    Target()
+}
+fun nonCallableProperty() { val Target = 1; Target() }
+fun nonCallableParameter(Target: kotlin.Int) { Target() }
+fun anonymousParameter() { val block = fun(Target: () -> Unit) { Target() } }
+fun initializerLambda() { val block = { val Target = {}; Target() } }
+fun declarationOrder() { Target(); val Target = {} }
 fun positive() { Target() }
-`))
+`
+	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Edges) != 4 || parsed.Edges[0].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[1].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[2].Evidence != graph.KotlinCallableShadowEvidence || parsed.Edges[3].Evidence != "Target" {
-		t.Fatalf("shadow evidence = %+v", parsed.Edges)
+	type expectedCall struct {
+		column   int
+		evidence string
+	}
+	want := map[int]expectedCall{}
+	for line, evidence := range map[int]string{
+		2: graph.KotlinCallableShadowEvidence, 3: graph.KotlinCallableShadowEvidence,
+		4: graph.KotlinCallableShadowEvidence, 5: graph.KotlinCallableShadowEvidence,
+		6: "Target", 7: graph.KotlinCallableShadowEvidence, 8: "Target",
+		13: "Target", 17: "Target", 19: "Target",
+		20: "Target", 21: graph.KotlinCallableShadowEvidence,
+		22: graph.KotlinCallableShadowEvidence, 23: "Target", 24: "Target",
+	} {
+		lineText := strings.Split(source, "\n")[line-1]
+		want[line] = expectedCall{column: strings.Index(lineText, "Target()") + 1, evidence: evidence}
+	}
+	seen := make(map[int]bool, len(want))
+	wantRunLines := map[int]bool{5: true, 6: true, 7: true, 8: true}
+	seenRunLines := make(map[int]bool, len(wantRunLines))
+	for _, edge := range parsed.Edges {
+		if edge.DstName != "Target" {
+			if edge.DstName == "run" {
+				if edge.Line < 1 || edge.Col < 1 || edge.Evidence != "run" {
+					t.Errorf("run call has invalid location or evidence: %+v", edge)
+				} else if !wantRunLines[edge.Line] || seenRunLines[edge.Line] {
+					t.Errorf("unexpected or duplicate run call at Shadow.kt:%d:%d: %+v", edge.Line, edge.Col, edge)
+				} else {
+					seenRunLines[edge.Line] = true
+				}
+			}
+			continue
+		}
+		if edge.Line < 1 || edge.Col < 1 {
+			t.Errorf("Target call lacks source location: %+v", edge)
+			continue
+		}
+		owner := ""
+		for _, symbol := range parsed.Symbols {
+			if symbol.Kind == "function" && symbol.Range.StartLine <= edge.Line && edge.Line <= symbol.Range.EndLine {
+				owner = symbol.Name
+				break
+			}
+		}
+		got, ok := want[edge.Line]
+		if !ok {
+			t.Errorf("unexpected Target call at Shadow.kt:%d:%d (owner %q): %+v", edge.Line, edge.Col, owner, edge)
+			continue
+		}
+		if seen[edge.Line] {
+			t.Errorf("duplicate Target call assertion at Shadow.kt:%d:%d in %s", edge.Line, edge.Col, owner)
+		}
+		seen[edge.Line] = true
+		if edge.Col != got.column {
+			t.Errorf("Target call Shadow.kt:%d:%d column, want %d", edge.Line, edge.Col, got.column)
+		}
+		if edge.Evidence != got.evidence {
+			t.Errorf("Target call Shadow.kt:%d:%d in %s evidence = %q, want %q", edge.Line, edge.Col, owner, edge.Evidence, got.evidence)
+		}
+	}
+	for line := range want {
+		if !seen[line] {
+			t.Errorf("missing Target call at Shadow.kt:%d", line)
+		}
+	}
+	for line := range wantRunLines {
+		if !seenRunLines[line] {
+			t.Errorf("missing run call at Shadow.kt:%d", line)
+		}
 	}
 }
 

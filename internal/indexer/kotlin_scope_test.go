@@ -70,6 +70,50 @@ fun positive() { Target() }`)
 	r.assertFreshParity(t, "callable shadow rebound")
 }
 
+func TestKotlinLexicalCallableShadowScopes(t *testing.T) {
+	r := newLifecycleRepo(t, tree{"Shadow.kt": `class Target
+fun localClassMember() {
+    class Inner {
+        val Target = {}
+    }
+    Target()
+}
+fun siblingScopes() {
+    run { val Target = {}; Target() }
+    Target()
+}
+fun nonCallableParameter(Target: kotlin.Int) { Target() }`})
+	for _, tc := range []struct {
+		line     int
+		kind     string
+		evidence string
+		target   string
+	}{
+		{line: 6, kind: "constructs", evidence: "Target", target: "Target"},
+		{line: 9, kind: "calls", evidence: graph.KotlinCallableShadowEvidence},
+		{line: 10, kind: "constructs", evidence: "Target", target: "Target"},
+		{line: 12, kind: "constructs", evidence: "Target", target: "Target"},
+	} {
+		var kind, evidence string
+		var target sql.NullString
+		err := r.raw(t).QueryRow(`SELECT e.edge_kind,e.evidence,s.name FROM edges e JOIN files f ON f.id=e.file_id LEFT JOIN symbols s ON s.id=e.dst_symbol_id WHERE e.repo_id=? AND f.path='Shadow.kt' AND e.dst_name='Target' AND e.line=?`, r.repoID, tc.line).Scan(&kind, &evidence, &target)
+		if err != nil {
+			t.Fatalf("edge at Shadow.kt:%d: %v", tc.line, err)
+		}
+		if kind != tc.kind || evidence != tc.evidence || target.String != tc.target {
+			t.Errorf("edge at Shadow.kt:%d = (%q, %q, %q), want (%q, %q, %q)", tc.line, kind, evidence, target.String, tc.kind, tc.evidence, tc.target)
+		}
+		if tc.target == "" {
+			var bound bool
+			err := r.raw(t).QueryRow(`SELECT r.symbol_id IS NOT NULL FROM references_tbl r JOIN files f ON f.id=r.file_id WHERE r.repo_id=? AND f.path='Shadow.kt' AND r.ref_kind='call' AND r.qualified_name='Target' AND r.start_line=?`, r.repoID, tc.line).Scan(&bound)
+			if err != nil || bound {
+				t.Errorf("reference at Shadow.kt:%d bound=%v, err=%v; want unbound", tc.line, bound, err)
+			}
+		}
+	}
+	r.assertFreshParity(t, "Kotlin lexical callable shadow scopes")
+}
+
 func TestKotlinAmbiguousCallableCandidateDoesNotConstruct(t *testing.T) {
 	r := newLifecycleRepo(t, tree{
 		"Types.kt": `class Target`,
