@@ -16,6 +16,9 @@ open class Api {
     }
 }
 
+internal class InternalApi { fun hiddenFromPublicContract(): String = "internal" }
+private class PrivateApi { fun hiddenFromPublicContract(): String = "private" }
+
 interface Getter<T> { fun get(): T }
 class StringGetter : Getter<String> { override fun get(): String = "x" }
 

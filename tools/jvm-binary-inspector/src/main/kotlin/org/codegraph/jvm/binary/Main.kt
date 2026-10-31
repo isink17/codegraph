@@ -184,6 +184,7 @@ internal fun inspect(bytes: ByteArray): Result {
     }
     if (
         kmClass.kind != ClassKind.CLASS ||
+        kmClass.visibility != Visibility.PUBLIC ||
         (node.access and Opcodes.ACC_PUBLIC) == 0 ||
         (node.access and Opcodes.ACC_INTERFACE) != 0 ||
         node.name.contains('$')
@@ -269,7 +270,16 @@ private fun parseHeader(annotation: AnnotationNode): MetadataHeader {
     val fields = mutableMapOf<String, Any?>()
     for (i in values.indices step 2) {
         val name = values[i] as? String ?: throw InspectionException("malformed Kotlin metadata annotation")
-        if (fields.put(name, values[i + 1]) != null) throw InspectionException("duplicate Kotlin metadata field")
+        if (fields.containsKey(name)) throw InspectionException("duplicate Kotlin metadata field")
+        fields[name] = values[i + 1]
+    }
+    fun intField(field: String, default: Int): Int {
+        if (!fields.containsKey(field)) return default
+        return fields[field] as? Int ?: throw InspectionException("malformed Kotlin metadata $field")
+    }
+    fun stringField(field: String): String {
+        if (!fields.containsKey(field)) return ""
+        return fields[field] as? String ?: throw InspectionException("malformed Kotlin metadata $field")
     }
     fun intList(field: String): List<Int> {
         val raw = fields[field] ?: return emptyList()
@@ -287,15 +297,14 @@ private fun parseHeader(annotation: AnnotationNode): MetadataHeader {
             string
         }.toTypedArray()
     }
-    val kind = fields["k"] as? Int ?: 1
+    val kind = intField("k", 1)
     val metadataVersion = intList("mv")
-    if (metadataVersion.size !in 2..3) throw InspectionException("malformed Kotlin metadata version")
-    val normalizedVersion = metadataVersion.let { if (it.size == 2) it + 0 else it }
+    if (metadataVersion.size != 3) throw InspectionException("malformed Kotlin metadata version")
     val bytecodeVersion = intList("bv")
-    val extraString = fields["xs"] as? String ?: ""
-    val packageName = fields["pn"] as? String ?: ""
-    val extraInt = fields["xi"] as? Int ?: 0
-    return MetadataHeader(kind, normalizedVersion, bytecodeVersion, stringList("d1"), stringList("d2"), extraString, packageName, extraInt)
+    val extraString = stringField("xs")
+    val packageName = stringField("pn")
+    val extraInt = intField("xi", 0)
+    return MetadataHeader(kind, metadataVersion, bytecodeVersion, stringList("d1"), stringList("d2"), extraString, packageName, extraInt)
 }
 
 private fun encodeResult(result: Result): String = buildString {

@@ -67,6 +67,15 @@ class InspectorTest {
     }
 
     @Test
+    fun excludesNonPublicTopLevelClasses() {
+        for (name in listOf("sample/InternalApi", "sample/PrivateApi")) {
+            val result = inspect(classBytes(name))
+            assertEquals("unsupported_class_shape", result.kotlin_metadata.state, name)
+            assertTrue(result.methods.isEmpty(), name)
+        }
+    }
+
+    @Test
     fun leavesBridgeWithoutMetadataAssociation() {
         val result = inspect(classBytes("sample/StringGetter"))
         assertEquals(listOf("get()Ljava/lang/String;"), result.methods.map { it.jvm_name + it.descriptor })
@@ -92,6 +101,24 @@ class InspectorTest {
         val metadata = metadataAnnotation(node)
         val index = metadata.values!!.indexOf("mv")
         metadata.values!![index + 1] = listOf(999, 0, 0)
+        assertFailsWith<Exception> { inspect(writeNode(node)) }
+    }
+
+    @Test
+    fun rejectsMetadataVersionWithoutExplicitPatchComponent() {
+        val node = readNode(classBytes("sample/Api"))
+        val metadata = metadataAnnotation(node)
+        val index = metadata.values!!.indexOf("mv")
+        metadata.values!![index + 1] = listOf(2, 3)
+        assertFailsWith<Exception> { inspect(writeNode(node)) }
+    }
+
+    @Test
+    fun rejectsWronglyTypedMetadataHeaderFields() {
+        val node = readNode(classBytes("sample/Api"))
+        val metadata = metadataAnnotation(node)
+        val index = metadata.values!!.indexOf("k")
+        metadata.values!![index + 1] = "not-an-integer"
         assertFailsWith<Exception> { inspect(writeNode(node)) }
     }
 
