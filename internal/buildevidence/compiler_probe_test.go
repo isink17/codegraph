@@ -36,13 +36,15 @@ func TestExportGradleCompilerProbePinnedFixture(t *testing.T) {
 	baselineFiles = baseline.Proof.OutputFiles
 
 	tokens := map[string]bool{}
-	for _, strategy := range []struct{ name, relation string }{{"daemon", "SEPARATE_PROCESS"}, {"in-process", "SAME_PROCESS"}} {
+	for _, strategy := range []struct{ name, requested, relation string }{
+		{"default", "", "SEPARATE_PROCESS"}, {"daemon", "daemon", "SEPARATE_PROCESS"}, {"in-process", "in-process", "SAME_PROCESS"},
+	} {
 		t.Run(strategy.name, func(t *testing.T) {
 			root := copyGradleFixture(t)
 			output := filepath.Join(t.TempDir(), "evidence.json")
 			artifact, err := ExportGradle(context.Background(), GradleRequest{
 				RepositoryRoot: root, GradleCommand: gradle, Project: ":app", Compilation: "main",
-				OutputPath: output, CompilerProbeJar: probeJar, CompilerExecutionStrategy: strategy.name,
+				OutputPath: output, CompilerProbeJar: probeJar, CompilerExecutionStrategy: strategy.requested,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -57,6 +59,12 @@ func TestExportGradleCompilerProbePinnedFixture(t *testing.T) {
 			}
 			if observation.Status != CompilerProbeStatus || !observation.CallbackExecuted {
 				t.Fatalf("probe status = %+v", observation)
+			}
+			if observation.RuntimeVersion == "" || observation.RuntimeVendor == "" {
+				t.Fatalf("compiler callback omitted available runtime identity observations: %+v", observation)
+			}
+			if observation.SelectedToolchainVersion == "" {
+				t.Fatalf("selected Kotlin task toolchain version was not observed: %+v", observation)
 			}
 			if observation.RequestedExecutionStrategy != strategy.name || observation.ProcessRelationship != strategy.relation {
 				t.Fatalf("process/strategy observation = %+v", observation)
@@ -178,6 +186,39 @@ func TestCompilerProbeFailClosedMatrix(t *testing.T) {
 	}
 }
 
+func TestCompilerProbeKeepsRuntimeToolchainAndGradleIdentitiesSeparate(t *testing.T) {
+	record, invocation, model, artifact := validProbeFixture(t)
+	writeProbeFixture(t, invocation.recordPath, record)
+	probe, err := readCompilerProbe(invocation, model, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.RuntimeVersion != "17.0.1" || probe.RuntimeVendor != "Oracle Corporation" || probe.SelectedToolchainVersion != "17" ||
+		probe.ProcessRelationship != "SAME_PROCESS" {
+		t.Fatalf("runtime/toolchain relationship evidence was lost or conflated: %+v", probe)
+	}
+	if probe.Status != CompilerProbeStatus {
+		t.Fatalf("partial runtime identity changed compiler callback status: %+v", probe)
+	}
+	if _, err := probe.Marshal(); err != nil {
+		t.Fatalf("valid partial identity artifact did not marshal: %v", err)
+	}
+
+	second := record
+	second.RuntimeVendor = "JetBrains s.r.o."
+	writeProbeFixture(t, invocation.recordPath, second)
+	secondProbe, err := readCompilerProbe(invocation, model, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondProbe.RuntimeVersion != probe.RuntimeVersion || secondProbe.RuntimeVendor == probe.RuntimeVendor {
+		t.Fatal("same-version runtime vendor negative control was not preserved")
+	}
+	if secondProbe.ProcessRelationship == "" {
+		t.Fatal("runtime vendor observation lost its independent process relationship")
+	}
+}
+
 func TestCompilerProbeMissingSkippedAndMalformedRecords(t *testing.T) {
 	t.Run("missing callback", func(t *testing.T) {
 		_, invocation, model, artifact := validProbeFixture(t)
@@ -258,7 +299,7 @@ func TestCompilerProbeConcurrentInvocationsHaveDistinctTokens(t *testing.T) {
 func TestPrepareCompilerProbeChecksPinnedJarManifest(t *testing.T) {
 	root := t.TempDir()
 	jar := filepath.Join(t.TempDir(), "wrong-probe.jar")
-	writeProbeJarManifest(t, jar, "1.0.0", "1", "2.3.21")
+	writeProbeJarManifest(t, jar, "2.0.0", "2", "2.3.21")
 	if _, err := prepareCompilerProbe(root, jar, filepath.Join(t.TempDir(), "evidence.json"), ":app", "main", ""); err == nil {
 		t.Fatal("probe built for a different Kotlin compiler was accepted")
 	}
@@ -325,7 +366,7 @@ func TestExportCompilerProbeDoesNotWriteEvidenceAfterGradleFailure(t *testing.T)
 
 func writeValidProbeJar(t *testing.T, path string) {
 	t.Helper()
-	writeProbeJarManifest(t, path, "1.0.0", "1", "2.3.20")
+	writeProbeJarManifest(t, path, "2.0.0", "2", "2.3.20")
 }
 
 func writeProbeJarManifest(t *testing.T, path, version, protocol, kotlinVersion string) {
@@ -401,12 +442,16 @@ func validProbeFixture(t *testing.T) (compilerProbeRecord, *probeInvocation, gra
 	artifact := Artifact{InputFingerprint: strings.Repeat("c", 64)}
 	record := compilerProbeRecord{
 		Schema: CompilerProbeSchema, ProtocolVersion: CompilerProbeProtocol, Status: "CALLBACK_OBSERVED",
-		InvocationToken: token, ProbeVersion: "1.0.0", ProbeJARSHA256: jarHash,
+		InvocationToken: token, ProbeVersion: "2.0.0", ProbeJARSHA256: jarHash,
 		CompilerClass: "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", CompilerClassloader: "java.net.URLClassLoader",
 		CompilerCodeSourceName: "kotlin-compiler-embeddable-2.3.20.jar", CompilerCodeSourceSHA256: strings.Repeat("d", 64),
 		CompilerClassSHA256: strings.Repeat("e", 64), Project: model.Project, Compilation: model.Compilation,
-		Task: model.CompileTask, CallbackExecuted: true, ProcessID: 12345, ProcessStart: "2026-10-30T00:00:00Z", RuntimeVersion: "17.0.1", RequestedExecutionStrategy: "default",
+		Task: model.CompileTask, CallbackExecuted: true, ProcessID: 12345, ProcessStart: "2026-10-30T00:00:00Z", RuntimeVersion: "17.0.1",
+		RuntimeVendor:              "Oracle Corporation",
+		RequestedExecutionStrategy: "default",
 	}
+	model.SelectedToolchainVersion = "17"
+	model.GradleProcessID = 12345
 	return record, invocation, model, artifact
 }
 
