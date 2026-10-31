@@ -86,7 +86,7 @@ func SemanticEpochs() map[string]int {
 var parserSemanticEpochs = map[string]int{
 	"treesitter:cpp": 1, "treesitter:csharp": 1, "treesitter:go": 1,
 	"treesitter:hcl":  1,
-	"treesitter:java": 1, "treesitter:kotlin": 1, "treesitter:php": 1,
+	"treesitter:java": 1, "treesitter:kotlin": 2, "treesitter:php": 1,
 	"treesitter:dart":   1,
 	"treesitter:lua":    1,
 	"treesitter:python": 2, "treesitter:ruby": 1, "treesitter:rust": 1,

@@ -182,7 +182,7 @@ func resolveKotlinScope(ctx context.Context, q javaQuery, repoID int64, only map
 				}
 			}
 		} else {
-			if e.evidence == graph.KotlinCallableShadowEvidence {
+			if e.evidence == graph.KotlinCallableShadowEvidence || e.evidence == graph.KotlinUnprovenLambdaParameterEvidence {
 				continue
 			}
 			owner := kotlinType(e.name, e, syms, imports[e.file])
