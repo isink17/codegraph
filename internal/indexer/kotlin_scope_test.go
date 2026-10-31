@@ -84,7 +84,8 @@ fun siblingScopes() {
 }
 fun nonCallableParameter(Target: kotlin.Int) { Target() }
 fun inferredLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target -> Target() } }
-fun explicitLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target: () -> Unit -> Target() } }`})
+fun explicitLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target: () -> Unit -> Target() } }
+fun nonCallableLambdaParameter(xs: List<Int>) { xs.forEach { Target: Int -> Target() } }`})
 	for _, tc := range []struct {
 		line     int
 		kind     string
@@ -97,6 +98,7 @@ fun explicitLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target: () -> U
 		{line: 12, kind: "constructs", evidence: "Target", target: "Target"},
 		{line: 13, kind: "calls", evidence: graph.KotlinUnprovenLambdaParameterEvidence},
 		{line: 14, kind: "calls", evidence: graph.KotlinCallableShadowEvidence},
+		{line: 15, kind: "constructs", evidence: "Target", target: "Target"},
 	} {
 		var kind, evidence string
 		var target sql.NullString
