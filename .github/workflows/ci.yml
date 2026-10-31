@@ -128,11 +128,31 @@ jobs:
       # uses a cgo-only helper without the build tag fails here.
       - run: CGO_ENABLED=0 go vet ./...
 
+  jvm-binary-inspector:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run pinned JVM helper fixture and association tests
+        run: ./gradlew --no-daemon clean test installDist
+        working-directory: tools/jvm-binary-inspector
+      - name: Run Go JVM inspector integration tests
+        run: go test ./internal/jvmbinary ./internal/cli -count=1
+
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.
   # Fails on any failed or cancelled job, and when classification failed.
   ci:
-    needs: [changes, test-native, quality, race, no-cgo]
+    needs: [changes, test-native, quality, race, no-cgo, jvm-binary-inspector]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

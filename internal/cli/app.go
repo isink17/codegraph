@@ -69,7 +69,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	// version and licenses run before the release check and config load: they
 	// must work offline and without a config file.
-	if args[0] == "version" || args[0] == "licenses" {
+	if args[0] == "version" || args[0] == "licenses" || args[0] == "inspect-jvm-class" {
 		cmd, ok := lookupCommand(args[0])
 		if !ok {
 			return fmt.Errorf("unknown command %q", args[0])
