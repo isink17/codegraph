@@ -1367,8 +1367,8 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if kotlinCallableShadow(call, name, content) {
-			evidence = graph.KotlinCallableShadowEvidence
+		if shadow := kotlinCallableShadow(call, name, content); shadow != "" {
+			evidence = shadow
 		}
 		if strings.HasPrefix(name, "this.") {
 			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
@@ -1399,7 +1399,7 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 	}
 }
 
-func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
+func kotlinCallableShadow(call *sitter.Node, name string, content []byte) string {
 	// Walk outward through lexical scopes. Stop at the nearest declaration that
 	// owns this spelling so an inner non-callable binding also shadows an outer
 	// callable value. Descendant searches alone incorrectly see declarations in
@@ -1409,6 +1409,27 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 		case "lambda_literal":
 			// A lambda introduces a lexical scope even when its body is nested
 			// directly below a call suffix rather than a function_body node.
+			params := firstChild(scope, "lambda_parameters")
+			for _, param := range findDescendants(params, "variable_declaration") {
+				id := firstChild(param, "simple_identifier")
+				if id == nil || nodeText(id, content) != name {
+					continue
+				}
+				if len(findDescendants(param, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				explicitType := false
+				for i := range int(param.NamedChildCount()) {
+					if param.NamedChild(i).StartByte() >= id.EndByte() {
+						explicitType = true
+						break
+					}
+				}
+				if !explicitType {
+					return graph.KotlinUnprovenLambdaParameterEvidence
+				}
+				return ""
+			}
 			for _, property := range directDescendants(scope, "property_declaration") {
 				if property.StartByte() > call.StartByte() {
 					continue
@@ -1416,7 +1437,10 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 				binding := firstChild(property, "variable_declaration")
 				id := firstChild(binding, "simple_identifier")
 				if id != nil && nodeText(id, content) == name {
-					return len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0
+					if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
+						return graph.KotlinCallableShadowEvidence
+					}
+					return ""
 				}
 			}
 		case "function_declaration", "anonymous_function":
@@ -1426,7 +1450,10 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 				if id == nil || nodeText(id, content) != name {
 					continue
 				}
-				return len(findDescendants(param, "function_type")) > 0
+				if len(findDescendants(param, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				return ""
 			}
 		case "function_body", "control_structure_body", "property_delegate":
 			for _, property := range directDescendants(scope, "property_declaration") {
@@ -1438,15 +1465,18 @@ func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
 				if id == nil || nodeText(id, content) != name {
 					continue
 				}
-				return len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0
+				if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				return ""
 			}
 		case "class_declaration", "object_declaration", "object_literal":
 			// Members and local bindings in a nested class, object, or function do
 			// not belong to the enclosing callable's lexical scope.
-			return false
+			return ""
 		}
 	}
-	return false
+	return ""
 }
 
 // directDescendants returns matching nodes whose nearest matching ancestor is

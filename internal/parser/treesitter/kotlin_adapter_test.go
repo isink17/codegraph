@@ -127,6 +127,8 @@ fun anonymousParameter() { val block = fun(Target: () -> Unit) { Target() } }
 fun initializerLambda() { val block = { val Target = {}; Target() } }
 fun declarationOrder() { Target(); val Target = {} }
 fun positive() { Target() }
+fun inferredLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target -> Target() } }
+fun explicitLambdaParameter(xs: List<() -> Unit>) { xs.forEach { Target: () -> Unit -> Target() } }
 `
 	parsed, err := NewKotlin().Parse(context.Background(), "Shadow.kt", []byte(source))
 	if err != nil {
@@ -144,6 +146,7 @@ fun positive() { Target() }
 		13: "Target", 17: "Target", 19: "Target",
 		20: "Target", 21: graph.KotlinCallableShadowEvidence,
 		22: graph.KotlinCallableShadowEvidence, 23: "Target", 24: "Target",
+		25: graph.KotlinUnprovenLambdaParameterEvidence, 26: graph.KotlinCallableShadowEvidence,
 	} {
 		lineText := strings.Split(source, "\n")[line-1]
 		want[line] = expectedCall{column: strings.Index(lineText, "Target()") + 1, evidence: evidence}

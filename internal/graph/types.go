@@ -176,6 +176,12 @@ const TypeScriptCallLocalBindingEvidence = "typescript:local_binding"
 // inference without pretending to resolve invoke dispatch.
 const KotlinCallableShadowEvidence = "kotlin:callable_shadow"
 
+// KotlinUnprovenLambdaParameterEvidence marks a call spelling bound to a
+// lambda parameter whose type is inferred and may be callable. It vetoes
+// constructor inference without claiming invoke dispatch or the parameter's
+// resolved type.
+const KotlinUnprovenLambdaParameterEvidence = "kotlin:lambda_parameter_shadow"
+
 // RustTraitImplVisibility is the visibility recorded for an item of a trait
 // impl (`impl Trait for T`). Such an item is as visible as the trait, which
 // the parser does not know, so it is neither private nor public.
