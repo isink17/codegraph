@@ -4,11 +4,38 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+type cancelDuringHashContext struct {
+	parent   context.Context
+	done     chan struct{}
+	checks   int
+	cancelAt int
+	once     sync.Once
+}
+
+func (c *cancelDuringHashContext) Deadline() (time.Time, bool) { return c.parent.Deadline() }
+func (c *cancelDuringHashContext) Done() <-chan struct{}       { return c.done }
+func (c *cancelDuringHashContext) Value(key any) any           { return c.parent.Value(key) }
+func (c *cancelDuringHashContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		c.once.Do(func() { close(c.done) })
+	}
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return c.parent.Err()
+	}
+}
 
 func sourceSnapshotFixture(t *testing.T) (string, Artifact, rawSourceObservation, gradleModel) {
 	t.Helper()
@@ -237,6 +264,28 @@ func TestSourceSnapshotRejectsSymlinksAndAggregateBudgetExhaustion(t *testing.T)
 		if strings.Contains(entry.Path, "Escape.kt") && entry.State == Complete {
 			t.Fatal("symlink source was accepted")
 		}
+	}
+}
+
+func TestSourceSnapshotCancellationDuringFingerprinting(t *testing.T) {
+	root, artifact, raw, model := sourceSnapshotFixture(t)
+	selected := raw.TaskFilesAfter[0]
+	if err := os.WriteFile(selected, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canceling := &cancelDuringHashContext{parent: context.Background(), done: make(chan struct{}), cancelAt: 5}
+
+	_, err := buildSourceSnapshotContext(canceling, root, artifact, raw, model)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-fingerprint cancellation error = %v, want context.Canceled", err)
+	}
+	if canceling.checks != canceling.cancelAt+1 {
+		t.Fatalf("cancellation occurred at context check %d, want second hashing read then caller check (%d)", canceling.checks, canceling.cancelAt+1)
+	}
+	select {
+	case <-canceling.Done():
+	default:
+		t.Fatal("context returned canceled without closing Done")
 	}
 }
 
