@@ -83,6 +83,21 @@ func registerCommand(reg map[string]*command, c *command) {
 func newCommandList() []*command {
 	return []*command{
 		{
+			name:        "inspect-jvm-class",
+			description: "verify Kotlin method signatures in one explicit class file; requires Java and a trusted external inspector",
+			usageLines:  []string{"  inspect-jvm-class --input FILE --inspector-dir DIR --java FILE --trust-inspector"},
+			flags: []commandFlag{
+				{name: "--input FILE", description: "one class file to inspect (maximum 16 MiB)"},
+				{name: "--inspector-dir DIR", description: "trusted Gradle installDist directory for the external JVM inspector"},
+				{name: "--java FILE", description: "explicit Java 17 executable"},
+				{name: "--trust-inspector", description: "authorize executing the external helper and its bundled runtime dependencies"},
+			},
+			examples: []string{"codegraph inspect-jvm-class --input Api.class --inspector-dir tools/jvm-binary-inspector/build/install/codegraph-jvm-binary-inspector --java /path/to/java --trust-inspector"},
+			run: func(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, invokedName string, args []string) error {
+				return runInspectJVMClass(ctx, stdout, stderr, args)
+			},
+		},
+		{
 			name:        "export-gradle-evidence",
 			description: "explicitly run and inspect one Kotlin/JVM Gradle compilation; existing build outputs are not cleaned",
 			usageLines:  []string{"  export-gradle-evidence --repo-root PATH --gradle PATH --project :path --compilation main --output FILE [--dependency-snapshot] [--source-snapshot]"},

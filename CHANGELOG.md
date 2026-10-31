@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add the opt-in `inspect-jvm-class` diagnostic for Kotlin method signatures in one explicitly supplied JVM classfile; Java and the separately built trusted helper are needed only for this command. Source/build association remains unknown.
 - Add explicit MCP `format=compact-v2` with typed, reversible string-array cells; preserve JSON defaults and compact/v1 bytes.
 
 <!-- Release step: these are the v2.0.0 notes. Before tagging, rename the heading above to `## v2.0.0 - DD-MM-YYYY` (the release date) and delete this comment. The release workflow publishes the section whose heading starts with `## v2.0.0 -` and fails without one. -->

@@ -8,6 +8,9 @@ The full reference for CodeGraph: installation details, client configuration, la
 
 **Reference:** [MCP Tools](#mcp-tools-32) · [Index and database behavior](#index-and-database-behavior) · [Database compatibility](#database-compatibility) · [Result Limits](#result-limits) · [Usage / Token Meter](#usage--token-meter) · [CLI Reference](#cli-reference) · [Optional: Embeddings & Agentic Mode](#optional-embeddings--agentic-mode) · [Configuration](#configuration) · [Architecture](#architecture) · [Building from Source](#building-from-source) · [Known limitations and scope of 2.0](#known-limitations-and-scope-of-20) · [Further documentation](#further-documentation) · [License](#license)
 
+For the optional single-class Kotlin/JVM binary signature diagnostic, see
+[JVM Binary Signature Inspector](jvm-binary-inspector.md).
+
 ## Install
 
 ### With the installer scripts
@@ -695,6 +698,7 @@ codegraph config show                     # Show current config
 codegraph --version                       # Print current version
 codegraph version                          # Print current version
 codegraph licenses                        # Print embedded license and third-party notices
+codegraph inspect-jvm-class --input Api.class --inspector-dir INSPECTOR_DIR --java /path/to/java --trust-inspector
 
 # Indexing
 codegraph index <path>                    # Full index
@@ -963,6 +967,7 @@ internal/
   graph/                Core types (Symbol, Edge, Reference, …)
   graphaudit/           codegraph audit / MCP audit over an indexed graph
   indexer/              Repository scan, incremental updates, embedding
+  jvmbinary/            Explicit bounded JVM binary inspection subprocess
   latency/              Percentile arithmetic shared by query benchmarks
   limits/               Shared page, depth, and batch size bounds
   logging/              slog logger construction
