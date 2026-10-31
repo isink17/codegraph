@@ -1367,8 +1367,8 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if kotlinCallableShadow(call, name, content) {
-			evidence = graph.KotlinCallableShadowEvidence
+		if shadow := kotlinCallableShadow(call, name, content); shadow != "" {
+			evidence = shadow
 		}
 		if strings.HasPrefix(name, "this.") {
 			unproven, ordinary := kotlinThisReceiverEvidence(call, content, imports)
@@ -1399,35 +1399,111 @@ func kotlinExtractCalls(root *sitter.Node, content []byte, skip map[*sitter.Node
 	}
 }
 
-func kotlinCallableShadow(call *sitter.Node, name string, content []byte) bool {
-	var fn *sitter.Node
-	for node := call.Parent(); node != nil; node = node.Parent() {
-		if node.Type() == "function_declaration" {
-			fn = node
-			break
+func kotlinCallableShadow(call *sitter.Node, name string, content []byte) string {
+	// Walk outward through lexical scopes. Stop at the nearest declaration that
+	// owns this spelling so an inner non-callable binding also shadows an outer
+	// callable value. Descendant searches alone incorrectly see declarations in
+	// sibling/nested blocks and lambda scopes.
+	for scope := call.Parent(); scope != nil; scope = scope.Parent() {
+		switch scope.Type() {
+		case "lambda_literal":
+			// A lambda introduces a lexical scope even when its body is nested
+			// directly below a call suffix rather than a function_body node.
+			params := firstChild(scope, "lambda_parameters")
+			for _, param := range findDescendants(params, "variable_declaration") {
+				id := firstChild(param, "simple_identifier")
+				if id == nil || nodeText(id, content) != name {
+					continue
+				}
+				if len(findDescendants(param, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				explicitType := false
+				for i := range int(param.NamedChildCount()) {
+					if param.NamedChild(i).StartByte() >= id.EndByte() {
+						explicitType = true
+						break
+					}
+				}
+				if !explicitType {
+					return graph.KotlinUnprovenLambdaParameterEvidence
+				}
+				return ""
+			}
+			for _, property := range directDescendants(scope, "property_declaration") {
+				if property.StartByte() > call.StartByte() {
+					continue
+				}
+				binding := firstChild(property, "variable_declaration")
+				id := firstChild(binding, "simple_identifier")
+				if id != nil && nodeText(id, content) == name {
+					if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
+						return graph.KotlinCallableShadowEvidence
+					}
+					return ""
+				}
+			}
+		case "function_declaration", "anonymous_function":
+			params := firstChild(scope, "function_value_parameters")
+			for _, param := range findDescendants(params, "parameter") {
+				id := firstChild(param, "simple_identifier")
+				if id == nil || nodeText(id, content) != name {
+					continue
+				}
+				if len(findDescendants(param, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				return ""
+			}
+		case "function_body", "control_structure_body", "property_delegate":
+			for _, property := range directDescendants(scope, "property_declaration") {
+				if property.StartByte() > call.StartByte() {
+					continue
+				}
+				binding := firstChild(property, "variable_declaration")
+				id := firstChild(binding, "simple_identifier")
+				if id == nil || nodeText(id, content) != name {
+					continue
+				}
+				if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
+					return graph.KotlinCallableShadowEvidence
+				}
+				return ""
+			}
+		case "class_declaration", "object_declaration", "object_literal":
+			// Members and local bindings in a nested class, object, or function do
+			// not belong to the enclosing callable's lexical scope.
+			return ""
 		}
 	}
-	if fn == nil {
-		return false
-	}
-	params := firstChild(fn, "function_value_parameters")
-	for _, param := range findDescendants(params, "parameter") {
-		if id := firstChild(param, "simple_identifier"); id != nil && nodeText(id, content) == name && len(findDescendants(param, "function_type")) > 0 {
-			return true
+	return ""
+}
+
+// directDescendants returns matching nodes whose nearest matching ancestor is
+// the supplied scope, without entering nested lexical scopes.
+func directDescendants(scope *sitter.Node, kind string) []*sitter.Node {
+	var out []*sitter.Node
+	var visit func(*sitter.Node)
+	visit = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type() == kind {
+			out = append(out, node)
+			return
+		}
+		switch node.Type() {
+		case "function_declaration", "class_declaration", "object_declaration", "object_literal", "anonymous_function", "control_structure_body", "lambda_literal":
+			if node != scope {
+				return
+			}
+		}
+		for i := range int(node.NamedChildCount()) {
+			visit(node.NamedChild(i))
 		}
 	}
-	body := firstChild(fn, "function_body")
-	for _, property := range findDescendants(body, "property_declaration") {
-		binding := firstChild(property, "variable_declaration")
-		id := firstChild(binding, "simple_identifier")
-		if id == nil || nodeText(id, content) != name || property.StartPoint().Row > call.StartPoint().Row {
-			continue
-		}
-		if len(findDescendants(property, "lambda_literal")) > 0 || len(findDescendants(property, "function_type")) > 0 {
-			return true
-		}
-	}
-	return false
+	visit(scope)
+	return out
 }
 
 func kotlinCallArity(call *sitter.Node) *int {
