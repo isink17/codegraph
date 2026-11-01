@@ -100,7 +100,7 @@ func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(r.ctx, `SELECT e.line,e.dst_symbol_id,e.resolution_strategy,r.symbol_id
+	rows, err := db.QueryContext(r.ctx, `SELECT e.line,e.dst_name,e.dst_symbol_id,e.resolution_strategy,r.id,r.name,r.qualified_name,r.ref_kind,r.symbol_id
 		FROM edges e JOIN files f ON f.id=e.file_id
 		LEFT JOIN references_tbl r ON r.repo_id=e.repo_id AND r.file_id=e.file_id AND r.ref_kind='call' AND r.start_line=e.line
 		WHERE e.repo_id=? AND f.path='Caller.java' AND e.edge_kind='calls' AND e.dst_name='Service.INSTANCE.setCount'
@@ -112,13 +112,17 @@ func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
 	var got int
 	for rows.Next() {
 		var line int
-		var edgeTarget, refTarget sql.NullInt64
-		var strategy string
-		if err := rows.Scan(&line, &edgeTarget, &strategy, &refTarget); err != nil {
+		var dstName, strategy string
+		var edgeTarget, refID, refTarget sql.NullInt64
+		var refName, refQualifiedName, refKind sql.NullString
+		if err := rows.Scan(&line, &dstName, &edgeTarget, &strategy, &refID, &refName, &refQualifiedName, &refKind, &refTarget); err != nil {
 			t.Fatal(err)
 		}
 		if line != 8 && line != 9 {
 			t.Errorf("unexpected setCount call line %d", line)
+		}
+		if !refID.Valid || !refName.Valid || !refQualifiedName.Valid || !refKind.Valid || refKind.String != "call" || refName.String != dstName || refQualifiedName.String != dstName {
+			t.Errorf("setCount line %d reference id=%v name=%v qualified_name=%v kind=%v; want exactly one matching persisted call reference", line, refID, refName, refQualifiedName, refKind)
 		}
 		if edgeTarget.Valid || refTarget.Valid || edgeTarget != refTarget || strategy != "" {
 			t.Errorf("setCount line %d edge target=%v reference target=%v strategy=%q; want consistent unresolved state", line, edgeTarget, refTarget, strategy)
