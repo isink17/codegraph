@@ -1015,7 +1015,15 @@ This rebuild path needs exclusive access to the repo database. If it fails becau
 
 ### Continuous integration
 
-Pull requests target the `v2.0` branch. A change that touches only `CHANGELOG.md`, `README.md` or Markdown files under `docs/` runs a short documentation check (`git diff --check`, valid UTF-8, closed code fences, working relative links). Every other change, including a mix of documentation and code, runs the full suite: tests on Linux, macOS and Windows, race, quality and no-cgo jobs. The `windows-stress` label always runs the full suite plus the deep Windows stress gate. The aggregate `ci` check reports the result.
+Pull requests target the `v2.0` branch. A change that touches only `CHANGELOG.md`, `README.md` or Markdown files under `docs/` runs a short documentation check (`git diff --check`, valid UTF-8, closed code fences, working relative links). Every other change, including a mix of documentation and code, runs native tests on Ubuntu plus the required race, quality, no-CGO and JVM binary inspector jobs. The `windows-stress` label forces the full configured non-docs CI suite, but does not execute Windows-native or Windows-specific stress tests while Windows CI remains paused under CG-117. macOS remains officially supported, but native macOS tests run locally rather than in GitHub Actions. For each relevant PR, run these commands on the exact candidate HEAD before merge and record the full HEAD SHA, macOS version/architecture, Go version, exact commands and pass/fail results in the PR validation evidence:
+
+```sh
+go test -timeout 20m ./...
+go vet ./...
+go build ./cmd/codegraph
+```
+
+Also run focused race tests and JVM/Gradle checks when the changed area requires them, recording their exact commands and results. This local evidence is separate from hosted CI: the aggregate `ci` check does not verify macOS, and the existing GitHub merge gate does not automatically enforce local macOS validation.
 
 ---
 
