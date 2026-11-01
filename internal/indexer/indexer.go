@@ -782,7 +782,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			continue
 		}
 		if !pathScoped && res.action != "skip_only" {
-			seenPaths[res.task.rel] = struct{}{}
+			// Only persisted active paths can appear in the missing-path sweep;
+			// new files need no presence entry.
+			if _, wasIndexed := existing[res.task.rel]; wasIndexed {
+				seenPaths[res.task.rel] = struct{}{}
+			}
 		}
 		switch res.action {
 		case "skip_only":
