@@ -11,6 +11,9 @@ import (
 )
 
 func TestKotlinPropertyJavaABIFailsClosed(t *testing.T) {
+	// Pinned Gradle 9.3.1 / KGP 2.3.20 `javap -p -s` oracle for this fixture:
+	// generated setCount(int) has descriptor (I)V; declared setCount(String)
+	// has descriptor (Ljava/lang/String;)V. Both Java calls compile with javac.
 	java := `package app;
 import lib.Service;
 class Caller {
@@ -110,6 +113,7 @@ func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
 	}
 	defer rows.Close()
 	var got int
+	lineCounts := map[int]int{8: 0, 9: 0}
 	for rows.Next() {
 		var line int
 		var dstName, strategy string
@@ -121,6 +125,7 @@ func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
 		if line != 8 && line != 9 {
 			t.Errorf("unexpected setCount call line %d", line)
 		}
+		lineCounts[line]++
 		if !refID.Valid || !refName.Valid || !refQualifiedName.Valid || !refKind.Valid || refKind.String != "call" || refName.String != dstName || refQualifiedName.String != dstName {
 			t.Errorf("setCount line %d reference id=%v name=%v qualified_name=%v kind=%v; want exactly one matching persisted call reference", line, refID, refName, refQualifiedName, refKind)
 		}
@@ -134,6 +139,9 @@ func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
 	}
 	if got != 2 {
 		t.Fatalf("persisted setCount call edges=%d, want int and String call edges", got)
+	}
+	if lineCounts[8] != 1 || lineCounts[9] != 1 {
+		t.Fatalf("persisted setCount edges by line=%v, want exactly one int call on line 8 and one String call on line 9", lineCounts)
 	}
 	callees, err := r.store.FindCallees(r.ctx, r.repoID, "app.Caller.access", 0, 50, 0)
 	if err != nil || len(callees) != 0 {
