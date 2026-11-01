@@ -590,7 +590,10 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	const metadataBatchSize = 300
 	const replaceBatchSize = 20
-	markSeenBatch := make([]string, 0, metadataBatchSize)
+	// Presence belongs to this scan, not to persisted file metadata. Only
+	// results that previously stamped last_scan_id count: skip_only (including
+	// denied extensions) and paths filtered out by the walk remain absent.
+	seenPaths := make(map[string]struct{})
 	touchBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	parseFailedBatch := make([]store.FileMetadataUpdate, 0, metadataBatchSize)
 	// Files present on disk but not indexable under THIS run's configuration or
@@ -635,24 +638,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	var embedDur time.Duration
 	var writeStats store.WriteStats
 
-	flushMarkSeen := func() error {
-		if len(markSeenBatch) == 0 {
-			return nil
-		}
-		if pathScoped {
-			summary.WriteMarkSeenSkipped += len(markSeenBatch)
-			markSeenBatch = markSeenBatch[:0]
-			return nil
-		}
-		started := time.Now()
-		if err := i.store.MarkFilesSeenBatch(ctx, repo.ID, scanID, markSeenBatch); err != nil {
-			return err
-		}
-		summary.WriteMarkSeenFlushes++
-		writeMetadataDur += time.Since(started)
-		markSeenBatch = markSeenBatch[:0]
-		return nil
-	}
 	flushTouch := func() error {
 		if len(touchBatch) == 0 {
 			return nil
@@ -796,28 +781,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		if runErr != nil {
 			continue
 		}
+		if !pathScoped && res.action != "skip_only" {
+			// Only persisted active paths can appear in the missing-path sweep;
+			// new files need no presence entry.
+			if _, wasIndexed := existing[res.task.rel]; wasIndexed {
+				seenPaths[res.task.rel] = struct{}{}
+			}
+		}
 		switch res.action {
 		case "skip_only":
 			summary.FilesSkipped++
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
 		case "mark_seen":
-			writeStart := time.Now()
-			markSeenBatch = append(markSeenBatch, res.task.rel)
+			summary.WriteMarkSeenSkipped++
 			updateLanguageCoverage(summary.LanguageCoverage, coverageLanguage, res.task.rel, store.LanguageCounts{Skipped: 1})
-			if len(markSeenBatch) < metadataBatchSize {
-				if pathScoped {
-					summary.WriteMarkSeenSkipped++
-					markSeenBatch = markSeenBatch[:0]
-				}
-				writeDur += time.Since(writeStart)
-				summary.FilesSkipped++
-				continue
-			}
-			if err := flushMarkSeen(); err != nil {
-				runErr = err
-				cancel()
-			}
-			writeDur += time.Since(writeStart)
 			summary.FilesSkipped++
 		case "retire_oversize":
 			writeStart := time.Now()
@@ -944,14 +921,6 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	if runErr == nil {
 		writeStart := time.Now()
-		if err := flushMarkSeen(); err != nil {
-			runErr = err
-			cancel()
-		}
-		writeDur += time.Since(writeStart)
-	}
-	if runErr == nil {
-		writeStart := time.Now()
 		if err := flushReplace(); err != nil {
 			runErr = err
 			cancel()
@@ -1020,7 +989,17 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 
 	if !pathScoped {
 		missingStarted := time.Now()
-		deleted, err := i.store.MarkMissingDeleted(ctx, repo.ID, scanID)
+		// Workers have joined and the walk succeeded. Compare active rows
+		// loaded for this scan with its presence facts; unchanged rows need no
+		// writes just to protect them from the deletion sweep.
+		missingPaths := make([]string, 0)
+		for rel := range existing {
+			if _, seen := seenPaths[rel]; !seen {
+				missingPaths = append(missingPaths, rel)
+			}
+		}
+		slices.Sort(missingPaths)
+		deleted, err := i.store.MarkFilesDeletedBatch(ctx, repo.ID, scanID, missingPaths)
 		if err != nil {
 			return summary, i.failScan(ctx, scanID, summary, started, err)
 		}
@@ -1535,7 +1514,7 @@ var readFile = os.ReadFile
 //
 // A regular file that vanishes between readdir and the lazy lstat behind
 // d.Info() is likewise not a traversal failure: it is gone, so the scan is not
-// missing anything it should have seen, and MarkMissingDeleted retires the row.
+// missing anything it should have seen, and the missing-path sweep retires the row.
 func entryFileInfo(path string, d fs.DirEntry) (fs.FileInfo, error) {
 	switch {
 	case d.Type().IsRegular():

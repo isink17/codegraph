@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -214,6 +216,75 @@ func TestServeIndexRepoCreatesThenLaterSessionReuses(t *testing.T) {
 	second, err := os.Stat(dbPath)
 	if err != nil || !os.SameFile(first, second) {
 		t.Fatalf("database was re-created instead of reused: %v", err)
+	}
+}
+
+func TestServeUpdateGraphNoopPreservesFileRows(t *testing.T) {
+	repoStateCLI(t)
+	root := sourceRepo(t)
+	res, err := serveSession(t, []string{"--repo-root", root}, callIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, isErr := res.toolText(t, 10); isErr {
+		t.Fatalf("index_repo: %s", text)
+	}
+	canonical, err := store.CanonicalRepoPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), filepath.Join(canonical, config.RepoArtifactsDir, store.RepoDatabaseFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot := func() [][]any {
+		t.Helper()
+		rows, err := db.Query(`SELECT * FROM files ORDER BY id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result [][]any
+		for rows.Next() {
+			values, ptrs := make([]any, len(cols)), make([]any, len(cols))
+			for j := range values {
+				ptrs[j] = &values[j]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, values)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	before := snapshot()
+	if len(before) != 1 {
+		t.Fatalf("indexed file rows = %d, want 1", len(before))
+	}
+	res, err = serveSession(t, []string{"--repo-root", root}, callUpdate, callFindHello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, isErr := res.toolText(t, 10); isErr {
+		t.Fatalf("update_graph: %s", text)
+	}
+	if text, isErr := res.toolText(t, 11); isErr || !strings.Contains(text, "Hello") {
+		t.Fatalf("find_symbol after update_graph = %q (error %v)", text, isErr)
+	}
+	if after := snapshot(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("MCP no-op rewrote files:\nbefore %v\nafter %v", before, after)
+	}
+	var scans int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scans WHERE status='completed'`).Scan(&scans); err != nil || scans != 2 {
+		t.Fatalf("completed scans = %d, %v; want 2", scans, err)
 	}
 }
 
