@@ -19,6 +19,7 @@ class Caller {
         Service.INSTANCE.getValue();
         Service.INSTANCE.getCount();
         Service.INSTANCE.setCount(3);
+        Service.INSTANCE.setCount("x");
         int ignored = Service.raw;
     }
 }`
@@ -27,6 +28,7 @@ object Service {
     fun run() {}
     val value: Int = 7
     var count: Int = 1
+    fun setCount(value: String) {}
     @JvmField val raw: Int = 2
 }`
 	r := newLifecycleRepo(t, tree{"Caller.java": java, "Service.kt": object})
@@ -41,6 +43,7 @@ object Service {
     fun run() {}
     val value: Int = 8
     var count: Int = 2
+    fun setCount(value: String) {}
     @JvmField val raw: Int = 4
 }`)
 	r.update(t, "Service.kt")
@@ -51,6 +54,7 @@ object Service {
     fun run() {}
     val renamed: Int = 8
     var count: Int = 2
+    fun setCount(value: String) {}
     @JvmField val raw: Int = 4
 }`)
 	r.update(t, "Service.kt")
@@ -60,6 +64,7 @@ object Service {
 object Service {
     fun run() {}
     var count: Int = 2
+    fun setCount(value: String) {}
     @JvmField val raw: Int = 4
 }`)
 	r.update(t, "Service.kt")
@@ -83,8 +88,61 @@ func assertPropertyFailClosedState(t *testing.T, r *lifecycleRepo, step string) 
 	}
 	assertNoKotlinPropertyCallableSymbols(t, r)
 	assertPropertyReferencesUnboundAndRecorded(t, r)
+	assertPropertySetterCollisionUnbound(t, r)
 	assertNoRawFieldCallBinding(t, r)
 	r.assertFreshParity(t, step)
+}
+
+func assertPropertySetterCollisionUnbound(t *testing.T, r *lifecycleRepo) {
+	t.Helper()
+	db, err := sql.Open(store.SQLiteDriverName(), r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(r.ctx, `SELECT e.line,e.dst_symbol_id,e.resolution_strategy,r.symbol_id
+		FROM edges e JOIN files f ON f.id=e.file_id
+		LEFT JOIN references_tbl r ON r.repo_id=e.repo_id AND r.file_id=e.file_id AND r.ref_kind='call' AND r.start_line=e.line
+		WHERE e.repo_id=? AND f.path='Caller.java' AND e.edge_kind='calls' AND e.dst_name='Service.INSTANCE.setCount'
+		ORDER BY e.line`, r.repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got int
+	for rows.Next() {
+		var line int
+		var edgeTarget, refTarget sql.NullInt64
+		var strategy string
+		if err := rows.Scan(&line, &edgeTarget, &strategy, &refTarget); err != nil {
+			t.Fatal(err)
+		}
+		if line != 8 && line != 9 {
+			t.Errorf("unexpected setCount call line %d", line)
+		}
+		if edgeTarget.Valid || refTarget.Valid || edgeTarget != refTarget || strategy != "" {
+			t.Errorf("setCount line %d edge target=%v reference target=%v strategy=%q; want consistent unresolved state", line, edgeTarget, refTarget, strategy)
+		}
+		got++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("persisted setCount call edges=%d, want int and String call edges", got)
+	}
+	callees, err := r.store.FindCallees(r.ctx, r.repoID, "app.Caller.access", 0, 50, 0)
+	if err != nil || len(callees) != 0 {
+		t.Fatalf("accessor caller callees=%+v, err=%v; want no unsupported accessor relation", callees, err)
+	}
+	var targetID int64
+	if err := db.QueryRowContext(r.ctx, `SELECT id FROM symbols WHERE repo_id=? AND language='kotlin' AND kind='function' AND qualified_name='lib.Service.setCount'`, r.repoID).Scan(&targetID); err != nil {
+		t.Fatal(err)
+	}
+	callers, err := r.store.FindCallers(r.ctx, r.repoID, "lib.Service.setCount", targetID, 50, 0)
+	if err != nil || len(callers) != 0 {
+		t.Fatalf("setCount callers=%+v, err=%v; want no falsely associated caller", callers, err)
+	}
 }
 
 func assertNoKotlinPropertyCallableSymbols(t *testing.T, r *lifecycleRepo) {
