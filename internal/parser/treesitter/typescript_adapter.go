@@ -23,13 +23,13 @@ func NewTypeScript() *TypeScriptAdapter { return &TypeScriptAdapter{} }
 
 func (a *TypeScriptAdapter) Language() string { return "typescript" }
 func (a *TypeScriptAdapter) Extensions() []string {
-	return []string{".ts", ".tsx", ".js", ".jsx", ".mjs"}
+	return []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}
 }
 
 func (a *TypeScriptAdapter) Supports(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
-	case ".ts", ".tsx", ".js", ".jsx", ".mjs":
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts":
 		return true
 	}
 	return false
@@ -38,7 +38,7 @@ func (a *TypeScriptAdapter) Supports(path string) bool {
 func (a *TypeScriptAdapter) Parse(ctx context.Context, logicalPath string, content []byte) (graph.ParsedFile, error) {
 	ext := strings.ToLower(path.Ext(logicalPath))
 	lang := typescript.GetLanguage()
-	if ext == ".js" || ext == ".jsx" || ext == ".mjs" {
+	if ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs" {
 		lang = javascript.GetLanguage()
 	}
 

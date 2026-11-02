@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Symbol kinds. Terraform kinds are recorded only for .tf and .tfvars files;
+// Symbol kinds. Terraform kinds are recorded only for .tf, .tofu and .tfvars files;
 // a generic .hcl file (Packer, Nomad, Terragrunt, ...) carries no Terraform
 // meaning and gets the generic kinds.
 const (
@@ -26,12 +26,13 @@ const (
 	KindHCLAttribute = "hcl_attribute"
 )
 
-// IsTerraformPath reports whether a file has Terraform semantics. .tf.json and
-// .tofu files are not indexed. The .tf suffix is matched case-sensitively, as
-// Terraform's module loader does: a file such as main.TF is never loaded by
-// Terraform, so it must not supply declarations.
+// IsTerraformPath reports whether a file has Terraform/OpenTofu semantics.
+// The .tf and .tofu suffixes are matched case-sensitively, as their module
+// loaders do: a file such as main.TF is not loaded and must not supply
+// declarations. .tf.json files are not indexed.
 func IsTerraformPath(path string) bool {
-	return filepath.Ext(path) == ".tf" || IsTFVarsPath(path)
+	ext := filepath.Ext(path)
+	return ext == ".tf" || ext == ".tofu" || IsTFVarsPath(path)
 }
 
 // IsOverridePath reports whether a .tf file is an override file: override.tf

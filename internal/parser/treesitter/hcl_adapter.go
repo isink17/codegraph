@@ -14,7 +14,7 @@ import (
 	"github.com/isink17/codegraph/internal/parser/terraform"
 )
 
-// HCLAdapter indexes HCL. .tf and .tfvars files get Terraform/OpenTofu
+// HCLAdapter indexes HCL. .tf, .tofu and .tfvars files get Terraform/OpenTofu
 // declarations and references; any other .hcl file (Packer, Nomad,
 // Terragrunt, ...) gets only its top-level blocks and attributes, with no
 // Terraform meaning.
@@ -22,10 +22,10 @@ type HCLAdapter struct{}
 
 func NewHCL() *HCLAdapter                  { return &HCLAdapter{} }
 func (a *HCLAdapter) Language() string     { return "hcl" }
-func (a *HCLAdapter) Extensions() []string { return []string{".hcl", ".tf", ".tfvars"} }
+func (a *HCLAdapter) Extensions() []string { return []string{".hcl", ".tf", ".tfvars", ".tofu"} }
 func (a *HCLAdapter) Supports(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".hcl", ".tf", ".tfvars":
+	case ".hcl", ".tf", ".tfvars", ".tofu":
 		return true
 	}
 	return false

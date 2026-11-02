@@ -15,10 +15,18 @@ import (
 
 type PHPAdapter struct{}
 
-func NewPHP() *PHPAdapter                       { return &PHPAdapter{} }
-func (a *PHPAdapter) Language() string          { return "php" }
-func (a *PHPAdapter) Extensions() []string      { return []string{".php"} }
-func (a *PHPAdapter) Supports(path string) bool { return strings.EqualFold(filepath.Ext(path), ".php") }
+func NewPHP() *PHPAdapter              { return &PHPAdapter{} }
+func (a *PHPAdapter) Language() string { return "php" }
+func (a *PHPAdapter) Extensions() []string {
+	return []string{".php", ".module", ".install", ".theme"}
+}
+func (a *PHPAdapter) Supports(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".php", ".module", ".install", ".theme":
+		return true
+	}
+	return false
+}
 
 func (a *PHPAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	root, err := parse(ctx, sitter.NewLanguage(php.LanguagePHP()), content)

@@ -106,22 +106,27 @@ Native CGO builds register 17 user-facing language categories through 16 adapter
 | Language | Extensions |
 |---|---|
 | Go | `.go` |
-| Python | `.py` |
-| TypeScript | `.ts`, `.tsx` |
-| JavaScript | `.js`, `.jsx`, `.mjs` |
+| Python | `.py`, `.pyw` |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
 | Java | `.java` |
 | Kotlin | `.kt`, `.kts` |
 | Dart | `.dart` |
 | Lua | `.lua` |
-| HCL / Terraform | `.tf`, `.tfvars`, `.hcl` |
+| HCL / Terraform | `.tf`, `.tofu`, `.tfvars`, `.hcl` |
 | Rust | `.rs` |
 | Scala | `.scala` |
 | C# | `.cs` |
-| Ruby | `.rb` |
+| Ruby | `.rb`, `.rake` |
 | Swift | `.swift` |
-| PHP | `.php` |
-| C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc` |
+| PHP | `.php`, `.module`, `.install`, `.theme` |
+| C / C++ | `.c`, `.h`, `.cpp`, `.hpp`, `.cc`, `.cxx`, `.hh`, `.hxx`, `.ipp` |
 | Solidity (CGO only) | `.sol` |
+
+The table describes native CGO adapter routing. Without CGO, the heuristic
+fallbacks also recognize JavaScript `.cjs` and Python `.pyw`; `.mts`/`.cts`,
+`.rake`, and the Drupal PHP suffixes remain CGO-only. The registry reports the
+extensions actually available in each build.
 
 For HCL, "call edges" in capability and `doctor` output means Terraform `references` edges; Terraform has no calls.
 
