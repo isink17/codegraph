@@ -21,10 +21,10 @@ type PythonAdapter struct{}
 func NewPython() *PythonAdapter { return &PythonAdapter{} }
 
 func (a *PythonAdapter) Language() string     { return "python" }
-func (a *PythonAdapter) Extensions() []string { return []string{".py"} }
+func (a *PythonAdapter) Extensions() []string { return []string{".py", ".pyw"} }
 
 func (a *PythonAdapter) Supports(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".py")
+	return strings.EqualFold(filepath.Ext(path), ".py") || strings.EqualFold(filepath.Ext(path), ".pyw")
 }
 
 func (a *PythonAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {

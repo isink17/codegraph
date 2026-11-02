@@ -211,6 +211,42 @@ func TestTerraformReferencesBindWithinTheirModuleDirectory(t *testing.T) {
 	expect("duplicate resource", map[[2]string]string{{"infra/outputs.tf", "aws_eip.app"}: unresolvedRef})
 }
 
+func TestOpenTofuFileIncrementalParity(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		"infra/main.tf":   "output \"region\" { value = var.region }\n",
+		"infra/vars.tofu": "variable \"region\" {\n  default = \"eu-central-1\"\n}\n",
+	})
+	want := ` => infra/vars.tofu:var.region(terraform_variable) [terraform_module_scope/high]`
+	if got := r.hclRefs(t, "infra/main.tf", "var.region"); got != want {
+		t.Fatalf("fresh .tofu declaration binding = %q, want %q", got, want)
+	}
+	r.assertFreshParity(t, "fresh .tofu declaration")
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+
+	r.write(t, "infra/vars.tofu", "variable \"location\" {}\n")
+	r.update(t, "infra/vars.tofu")
+	if got := r.hclRefs(t, "infra/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("renamed .tofu declaration leaves edge %q, want unresolved", got)
+	}
+	r.assertFreshParity(t, "incremental .tofu rename")
+
+	r.write(t, "infra/vars.tofu", "variable \"region\" {\n  default = \"eu-central-1\"\n}\n")
+	r.update(t, "infra/vars.tofu")
+	if got := r.hclRefs(t, "infra/main.tf", "var.region"); got != want {
+		t.Fatalf("restored .tofu declaration binding = %q, want %q", got, want)
+	}
+	r.assertFreshParity(t, "incremental .tofu restore")
+
+	r.remove(t, "infra/vars.tofu")
+	r.update(t, "infra/vars.tofu")
+	if got := r.hclRefs(t, "infra/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("deleted .tofu declaration leaves edge %q, want unresolved", got)
+	}
+	r.assertFreshParity(t, "incremental .tofu deletion")
+}
+
 // The non-cgo fallback records no references, so replacing a tree-sitter HCL
 // graph with it is refused like any other call-graph downgrade.
 func TestTerraformFallbackReindexIsRefusedAsDowngrade(t *testing.T) {
@@ -256,15 +292,60 @@ func TestTerraformNewOversizeFileUnbindsItsDirectory(t *testing.T) {
 	r.assertFreshParity(t, "oversize removed")
 }
 
+func TestOpenTofuNewOversizeFileUnbindsItsDirectory(t *testing.T) {
+	r := newLifecycleRepo(t, tree{
+		".codegraph/config.json": `{"max_file_size_bytes": 4096}`,
+		"b/main.tf":              terraformRegionModule,
+		"b/vars.tf":              "variable \"region\" {}\n",
+	})
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got == unresolvedRef {
+		t.Fatalf("fresh: var.region unresolved")
+	}
+	r.write(t, "b/big.tofu", "variable \"region\" {}\n"+strings.Repeat("# padding\n", 1000))
+	r.update(t)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("oversize .tofu added: var.region = %q, want unresolved", got)
+	}
+	r.assertFreshParity(t, "oversize .tofu added")
+	r.remove(t, "b/big.tofu")
+	r.update(t)
+	r.assertFreshParity(t, "oversize .tofu removed")
+}
+
 // failingTerraform refuses to parse bad.tf, standing in for a parse failure
 // under best_effort, which the tree-sitter grammar itself never reports.
 type failingTerraform struct{ *tsparser.HCLAdapter }
 
 func (a failingTerraform) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
-	if filepath.Base(path) == "bad.tf" {
+	if filepath.Base(path) == "bad.tf" || filepath.Base(path) == "bad.tofu" {
 		return graph.ParsedFile{}, errors.New("unparseable")
 	}
 	return a.HCLAdapter.Parse(ctx, path, content)
+}
+
+func TestOpenTofuNewUnparseableFileUnbindsItsDirectory(t *testing.T) {
+	root := t.TempDir()
+	r := &lifecycleRepo{root: root}
+	r.write(t, ".codegraph/config.json", `{"parse_error_policy": "best_effort"}`)
+	r.write(t, "b/main.tf", terraformRegionModule)
+	r.write(t, "b/vars.tf", "variable \"region\" {}\n")
+	r = newFailingTerraformRepo(t, root)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got == unresolvedRef {
+		t.Fatalf("fresh: var.region unresolved")
+	}
+	r.write(t, "b/bad.tofu", "variable \"region\" {}\n")
+	r.update(t)
+	if got := r.hclRefs(t, "b/main.tf", "var.region"); got != unresolvedRef {
+		t.Fatalf("unparseable .tofu added: var.region = %q, want unresolved", got)
+	}
+	current := r.currentTree(t)
+	fresh := t.TempDir()
+	for rel, content := range current {
+		(&lifecycleRepo{root: fresh}).write(t, rel, content)
+	}
+	if diff := projectionDiff(newFailingTerraformRepo(t, fresh).projection(t), r.projection(t)); diff != "" {
+		t.Fatalf("incremental .tofu parse failure differs from fresh:\n%s", diff)
+	}
 }
 
 func newFailingTerraformRepo(t *testing.T, root string) *lifecycleRepo {

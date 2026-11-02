@@ -59,3 +59,20 @@ locals {
 		}
 	}
 }
+
+func TestHCLFallbackRoutesOpenTofuDeclarations(t *testing.T) {
+	adapter := NewHCL()
+	if !adapter.Supports("infra/main.tofu") || !slices.Contains(adapter.Extensions(), ".tofu") {
+		t.Fatal("HCL fallback does not declare .tofu support")
+	}
+	pf, err := adapter.Parse(context.Background(), "infra/main.tofu", []byte("variable \"region\" {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pf.Symbols) != 1 || pf.Symbols[0].QualifiedName != "var.region" || pf.Symbols[0].Kind != "terraform_variable" {
+		t.Fatalf(".tofu symbols = %+v", pf.Symbols)
+	}
+	if generic, err := adapter.Parse(context.Background(), "infra/build.pkr.hcl", []byte("variable \"region\" {}\n")); err != nil || len(generic.Symbols) != 0 {
+		t.Fatalf("generic HCL parse = symbols %v, err %v; want no Terraform symbols", generic.Symbols, err)
+	}
+}

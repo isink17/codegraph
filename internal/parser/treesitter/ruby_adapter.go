@@ -15,10 +15,13 @@ import (
 
 type RubyAdapter struct{}
 
-func NewRuby() *RubyAdapter                      { return &RubyAdapter{} }
-func (a *RubyAdapter) Language() string          { return "ruby" }
-func (a *RubyAdapter) Extensions() []string      { return []string{".rb"} }
-func (a *RubyAdapter) Supports(path string) bool { return strings.EqualFold(filepath.Ext(path), ".rb") }
+func NewRuby() *RubyAdapter                 { return &RubyAdapter{} }
+func (a *RubyAdapter) Language() string     { return "ruby" }
+func (a *RubyAdapter) Extensions() []string { return []string{".rb", ".rake"} }
+func (a *RubyAdapter) Supports(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".rb" || ext == ".rake"
+}
 
 func (a *RubyAdapter) Parse(ctx context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	root, err := parse(ctx, ruby.GetLanguage(), content)

@@ -32,10 +32,9 @@ Apache-2.0 notice obligation (section 4); the license text ships in
 
 ## What the adapter records
 
-`.tf` and `.tfvars` files have Terraform/OpenTofu meaning; every other `.hcl`
+`.tf`, `.tofu` and `.tfvars` files have Terraform/OpenTofu meaning; every other `.hcl`
 file gets only its top-level blocks (`hcl_block`, qualified as type and labels
-joined by `.`) and attributes (`hcl_attribute`). `.tf.json` and `.tofu` files
-are not indexed.
+joined by `.`) and attributes (`hcl_attribute`). `.tf.json` files are not indexed.
 
 | Terraform block | Kind | Qualified name |
 |---|---|---|
@@ -66,10 +65,10 @@ a dynamic edge never binds: the instance a `count` or `for_each` index selects
 is a plan-time value. A literal index (`aws_instance.web[0]`) binds.
 
 A Terraform module is a directory. A reference binds only to the one
-declaration of its address among the `.tf` files of its own directory. A
+declaration of its address among the `.tf` and `.tofu` files of its own directory. A
 duplicate (including `override.tf` merges), a missing declaration, a
 declaration in another directory, and every reference in a directory one of
-whose `.tf` files was not parsed completely stay unresolved. A cleanly parsed
+whose `.tf` or `.tofu` files was not parsed completely stay unresolved. A cleanly parsed
 Terraform file is recorded as complete in `file_scope_evidence`; a file with a
 syntax error records no references and no completeness row, and neither does
 a failed or oversize parse or the non-CGO fallback. `module.M.out` binds to
@@ -82,7 +81,7 @@ lookup can be ambiguous; query by address (`aws_vpc.main`, `var.region`).
 `find_callers` on a declaration lists the blocks that reference it.
 
 The non-CGO fallback (`heuristic:hcl:v1`) records only top-level declarations
-of `.tf` files, under the same names, and no references or imports. The CGO
+of `.tf` and `.tofu` files, under the same names, and no references or imports. The CGO
 profile declares a relationship graph (its `references` edges), so an index
 with Terraform files is not reported as symbols-only, and replacing it with
 the fallback is refused as a downgrade.
