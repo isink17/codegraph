@@ -40,7 +40,7 @@ var hclTerraformDeclarationKinds = map[string]bool{
 // isHCLPath reports whether a changed path can change an HCL decision.
 func isHCLPath(p string) bool {
 	switch strings.ToLower(filepath.Ext(p)) {
-	case ".tf", ".tfvars", ".hcl":
+	case ".tf", ".tofu", ".tfvars", ".hcl":
 		return true
 	}
 	return false
