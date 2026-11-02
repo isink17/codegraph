@@ -16,6 +16,12 @@ var symbolsOnlyCgoLanguages = map[string]bool{"solidity": true}
 // those adapters except symbolsOnlyCgoLanguages build a call graph.
 func TestCgoRegistryProfiles(t *testing.T) {
 	registry := newDefaultRegistry()
+	for _, extension := range []string{".metal", ".cu", ".cuh"} {
+		adapter := registry.AdapterFor("fixture" + extension)
+		if adapter == nil || adapter.Language() != "cpp" {
+			t.Errorf("CGO adapter for %s = %v, want C++ tree-sitter", extension, adapter)
+		}
+	}
 	for _, lang := range registry.SupportedLanguages() {
 		want := "treesitter:" + lang.Language + ":v1"
 		if lang.Language == "csharp" {
@@ -49,7 +55,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:lua:v4"
 		}
 		if lang.Language == "cpp" {
-			want = "treesitter:cpp:v2"
+			want = "treesitter:cpp:v3"
 		}
 		if lang.Language == "go" {
 			want = "treesitter:go:v6"
@@ -93,6 +99,24 @@ func TestCgoRegistryProfiles(t *testing.T) {
 	}
 	if !capabilityFound {
 		t.Fatal("Solidity capability was not reported")
+	}
+	cppCapabilityFound := false
+	for _, capability := range registry.Capabilities() {
+		if capability.ID != "cpp" {
+			continue
+		}
+		cppCapabilityFound = true
+		if capability.Calls == nil || !*capability.Calls {
+			t.Fatalf("CGO C++ capability = %+v, want calls enabled", capability)
+		}
+		for _, extension := range []string{".metal", ".cu", ".cuh"} {
+			if !slices.Contains(capability.Extensions, extension) {
+				t.Errorf("CGO C++ capability extensions %v omit %s", capability.Extensions, extension)
+			}
+		}
+	}
+	if !cppCapabilityFound {
+		t.Fatal("CGO C++ capability missing")
 	}
 	for _, collision := range registry.ExtensionCollisions() {
 		if collision.Extension == ".sol" {

@@ -569,6 +569,103 @@ void seven();
 	}
 }
 
+func TestCppMetalAttributesKeepSymbolsCallsAndSourceOffsets(t *testing.T) {
+	src := "struct VertexOut {\n  float4 position [[position]];\n};\n\n[[kernel]] void shade(VertexOut in [[buffer(0)]]) {\n  helper();\n}\nvoid helper() {}\n"
+	pf, err := NewCpp().Parse(context.Background(), "Shaders/Main.metal", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, sym := range pf.Symbols {
+		got = append(got, sym.QualifiedName)
+		if sym.Name == "shade" && (sym.Range.StartLine != 5 || sym.Range.StartCol != 12) {
+			t.Errorf("shade source range = %+v, want declaration at line 5 column 12", sym.Range)
+		}
+	}
+	if !reflect.DeepEqual(got, []string{"VertexOut", "shade", "helper"}) {
+		t.Fatalf("Metal symbols = %q", got)
+	}
+	if len(pf.Edges) != 1 || pf.Edges[0].Kind != "calls" || pf.Edges[0].DstName != "helper" {
+		t.Fatalf("Metal call edges = %+v, want only shade -> helper", pf.Edges)
+	}
+}
+
+func TestCppCUDAKernelLaunchAndSpecifiers(t *testing.T) {
+	src := "__device__ float square(float x) { return x * x; }\n__global__ __launch_bounds__(256) void scale(float *x) { x[0] = square(x[0]); }\nvoid launch(float *x, int n) {\n  scale<<<dim3((n + 127) / 128), dim3(128), 0, stream>>>(x, n);\n}\n"
+	pf, err := NewCpp().Parse(context.Background(), "kernels/scale.cu", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, sym := range pf.Symbols {
+		got = append(got, sym.QualifiedName)
+	}
+	if !reflect.DeepEqual(got, []string{"square", "scale", "launch"}) {
+		t.Fatalf("CUDA symbols = %q", got)
+	}
+	var calls []string
+	for _, edge := range pf.Edges {
+		if edge.Kind == "calls" {
+			calls = append(calls, edge.DstName)
+		}
+	}
+	if !reflect.DeepEqual(calls, []string{"square", "scale"}) {
+		t.Fatalf("CUDA calls = %q, want device call and kernel launch", calls)
+	}
+	if pf.Symbols[0].Range.StartLine != 1 || pf.Symbols[1].Range.StartLine != 2 || pf.Symbols[2].Range.StartLine != 3 {
+		t.Fatalf("CUDA source lines = %+v, want 1, 2, 3", pf.Symbols)
+	}
+	header, err := NewCpp().Parse(context.Background(), "kernels/shared.hpp", []byte("__device__ void headerStep() {}\n"))
+	if err != nil || len(header.Symbols) != 1 || header.Symbols[0].Name != "headerStep" {
+		t.Fatalf("CUDA-bearing C++ header symbols = %+v, err = %v", header.Symbols, err)
+	}
+}
+
+func TestCppLanguagePreprocessDoesNotTouchOrdinaryCppOrLiterals(t *testing.T) {
+	plain := []byte("void f() { const char *s = \"<<<not a launch>>> [[not an attribute]]\"; }\n")
+	if got := cppLanguagePreprocess("plain.cpp", plain); !reflect.DeepEqual(got, plain) {
+		t.Fatal("ordinary C++ source was modified")
+	}
+	shiftLike := []byte("void f() { value<<<count>>>tail; }\n")
+	if got := cppLanguagePreprocess("kernel.cu", shiftLike); !reflect.DeepEqual(got, shiftLike) {
+		t.Fatalf("non-call triple-angle syntax was modified: %q", got)
+	}
+	for _, path := range []string{"plain.h", "plain.hpp"} {
+		src := []byte("// __global__ void fake(); <<<comment>>>\nconst char *s = \"__device__ <<<x>>> [[x]]\";\nvoid real();\n")
+		got := cppLanguagePreprocess(path, src)
+		if len(got) != len(src) {
+			t.Fatalf("%s transformed length = %d, want %d", path, len(got), len(src))
+		}
+		if string(got[:bytesIndex(got, '\n')]) != string(src[:bytesIndex(src, '\n')]) {
+			t.Fatalf("%s comment changed", path)
+		}
+		if !strings.Contains(string(got), "<<<x>>>") || !strings.Contains(string(got), "__device__") {
+			t.Fatalf("%s string literal was changed: %q", path, got)
+		}
+	}
+}
+
+func bytesIndex(b []byte, value byte) int {
+	for i, current := range b {
+		if current == value {
+			return i
+		}
+	}
+	return len(b)
+}
+
+func TestCppAdapterRoutesMetalAndCUDAExtensions(t *testing.T) {
+	adapter := NewCpp()
+	for _, path := range []string{"a.metal", "a.cu", "a.cuh"} {
+		if !adapter.Supports(path) {
+			t.Errorf("Supports(%q) = false", path)
+		}
+	}
+	if adapter.Supports("a.cu.txt") || adapter.Supports("a.msl") {
+		t.Fatal("adapter accepted a non-language extension")
+	}
+}
+
 // TestCppTemplateWrapperEmitsWrappedDeclaration pins the template half: the
 // wrapped declaration is the symbol, the `template <...>` wrapper never becomes
 // one, and a templated class still owns its members.

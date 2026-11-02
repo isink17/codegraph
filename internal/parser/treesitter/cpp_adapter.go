@@ -23,13 +23,13 @@ func NewCpp() *CppAdapter { return &CppAdapter{} }
 
 func (a *CppAdapter) Language() string { return "cpp" }
 func (a *CppAdapter) Extensions() []string {
-	return []string{".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp"}
+	return []string{".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp", ".metal", ".cu", ".cuh"}
 }
 
 func (a *CppAdapter) Supports(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
-	case ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp":
+	case ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp", ".metal", ".cu", ".cuh":
 		return true
 	}
 	return false
@@ -42,7 +42,11 @@ func (a *CppAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		lang = clang.GetLanguage()
 	}
 
-	root, err := parse(ctx, lang, content)
+	// Metal attributes and CUDA execution/launch syntax are outside the C++
+	// grammar. Mask only those tokens in a same-length copy: Tree-sitter byte
+	// ranges then continue to index the original source used by the extractors.
+	parseContent := cppLanguagePreprocess(path, content)
+	root, err := parse(ctx, lang, parseContent)
 	if err != nil {
 		return graph.ParsedFile{}, err
 	}
@@ -60,6 +64,252 @@ func (a *CppAdapter) Parse(ctx context.Context, path string, content []byte) (gr
 		return cppStableKey("func", testTargetModule(module, "_test"), target)
 	})
 	return pf, nil
+}
+
+func cppLanguagePreprocess(path string, content []byte) []byte {
+	ext := strings.ToLower(filepath.Ext(path))
+	metal := ext == ".metal"
+	cuda := ext == ".cu" || ext == ".cuh"
+	if !metal && !cuda && (ext != ".h" && ext != ".hpp") {
+		return content
+	}
+	if !cuda && (ext == ".h" || ext == ".hpp") {
+		// CUDA is also commonly kept in C++ headers. Do not change ordinary
+		// headers; require a recognizable CUDA-only construct first.
+		cuda = strings.Contains(string(content), "__global__") || strings.Contains(string(content), "__device__") || strings.Contains(string(content), "<<<")
+	}
+	if !metal && !cuda {
+		return content
+	}
+
+	out := append([]byte(nil), content...)
+	for i := 0; i < len(content); {
+		if end, ok := cppSkipLexicalToken(content, i); ok {
+			i = end
+			continue
+		}
+		if metal && i+1 < len(content) && content[i] == '[' && content[i+1] == '[' {
+			if end := cppMetalAttributeEnd(content, i); end > i {
+				cppMaskRange(out, i, end)
+				i = end
+				continue
+			}
+		}
+		if cuda {
+			if content[i] == '<' && i+2 < len(content) && content[i+1] == '<' && content[i+2] == '<' {
+				if end := cppCudaLaunchConfigEnd(content, i); end > i {
+					cppMaskRange(out, i, end)
+					i = end
+					continue
+				}
+			}
+			if isCppIdentStart(content[i]) {
+				end := i + 1
+				for end < len(content) && isCppIdentContinue(content[end]) {
+					end++
+				}
+				word := string(content[i:end])
+				if cppCudaExecutionSpecifier(word) {
+					maskEnd := end
+					if word == "__launch_bounds__" {
+						maskEnd = cppOptionalCallEnd(content, end)
+					}
+					cppMaskRange(out, i, maskEnd)
+					end = maskEnd
+				}
+				i = end
+				continue
+			}
+		}
+		i++
+	}
+	return out
+}
+
+func cppSkipLexicalToken(content []byte, i int) (int, bool) {
+	if i+1 >= len(content) {
+		return 0, false
+	}
+	if content[i] == '/' && content[i+1] == '/' {
+		end := i + 2
+		for end < len(content) && content[end] != '\n' {
+			end++
+		}
+		return end, true
+	}
+	if content[i] == '/' && content[i+1] == '*' {
+		end := i + 2
+		for end+1 < len(content) && !(content[end] == '*' && content[end+1] == '/') {
+			end++
+		}
+		if end+1 < len(content) {
+			end += 2
+		} else {
+			end = len(content)
+		}
+		return end, true
+	}
+	if content[i] != '"' && content[i] != '\'' {
+		return 0, false
+	}
+	quote, escaped := content[i], false
+	for end := i + 1; end < len(content); end++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if content[end] == '\\' {
+			escaped = true
+			continue
+		}
+		if content[end] == quote {
+			return end + 1, true
+		}
+	}
+	return len(content), true
+}
+
+func cppMetalAttributeEnd(content []byte, start int) int {
+	paren, bracket, brace := 0, 0, 0
+	for i := start + 2; i < len(content); {
+		if end, ok := cppSkipLexicalToken(content, i); ok {
+			i = end
+			continue
+		}
+		switch content[i] {
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			} else if paren == 0 && brace == 0 && i+1 < len(content) && content[i+1] == ']' {
+				return i + 2
+			}
+		case '{':
+			brace++
+		case '}':
+			if brace > 0 {
+				brace--
+			}
+		}
+		i++
+	}
+	return 0
+}
+
+func cppCudaLaunchConfigEnd(content []byte, start int) int {
+	paren, bracket, brace := 0, 0, 0
+	for i := start + 3; i < len(content); {
+		if end, ok := cppSkipLexicalToken(content, i); ok {
+			i = end
+			continue
+		}
+		if paren == 0 && bracket == 0 && brace == 0 && i+2 < len(content) && content[i] == '>' && content[i+1] == '>' && content[i+2] == '>' {
+			end := i + 3
+			if next := cppSkipHorizontalAndComments(content, end); next < len(content) && content[next] == '(' {
+				return end
+			}
+		}
+		switch content[i] {
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		case '{':
+			brace++
+		case '}':
+			if brace > 0 {
+				brace--
+			}
+		}
+		i++
+	}
+	return 0
+}
+
+func cppSkipHorizontalAndComments(content []byte, i int) int {
+	for i < len(content) {
+		if content[i] == ' ' || content[i] == '\t' || content[i] == '\r' || content[i] == '\n' {
+			i++
+			continue
+		}
+		if i+1 < len(content) && content[i] == '/' && content[i+1] == '/' {
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(content) && content[i] == '/' && content[i+1] == '*' {
+			if end, ok := cppSkipLexicalToken(content, i); ok {
+				i = end
+				continue
+			}
+		}
+		break
+	}
+	return i
+}
+
+func cppOptionalCallEnd(content []byte, start int) int {
+	i := start
+	for i < len(content) && (content[i] == ' ' || content[i] == '\t' || content[i] == '\r' || content[i] == '\n') {
+		i++
+	}
+	if i == len(content) || content[i] != '(' {
+		return start
+	}
+	depth := 0
+	for i < len(content) {
+		if end, ok := cppSkipLexicalToken(content, i); ok {
+			i = end
+			continue
+		}
+		switch content[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+		i++
+	}
+	return start
+}
+
+func cppCudaExecutionSpecifier(word string) bool {
+	switch word {
+	case "__global__", "__device__", "__host__", "__shared__", "__constant__", "__managed__", "__launch_bounds__", "__forceinline__", "__noinline__":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCppIdentStart(b byte) bool    { return b == '_' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' }
+func isCppIdentContinue(b byte) bool { return isCppIdentStart(b) || b >= '0' && b <= '9' }
+
+func cppMaskRange(content []byte, start, end int) {
+	for i := start; i < end; i++ {
+		if content[i] != '\n' && content[i] != '\r' {
+			content[i] = ' '
+		}
+	}
 }
 
 func cppExtractImports(root *sitter.Node, content []byte, pf *graph.ParsedFile) {

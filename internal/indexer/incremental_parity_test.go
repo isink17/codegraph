@@ -57,6 +57,28 @@ func lifecycleRegistry() *parser.Registry {
 	return parser.NewRegistry(goparser.New(), tsparser.NewTypeScript(), tsparser.NewPython(), tsparser.NewCpp(), tsparser.NewJava(), tsparser.NewKotlin(), tsparser.NewRust(), tsparser.NewLua(), tsparser.NewScala(), tsparser.NewHCL(), tsparser.NewDart())
 }
 
+func TestCppMetalAndCUDAExtensionsLifecycleParity(t *testing.T) {
+	files := tree{
+		"shaders/Main.metal": "struct VertexOut { float4 position [[position]]; };\nvoid shade() [[kernel]] { shaderStep(); }\nvoid shaderStep() {}\n",
+		"cuda/kernel.cu":     "__device__ void deviceStep() {}\n__global__ void runKernel() { deviceStep(); }\nvoid launch() { runKernel<<<1, 1>>>(); }\n",
+	}
+	r := newLifecycleRepo(t, files)
+	r.assertFreshParity(t, "initial index")
+	if got := r.edgeState(t, "cuda/kernel.cu", "runKernel"); got == "<no edge>" {
+		t.Fatal("CUDA kernel launch produced no call edge")
+	}
+	if got := r.edgeState(t, "shaders/Main.metal", "shaderStep"); got == "<no edge>" {
+		t.Fatal("Metal function call produced no call edge")
+	}
+	if noop := r.update(t); noop.FilesChanged != 0 || noop.FilesIndexed != 0 {
+		t.Fatalf("no-op update = %+v", noop)
+	}
+	r.assertFreshParity(t, "no-op update")
+	r.write(t, "cuda/kernel.cu", strings.Replace(files["cuda/kernel.cu"], "deviceStep", "deviceStep2", 1))
+	r.update(t, "cuda/kernel.cu")
+	r.assertFreshParity(t, "CUDA edit")
+}
+
 // Scala builds no cross-file call graph: a call whose only candidate is a same-named
 // method elsewhere, or an overload in the same object, stays edgeless on every
 // path, and overloads and a companion keep their symbols across updates.
