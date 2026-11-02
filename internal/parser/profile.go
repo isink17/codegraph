@@ -92,6 +92,7 @@ var parserSemanticEpochs = map[string]int{
 	"treesitter:python": 2, "treesitter:ruby": 1, "treesitter:rust": 1,
 	"treesitter:scala":    1,
 	"treesitter:solidity": 1,
+	"treesitter:svelte":   1,
 	"treesitter:swift":    1, "treesitter:typescript": 1,
 	"python-regex:python": 2,
 	"heuristic:cpp":       1, "heuristic:csharp": 1, "heuristic:go": 1,

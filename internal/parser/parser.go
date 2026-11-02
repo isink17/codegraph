@@ -67,6 +67,7 @@ var languageNames = map[string]string{
 	"lua":  "Lua",
 	"rust": "Rust", "scala": "Scala", "swift": "Swift", "typescript": "TypeScript/JavaScript",
 	"solidity": "Solidity",
+	"svelte":   "Svelte",
 }
 
 type LanguageSupport struct {
