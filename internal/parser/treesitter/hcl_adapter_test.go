@@ -416,3 +416,23 @@ func TestHCLTerraformReferencesInOperations(t *testing.T) {
 		t.Fatalf("edges = %v\nwant %v", got, want)
 	}
 }
+
+func TestHCLAdapterRoutesOpenTofuFilesAsTerraform(t *testing.T) {
+	adapter := NewHCL()
+	if !adapter.Supports("infra/main.tofu") || !slices.Contains(adapter.Extensions(), ".tofu") {
+		t.Fatal("HCL adapter does not declare .tofu support")
+	}
+	pf := parseHCL(t, "/r/main.tofu", "variable \"region\" {}\noutput \"r\" { value = var.region }\n")
+	if got := hclSymbols(pf); !slices.Equal(got, []string{"terraform_variable var.region", "terraform_output output.r"}) {
+		t.Fatalf("symbols = %v", got)
+	}
+	if got := hclEdges(pf); !slices.Equal(got, []string{"var.region"}) {
+		t.Fatalf("references = %v, want Terraform reference to var.region", got)
+	}
+	if !pf.Scope.TerraformComplete {
+		t.Fatal("clean .tofu file does not claim Terraform completeness")
+	}
+	if generic := parseHCL(t, "/r/build.pkr.hcl", `variable "ignored" {}`); len(generic.Symbols) != 1 || generic.Symbols[0].Kind != "hcl_block" {
+		t.Fatalf("generic HCL was interpreted as Terraform: %+v", generic.Symbols)
+	}
+}

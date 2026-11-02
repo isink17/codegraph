@@ -46,11 +46,12 @@ func (a *Adapter) Language() string {
 }
 
 func (a *Adapter) Supports(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".py")
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".py" || ext == ".pyw"
 }
 
 func (a *Adapter) Extensions() []string {
-	return []string{".py"}
+	return []string{".py", ".pyw"}
 }
 
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {

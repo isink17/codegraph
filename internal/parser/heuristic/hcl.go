@@ -13,16 +13,16 @@ import (
 )
 
 // HCLAdapter is the non-cgo HCL fallback: Terraform top-level declarations of
-// .tf files under the names the tree-sitter adapter uses, and nothing else --
+// .tf and .tofu files under the names the tree-sitter adapter uses, and nothing else --
 // no locals, no tfvars assignments, no module sources, no references.
 type HCLAdapter struct{}
 
 func NewHCL() *HCLAdapter                  { return &HCLAdapter{} }
 func (a *HCLAdapter) Language() string     { return "hcl" }
-func (a *HCLAdapter) Extensions() []string { return []string{".hcl", ".tf", ".tfvars"} }
+func (a *HCLAdapter) Extensions() []string { return []string{".hcl", ".tf", ".tfvars", ".tofu"} }
 func (a *HCLAdapter) Supports(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".hcl", ".tf", ".tfvars":
+	case ".hcl", ".tf", ".tfvars", ".tofu":
 		return true
 	}
 	return false

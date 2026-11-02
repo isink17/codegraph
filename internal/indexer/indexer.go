@@ -22,6 +22,7 @@ import (
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
 	"github.com/isink17/codegraph/internal/parser"
+	"github.com/isink17/codegraph/internal/parser/terraform"
 	"github.com/isink17/codegraph/internal/platform"
 	"github.com/isink17/codegraph/internal/store"
 )
@@ -686,13 +687,13 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		// nothing to re-decide, and dispatching it anyway would turn every
 		// watcher event in such a repository into a repo-wide resolve and
 		// test-link pass. A file new to the index, though, owned nothing and
-		// still changes a decision: an unparsed .tf file may hide a
+		// still changes a decision: an unparsed .tf or .tofu file may hide a
 		// declaration of its Terraform module directory. For the same reason a
 		// .tf file leaving a parsed state is dispatched even when it held no
 		// counted rows; other languages keep the row-count rule.
 		for _, path := range paths {
 			prev, had := existing[path]
-			entered := !had || strings.EqualFold(filepath.Ext(path), ".tf") &&
+			entered := !had || terraform.IsTerraformPath(path) && !terraform.IsTFVarsPath(path) &&
 				prev.ParseState != store.ParseStateFailed && prev.ParseState != store.ParseStateOversize
 			if retired > 0 || entered {
 				changedPathSet[path] = struct{}{}

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Recognize OpenTofu `.tofu` files in the existing HCL/Terraform adapter, with the same scoped reference handling in CGO builds and truthful symbols-only fallback support without CGO. Add CGO routing for `.cjs`, `.mts`, `.cts`, `.pyw`, `.rake`, and Drupal PHP `.module`/`.install`/`.theme` files; no-CGO retains `.cjs` and gains `.pyw`, while `.mts`/`.cts`, `.rake`, and Drupal PHP suffixes remain unavailable there. `.inc` and Scala `.sc` remain unclaimed because they collide with C headers and SuperCollider.
 - Add the opt-in `inspect-jvm-class` diagnostic for Kotlin method signatures in one explicitly supplied JVM classfile; Java and the separately built trusted helper are needed only for this command. Source/build association remains unknown.
 - Add explicit MCP `format=compact-v2` with typed, reversible string-array cells; preserve JSON defaults and compact/v1 bytes.
 
