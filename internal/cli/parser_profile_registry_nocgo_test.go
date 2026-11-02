@@ -30,9 +30,32 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		"ruby":       {"heuristic:ruby:v1", false},
 		"swift":      {"heuristic:swift:v1", false},
 		"php":        {"heuristic:php:v1", false},
-		"cpp":        {"heuristic:cpp:v1", false},
+		"cpp":        {"heuristic:cpp:v2", false},
 	}
 	registry := newDefaultRegistry()
+	for _, extension := range []string{".metal", ".cu", ".cuh"} {
+		adapter := registry.AdapterFor("fixture" + extension)
+		if adapter == nil || adapter.Language() != "cpp" {
+			t.Errorf("no-CGO adapter for %s = %v, want C++ heuristic", extension, adapter)
+		}
+	}
+	cppCapabilityFound := false
+	for _, capability := range registry.Capabilities() {
+		if capability.ID == "cpp" {
+			cppCapabilityFound = true
+			if capability.Calls == nil || *capability.Calls || capability.NoCGOParser == nil || !*capability.NoCGOParser || capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph {
+				t.Fatalf("no-CGO C++ capability = %+v, want parser/symbols yes and calls no", capability)
+			}
+			for _, extension := range []string{".metal", ".cu", ".cuh"} {
+				if !slices.Contains(capability.Extensions, extension) {
+					t.Errorf("no-CGO C++ capability extensions %v omit %s", capability.Extensions, extension)
+				}
+			}
+		}
+	}
+	if !cppCapabilityFound {
+		t.Fatal("no-CGO C++ capability missing")
+	}
 	if availability, ok := noCGOCapabilities()["solidity"]; !ok || availability.Parser || availability.CallGraph {
 		t.Fatalf("no-CGO Solidity availability = %+v, registered = %v; want explicitly unavailable", availability, ok)
 	}

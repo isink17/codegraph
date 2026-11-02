@@ -62,6 +62,39 @@ func TestCRLFRangesDoNotCountCarriageReturns(t *testing.T) {
 	}
 }
 
+func TestCppGPUFallbackIsSymbolsOnlyAndRoutesExtensions(t *testing.T) {
+	adapter := NewCAndCpp()
+	for _, path := range []string{"shader.metal", "kernel.cu", "kernel.cuh", "shared.hpp"} {
+		if !adapter.Supports(path) {
+			t.Errorf("Supports(%q) = false", path)
+		}
+	}
+	if profile := adapter.Profile(); profile.EmitsCallEdges || profile.ID != "heuristic:cpp:v2" {
+		t.Fatalf("fallback profile = %+v, want symbols-only heuristic:cpp:v2", profile)
+	}
+	cases := []struct {
+		path string
+		src  string
+		want string
+	}{
+		{"kernel.cu", "__global__ __launch_bounds__(256) void runKernel() { deviceStep(); }\n", "runKernel"},
+		{"shader.metal", "void shade(VertexOut in [[buffer(0)]]) [[kernel]] { helper(); }\n", "shade"},
+		{"shared.hpp", "__device__ void headerStep() {}\n", "headerStep"},
+	}
+	for _, tc := range cases {
+		parsed, err := adapter.Parse(context.Background(), tc.path, []byte(tc.src))
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tc.path, err)
+		}
+		if len(parsed.Symbols) != 1 || parsed.Symbols[0].Name != tc.want {
+			t.Errorf("%s symbols = %+v, want %s", tc.path, parsed.Symbols, tc.want)
+		}
+		if len(parsed.Edges) != 0 {
+			t.Errorf("%s emitted call edges in symbols-only mode: %+v", tc.path, parsed.Edges)
+		}
+	}
+}
+
 func TestJVMHeuristicKeepsNestedContainersAndHeaders(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

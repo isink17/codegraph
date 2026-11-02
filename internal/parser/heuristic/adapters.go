@@ -24,6 +24,8 @@ type symbolPattern struct {
 }
 
 var heredocStartRE = regexp.MustCompile(`<<[-~]?['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+var heuristicCppGPUAttributeRE = regexp.MustCompile(`\[\[.*?\]\]`)
+var heuristicCppGPUExecutionRE = regexp.MustCompile(`\b__(?:global|device|host|shared|constant|managed|forceinline|noinline)__\b|\b__launch_bounds__\s*\([^)]*\)`)
 var heuristicCSharpStaticRE = regexp.MustCompile(`^static\s+`)
 var heuristicCSharpNamespaceRE = regexp.MustCompile(`(?m)^\s*namespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*(?:;|\{)`)
 
@@ -217,7 +219,7 @@ func NewPHP() *Adapter {
 func NewCAndCpp() *Adapter {
 	return &Adapter{
 		language: "cpp",
-		exts:     extSet(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp"),
+		exts:     extSet(".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ipp", ".metal", ".cu", ".cuh"),
 		imports: []importPattern{
 			{re: regexp.MustCompile(`^\s*#include\s+[<"]([^>"]+)[>"]`), nameGroup: 1},
 		},
@@ -272,6 +274,7 @@ type stripState struct {
 func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.ParsedFile, error) {
 	module := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	lines := strings.Split(string(content), "\n")
+	cppGPU := a.language == "cpp" && heuristicCppGPUPath(path, content)
 	pf := graph.ParsedFile{
 		Language:   a.language,
 		FileTokens: texttoken.Weights(content),
@@ -295,6 +298,10 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		lineStartsInCode := !state.inString && !state.inBlockComment && state.heredocTerm == ""
 		normalized, nextState := stripForHeuristic(line, state, a.cStyle, a.hashStyle)
 		state = nextState
+		if cppGPU {
+			normalized = heuristicCppGPUExecutionRE.ReplaceAllString(normalized, " ")
+			normalized = heuristicCppGPUAttributeRE.ReplaceAllString(normalized, " ")
+		}
 		trimmed := strings.TrimSpace(normalized)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#!") {
 			depth += braceDelta(normalized)
@@ -407,6 +414,17 @@ func (a *Adapter) Parse(_ context.Context, path string, content []byte) (graph.P
 		}
 	}
 	return pf, nil
+}
+
+func heuristicCppGPUPath(path string, content []byte) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".metal", ".cu", ".cuh":
+		return true
+	case ".h", ".hpp":
+		return heuristicCppGPUExecutionRE.Match(content) || strings.Contains(string(content), "<<<")
+	default:
+		return false
+	}
 }
 
 func heuristicQualified(pkg, name string) string {
@@ -689,6 +707,11 @@ func quoteRun(line string, i int) int {
 // a call-capable graph with one of them. See parser.Profile.
 func (a *Adapter) Profile() parser.Profile {
 	version := "v1"
+	if a.language == "cpp" {
+		// v2 routes Metal/CUDA files and extracts their simple declaration
+		// forms with the same symbol-only guarantee as ordinary C++.
+		version = "v2"
+	}
 	// v4 handles raw and verbatim strings without leaking scope text.
 	if a.language == "kotlin" {
 		version = "v4"

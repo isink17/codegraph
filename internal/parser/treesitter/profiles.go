@@ -252,7 +252,9 @@ func (a *PHPAdapter) Profile() parser.Profile {
 }
 
 // C++ v2 no longer marks a static member function defined in its class body
-// as file-local, so it can bind from another file that includes it.
+// as file-local, so it can bind from another file that includes it. v3 adds
+// Metal/CUDA preprocessing and routes their file extensions through this
+// adapter; CUDA-bearing ordinary C++ headers are reparsed as well.
 func (a *CppAdapter) Profile() parser.Profile {
-	return parser.NewProfile("cpp", "treesitter:cpp:v2", true)
+	return parser.NewProfile("cpp", "treesitter:cpp:v3", true)
 }
