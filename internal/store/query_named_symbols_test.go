@@ -156,8 +156,15 @@ func TestSymbolsForNamedReferencesAmbiguityCapIsBounded(t *testing.T) {
 		t.Fatalf("an ambiguous reference resolved to %d symbols, want 0", len(got))
 	}
 	// At the cap it still answers, which is what makes the previous case a
-	// decision about ambiguity rather than a blanket refusal.
-	if got := fx.resolve(t, fx.repoID, "setUp", 10); len(got) != 6 {
-		t.Fatalf("resolved %d symbols under a cap of 10, want 6", len(got))
+	// decision about ambiguity rather than a blanket refusal. The boundary is
+	// what the perNameLimit+1 probe exists to get right, so pin both sides of
+	// it and not just a comfortable margin.
+	for _, tc := range []struct {
+		cap  int
+		want int
+	}{{5, 0}, {6, 6}, {10, 6}} {
+		if got := fx.resolve(t, fx.repoID, "setUp", tc.cap); len(got) != tc.want {
+			t.Fatalf("resolved %d symbols under a cap of %d, want %d", len(got), tc.cap, tc.want)
+		}
 	}
 }

@@ -40,6 +40,11 @@ func TestExtractNamedReferences(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "typographic punctuation is still a boundary",
+			task: "the \u201cCacheInterceptor\u201d class, then RealCall.execute\u2192done",
+			want: []string{"CacheInterceptor", "RealCall.execute"},
+		},
+		{
 			name: "abbreviated prose is not a dotted reference",
 			task: "e.g. the handler, i.e. the U.S. one",
 			want: nil,

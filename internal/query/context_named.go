@@ -1,6 +1,9 @@
 package query
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 const (
 	// maxNamedReferences bounds how many symbol references one task may spend
@@ -65,7 +68,12 @@ func splitIdentifierRuns(text string) []string {
 			// the fragment `_handler`, which then qualifies as a reference on
 			// its underscore and spends one of the few slots this task has.
 			// Kept whole, isIdentifier rejects the run outright.
-			return false
+			//
+			// Non-ASCII punctuation is the opposite case and far more common:
+			// editors and autocorrect turn quotes into “ ” and dashes into —,
+			// and a reference glued to one of those would be lost entirely.
+			// Those stay separators.
+			return !(unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Mn, r))
 		default:
 			return true
 		}
