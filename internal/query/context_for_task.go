@@ -39,7 +39,7 @@ type contextStoreOps interface {
 	SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (map[int64]graph.Symbol, error)
 	SymbolsForRefs(ctx context.Context, repoID int64, refs []store.SymbolRef) (map[store.SymbolRef]graph.Symbol, error)
 	SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error)
-	SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]store.NamedSymbolMatch, error)
+	SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]graph.Symbol, error)
 	FindContextNeighbors(ctx context.Context, repoID int64, seeds []store.ContextSeed, fanout int) ([]store.ContextNeighbors, error)
 	RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error)
 }
@@ -196,9 +196,19 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 		signal float64
 	}
 	seeds := make([]seed, 0, len(named)+len(hits))
-	for _, m := range named {
-		set.add(contextCandidate{sym: m.Symbol, relevance: relevanceDirectMatch, taskSignal: namedReferenceSignal})
-		seeds = append(seeds, seed{sym: m.Symbol, signal: namedReferenceSignal})
+	// One symbol, one expansion slot. A symbol reached by both legs would
+	// otherwise spend two of the bounded seed budget on the same neighbourhood.
+	seeded := make(map[int64]bool, len(named)+len(hits))
+	addSeed := func(sym graph.Symbol, signal float64) {
+		set.add(contextCandidate{sym: sym, relevance: relevanceDirectMatch, taskSignal: signal})
+		if seeded[sym.ID] {
+			return
+		}
+		seeded[sym.ID] = true
+		seeds = append(seeds, seed{sym: sym, signal: signal})
+	}
+	for _, sym := range named {
+		addSeed(sym, namedReferenceSignal)
 	}
 	for i, hit := range hits {
 		sym, ok := resolved[hit.SymbolID]
@@ -207,9 +217,7 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 			// another overload by resolving the hit's textual fields.
 			continue
 		}
-		signal := signals[i] * searchSignalCeiling
-		set.add(contextCandidate{sym: sym, relevance: relevanceDirectMatch, taskSignal: signal})
-		seeds = append(seeds, seed{sym: sym, signal: signal})
+		addSeed(sym, signals[i]*searchSignalCeiling)
 	}
 
 	if opts.IncludeCallers {

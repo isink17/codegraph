@@ -18,8 +18,9 @@ const (
 // It is deliberately conservative, because a reference becomes a top-ranked
 // seed and prose must not. Two shapes qualify:
 //
-//   - a dotted reference whose every segment is identifier-shaped
-//     (`RealCall.execute`, `OkHttpClient.newCall`), and
+//   - a dotted reference whose every segment is identifier-shaped and at
+//     least two characters long (`RealCall.execute`, `OkHttpClient.newCall`;
+//     not `e.g`, `i.e` or `U.S`), and
 //   - a bare identifier carrying an uppercase letter somewhere other than its
 //     first position (`CacheInterceptor`, `newCall`) or an underscore
 //     (`process_payment`).
@@ -58,6 +59,13 @@ func splitIdentifierRuns(text string) []string {
 			return false
 		case r == '_' || r == '.':
 			return false
+		case r >= 0x80:
+			// A non-ASCII letter is part of the identifier it was written in,
+			// not a boundary. Cutting there would hand `café_handler` back as
+			// the fragment `_handler`, which then qualifies as a reference on
+			// its underscore and spends one of the few slots this task has.
+			// Kept whole, isIdentifier rejects the run outright.
+			return false
 		default:
 			return true
 		}
@@ -67,7 +75,9 @@ func splitIdentifierRuns(text string) []string {
 func isNamedReference(word string) bool {
 	if strings.Contains(word, ".") {
 		for _, seg := range strings.Split(word, ".") {
-			if !isIdentifier(seg) {
+			// A one-character segment is abbreviated prose far more often than
+			// it is a qualified name: `e.g`, `i.e`, `U.S`.
+			if len(seg) < 2 || !isIdentifier(seg) {
 				return false
 			}
 		}

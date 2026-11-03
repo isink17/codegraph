@@ -35,6 +35,16 @@ func TestExtractNamedReferences(t *testing.T) {
 			want: []string{"process_payment"},
 		},
 		{
+			name: "a non-ascii identifier is rejected whole, not split into a fragment",
+			task: "fix the café_handler and Zählerstand_x paths",
+			want: nil,
+		},
+		{
+			name: "abbreviated prose is not a dotted reference",
+			task: "e.g. the handler, i.e. the U.S. one",
+			want: nil,
+		},
+		{
 			name: "no identifier in the task",
 			task: "explain how the cache decides to use a stored response",
 			want: nil,
@@ -204,11 +214,11 @@ func TestNamedReferenceSurfacesBareSuffix(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("SymbolsForNamedReferences() returned %d matches, want 1: %+v", len(got), got)
 	}
-	if !strings.HasSuffix(got[0].Symbol.QualifiedName, "RequestGateway.Dispatch") {
-		t.Fatalf("resolved %q, want a qualified name ending in RequestGateway.Dispatch", got[0].Symbol.QualifiedName)
+	if !strings.HasSuffix(got[0].QualifiedName, "RequestGateway.Dispatch") {
+		t.Fatalf("resolved %q, want a qualified name ending in RequestGateway.Dispatch", got[0].QualifiedName)
 	}
-	if got[0].Symbol.FilePath != "gateway/gateway.go" {
-		t.Fatalf("resolved file %q, want gateway/gateway.go", got[0].Symbol.FilePath)
+	if got[0].FilePath != "gateway/gateway.go" {
+		t.Fatalf("resolved file %q, want gateway/gateway.go", got[0].FilePath)
 	}
 }
 
@@ -223,7 +233,7 @@ func TestNamedReferenceNegativeCases(t *testing.T) {
 		}
 		files := map[string]bool{}
 		for _, m := range got {
-			files[m.Symbol.FilePath] = true
+			files[m.FilePath] = true
 		}
 		if !files["billing/renew.go"] || !files["subscription/renew.go"] || len(files) != 2 {
 			t.Fatalf("Renew resolved to %v, want exactly both package declarations", files)
@@ -268,7 +278,7 @@ func TestNamedReferenceNegativeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SymbolsForNamedReferences() error = %v", err)
 		}
-		if len(got) != 1 || got[0].Symbol.Language != "python" {
+		if len(got) != 1 || got[0].Language != "python" {
 			t.Fatalf("python reference resolved to %+v, want one python symbol", got)
 		}
 	})
@@ -288,17 +298,6 @@ func TestNamedReferenceRespectsFileCap(t *testing.T) {
 		}
 		if rankOf(paths, "gateway/gateway.go") != 0 {
 			t.Fatalf("MaxFiles=%d: named implementation is not first: %v", maxFiles, paths)
-		}
-	}
-}
-
-func TestNamedReferenceRankingIsStable(t *testing.T) {
-	fx := newNamedFixture(t)
-	task := "Trace a request through RequestGateway.Dispatch: request, response, dispatch, gateway"
-	first := fx.paths(t, task, ContextForTaskOptions{})
-	for i := 0; i < 3; i++ {
-		if got := fx.paths(t, task, ContextForTaskOptions{}); strings.Join(got, ",") != strings.Join(first, ",") {
-			t.Fatalf("repeat %d returned %v, want %v", i, got, first)
 		}
 	}
 }

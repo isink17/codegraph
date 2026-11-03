@@ -36,6 +36,11 @@ func (c *countingContextStore) SymbolsForIDs(ctx context.Context, repoID int64, 
 	return c.inner.SymbolsForIDs(ctx, repoID, ids)
 }
 
+func (c *countingContextStore) SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]graph.Symbol, error) {
+	c.calls["SymbolsForNamedReferences"]++
+	return c.inner.SymbolsForNamedReferences(ctx, repoID, names, perNameLimit)
+}
+
 func (c *countingContextStore) SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error) {
 	c.calls["SymbolNameCounts"]++
 	return c.inner.SymbolNameCounts(ctx, repoID, names)
@@ -77,6 +82,11 @@ func TestContextForTaskQueryCountIsBounded(t *testing.T) {
 	// generations.
 	if got := counter.calls["LastScanID"]; got != 2 {
 		t.Fatalf("LastScanID calls = %d, want 2", got)
+	}
+	// One call, whatever the task names. The store spends up to
+	// maxNamedReferences statements behind it, which is the bound that matters.
+	if got := counter.calls["SymbolsForNamedReferences"]; got != 1 {
+		t.Fatalf("SymbolsForNamedReferences calls = %d, want 1", got)
 	}
 	// One batch for the seeds, one for the test symbols.
 	if got := counter.calls["SymbolsForRefs"]; got > 2 {
@@ -129,9 +139,4 @@ func TestContinuationQueryCountMatchesFirstPage(t *testing.T) {
 			t.Fatalf("continuation made %d %s calls, first page made %d", got, name, firstCounts[name])
 		}
 	}
-}
-
-func (c *countingContextStore) SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]store.NamedSymbolMatch, error) {
-	c.calls["SymbolsForNamedReferences"]++
-	return c.inner.SymbolsForNamedReferences(ctx, repoID, names, perNameLimit)
 }
