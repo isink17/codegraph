@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -59,6 +62,38 @@ func TestRunRefusesBinaryIdentityMismatch(t *testing.T) {
 		"-expect-binary-sha256", strings.Repeat("0", 64)}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "binary identity mismatch") {
 		t.Fatalf("err = %v, want a binary identity refusal", err)
+	}
+}
+
+// The mismatch test above would also pass against an empty digest, so assert
+// the digest is really computed: the matching case must get past the binary
+// gate and fail on the corpus instead.
+func TestRunAcceptsItsOwnBinaryDigest(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("no executable path: %v", err)
+	}
+	sum, err := fileSHA256(exe)
+	if err != nil {
+		t.Skipf("cannot digest %s: %v", exe, err)
+	}
+	err = run([]string{"-dataset", "datasets/v1.json", "-corpora-root", t.TempDir(),
+		"-only", "cobra_execute_callers", "-expect-binary-sha256", sum}, io.Discard)
+	if err == nil || strings.Contains(err.Error(), "binary identity mismatch") {
+		t.Fatalf("err = %v, want the run to pass the binary gate and fail on the corpus", err)
+	}
+	if !strings.Contains(err.Error(), "no index at") {
+		t.Fatalf("err = %v, want the missing-index refusal", err)
+	}
+}
+
+func TestRunPrintsUsageForHelp(t *testing.T) {
+	var out strings.Builder
+	if err := run([]string{"-h"}, &out); err != nil {
+		t.Fatalf("-h returned %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "-corpora-root") {
+		t.Fatalf("usage did not mention the flags: %q", out.String())
 	}
 }
 
@@ -136,7 +171,9 @@ func TestAggregateWithholdsUndefinedMeans(t *testing.T) {
 func baseReport() Report {
 	r := Report{Schema: ReportSchema}
 	r.Dataset.SHA256 = "d1"
-	r.Config = RunConfig{SearchLimit: 30, MaxFiles: 10, MaxSymbols: 30, MaxTokens: 9000, Runs: 10}
+	r.Binary.OSArch = "darwin/arm64"
+	r.Config = RunConfig{SearchLimit: 30, MaxFiles: 10, MaxSymbols: 30, MaxTokens: 9000, Runs: 10,
+		SelectedQueries: 14, DatasetQueries: 14}
 	c := CorpusCheck{Name: "cobra", Match: true}
 	c.Observed.Commit = "c1"
 	r.Corpora = []CorpusCheck{c}
@@ -149,10 +186,15 @@ func baseReport() Report {
 
 func TestCompareReportsRefusesIncomparablePairs(t *testing.T) {
 	cases := map[string]func(*Report){
-		"different dataset": func(r *Report) { r.Dataset.SHA256 = "d2" },
-		"different config":  func(r *Report) { r.Config.MaxFiles = 20 },
-		"reindexed corpus":  func(r *Report) { r.Corpora[0].Observed.Commit = "c2" },
-		"query set changed": func(r *Report) { r.Queries = nil },
+		"different dataset":  func(r *Report) { r.Dataset.SHA256 = "d2" },
+		"different config":   func(r *Report) { r.Config.MaxFiles = 20 },
+		"reindexed corpus":   func(r *Report) { r.Corpora[0].Observed.Commit = "c2" },
+		"query set changed":  func(r *Report) { r.Queries = nil },
+		"different platform": func(r *Report) { r.Binary.OSArch = "linux/amd64" },
+		"subset of the dataset": func(r *Report) {
+			r.Config.SelectedQueries = 1
+			r.Config.DatasetQueries = 14
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -186,5 +228,41 @@ func TestCompareReportsReportsRankingChange(t *testing.T) {
 	}
 	if same.Queries[0].OrderingChanged || same.Delta.ContextRecallAt10 != 0 {
 		t.Fatalf("an identical rerun must show no change: %+v", same)
+	}
+}
+
+func TestCompareReportsRefusesADifferentQueryAtTheSamePosition(t *testing.T) {
+	candidate := baseReport()
+	candidate.Queries[0].ID = "q2"
+	if _, err := CompareReports(baseReport(), candidate); err == nil ||
+		!strings.Contains(err.Error(), "query order differs") {
+		t.Fatalf("err = %v, want a query-order refusal", err)
+	}
+}
+
+func TestLoadReportRefusesWrongSchemaAndUnmatchedCorpus(t *testing.T) {
+	write := func(r Report) string {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(t.TempDir(), "r.json")
+		if err := os.WriteFile(p, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	bad := baseReport()
+	bad.Schema = "other/v9"
+	if _, err := loadReport(write(bad)); err == nil || !strings.Contains(err.Error(), "schema") {
+		t.Fatalf("err = %v, want a schema refusal", err)
+	}
+	unmatched := baseReport()
+	unmatched.Corpora[0].Match = false
+	if _, err := loadReport(write(unmatched)); err == nil || !strings.Contains(err.Error(), "not matching") {
+		t.Fatalf("err = %v, want an unmatched-corpus refusal", err)
+	}
+	if _, err := loadReport(write(baseReport())); err != nil {
+		t.Fatalf("a well-formed report must load: %v", err)
 	}
 }

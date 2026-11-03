@@ -6,7 +6,12 @@
 // read-only, deterministic and free of model inference -- no Claude, no LLM
 // API, no embedding service. Two runs of the same dataset against the same
 // indexed corpora produce the same ranked identities and the same metrics;
-// only the latency samples differ.
+// the latency samples differ, and so does the recorded binary path and digest
+// when the tool is rebuilt (go run builds a fresh temporary binary each time).
+//
+// It resolves a corpus index at <root>/.codegraph/<RepoDatabaseFileName>, the
+// repo-local layout only. A graph kept in the global artifacts directory is
+// reported as "no index at", not searched for.
 //
 // It reports two stages separately. The search stage is Store.SemanticSearch's
 // own candidate set, and the context stage is query.Service.ContextForTask's
@@ -23,6 +28,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -62,15 +68,19 @@ type RunConfig struct {
 	IncludeCallers bool `json:"include_callers"`
 	Runs           int  `json:"runs"`
 	Warmup         int  `json:"warmup"`
+	// SelectedQueries and DatasetQueries make a -only subset visible on the
+	// face of the report. They also take part in the comparison refusal, so a
+	// subset is never compared against a full run.
+	SelectedQueries int `json:"selected_queries"`
+	DatasetQueries  int `json:"dataset_queries"`
 }
 
 // LatencyReport keeps every measured sample, not only the percentiles.
 type LatencyReport struct {
-	Samples   []float64 `json:"samples_ms"`
-	P50MS     float64   `json:"p50_ms"`
-	P95MS     float64   `json:"p95_ms"`
-	MaxMS     float64   `json:"max_ms"`
-	QueryCost int       `json:"store_calls_per_sample"`
+	Samples []float64 `json:"samples_ms"`
+	P50MS   float64   `json:"p50_ms"`
+	P95MS   float64   `json:"p95_ms"`
+	MaxMS   float64   `json:"max_ms"`
 }
 
 // ReturnedSymbol is one ordered result identity.
@@ -189,6 +199,11 @@ func run(args []string, stdout io.Writer) error {
 	compare := fs.String("compare", "", "after the run, emit a comparison against this earlier report instead of the report itself")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fs.SetOutput(stdout)
+			fs.Usage()
+			return nil
+		}
 		return err
 	}
 	if *corporaRoot == "" {
@@ -216,11 +231,16 @@ func run(args []string, stdout io.Writer) error {
 	report.Dataset.Frozen = ds.Frozen
 	report.Binary.GoVersion = runtime.Version()
 	report.Binary.OSArch = runtime.GOOS + "/" + runtime.GOARCH
-	if exe, err := os.Executable(); err == nil {
-		report.Binary.Path = exe
-		if sum, err := fileSHA256(exe); err == nil {
-			report.Binary.SHA256 = sum
-		}
+	// A report whose own binary identity is unknown cannot be compared, and
+	// this tool exists to refuse exactly that, so an unreadable executable is
+	// a failure rather than an empty field.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve this tool's own binary: %w", err)
+	}
+	report.Binary.Path = exe
+	if report.Binary.SHA256, err = fileSHA256(exe); err != nil {
+		return fmt.Errorf("digest this tool's own binary: %w", err)
 	}
 	if *expectBinary != "" && !strings.EqualFold(*expectBinary, report.Binary.SHA256) {
 		return fmt.Errorf("binary identity mismatch: running %s, expected %s; refusing to produce comparable numbers from a different build",
@@ -229,6 +249,7 @@ func run(args []string, stdout io.Writer) error {
 	report.Config = RunConfig{
 		SearchLimit: 30, MaxFiles: 10, MaxSymbols: 30, MaxTokens: *maxTokens,
 		IncludeTests: true, IncludeCallers: true, Runs: *runs, Warmup: *warmup,
+		SelectedQueries: len(selected), DatasetQueries: len(ds.Queries),
 	}
 
 	ctx := context.Background()
@@ -246,6 +267,10 @@ func run(args []string, stdout io.Writer) error {
 				name, root, corpus.Commit, corpus.Tree, corpus.Files, corpus.Symbols, corpus.References, corpus.Edges,
 				check.Observed.Commit, check.Observed.Tree, check.Observed.Files, check.Observed.Symbols,
 				check.Observed.References, check.Observed.Edges)
+		}
+		if err := verifyLabelledFiles(ctx, opened, name, selected); err != nil {
+			opened.close()
+			return err
 		}
 		for _, q := range selected {
 			if q.Corpus != name {
@@ -335,7 +360,6 @@ type openedCorpus struct {
 	store  *store.Store
 	svc    *query.Service
 	repoID int64
-	root   string
 }
 
 func (o *openedCorpus) close() {
@@ -346,7 +370,7 @@ func (o *openedCorpus) close() {
 
 func openCorpus(ctx context.Context, corpus Corpus, root string) (*openedCorpus, CorpusCheck, error) {
 	check := CorpusCheck{Name: corpus.Name, Root: root, Expected: corpus}
-	dbPath := filepath.Join(root, ".codegraph", "codegraph.v2.sqlite")
+	dbPath := filepath.Join(root, ".codegraph", store.RepoDatabaseFileName)
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, check, fmt.Errorf("corpus %q: no index at %s (run codegraph index %s --rebuild): %w", corpus.Name, dbPath, root, err)
 	}
@@ -375,7 +399,7 @@ func openCorpus(ctx context.Context, corpus Corpus, root string) (*openedCorpus,
 	check.Observed.References = stats.References
 	check.Observed.Edges = stats.Edges
 	check.Match = check.matches()
-	return &openedCorpus{store: s, svc: query.New(s, nil), repoID: repo.ID, root: root}, check, nil
+	return &openedCorpus{store: s, svc: query.New(s, nil), repoID: repo.ID}, check, nil
 }
 
 // matches reports whether the indexed corpus is the one the dataset labels
@@ -390,6 +414,60 @@ func (c CorpusCheck) matches() bool {
 		c.Observed.Symbols == c.Expected.Symbols &&
 		c.Observed.References == c.Expected.References &&
 		c.Observed.Edges == c.Expected.Edges
+}
+
+// verifyLabelledFiles refuses a dataset whose labels name files this corpus
+// does not hold.
+//
+// A mistyped relevant path can never match a returned file, so it sits in
+// missing_relevant_files forever and silently caps recall below 1 for every
+// run and every A/B that follows. That is a denominator the corpus does not
+// support, which is the one thing this tool must not produce quietly. An
+// irrelevant label is checked too: a verified-irrelevant file that is not in
+// the index is evidence about something else.
+func verifyLabelledFiles(ctx context.Context, c *openedCorpus, corpus string, queries []Query) error {
+	indexed, err := c.indexedFiles(ctx)
+	if err != nil {
+		return fmt.Errorf("corpus %q: list indexed files: %w", corpus, err)
+	}
+	var bad []string
+	for _, q := range queries {
+		if q.Corpus != corpus {
+			continue
+		}
+		for _, l := range append(append([]Label{}, q.Relevant...), q.Irrelevant...) {
+			if !indexed[l.File] {
+				bad = append(bad, q.ID+": "+l.File)
+			}
+		}
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		return fmt.Errorf("corpus %q: %d labelled file(s) are not in the index, so they can never be matched: %s",
+			corpus, len(bad), strings.Join(bad, "; "))
+	}
+	return nil
+}
+
+// indexedFiles reads every live file path in the corpus, paging because
+// ListFiles caps a page at the shared public page size.
+func (o *openedCorpus) indexedFiles(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	const page = 500
+	for offset := 0; ; offset += page {
+		rows, err := o.store.ListFiles(ctx, o.repoID, "", page, offset)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			if path, ok := r["path"].(string); ok {
+				out[path] = true
+			}
+		}
+		if len(rows) < page {
+			return out, nil
+		}
+	}
 }
 
 // gitRevision resolves one revision in a corpus checkout. An empty string is
@@ -425,24 +503,27 @@ func runQuery(ctx context.Context, c *openedCorpus, q Query, cfg RunConfig) (Que
 	if err != nil {
 		return res, fmt.Errorf("semantic search: %w", err)
 	}
-	res.Search = searchStageResult(q, hits)
+	if res.Search, err = searchStageResult(q, hits); err != nil {
+		return res, err
+	}
 	if res.Search.Latency, err = measure(searchCall, cfg); err != nil {
 		return res, err
 	}
-	res.Search.Latency.QueryCost = 1
 
 	tc, err := c.svc.ContextForTask(ctx, c.repoID, q.QueryText, ctxOpts)
 	if err != nil {
 		return res, fmt.Errorf("context for task: %w", err)
 	}
-	res.Context = contextStageResult(q, tc, res.Search.Files)
+	if res.Context, err = contextStageResult(q, tc, res.Search.Files); err != nil {
+		return res, err
+	}
 	if res.Context.Latency, err = measure(contextCall, cfg); err != nil {
 		return res, err
 	}
 	return res, nil
 }
 
-func searchStageResult(q Query, hits []map[string]any) StageResult {
+func searchStageResult(q Query, hits []map[string]any) (StageResult, error) {
 	out := StageResult{Stage: StageSearch, Files: []string{}, Symbols: []ReturnedSymbol{}}
 	seenFile := map[string]bool{}
 	symbols := map[string]bool{}
@@ -467,14 +548,15 @@ func searchStageResult(q Query, hits []map[string]any) StageResult {
 		}
 	}
 	tokens, bytes, err := tokenest.OfJSON(hits)
-	if err == nil {
-		out.EstimatedTokens, out.ResponseBytes = tokens, bytes
+	if err != nil {
+		return out, fmt.Errorf("estimate search response size: %w", err)
 	}
+	out.EstimatedTokens, out.ResponseBytes = tokens, bytes
 	out.Metrics = Evaluate(q, out.Files, symbols)
-	return out
+	return out, nil
 }
 
-func contextStageResult(q Query, tc *graph.TaskContext, searchFiles []string) StageResult {
+func contextStageResult(q Query, tc *graph.TaskContext, searchFiles []string) (StageResult, error) {
 	out := StageResult{Stage: StageContext, Files: []string{}, Symbols: []ReturnedSymbol{}}
 	symbols := map[string]bool{}
 	rank := 0
@@ -494,12 +576,13 @@ func contextStageResult(q Query, tc *graph.TaskContext, searchFiles []string) St
 		}
 	}
 	tokens, bytes, err := tokenest.OfJSON(tc)
-	if err == nil {
-		out.EstimatedTokens, out.ResponseBytes = tokens, bytes
+	if err != nil {
+		return out, fmt.Errorf("estimate context response size: %w", err)
 	}
+	out.EstimatedTokens, out.ResponseBytes = tokens, bytes
 	out.Metrics = Evaluate(q, out.Files, symbols)
 	out.MissingAttribution = AttributeMissing(out.Metrics.MissingRelevantFiles, searchFiles)
-	return out
+	return out, nil
 }
 
 func measure(call func() error, cfg RunConfig) (LatencyReport, error) {

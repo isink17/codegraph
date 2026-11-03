@@ -82,6 +82,19 @@ func TestLoadDatasetRejects(t *testing.T) {
 				map[string]any{"file": "a.go", "evidence": "also irrelevant"}}
 		},
 		"unknown field": func(m map[string]any) { m["weights"] = "tuned" },
+		"absolute label path": func(m map[string]any) {
+			m["queries"].([]any)[0].(map[string]any)["relevant"].([]any)[0].(map[string]any)["file"] = "/src/a.go"
+		},
+		"unclean label path": func(m map[string]any) {
+			m["queries"].([]any)[0].(map[string]any)["relevant"].([]any)[0].(map[string]any)["file"] = "./a.go"
+		},
+		"backslash label path": func(m map[string]any) {
+			m["queries"].([]any)[0].(map[string]any)["relevant"].([]any)[0].(map[string]any)["file"] = `src\a.go`
+		},
+		"graded irrelevant label": func(m map[string]any) {
+			m["queries"].([]any)[0].(map[string]any)["irrelevant"] = []any{
+				map[string]any{"file": "b.go", "grade": 3, "evidence": "misfiled"}}
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -120,10 +133,15 @@ func TestShippedDatasetIsValid(t *testing.T) {
 			heldOut++
 		}
 	}
-	if heldOut == 0 {
-		t.Fatal("shipped dataset has no held-out queries to evaluate a tuned change against")
+	// Pinned to the shape the evidence and the commit message describe, so a
+	// silent dataset edit fails here instead of quietly changing a baseline.
+	if len(ds.Queries) != 14 {
+		t.Fatalf("shipped dataset has %d queries, want 14", len(ds.Queries))
 	}
-	if len(categories) < 5 {
-		t.Fatalf("shipped dataset covers only %d categories", len(categories))
+	if heldOut != 4 {
+		t.Fatalf("shipped dataset holds out %d queries, want 4", heldOut)
+	}
+	if len(categories) != 6 {
+		t.Fatalf("shipped dataset covers %d categories, want 6", len(categories))
 	}
 }

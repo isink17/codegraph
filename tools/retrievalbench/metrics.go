@@ -36,15 +36,20 @@ type Metrics struct {
 	FirstRelevantRank *int    `json:"first_relevant_rank"`
 	ReciprocalRank    float64 `json:"reciprocal_rank"`
 
-	ProductionFiles int `json:"production_files"`
-	TestFiles       int `json:"test_files"`
+	// ProductionFiles and TestFiles count distinct returned files over the
+	// whole stage output, not over a top-k window: 30 candidates for the
+	// search stage, about 10 for the context stage. Every other metric here
+	// is @5 or @10, so the two are not comparable across stages.
+	ProductionFiles int `json:"production_files_whole_response"`
+	TestFiles       int `json:"test_files_whole_response"`
 
 	// FalsePositivesAt10 is populated only for a complete truth set.
 	FalsePositivesAt10 []string `json:"false_positives_at_10"`
 	// LabelledIrrelevantReturned holds returned files a human verified as
-	// irrelevant. It is available whatever the truth completeness, because
-	// each entry carries its own evidence.
-	LabelledIrrelevantReturned []string `json:"labelled_irrelevant_returned"`
+	// irrelevant, over the whole response rather than the top 10. It is
+	// available whatever the truth completeness, because each entry carries
+	// its own evidence.
+	LabelledIrrelevantReturned []string `json:"labelled_irrelevant_returned_whole_response"`
 
 	MissingRelevantFiles   []string `json:"missing_relevant_files"`
 	MissingExpectedSymbols []string `json:"missing_expected_symbols"`
@@ -77,9 +82,16 @@ func isTestPath(p string) bool {
 	return false
 }
 
-// Evaluate scores one ordered, deduplicated file list against a query's
-// labels. returnedSymbols is the set of qualified names the stage returned; it
-// is what MissingExpectedSymbols is computed against.
+// Evaluate scores one ordered file list against a query's labels.
+// returnedSymbols is the set of qualified names the stage returned; it is what
+// MissingExpectedSymbols is computed against.
+//
+// A repeated path is counted once, at its first position. ContextForTask can
+// legitimately return one file in both its production and its test section --
+// candidates dedup by symbol id, not by file, so a file holding one directly
+// matched symbol and one test-linked symbol lands in both. Counting it twice
+// would push recall above 1 and inflate the file counts, so the guard lives
+// here, where every caller passes through, rather than only in the producer.
 //
 // It is a pure function of its arguments: the same inputs always produce the
 // same Metrics, which is what makes a repeated benchmark run comparable.
@@ -96,7 +108,7 @@ func Evaluate(q Query, files []string, returnedSymbols map[string]bool) Metrics 
 	}
 
 	m := Metrics{
-		ReturnedFiles:              len(files),
+		ReturnedFiles:              distinct(files),
 		RelevantLabeled:            len(q.Relevant),
 		FalsePositivesAt10:         []string{},
 		LabelledIrrelevantReturned: []string{},
@@ -105,7 +117,14 @@ func Evaluate(q Query, files []string, returnedSymbols map[string]bool) Metrics 
 	}
 
 	seenRelevant := map[string]bool{}
-	for i, f := range files {
+	seenFile := map[string]bool{}
+	i := -1
+	for _, f := range files {
+		if seenFile[f] {
+			continue
+		}
+		seenFile[f] = true
+		i++
 		if isTestPath(f) {
 			m.TestFiles++
 		} else {
@@ -141,8 +160,8 @@ func Evaluate(q Query, files []string, returnedSymbols map[string]bool) Metrics 
 	}
 
 	if q.Truth == TruthComplete {
-		m.PrecisionDenom5 = min(5, len(files))
-		m.PrecisionDenom10 = min(10, len(files))
+		m.PrecisionDenom5 = min(5, m.ReturnedFiles)
+		m.PrecisionDenom10 = min(10, m.ReturnedFiles)
 		if m.PrecisionDenom5 > 0 {
 			v := float64(m.RelevantAt5) / float64(m.PrecisionDenom5)
 			m.PrecisionAt5 = &v
@@ -161,15 +180,26 @@ func Evaluate(q Query, files []string, returnedSymbols map[string]bool) Metrics 
 			m.MissingRelevantFiles = append(m.MissingRelevantFiles, f)
 		}
 	}
+	missing := map[string]bool{}
 	for _, l := range q.Relevant {
 		for _, sym := range l.Symbols {
-			if !returnedSymbols[sym] {
+			if !returnedSymbols[sym] && !missing[sym] {
+				missing[sym] = true
 				m.MissingExpectedSymbols = append(m.MissingExpectedSymbols, sym)
 			}
 		}
 	}
 	sort.Strings(m.MissingExpectedSymbols)
 	return m
+}
+
+// distinct counts unique paths, preserving nothing else.
+func distinct(files []string) int {
+	seen := map[string]bool{}
+	for _, f := range files {
+		seen[f] = true
+	}
+	return len(seen)
 }
 
 // ndcgAt10 uses gain 2^grade-1 and the standard log2(rank+2) discount. The
@@ -180,15 +210,20 @@ func ndcgAt10(files []string, grades map[string]int) (float64, bool) {
 		return 0, false
 	}
 	dcg := 0.0
-	for i, f := range files {
-		if i >= 10 {
-			break
-		}
-		g, ok := grades[f]
-		if !ok {
+	seen := map[string]bool{}
+	rank := 0
+	for _, f := range files {
+		if seen[f] {
 			continue
 		}
-		dcg += (math.Pow(2, float64(g)) - 1) / math.Log2(float64(i)+2)
+		seen[f] = true
+		if rank >= 10 {
+			break
+		}
+		if g, ok := grades[f]; ok {
+			dcg += (math.Pow(2, float64(g)) - 1) / math.Log2(float64(rank)+2)
+		}
+		rank++
 	}
 	ideal := make([]int, 0, len(grades))
 	for _, g := range grades {

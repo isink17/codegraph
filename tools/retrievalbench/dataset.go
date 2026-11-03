@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 )
@@ -80,7 +82,7 @@ func LoadDataset(path string) (*Dataset, error) {
 		return nil, err
 	}
 	var ds Dataset
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ds); err != nil {
 		return nil, fmt.Errorf("decode dataset %s: %w", path, err)
@@ -141,6 +143,9 @@ func (d *Dataset) Validate() error {
 			if l.File == "" || strings.TrimSpace(l.Evidence) == "" {
 				return fmt.Errorf("query %q: relevant label needs a file and evidence", q.ID)
 			}
+			if err := checkLabelPath(q.ID, l.File); err != nil {
+				return err
+			}
 			if l.Grade < 1 || l.Grade > 3 {
 				return fmt.Errorf("query %q: relevant %s grade %d outside 1..3", q.ID, l.File, l.Grade)
 			}
@@ -153,11 +158,36 @@ func (d *Dataset) Validate() error {
 			if l.File == "" || strings.TrimSpace(l.Evidence) == "" {
 				return fmt.Errorf("query %q: irrelevant label needs a file and evidence", q.ID)
 			}
+			if err := checkLabelPath(q.ID, l.File); err != nil {
+				return err
+			}
+			// An irrelevant label carries no grade and no expected symbols: a
+			// graded entry here is a relevant label filed in the wrong list,
+			// and silently ignoring it loses a judgement.
+			if l.Grade != 0 || len(l.Symbols) != 0 {
+				return fmt.Errorf("query %q: irrelevant label %s must carry no grade and no symbols", q.ID, l.File)
+			}
 			if prev, dup := seen[l.File]; dup {
 				return fmt.Errorf("query %q: file %s labelled twice (%s)", q.ID, l.File, prev)
 			}
 			seen[l.File] = "irrelevant"
 		}
+	}
+	return nil
+}
+
+// checkLabelPath keeps a label addressable against the index, whose paths are
+// slash-delimited, relative and already cleaned. A label that cannot be equal
+// to any indexed path would otherwise survive validation and be reported as a
+// permanent miss.
+func checkLabelPath(queryID, file string) error {
+	switch {
+	case strings.ContainsRune(file, '\\'):
+		return fmt.Errorf("query %q: label path %q must use '/' separators", queryID, file)
+	case path.IsAbs(file):
+		return fmt.Errorf("query %q: label path %q must be repository-relative", queryID, file)
+	case path.Clean(file) != file:
+		return fmt.Errorf("query %q: label path %q must be clean (got %q)", queryID, file, path.Clean(file))
 	}
 	return nil
 }

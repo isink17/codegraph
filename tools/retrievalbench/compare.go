@@ -51,6 +51,10 @@ func CompareReports(base, candidate Report) (Comparison, error) {
 		return Comparison{}, fmt.Errorf("run configuration differs: %+v vs %+v; a configuration change is not a scoring change",
 			base.Config, candidate.Config)
 	}
+	if base.Binary.OSArch != candidate.Binary.OSArch {
+		return Comparison{}, fmt.Errorf("platform differs: base %s, candidate %s; a platform change is not a scoring change",
+			base.Binary.OSArch, candidate.Binary.OSArch)
+	}
 	if err := sameCorpora(base, candidate); err != nil {
 		return Comparison{}, err
 	}
@@ -113,6 +117,14 @@ func loadReport(path string) (Report, error) {
 	}
 	if r.Schema != ReportSchema {
 		return Report{}, fmt.Errorf("report %s has schema %q, want %q", path, r.Schema, ReportSchema)
+	}
+	for _, c := range r.Corpora {
+		// A report produced against a corpus that failed its identity check
+		// was never comparable in the first place; the run that wrote it
+		// stopped, so such a file is truncated or hand-edited.
+		if !c.Match {
+			return Report{}, fmt.Errorf("report %s records corpus %q as not matching its pinned identity", path, c.Name)
+		}
 	}
 	return r, nil
 }

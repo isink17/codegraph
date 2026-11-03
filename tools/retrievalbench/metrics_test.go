@@ -145,3 +145,56 @@ func TestAttributeMissingSeparatesRankingFromCandidacy(t *testing.T) {
 		t.Fatalf("attribution = %v, want %v", got, want)
 	}
 }
+
+func TestEvaluateCountsARepeatedFileOnce(t *testing.T) {
+	// ContextForTask returns a file in both its production and its test
+	// section when one of its symbols matched directly and another arrived
+	// through a test link. Counting it twice pushes recall above 1.
+	query := q(TruthComplete, []Label{{File: "a.go", Grade: 3, Evidence: "e"}})
+	m := Evaluate(query, []string{"a.go", "a.go"}, nil)
+	if m.RecallAt10 != 1 {
+		t.Fatalf("recall@10 = %v, want 1", m.RecallAt10)
+	}
+	if m.RelevantAt10 != 1 || m.ReturnedFiles != 1 || m.ProductionFiles != 1 {
+		t.Fatalf("a repeated file must be counted once: %+v", m)
+	}
+	if *m.PrecisionAt10 != 1 || m.PrecisionDenom10 != 1 {
+		t.Fatalf("precision denominator must be distinct files: %v/%d", *m.PrecisionAt10, m.PrecisionDenom10)
+	}
+	if *m.NDCGAt10 != 1 {
+		t.Fatalf("nDCG = %v, want 1", *m.NDCGAt10)
+	}
+}
+
+func TestEvaluateRanksByFirstOccurrenceOfARepeatedFile(t *testing.T) {
+	query := q(TruthPartial, []Label{{File: "b.go", Grade: 2, Evidence: "e"}})
+	m := Evaluate(query, []string{"a.go", "b.go", "a.go", "b.go"}, nil)
+	if *m.FirstRelevantRank != 1 || m.ReciprocalRank != 0.5 {
+		t.Fatalf("rank must ignore repeats: %+v", m)
+	}
+	if m.ReturnedFiles != 2 {
+		t.Fatalf("returned files = %d, want 2 distinct", m.ReturnedFiles)
+	}
+}
+
+func TestEvaluateRecallNeverExceedsOne(t *testing.T) {
+	query := q(TruthPartial, []Label{
+		{File: "a.go", Grade: 3, Evidence: "e"},
+		{File: "b.go", Grade: 1, Evidence: "e"},
+	})
+	m := Evaluate(query, []string{"a.go", "b.go", "a.go", "b.go", "a.go"}, nil)
+	if m.RecallAt5 > 1 || m.RecallAt10 > 1 {
+		t.Fatalf("recall above 1: %+v", m)
+	}
+}
+
+func TestEvaluateDeduplicatesMissingExpectedSymbols(t *testing.T) {
+	query := q(TruthPartial, []Label{
+		{File: "a.go", Grade: 3, Symbols: []string{"pkg.A.run"}, Evidence: "e"},
+		{File: "b.go", Grade: 1, Symbols: []string{"pkg.A.run"}, Evidence: "e"},
+	})
+	m := Evaluate(query, []string{"a.go", "b.go"}, nil)
+	if !reflect.DeepEqual(m.MissingExpectedSymbols, []string{"pkg.A.run"}) {
+		t.Fatalf("missing expected symbols = %v, want one entry", m.MissingExpectedSymbols)
+	}
+}

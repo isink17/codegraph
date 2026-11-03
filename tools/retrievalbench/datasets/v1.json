@@ -205,7 +205,7 @@
       ],
       "irrelevant": [
         {"file": "okhttp/src/test/java/okhttp3/KotlinSourceModernTest.kt", "evidence": "a compile-only API surface test full of TODO() stubs; carries no execution behaviour"},
-        {"file": "mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt", "evidence": "test server, not part of the client call path"},
+        {"file": "mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt", "evidence": "test server, not part of the client call path"},
         {"file": "samples/guide/src/main/java/okhttp3/recipes/kt/CacheResponse.kt", "evidence": "documentation sample"},
         {"file": "okhttp/src/main/kotlin/okhttp3/internal/ws/RealWebSocket.kt", "evidence": "web socket path; the task is the synchronous HTTP call path"}
       ]
