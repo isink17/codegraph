@@ -50,6 +50,11 @@ func TestExtractNamedReferences(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "a list marker is a boundary, not part of the name",
+			task: "see \u2460CacheInterceptor and \u2461RealCall.execute",
+			want: []string{"CacheInterceptor", "RealCall.execute"},
+		},
+		{
 			name: "abbreviated prose is not a dotted reference",
 			task: "e.g. the handler, i.e. the U.S. one",
 			want: nil,

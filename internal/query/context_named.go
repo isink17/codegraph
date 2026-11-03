@@ -80,9 +80,23 @@ func splitIdentifierRuns(text string) []string {
 			// any of them as a boundary splits the identifier and leaves the
 			// ASCII half behind as its own apparent reference -- `நி_handler`
 			// yielding `_handler` is the same bug as `café_handler` yielding
-			// it, one script over. This admits what UAX #31 ID_Continue plus
-			// the joiner rules admit.
-			return !(unicode.IsLetter(r) || unicode.In(r, unicode.N, unicode.M) ||
+			// it, one script over.
+			//
+			// The categories are UAX #31's own ID_Continue, plus the joiners.
+			// Taking all of N and M instead would be looser than the standard
+			// and lose references the other way: a circled list marker (No) or
+			// an enclosing mark (Me) written flush against a name would be
+			// absorbed into it, and `①CacheInterceptor` would extract nothing.
+			//
+			// Ceiling: a reference written flush against the letters of a
+			// script that does not space its words -- `CacheInterceptorクラス`,
+			// `请跟踪RequestGateway.Dispatch的调用` -- is not extracted, because
+			// those letters are L, and keeping `café` whole necessarily keeps
+			// these whole too. Closing that needs a script policy, not a
+			// character property. The cost is a miss that falls back to
+			// semantic search, never a wrong reference.
+			return !(unicode.IsLetter(r) ||
+				unicode.In(r, unicode.Nl, unicode.Nd, unicode.Mn, unicode.Mc, unicode.Pc) ||
 				r == '\u200C' || r == '\u200D')
 		default:
 			return true
