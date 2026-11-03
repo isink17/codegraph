@@ -163,9 +163,13 @@ type Summary struct {
 }
 
 // Aggregate is the mean of the metrics that are defined for every member, plus
-// counts for the ones that are not.
+// counts for the ones that are not. A negative query has no recall and no
+// reciprocal rank, so it is counted in Queries and in NegativeQueries but
+// contributes to neither mean.
 type Aggregate struct {
 	Queries           int     `json:"queries"`
+	ScoredQueries     int     `json:"queries_with_recall"`
+	NegativeQueries   int     `json:"negative_queries"`
 	MeanRecallAt5     float64 `json:"mean_recall_at_5"`
 	MeanRecallAt10    float64 `json:"mean_recall_at_10"`
 	MeanReciprocal    float64 `json:"mean_reciprocal_rank"`
@@ -646,11 +650,18 @@ func aggregate(ms []Metrics, tokens int) Aggregate {
 	}
 	var r5, r10, rr, p10, ndcg float64
 	for _, m := range ms {
-		r5 += m.RecallAt5
-		r10 += m.RecallAt10
-		rr += m.ReciprocalRank
-		if m.FirstRelevantRank == nil {
-			a.QueriesWithNoHit++
+		if m.RecallAt5 == nil {
+			a.NegativeQueries++
+		} else {
+			a.ScoredQueries++
+			r5 += *m.RecallAt5
+			r10 += *m.RecallAt10
+			if m.ReciprocalRank != nil {
+				rr += *m.ReciprocalRank
+			}
+			if m.FirstRelevantRank == nil {
+				a.QueriesWithNoHit++
+			}
 		}
 		if m.PrecisionAt10 != nil {
 			a.ScoredPrecision++
@@ -663,10 +674,12 @@ func aggregate(ms []Metrics, tokens int) Aggregate {
 		a.TestFiles += m.TestFiles
 		a.ProductionFiles += m.ProductionFiles
 	}
-	n := float64(len(ms))
-	a.MeanRecallAt5 = r5 / n
-	a.MeanRecallAt10 = r10 / n
-	a.MeanReciprocal = rr / n
+	if a.ScoredQueries > 0 {
+		n := float64(a.ScoredQueries)
+		a.MeanRecallAt5 = r5 / n
+		a.MeanRecallAt10 = r10 / n
+		a.MeanReciprocal = rr / n
+	}
 	if a.ScoredPrecision > 0 {
 		a.MeanPrecisionAt10 = p10 / float64(a.ScoredPrecision)
 	}

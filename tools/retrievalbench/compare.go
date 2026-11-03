@@ -74,9 +74,9 @@ func CompareReports(base, candidate Report) (Comparison, error) {
 			ID: b.ID, HeldOut: b.HeldOut,
 			BaseFiles: b.Context.Files, CandidateFiles: a.Context.Files,
 			OrderingChanged:  !reflect.DeepEqual(b.Context.Files, a.Context.Files),
-			RecallAt10Delta:  a.Context.Metrics.RecallAt10 - b.Context.Metrics.RecallAt10,
-			ReciprocalDelta:  a.Context.Metrics.ReciprocalRank - b.Context.Metrics.ReciprocalRank,
-			SearchRecallAt10: a.Search.Metrics.RecallAt10 - b.Search.Metrics.RecallAt10,
+			RecallAt10Delta:  delta(a.Context.Metrics.RecallAt10, b.Context.Metrics.RecallAt10),
+			ReciprocalDelta:  delta(a.Context.Metrics.ReciprocalRank, b.Context.Metrics.ReciprocalRank),
+			SearchRecallAt10: delta(a.Search.Metrics.RecallAt10, b.Search.Metrics.RecallAt10),
 		}
 		c.Queries = append(c.Queries, qc)
 		if b.HeldOut {
@@ -91,6 +91,16 @@ func CompareReports(base, candidate Report) (Comparison, error) {
 		c.Delta.HeldOutRecallAt10 = heldOut / heldOutN
 	}
 	return c, nil
+}
+
+// delta subtracts two optional metrics. A metric undefined on either side --
+// a negative query has no recall -- contributes zero rather than a number
+// invented from a nil.
+func delta(candidate, base *float64) float64 {
+	if candidate == nil || base == nil {
+		return 0
+	}
+	return *candidate - *base
 }
 
 func sameCorpora(base, candidate Report) error {

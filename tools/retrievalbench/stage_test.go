@@ -30,7 +30,7 @@ func TestContextStageDeduplicatesAFileReturnedInBothSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Metrics.RecallAt10 != 1 {
+	if deref(got.Metrics.RecallAt10) != 1 {
 		t.Fatalf("recall@10 = %v, want 1", got.Metrics.RecallAt10)
 	}
 	if got.Metrics.ReturnedFiles != 2 {
@@ -96,7 +96,7 @@ func TestSearchStageOnNoHits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Files) != 0 || got.Metrics.FirstRelevantRank != nil || got.Metrics.RecallAt10 != 0 {
+	if len(got.Files) != 0 || got.Metrics.FirstRelevantRank != nil || deref(got.Metrics.RecallAt10) != 0 {
 		t.Fatalf("an empty result must report a clean miss: %+v", got.Metrics)
 	}
 }

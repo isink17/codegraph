@@ -5,6 +5,15 @@ import (
 	"testing"
 )
 
+// deref reads an optional metric in a test assertion. -1 marks "withheld",
+// which no real metric can equal.
+func deref(v *float64) float64 {
+	if v == nil {
+		return -1
+	}
+	return *v
+}
+
 func q(truth string, relevant []Label, irrelevant ...Label) Query {
 	return Query{ID: "q", Corpus: "c", Category: "k", Truth: truth, QueryText: "t",
 		Relevant: relevant, Irrelevant: irrelevant}
@@ -16,8 +25,8 @@ func TestEvaluateWithholdsPrecisionAndNDCGForPartialTruth(t *testing.T) {
 	if m.PrecisionAt5 != nil || m.PrecisionAt10 != nil || m.NDCGAt10 != nil {
 		t.Fatalf("partial truth must withhold precision and nDCG, got %+v", m)
 	}
-	if m.RecallAt10 != 1 {
-		t.Fatalf("recall against the labelled set is still defined: got %v", m.RecallAt10)
+	if deref(m.RecallAt10) != 1 {
+		t.Fatalf("recall against the labelled set is still defined: got %v", deref(m.RecallAt10))
 	}
 	if len(m.FalsePositivesAt10) != 0 {
 		t.Fatalf("an unlabelled file is not a false positive under partial truth: %v", m.FalsePositivesAt10)
@@ -36,7 +45,7 @@ func TestEvaluateDenominators(t *testing.T) {
 	if *m.PrecisionAt5 != 2.0/3.0 {
 		t.Fatalf("precision@5 = %v, want 2/3", *m.PrecisionAt5)
 	}
-	if m.RecallAt5 != 1 {
+	if deref(m.RecallAt5) != 1 {
 		t.Fatalf("recall@5 = %v, want 1", m.RecallAt5)
 	}
 	if !reflect.DeepEqual(m.FalsePositivesAt10, []string{"x.go"}) {
@@ -50,11 +59,11 @@ func TestEvaluateFirstRelevantRankAndReciprocal(t *testing.T) {
 	if m.FirstRelevantRank == nil || *m.FirstRelevantRank != 1 {
 		t.Fatalf("first relevant rank = %v, want 1", m.FirstRelevantRank)
 	}
-	if m.ReciprocalRank != 0.5 {
-		t.Fatalf("reciprocal rank = %v, want 0.5", m.ReciprocalRank)
+	if deref(m.ReciprocalRank) != 0.5 {
+		t.Fatalf("reciprocal rank = %v, want 0.5", deref(m.ReciprocalRank))
 	}
 	empty := Evaluate(query, []string{"a.go"}, nil)
-	if empty.FirstRelevantRank != nil || empty.ReciprocalRank != 0 {
+	if empty.FirstRelevantRank != nil || deref(empty.ReciprocalRank) != 0 {
 		t.Fatalf("a miss must report no rank, got %+v", empty)
 	}
 }
@@ -103,7 +112,7 @@ func TestEvaluateIsDeterministicAndOrderSensitive(t *testing.T) {
 	if !(*better.NDCGAt10 > *first.NDCGAt10) {
 		t.Fatalf("a better ordering must score higher: %v vs %v", *better.NDCGAt10, *first.NDCGAt10)
 	}
-	if better.ReciprocalRank <= first.ReciprocalRank {
+	if deref(better.ReciprocalRank) <= deref(first.ReciprocalRank) {
 		t.Fatalf("reciprocal rank must reward the earlier hit")
 	}
 }
@@ -152,8 +161,8 @@ func TestEvaluateCountsARepeatedFileOnce(t *testing.T) {
 	// through a test link. Counting it twice pushes recall above 1.
 	query := q(TruthComplete, []Label{{File: "a.go", Grade: 3, Evidence: "e"}})
 	m := Evaluate(query, []string{"a.go", "a.go"}, nil)
-	if m.RecallAt10 != 1 {
-		t.Fatalf("recall@10 = %v, want 1", m.RecallAt10)
+	if deref(m.RecallAt10) != 1 {
+		t.Fatalf("recall@10 = %v, want 1", deref(m.RecallAt10))
 	}
 	if m.RelevantAt10 != 1 || m.ReturnedFiles != 1 || m.ProductionFiles != 1 {
 		t.Fatalf("a repeated file must be counted once: %+v", m)
@@ -169,7 +178,7 @@ func TestEvaluateCountsARepeatedFileOnce(t *testing.T) {
 func TestEvaluateRanksByFirstOccurrenceOfARepeatedFile(t *testing.T) {
 	query := q(TruthPartial, []Label{{File: "b.go", Grade: 2, Evidence: "e"}})
 	m := Evaluate(query, []string{"a.go", "b.go", "a.go", "b.go"}, nil)
-	if *m.FirstRelevantRank != 1 || m.ReciprocalRank != 0.5 {
+	if *m.FirstRelevantRank != 1 || deref(m.ReciprocalRank) != 0.5 {
 		t.Fatalf("rank must ignore repeats: %+v", m)
 	}
 	if m.ReturnedFiles != 2 {
@@ -183,7 +192,7 @@ func TestEvaluateRecallNeverExceedsOne(t *testing.T) {
 		{File: "b.go", Grade: 1, Evidence: "e"},
 	})
 	m := Evaluate(query, []string{"a.go", "b.go", "a.go", "b.go", "a.go"}, nil)
-	if m.RecallAt5 > 1 || m.RecallAt10 > 1 {
+	if deref(m.RecallAt5) > 1 || deref(m.RecallAt10) > 1 {
 		t.Fatalf("recall above 1: %+v", m)
 	}
 }
@@ -196,5 +205,35 @@ func TestEvaluateDeduplicatesMissingExpectedSymbols(t *testing.T) {
 	m := Evaluate(query, []string{"a.go", "b.go"}, nil)
 	if !reflect.DeepEqual(m.MissingExpectedSymbols, []string{"pkg.A.run"}) {
 		t.Fatalf("missing expected symbols = %v, want one entry", m.MissingExpectedSymbols)
+	}
+}
+
+func TestEvaluateWithholdsEveryRatioForANegativeQuery(t *testing.T) {
+	query := Query{ID: "n", Corpus: "c", Category: "negative", Truth: TruthNegative,
+		QueryText:  "where is the GraphQL resolver",
+		Irrelevant: []Label{{File: "lib/core/Axios.js", Evidence: "no GraphQL anywhere in this corpus"}}}
+	m := Evaluate(query, []string{"lib/core/Axios.js", "lib/utils.js"}, nil)
+	if m.RecallAt5 != nil || m.RecallAt10 != nil || m.ReciprocalRank != nil ||
+		m.PrecisionAt10 != nil || m.NDCGAt10 != nil || m.FirstRelevantRank != nil {
+		t.Fatalf("a negative query has no defined ratio: %+v", m)
+	}
+	if m.ReturnedFiles != 2 {
+		t.Fatalf("returned files = %d, want 2", m.ReturnedFiles)
+	}
+	if !reflect.DeepEqual(m.LabelledIrrelevantReturned, []string{"lib/core/Axios.js"}) {
+		t.Fatalf("a verified-irrelevant hit is still reported: %v", m.LabelledIrrelevantReturned)
+	}
+}
+
+func TestAggregateExcludesNegativeQueriesFromTheMeans(t *testing.T) {
+	one := 1.0
+	scored := Metrics{RelevantLabeled: 1, RecallAt5: &one, RecallAt10: &one, ReciprocalRank: &one}
+	negative := Metrics{ReturnedFiles: 10}
+	a := aggregate([]Metrics{scored, negative}, 0)
+	if a.Queries != 2 || a.ScoredQueries != 1 || a.NegativeQueries != 1 {
+		t.Fatalf("counts = %+v", a)
+	}
+	if a.MeanRecallAt10 != 1 {
+		t.Fatalf("mean recall = %v; a negative query must not halve it", a.MeanRecallAt10)
 	}
 }

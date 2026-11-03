@@ -145,3 +145,24 @@ func TestShippedDatasetIsValid(t *testing.T) {
 		t.Fatalf("shipped dataset covers %d categories, want 6", len(categories))
 	}
 }
+
+func TestNegativeQueryValidation(t *testing.T) {
+	negative := func() map[string]any {
+		m := validDataset()
+		q := m["queries"].([]any)[0].(map[string]any)
+		q["truth"] = TruthNegative
+		q["category"] = "negative"
+		q["relevant"] = []any{}
+		q["irrelevant"] = []any{map[string]any{"file": "a.go", "evidence": "corpus has no such feature"}}
+		return m
+	}
+	if _, err := LoadDataset(writeDataset(t, negative())); err != nil {
+		t.Fatalf("a well-formed negative query must validate: %v", err)
+	}
+	withRelevant := negative()
+	withRelevant["queries"].([]any)[0].(map[string]any)["relevant"] = []any{
+		map[string]any{"file": "a.go", "grade": 3, "evidence": "e"}}
+	if _, err := LoadDataset(writeDataset(t, withRelevant)); err == nil {
+		t.Fatal("a negative query carrying a relevant label must be refused")
+	}
+}
