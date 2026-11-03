@@ -130,3 +130,8 @@ func TestContinuationQueryCountMatchesFirstPage(t *testing.T) {
 		}
 	}
 }
+
+func (c *countingContextStore) SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]store.NamedSymbolMatch, error) {
+	c.calls["SymbolsForNamedReferences"]++
+	return c.inner.SymbolsForNamedReferences(ctx, repoID, names, perNameLimit)
+}

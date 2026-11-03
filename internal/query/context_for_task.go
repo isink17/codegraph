@@ -39,6 +39,7 @@ type contextStoreOps interface {
 	SymbolsForIDs(ctx context.Context, repoID int64, ids []int64) (map[int64]graph.Symbol, error)
 	SymbolsForRefs(ctx context.Context, repoID int64, refs []store.SymbolRef) (map[store.SymbolRef]graph.Symbol, error)
 	SymbolNameCounts(ctx context.Context, repoID int64, names []string) (map[string]int, error)
+	SymbolsForNamedReferences(ctx context.Context, repoID int64, names []string, perNameLimit int) ([]store.NamedSymbolMatch, error)
 	FindContextNeighbors(ctx context.Context, repoID int64, seeds []store.ContextSeed, fanout int) ([]store.ContextNeighbors, error)
 	RelatedTests(ctx context.Context, repoID int64, symbol, file string, limit, offset int) ([]store.RelatedTest, error)
 }
@@ -152,6 +153,24 @@ func (s *Service) ContextForTask(ctx context.Context, repoID int64, task string,
 // stream for a task. The same options and the same graph always produce the same
 // stream, which is what makes an offset cursor safe.
 func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task string, opts ContextForTaskOptions) ([]contextCandidate, error) {
+	// The named-reference leg comes first because it is the strongest evidence
+	// the request carries: the task wrote an identifier, and the index either
+	// holds a symbol with that exact name or it does not.
+	//
+	// Semantic search cannot stand in for it. Its score is a sum of token
+	// weights over a symbol's name, qualified name, signature and doc, so it
+	// rewards a symbol with a large token vocabulary; a long test method
+	// repeating a common word outscores the small implementation the task
+	// named. Worse, the tokenizer treats '.' as a token character, so the
+	// reference `RealCall.execute` is one token that the stored qualified name
+	// `okhttp3.internal.connection.RealCall.execute` tokenizes as a different
+	// one: spelling a symbol out contributes nothing to the token score at all.
+	named, err := s.ctxStore.SymbolsForNamedReferences(ctx, repoID,
+		extractNamedReferences(task), namedReferenceFanout)
+	if err != nil {
+		return nil, fmt.Errorf("resolve named symbols: %w", err)
+	}
+
 	rawHits, err := s.semanticSearch(ctx, repoID, task, opts.MaxSymbols, 0)
 	if err != nil {
 		return nil, fmt.Errorf("semantic search: %w", err)
@@ -176,7 +195,11 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 		sym    graph.Symbol
 		signal float64
 	}
-	seeds := make([]seed, 0, len(hits))
+	seeds := make([]seed, 0, len(named)+len(hits))
+	for _, m := range named {
+		set.add(contextCandidate{sym: m.Symbol, relevance: relevanceDirectMatch, taskSignal: namedReferenceSignal})
+		seeds = append(seeds, seed{sym: m.Symbol, signal: namedReferenceSignal})
+	}
 	for i, hit := range hits {
 		sym, ok := resolved[hit.SymbolID]
 		if !ok {
@@ -184,8 +207,9 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 			// another overload by resolving the hit's textual fields.
 			continue
 		}
-		set.add(contextCandidate{sym: sym, relevance: relevanceDirectMatch, taskSignal: signals[i]})
-		seeds = append(seeds, seed{sym: sym, signal: signals[i]})
+		signal := signals[i] * searchSignalCeiling
+		set.add(contextCandidate{sym: sym, relevance: relevanceDirectMatch, taskSignal: signal})
+		seeds = append(seeds, seed{sym: sym, signal: signal})
 	}
 
 	if opts.IncludeCallers {
