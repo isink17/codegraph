@@ -178,14 +178,16 @@ func TestExhaustiveWalkLosesNoCandidate(t *testing.T) {
 	}
 }
 
-// End to end through the service: a budget that strands a real cursor refuses
-// it recoverably, and replaying that exact cursor with a larger max_tokens
-// serves the page. max_tokens is deliberately outside the cursor's option
-// fingerprint so the replay is not a staleness mismatch.
-func TestStrandedCursorIsRecoverableWithALargerBudget(t *testing.T) {
-	fx := newContextFixture(t)
+// strandingBudget searches for a budget at which this fixture serves a first
+// page and then refuses the continuation because the next candidate is wider
+// than the budget, and returns that budget with the cursor it stranded.
+//
+// The band is found rather than hardcoded: the costs that place it are the
+// serialized sizes of a fixture the fixture owns, and they do not have to be
+// the same on every platform or after any change to the response record.
+func strandingBudget(t *testing.T, fx *contextFixture) (int, string) {
+	t.Helper()
 	ctx := context.Background()
-	recovered := 0
 	for budget := 120; budget <= 1200; budget++ {
 		opts := fullOpts()
 		opts.MaxTokens = budget
@@ -194,9 +196,9 @@ func TestStrandedCursorIsRecoverableWithALargerBudget(t *testing.T) {
 			continue
 		}
 		for page.NextCursor != "" {
-			next := opts
-			next.Cursor = page.NextCursor
 			stranded := page.NextCursor
+			next := opts
+			next.Cursor = stranded
 			page, err = fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, next)
 			if err == nil {
 				continue
@@ -204,49 +206,51 @@ func TestStrandedCursorIsRecoverableWithALargerBudget(t *testing.T) {
 			if !errors.Is(err, ErrContextBudgetTooSmall) {
 				t.Fatalf("continuation at max_tokens=%d error = %v", budget, err)
 			}
-			retry := opts
-			retry.Cursor = stranded
-			retry.MaxTokens = MaxContextMaxTokens
-			resumed, retryErr := fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, retry)
-			if retryErr != nil {
-				t.Fatalf("retry of the stranded cursor at max_tokens=%d: %v", budget, retryErr)
-			}
-			if resumed.ReturnedSymbols == 0 {
-				t.Fatalf("retry of the stranded cursor at max_tokens=%d returned nothing", budget)
-			}
-			recovered++
-			break
+			return budget, stranded
 		}
 	}
-	if recovered == 0 {
-		t.Fatal("no budget stranded a cursor; the recovery path was never exercised")
+	t.Fatal("no budget stranded a cursor; the oversized-candidate path was never reached")
+	return 0, ""
+}
+
+// End to end through the service: a budget that strands a real cursor refuses
+// it recoverably, and replaying that exact cursor with a larger max_tokens
+// serves the page. max_tokens is deliberately outside the cursor's option
+// fingerprint so the replay is not a staleness mismatch.
+func TestStrandedCursorIsRecoverableWithALargerBudget(t *testing.T) {
+	fx := newContextFixture(t)
+	budget, stranded := strandingBudget(t, fx)
+
+	retry := fullOpts()
+	retry.Cursor = stranded
+	retry.MaxTokens = MaxContextMaxTokens
+	resumed, err := fx.svc.ContextForTask(context.Background(), fx.repoID, taskPayment, retry)
+	if err != nil {
+		t.Fatalf("retry of the cursor stranded at max_tokens=%d: %v", budget, err)
+	}
+	if resumed.ReturnedSymbols == 0 {
+		t.Fatalf("retry of the cursor stranded at max_tokens=%d returned nothing", budget)
 	}
 }
 
 // Staleness is decided before the budget is: a cursor stranded by a small
 // budget and then replayed against a re-ranked stream is refused as stale, not
-// served and not reported as a budget problem.
+// served and not reported as a budget problem. The budget stays at the value
+// that stranded it, so both failure modes are live and the one that wins is
+// the one under test.
 func TestStrandedCursorStillFailsClosedOnRankingDrift(t *testing.T) {
 	fx := newContextFixture(t)
-	ctx := context.Background()
-	opts := fullOpts()
-	// 162 is inside the band where this fixture's second page meets a candidate
-	// wider than the budget; TestStrandedCursorIsRecoverableWithALargerBudget
-	// sweeps for that band rather than hardcoding it.
-	opts.MaxTokens = 162
-	page, err := fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, opts)
-	if err != nil {
-		t.Fatalf("first page error = %v", err)
-	}
-	if page.NextCursor == "" {
-		t.Fatal("first page carries no cursor")
-	}
-	// The budget stays narrow so the two failure modes compete: a stale cursor
-	// must be refused as stale even when the budget would also have refused it.
-	drifted := opts
-	drifted.Cursor = page.NextCursor
-	drifted.IncludeCallers = !opts.IncludeCallers
-	if _, err := fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, drifted); !errors.Is(err, ErrContextCursorStale) {
+	budget, stranded := strandingBudget(t, fx)
+
+	drifted := fullOpts()
+	drifted.MaxTokens = budget
+	drifted.Cursor = stranded
+	drifted.IncludeCallers = !drifted.IncludeCallers
+	_, err := fx.svc.ContextForTask(context.Background(), fx.repoID, taskPayment, drifted)
+	if !errors.Is(err, ErrContextCursorStale) {
 		t.Fatalf("error = %v, want ErrContextCursorStale", err)
+	}
+	if errors.Is(err, ErrContextBudgetTooSmall) {
+		t.Fatalf("budget refusal preempted the staleness check: %v", err)
 	}
 }
