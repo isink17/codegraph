@@ -136,8 +136,10 @@ func buildBudgetedContext(in budgetInput) (*graph.TaskContext, error) {
 		// measured and the last item dropped until it fits.
 		paged := in
 		paged.offset = offset
+		var result *graph.TaskContext
 		for {
-			result, err := assembleContext(paged, count)
+			var err error
+			result, err = assembleContext(paged, count)
 			if err != nil {
 				return nil, err
 			}
@@ -147,7 +149,9 @@ func buildBudgetedContext(in budgetInput) (*graph.TaskContext, error) {
 			count--
 		}
 		if count > 0 {
-			return assembleContext(paged, count)
+			// The measured document is the one to return: assembling it again
+			// would re-serialize the whole page for an identical result.
+			return result, nil
 		}
 		if offset >= total {
 			// Nothing remains; the terminal empty page is a legitimate end of

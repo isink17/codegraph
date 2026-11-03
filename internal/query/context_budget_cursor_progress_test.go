@@ -27,9 +27,14 @@ func TestContinuationAlwaysAdvancesPastAnOversizedCandidate(t *testing.T) {
 		}
 		walked++
 		seen := 0
-		for page.NextCursor != "" {
+		for {
+			// Checked for every page, the terminal one included: a walk of a
+			// single page must still respect the budget.
 			if page.EstimatedTokens > budget {
 				t.Fatalf("page at max_tokens=%d reported %d tokens", budget, page.EstimatedTokens)
+			}
+			if page.NextCursor == "" {
+				break
 			}
 			next := opts
 			next.Cursor = page.NextCursor

@@ -650,9 +650,11 @@ func aggregate(ms []Metrics, tokens int) Aggregate {
 	}
 	var r5, r10, rr, p10, ndcg float64
 	for _, m := range ms {
-		if m.RecallAt5 == nil {
+		// No labelled relevant file is what makes recall undefined; the nil
+		// pointer is the consequence, not the condition.
+		if m.RelevantLabeled == 0 {
 			a.NegativeQueries++
-		} else {
+		} else if m.RecallAt5 != nil && m.RecallAt10 != nil {
 			a.ScoredQueries++
 			r5 += *m.RecallAt5
 			r10 += *m.RecallAt10

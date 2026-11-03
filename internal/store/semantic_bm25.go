@@ -17,9 +17,11 @@ const (
 	bm25B  = 0.75
 	// bm25ScorePrecision rounds the summed score before it is ordered and
 	// returned. A float sum over a GROUP BY depends on the order SQLite
-	// aggregates rows in, which the planner may change; rounding makes two
-	// runs of the same query agree exactly, so the documented tie-break
-	// columns decide genuinely equal scores rather than float noise.
+	// aggregates rows in, which the planner may change; rounding makes a
+	// disagreement between two runs unlikely rather than impossible, since
+	// two orders can still straddle a rounding boundary. What actually makes
+	// a page boundary deterministic is the tie-break column chain in the
+	// ORDER BY, not this.
 	bm25ScorePrecision = 6
 )
 
@@ -35,15 +37,25 @@ type corpusTokenStats struct {
 	AvgLen  float64
 }
 
-// tokenStatsCache holds the statistics per repository, keyed by the scan
-// generation they were computed from.
+// tokenStatsCache holds the statistics per repository, keyed by the
+// generation of the newest scan that has finished running.
 //
-// Computing them costs a full aggregate over symbol_tokens -- measured at
-// about 54 ms on a 6 081-symbol repository, which is more than the entire
-// query it would serve. They change only when the repository is re-indexed,
-// and the scan id is exactly that generation, so a cache entry is either
-// current or replaced; a stale one can never be served. This is why the
-// alternative, a persisted column behind a migration, was not needed.
+// Computing them costs a full aggregate over symbol_tokens -- tens of
+// milliseconds on a repository of a few thousand symbols, which is more than
+// the query it would serve. They change only when the repository is
+// re-indexed, so caching them is what keeps BM25 cheaper than the scoring it
+// replaces, and is why a persisted column behind a migration was not needed.
+//
+// The key deliberately excludes a scan that is still running. A scan row is
+// inserted with status 'running' before the first symbol of that scan is
+// written, so keying on MAX(id) alone would let a query that lands in the
+// middle of an index compute pre-scan statistics and store them under the
+// post-scan generation -- where they would be served until the scan after
+// next. That is not merely stale: df is recomputed live on every query, so a
+// cached N from before the scan can be smaller than a token's current df,
+// and ln(1 + (N-df+0.5)/(df+0.5)) then goes negative and inverts the order.
+// See also the max(symbols, df) floor in SemanticSearch, which makes that
+// arithmetic unreachable however the cache behaves.
 type tokenStatsCache struct {
 	mu sync.RWMutex
 	by map[int64]corpusTokenStats
@@ -68,7 +80,13 @@ func (c *tokenStatsCache) put(repoID int64, stats corpusTokenStats) {
 // corpusTokenStatsFor returns the repository's BM25 corpus statistics,
 // recomputing them only when the graph generation has moved.
 func (s *Store) corpusTokenStatsFor(ctx context.Context, repoID int64) (corpusTokenStats, error) {
-	scan, err := s.LastScanID(ctx, repoID)
+	// Read the generation through the same queryer as the aggregate below. A
+	// read that has pinned a snapshot must label the statistics with the
+	// generation of that snapshot, not with one a commit landed afterwards.
+	var scan int64
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM scans WHERE repo_id = ? AND status <> 'running'`,
+		repoID).Scan(&scan)
 	if err != nil {
 		return corpusTokenStats{}, err
 	}
@@ -97,6 +115,9 @@ func (s *Store) corpusTokenStatsFor(ctx context.Context, repoID int64) (corpusTo
 
 // bm25IDF is the standard BM25 inverse document frequency, in the
 // non-negative form: ln(1 + (N - df + 0.5)/(df + 0.5)).
+//
+// Non-negative only while df <= symbols. Callers pass a symbols count that
+// cannot be below df; see SemanticSearch.
 //
 // It is what stops a stopword from deciding the ranking. On the pinned OkHttp
 // index `the` occurs in 413 of 6 081 symbols and `store` in 2; under a raw

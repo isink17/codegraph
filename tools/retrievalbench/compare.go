@@ -79,7 +79,9 @@ func CompareReports(base, candidate Report) (Comparison, error) {
 			SearchRecallAt10: delta(a.Search.Metrics.RecallAt10, b.Search.Metrics.RecallAt10),
 		}
 		c.Queries = append(c.Queries, qc)
-		if b.HeldOut {
+		// A negative query has no recall, so counting it would pull the
+		// held-out mean toward zero with a delta that does not exist.
+		if b.HeldOut && b.Context.Metrics.RecallAt10 != nil && a.Context.Metrics.RecallAt10 != nil {
 			heldOut += qc.RecallAt10Delta
 			heldOutN++
 		}

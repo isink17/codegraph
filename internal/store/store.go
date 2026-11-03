@@ -8511,6 +8511,11 @@ func StrongerRelatedTest(a, b RelatedTest) bool {
 // index-only count, and the scoring query is the original one with a
 // different expression in its SUM. Inverse document frequency is computed in
 // Go rather than in SQL so the query needs no math extension.
+//
+// Every figure quoted here and below was produced by tools/retrievalbench
+// against the pinned corpora; the reports, query plans and timings are in
+// codegraph-evidence/v2-cg142-scoring-20261103 and, for the baseline it is
+// measured against, v2-semantic-retrieval-benchmark-20261103.
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	tokens := texttoken.WeightsString(query)
 	if len(tokens) == 0 {
@@ -8545,7 +8550,12 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	scored := make([]weighted, 0, len(tokenList))
 	for _, token := range tokenList {
 		if n := df[token]; n > 0 {
-			scored = append(scored, weighted{token: token, idf: bm25IDF(stats.Symbols, n)})
+			// The corpus size is cached per graph generation and the document
+			// frequency is counted now, so the two can disagree if an index
+			// commits between them. df > N would drive the idf term negative
+			// and invert the ranking, which is a far worse failure than a
+			// slightly stale corpus size, so the count is floored at df.
+			scored = append(scored, weighted{token: token, idf: bm25IDF(max(stats.Symbols, n), n)})
 		}
 	}
 	if len(scored) == 0 {

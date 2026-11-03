@@ -166,6 +166,90 @@ func TestSemanticSearchIgnoresGhostSymbolsInCorpusStatistics(t *testing.T) {
 	}
 }
 
+// A scan row exists from the moment an index starts, before it has written a
+// symbol. The cache must not key on it: doing so stores pre-scan statistics
+// under the post-scan generation and serves them until the scan after next.
+func TestCorpusTokenStatsIgnoreAScanStillRunning(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	fileID, err := insertTestFile(ctx, s, repoID, "a.go")
+	if err != nil {
+		t.Fatalf("insertTestFile: %v", err)
+	}
+	seedScoredSymbol(t, ctx, s, repoID, fileID, "One", scoredToken{"renew", 1})
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO scans(repo_id, scan_kind, started_at, status) VALUES(?, 'full', '2026-01-01T00:00:00Z', 'finished')`,
+		repoID); err != nil {
+		t.Fatalf("record scan: %v", err)
+	}
+	before, err := s.corpusTokenStatsFor(ctx, repoID)
+	if err != nil {
+		t.Fatalf("corpusTokenStatsFor: %v", err)
+	}
+
+	// An index starts: its row lands first, its symbols later.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO scans(repo_id, scan_kind, started_at, status) VALUES(?, 'full', '2026-01-02T00:00:00Z', 'running')`,
+		repoID); err != nil {
+		t.Fatalf("record running scan: %v", err)
+	}
+	during, err := s.corpusTokenStatsFor(ctx, repoID)
+	if err != nil {
+		t.Fatalf("corpusTokenStatsFor: %v", err)
+	}
+	if during.Scan != before.Scan {
+		t.Fatalf("a running scan must not mint a new generation: %d then %d", before.Scan, during.Scan)
+	}
+	seedScoredSymbol(t, ctx, s, repoID, fileID, "Two", scoredToken{"renew", 1})
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE scans SET status = 'finished' WHERE repo_id = ? AND status = 'running'`, repoID); err != nil {
+		t.Fatalf("finish scan: %v", err)
+	}
+	after, err := s.corpusTokenStatsFor(ctx, repoID)
+	if err != nil {
+		t.Fatalf("corpusTokenStatsFor: %v", err)
+	}
+	if after.Symbols != 2 {
+		t.Fatalf("once the scan finished the statistics must be recomputed, got %+v", after)
+	}
+}
+
+// Whatever the cache holds, a score must never be negative: a corpus size
+// below a token's document frequency drives the idf term negative and
+// inverts the ranking.
+func TestSemanticSearchNeverScoresNegativeOnAStaleCorpusSize(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := newQueryTestStore(t)
+	fileID, err := insertTestFile(ctx, s, repoID, "a.go")
+	if err != nil {
+		t.Fatalf("insertTestFile: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		seedScoredSymbol(t, ctx, s, repoID, fileID, fmt.Sprintf("Sym%02d", i), scoredToken{"renew", 2})
+	}
+	// A corpus size from before those symbols existed, cached under the
+	// current generation: df for "renew" is 40, N claims 3.
+	var scan int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM scans WHERE repo_id = ? AND status <> 'running'`, repoID).Scan(&scan); err != nil {
+		t.Fatalf("read generation: %v", err)
+	}
+	s.tokenStats.put(repoID, corpusTokenStats{Scan: scan, Symbols: 3, AvgLen: 2})
+
+	rows, err := s.SemanticSearch(ctx, repoID, "renew", 10, 0)
+	if err != nil {
+		t.Fatalf("SemanticSearch: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("expected hits")
+	}
+	for _, r := range rows {
+		if score := r["score"].(float64); score < 0 {
+			t.Fatalf("symbol %v scored %v; a stale corpus size must not invert the ranking", r["symbol"], score)
+		}
+	}
+}
+
 // The corpus statistics are cached, so the cache must follow the graph
 // generation and never serve a stale corpus.
 func TestCorpusTokenStatsCacheFollowsTheScanGeneration(t *testing.T) {
