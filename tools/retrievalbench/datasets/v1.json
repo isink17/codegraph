@@ -1,0 +1,288 @@
+{
+  "schema": "codegraph.retrieval_bench_dataset/v1",
+  "id": "semantic-retrieval-v1",
+  "frozen": "2026-11-03",
+  "notes": "Relevance labels were read out of the pinned corpus source, not out of any agent transcript. Grades: 3 primary implementation the query is about, 2 required supporting implementation, 1 peripheral but genuinely involved. truth=complete means the relevant set was enumerated exhaustively over the corpus, so an unlabelled returned file is a false positive; truth=partial means it was not, so precision and nDCG are withheld.",
+  "corpora": [
+    {
+      "name": "cobra",
+      "upstream": "spf13/cobra",
+      "tag": "v1.9.1",
+      "commit": "40b5bc1437a564fc795d388b23835e84f54cd1d1",
+      "tree": "cefed611a4b3df9b3ca2aff2ec1f689346835665",
+      "files": 60,
+      "symbols": 675,
+      "references": 4064,
+      "edges": 4063
+    },
+    {
+      "name": "click",
+      "upstream": "pallets/click",
+      "tag": "8.2.1",
+      "commit": "fd183b2ced1cb5857784fe7fb22f4982f671f098",
+      "tree": "9d603ea306b13bd10ef094a845b3bbb16f520bc7",
+      "files": 128,
+      "symbols": 1480,
+      "references": 4435,
+      "edges": 3947
+    },
+    {
+      "name": "okhttp",
+      "upstream": "square/okhttp",
+      "tag": "pinned commit",
+      "commit": "4984568367caaf359b82c452bd28b5e192824d1c",
+      "tree": "f62723df79553c220dcca74d998ad8d52f860482",
+      "files": 492,
+      "symbols": 6081,
+      "references": 36394,
+      "edges": 38260
+    }
+  ],
+  "queries": [
+    {
+      "id": "cobra_execution_path",
+      "corpus": "cobra",
+      "category": "execution_path",
+      "origin": "frozen TASKS.json sha256 4506445f9dadc6fba63433923003acadf85d9b054f13a04bd6e6a0521b2e573f",
+      "held_out": false,
+      "truth": "partial",
+      "query": "In this repository, trace how a caller invokes a Cobra root command with command-line arguments through command selection to the selected command's execution. Explain the significant handoffs and error handling, naming the files and symbols that establish the path. Distinguish argument selection from parsing and execution. Cite source locations.",
+      "relevant": [
+        {"file": "command.go", "grade": 3, "symbols": ["Command.Execute", "Command.ExecuteC", "Command.Find", "Command.execute", "Command.ParseFlags", "Command.ValidateArgs"], "evidence": "command.go:1070 Execute -> :1084 ExecuteC -> :1123 c.Find(args) -> :1148 cmd.execute(flags) -> :919 c.ParseFlags(a) -> :968 c.ValidateArgs(argWoFlags)"},
+        {"file": "args.go", "grade": 1, "symbols": ["legacyArgs"], "evidence": "args.go:28 legacyArgs is the default PositionalArgs reached from command.go:1174 ValidateArgs"},
+        {"file": "flag_groups.go", "grade": 1, "symbols": ["Command.ValidateFlagGroups"], "evidence": "flag_groups.go:81 ValidateFlagGroups, called at command.go:1010 inside execute"}
+      ],
+      "irrelevant": [
+        {"file": "command_test.go", "evidence": "test file; executeCommand helpers at command_test.go:32-59 are test scaffolding, not the production path"}
+      ]
+    },
+    {
+      "id": "cobra_execute_callers",
+      "corpus": "cobra",
+      "category": "cross_file_relationships",
+      "origin": "frozen TASKS.json",
+      "held_out": false,
+      "truth": "complete",
+      "query": "Identify the internal call sites that call (*Command).execute in Cobra and explain how their roles differ. Trace any call path that goes through this method back to the public execution entry point. Include the enclosing file/symbols and source evidence; do not count tests or comments as production callers.",
+      "relevant": [
+        {"file": "command.go", "grade": 3, "symbols": ["Command.execute", "Command.ExecuteC"], "evidence": "grep '\\.execute(' over the corpus returns exactly one production call site: command.go:1148 inside ExecuteC. The definition is command.go:905."}
+      ],
+      "irrelevant": [
+        {"file": "completions.go", "evidence": "completions.go:342 mentions finalCmd.execute() only inside a comment; no call"},
+        {"file": "command_test.go", "evidence": "test file"}
+      ]
+    },
+    {
+      "id": "cobra_positional_argument_validators",
+      "corpus": "cobra",
+      "category": "explicit_symbol_lookup",
+      "origin": "new 2026-11-03",
+      "held_out": false,
+      "truth": "complete",
+      "query": "Where are the positional argument validators ExactArgs, MinimumNArgs, MaximumNArgs, RangeArgs, MatchAll and OnlyValidArgs implemented, and how does a command apply them?",
+      "relevant": [
+        {"file": "args.go", "grade": 3, "symbols": ["ExactArgs", "MinimumNArgs", "MaximumNArgs", "RangeArgs", "MatchAll", "OnlyValidArgs", "ArbitraryArgs", "NoArgs", "legacyArgs"], "evidence": "args.go:42-129 defines every validator named in the query; no other non-test file declares one"},
+        {"file": "command.go", "grade": 1, "symbols": ["Command.ValidateArgs"], "evidence": "command.go:1172 ValidateArgs is the single application point, defaulting to ArbitraryArgs at :1174"}
+      ],
+      "irrelevant": [
+        {"file": "completions.go", "evidence": "completions.go:231,760,810,847,875,897 pass NoArgs/MinimumNArgs as values when building the completion commands; it neither implements nor applies a validator"},
+        {"file": "args_test.go", "evidence": "test file"}
+      ]
+    },
+    {
+      "id": "cobra_shell_completion_generation",
+      "corpus": "cobra",
+      "category": "architecture_discovery",
+      "origin": "new 2026-11-03",
+      "held_out": true,
+      "truth": "partial",
+      "query": "How does this project produce the script a user sources to get tab completion in their shell, and what differs between the supported shells?",
+      "relevant": [
+        {"file": "bash_completions.go", "grade": 3, "symbols": ["Command.GenBashCompletion"], "evidence": "bash_completions.go writes the legacy bash script"},
+        {"file": "bash_completionsV2.go", "grade": 3, "symbols": ["Command.GenBashCompletionV2"], "evidence": "bash_completionsV2.go writes the v2 bash script"},
+        {"file": "zsh_completions.go", "grade": 3, "symbols": ["Command.GenZshCompletion"], "evidence": "zsh_completions.go writes the zsh script"},
+        {"file": "fish_completions.go", "grade": 3, "symbols": ["Command.GenFishCompletion"], "evidence": "fish_completions.go writes the fish script"},
+        {"file": "powershell_completions.go", "grade": 3, "symbols": ["Command.GenPowerShellCompletion"], "evidence": "powershell_completions.go writes the powershell script"},
+        {"file": "completions.go", "grade": 2, "symbols": ["Command.initCompleteCmd", "Command.getCompletions", "Command.InitDefaultCompletionCmd"], "evidence": "completions.go:224 initCompleteCmd and :730 InitDefaultCompletionCmd are the shared machinery every generated script calls back into"},
+        {"file": "shell_completions.go", "grade": 1, "symbols": ["Command.MarkFlagFilename", "Command.MarkFlagDirname"], "evidence": "shell_completions.go:24-96 annotates flags that the generated scripts read"},
+        {"file": "active_help.go", "grade": 1, "evidence": "active_help.go carries the ActiveHelp messages the generated scripts render"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "cobra_flag_group_tests",
+      "corpus": "cobra",
+      "category": "test_discovery",
+      "origin": "new 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Which tests cover validation of mutually exclusive flags and flags that must be required together?",
+      "relevant": [
+        {"file": "flag_groups_test.go", "grade": 3, "evidence": "flag_groups_test.go is the only test file exercising MarkFlagsMutuallyExclusive / MarkFlagsRequiredTogether"},
+        {"file": "flag_groups.go", "grade": 1, "symbols": ["Command.ValidateFlagGroups", "Command.MarkFlagsMutuallyExclusive", "Command.MarkFlagsRequiredTogether"], "evidence": "flag_groups.go:81 is the implementation those tests cover"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_group_execution_path",
+      "corpus": "click",
+      "category": "execution_path",
+      "origin": "frozen TASKS.json",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Trace a normal Click Group invocation with one subcommand from Command.main through context creation, parsing, command resolution and callback invocation. Explain where the group callback and subcommand callback run, and how standalone mode affects termination. Cite the relevant source symbols and locations.",
+      "relevant": [
+        {"file": "src/click/core.py", "grade": 3, "symbols": ["Command.main", "Command.make_context", "Command.parse_args", "Command.invoke", "Group.invoke", "Group.resolve_command", "Context.invoke"], "evidence": "core.py:1295 main -> :1152 make_context -> :1189/:1782 parse_args -> :1864 resolve_command -> :1212/:1796 invoke -> :748 Context.invoke; standalone_mode handling is in main"},
+        {"file": "src/click/parser.py", "grade": 1, "evidence": "parser.py holds the option parser Command.parse_args drives"},
+        {"file": "src/click/exceptions.py", "grade": 1, "evidence": "exceptions.py defines the ClickException/Abort types main catches to terminate in standalone mode"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_group_invoke_callers",
+      "corpus": "click",
+      "category": "cross_file_relationships",
+      "origin": "frozen TASKS.json",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Find the production call sites that invoke Command.invoke or Group.invoke in Click's core execution flow. Explain which path dispatches a subcommand and which invokes command callbacks, including how nested groups continue dispatch. Exclude tests. Cite source locations and avoid listing unrelated methods with the same name.",
+      "relevant": [
+        {"file": "src/click/core.py", "grade": 3, "symbols": ["Command.invoke", "Group.invoke", "Context.invoke", "Command.main"], "evidence": "call sites core.py:813, 1226, 1363, 1799, 1808, 1827, 1830, 1839, 1861 are all inside core.py"},
+        {"file": "src/click/decorators.py", "grade": 1, "evidence": "decorators.py:67,93,119 call ctx.invoke from pass_obj/pass_context style wrappers"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_help_text_wrapping",
+      "corpus": "click",
+      "category": "architecture_discovery",
+      "origin": "new 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Where does this library decide how to lay out help output and rewrap paragraphs to the terminal width?",
+      "relevant": [
+        {"file": "src/click/formatting.py", "grade": 3, "symbols": ["wrap_text", "HelpFormatter", "HelpFormatter.write_dl", "HelpFormatter.write_text", "measure_table"], "evidence": "formatting.py:31 wrap_text and the HelpFormatter class own layout and wrapping"},
+        {"file": "src/click/_textwrap.py", "grade": 3, "evidence": "_textwrap.py subclasses textwrap.TextWrapper with the indent-preserving behaviour wrap_text relies on"},
+        {"file": "src/click/core.py", "grade": 1, "symbols": ["Command.format_help", "Command.format_options", "Context.make_formatter"], "evidence": "core.py:557 make_formatter, :1090 format_help and the format_* family drive the formatter"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_shell_completion_tests",
+      "corpus": "click",
+      "category": "test_discovery",
+      "origin": "new 2026-11-03",
+      "held_out": true,
+      "truth": "partial",
+      "query": "Which tests exercise generating completion candidates for an incomplete command line?",
+      "relevant": [
+        {"file": "tests/test_shell_completion.py", "grade": 3, "evidence": "the only test module importing ShellComplete / calling shell_complete"},
+        {"file": "src/click/shell_completion.py", "grade": 1, "evidence": "the implementation those tests cover"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "okhttp_sync_execution_path",
+      "corpus": "okhttp",
+      "category": "execution_path",
+      "origin": "frozen TASKS.json",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Trace a synchronous OkHttp Call from OkHttpClient.newCall through RealCall.execute to the network exchange and response. Explain the ordered interceptor chain, what proceed does at each hop, and where the request is actually sent and response headers/body are obtained. Name relevant files/symbols and cite source evidence.",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealCall.execute", "okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain"], "evidence": "RealCall.kt:147 execute; the chain is assembled in getResponseWithInterceptorChain"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt", "grade": 3, "symbols": ["okhttp3.OkHttpClient.newCall"], "evidence": "OkHttpClient.kt:268 newCall returns RealCall"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/RealInterceptorChain.kt", "grade": 3, "symbols": ["okhttp3.internal.http.RealInterceptorChain.proceed"], "evidence": "RealInterceptorChain.proceed recurses through an immutable copy()"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/CallServerInterceptor.kt", "grade": 3, "evidence": "terminal interceptor that writes the request and reads the response"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt", "grade": 2, "evidence": "Exchange carries the request/response byte transfer for one call"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/BridgeInterceptor.kt", "grade": 2, "evidence": "ordered interceptor in the chain"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt", "grade": 2, "evidence": "ordered interceptor in the chain"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/ConnectInterceptor.kt", "grade": 2, "evidence": "ordered interceptor in the chain; sets the exchange"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/RetryAndFollowUpInterceptor.kt", "grade": 2, "evidence": "first interceptor in the chain"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/ExchangeCodec.kt", "grade": 1, "evidence": "the codec interface the exchange writes through"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt", "grade": 1, "evidence": "writeRequest / readResponseHeaders are where bytes actually move for HTTP/1"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Call.kt", "grade": 1, "symbols": ["okhttp3.Call.execute"], "evidence": "Call.kt:55 declares the execute() contract RealCall overrides"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/test/java/okhttp3/KotlinSourceModernTest.kt", "evidence": "a compile-only API surface test full of TODO() stubs; carries no execution behaviour"},
+        {"file": "mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt", "evidence": "test server, not part of the client call path"},
+        {"file": "samples/guide/src/main/java/okhttp3/recipes/kt/CacheResponse.kt", "evidence": "documentation sample"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/ws/RealWebSocket.kt", "evidence": "web socket path; the task is the synchronous HTTP call path"}
+      ]
+    },
+    {
+      "id": "okhttp_execute_impact",
+      "corpus": "okhttp",
+      "category": "cross_file_relationships",
+      "origin": "frozen TASKS.json",
+      "held_out": false,
+      "truth": "partial",
+      "query": "For a proposed change to RealCall.execute, identify the direct production callers, interface/implementation relationships, and downstream behavior that could be affected. Include synchronous execution lifecycle, shared response-chain behavior, and the async entry point's relationship (if any). Give source evidence and distinguish direct callers from indirect effects.",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealCall.execute", "okhttp3.internal.connection.RealCall.enqueue", "okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain"], "evidence": "RealCall.kt:147 execute and :493 AsyncCall.executeOn share getResponseWithInterceptorChain"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Call.kt", "grade": 3, "symbols": ["okhttp3.Call.execute"], "evidence": "Call.kt:55 is the interface declaration RealCall.execute overrides"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Dispatcher.kt", "grade": 2, "evidence": "Dispatcher tracks running synchronous calls (executed/finished) around execute"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt", "grade": 2, "symbols": ["okhttp3.OkHttpClient.newCall"], "evidence": "the factory that hands out the RealCall instances"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/RealInterceptorChain.kt", "grade": 1, "evidence": "shared response chain behaviour downstream of execute"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/test/java/okhttp3/KotlinSourceModernTest.kt", "evidence": "compile-only stub override at line 1161, not a production caller"}
+      ]
+    },
+    {
+      "id": "okhttp_realcall_execute_lookup",
+      "corpus": "okhttp",
+      "category": "explicit_symbol_lookup",
+      "origin": "new 2026-11-03",
+      "held_out": false,
+      "truth": "complete",
+      "query": "RealCall.execute",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealCall.execute"], "evidence": "RealCall.kt:147 is the only production definition"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Call.kt", "grade": 2, "symbols": ["okhttp3.Call.execute"], "evidence": "Call.kt:55 declares the overridden member"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/test/java/okhttp3/KotlinSourceModernTest.kt", "evidence": "KotlinSourceModernTest.kt:1161 overrides execute() with TODO() in a compile-only API test"}
+      ]
+    },
+    {
+      "id": "okhttp_response_caching",
+      "corpus": "okhttp",
+      "category": "architecture_discovery",
+      "origin": "new 2026-11-03",
+      "held_out": true,
+      "truth": "partial",
+      "query": "How does this library store responses on disk and decide whether a stored one may be served without asking the server again?",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/Cache.kt", "grade": 3, "symbols": ["okhttp3.Cache.get", "okhttp3.Cache.put", "okhttp3.Cache.update"], "evidence": "Cache.kt:169 get, :193 put, :232 update are the on-disk store entry points"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/cache/CacheStrategy.kt", "grade": 3, "evidence": "CacheStrategy decides cached-vs-network for a request"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt", "grade": 3, "evidence": "applies the strategy inside the chain and performs conditional revalidation"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/CacheControl.kt", "grade": 2, "evidence": "parses and models the Cache-Control directives the strategy reads"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/cache/DiskLruCache.kt", "grade": 2, "evidence": "the bounded on-disk journal Cache is built on"}
+      ],
+      "irrelevant": [
+        {"file": "samples/guide/src/main/java/okhttp3/recipes/kt/CacheResponse.kt", "evidence": "documentation sample using the cache, not implementing it"}
+      ]
+    },
+    {
+      "id": "okhttp_cancel_ambiguous",
+      "corpus": "okhttp",
+      "category": "ambiguous_identifier",
+      "origin": "new 2026-11-03",
+      "held_out": true,
+      "truth": "partial",
+      "query": "Where is an in-flight HTTP call cancelled, and what does cancelling propagate to?",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealCall.cancel"], "evidence": "RealCall.kt:135 cancel is the call-level entry point"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt", "grade": 2, "symbols": ["okhttp3.internal.connection.Exchange.cancel"], "evidence": "Exchange.kt:156 cancel is what RealCall.cancel propagates to"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Call.kt", "grade": 2, "symbols": ["okhttp3.Call.cancel"], "evidence": "Call.kt:71 declares cancel()"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt", "grade": 1, "symbols": ["okhttp3.internal.connection.RealConnection.cancel"], "evidence": "RealConnection.kt:639 cancel closes the socket the exchange rides on"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http/ExchangeCodec.kt", "grade": 1, "evidence": "ExchangeCodec.kt:70 declares cancel(), implemented per protocol"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/ws/RealWebSocket.kt", "evidence": "RealWebSocket.kt:142 cancel() is the web-socket name collision, not an HTTP call"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/WebSocket.kt", "evidence": "WebSocket.kt:110 cancel() is the same collision at the interface"}
+      ]
+    }
+  ]
+}
