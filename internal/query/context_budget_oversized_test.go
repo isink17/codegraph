@@ -11,9 +11,11 @@ import (
 	"github.com/isink17/codegraph/internal/tokenest"
 )
 
-// oversizedStream builds a ranked stream whose candidate at index wide is far
-// wider than the others, so a budget exists that serves its neighbours and
-// cannot serve it.
+// oversizedStream builds a ranked stream whose candidate at index wide costs
+// noticeably more than the others -- 92 tokens against 53, the doc summary
+// being capped at maxContextDocChars -- so a band of budgets exists that
+// serves its neighbours and cannot serve it. The band is narrow, which is why
+// the sweeps below start low enough to enter it and assert that they did.
 func oversizedStream(t *testing.T, n, wide int) []contextCandidate {
 	t.Helper()
 	candidates := make([]contextCandidate, 0, n)
@@ -95,12 +97,14 @@ func TestContinuationPreservesAnOversizedCandidate(t *testing.T) {
 // and on every continuation.
 func TestServedPagesStayWithinBudget(t *testing.T) {
 	stream := oversizedStream(t, 8, 5)
-	for budget := 200; budget <= 2000; budget += 7 {
+	refusals := 0
+	for budget := 105; budget <= 2000; budget += 7 {
 		offset := 0
 		for offset < len(stream) {
 			page, err := buildBudgetedContext(budgetInputAt(stream, offset, budget))
 			if err != nil {
 				if errors.Is(err, ErrContextBudgetTooSmall) {
+					refusals++
 					break
 				}
 				t.Fatalf("budget=%d offset=%d error = %v", budget, offset, err)
@@ -114,6 +118,9 @@ func TestServedPagesStayWithinBudget(t *testing.T) {
 			offset += page.ReturnedSymbols
 		}
 	}
+	if refusals == 0 {
+		t.Fatal("no budget refused a page; the sweep never reached the oversized candidate")
+	}
 }
 
 // Walking the stream to exhaustion, raising the budget whenever a candidate is
@@ -123,10 +130,16 @@ func TestExhaustiveWalkLosesNoCandidate(t *testing.T) {
 	stream := oversizedStream(t, 8, 3)
 	want := make([]string, 0, len(stream))
 	for _, cand := range stream {
-		want = append(want, cand.sym.QualifiedName)
+		want = append(want, cand.sym.StableKey+"|"+cand.sym.QualifiedName)
 	}
 
-	for budget := 200; budget <= 1200; budget += 11 {
+	// The refusal at offset 3 fires for budgets 57-140, and a budget below
+	// ~101 cannot serve even a narrow candidate, so the window that walks the
+	// whole stream with exactly one raise is 105-140. The sweep covers it and
+	// the budgets above it, and totalRaises below fails if it ever stops
+	// landing in it.
+	totalRaises := 0
+	for budget := 105; budget <= 1200; budget++ {
 		var got []string
 		offset, raises := 0, 0
 		for offset < len(stream) {
@@ -139,14 +152,13 @@ func TestExhaustiveWalkLosesNoCandidate(t *testing.T) {
 				if errors.Is(err, ErrContextBudgetTooSmall) && raises == 0 {
 					// The contract the refusal promises: same offset, bigger budget.
 					raises++
+					totalRaises++
 					continue
 				}
 				t.Fatalf("budget=%d offset=%d error = %v", budget, offset, err)
 			}
 			raises = 0
-			for _, key := range symbolKeys(page) {
-				got = append(got, strings.TrimSuffix(key, "#"+page.Task))
-			}
+			got = append(got, symbolKeys(page)...)
 			if page.ReturnedSymbols == 0 {
 				break
 			}
@@ -156,10 +168,13 @@ func TestExhaustiveWalkLosesNoCandidate(t *testing.T) {
 			t.Fatalf("budget=%d walked %d symbols, want %d", budget, len(got), len(want))
 		}
 		for i := range want {
-			if !strings.Contains(got[i], want[i]) {
+			if got[i] != want[i] {
 				t.Fatalf("budget=%d position %d = %q, want %q", budget, i, got[i], want[i])
 			}
 		}
+	}
+	if totalRaises == 0 {
+		t.Fatal("no budget exercised the refusal; the walk proved nothing about the oversized candidate")
 	}
 }
 
@@ -215,6 +230,9 @@ func TestStrandedCursorStillFailsClosedOnRankingDrift(t *testing.T) {
 	fx := newContextFixture(t)
 	ctx := context.Background()
 	opts := fullOpts()
+	// 162 is inside the band where this fixture's second page meets a candidate
+	// wider than the budget; TestStrandedCursorIsRecoverableWithALargerBudget
+	// sweeps for that band rather than hardcoding it.
 	opts.MaxTokens = 162
 	page, err := fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, opts)
 	if err != nil {
@@ -223,9 +241,10 @@ func TestStrandedCursorStillFailsClosedOnRankingDrift(t *testing.T) {
 	if page.NextCursor == "" {
 		t.Fatal("first page carries no cursor")
 	}
+	// The budget stays narrow so the two failure modes compete: a stale cursor
+	// must be refused as stale even when the budget would also have refused it.
 	drifted := opts
 	drifted.Cursor = page.NextCursor
-	drifted.MaxTokens = MaxContextMaxTokens
 	drifted.IncludeCallers = !opts.IncludeCallers
 	if _, err := fx.svc.ContextForTask(ctx, fx.repoID, taskPayment, drifted); !errors.Is(err, ErrContextCursorStale) {
 		t.Fatalf("error = %v, want ErrContextCursorStale", err)

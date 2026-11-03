@@ -132,7 +132,7 @@ func buildBudgetedContext(in budgetInput) (*graph.TaskContext, error) {
 				// Skipping it would drop it from the stream for good, so the
 				// offset stays where it is and the caller is told to retry
 				// this same cursor with a larger max_tokens.
-				return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but not the next context symbol; retry the same cursor with a larger max_tokens",
+				return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but not the next context symbol; retry with a larger max_tokens, replaying the same cursor if you hold one",
 					ErrContextBudgetTooSmall, in.maxTokens)
 			}
 			return result, nil

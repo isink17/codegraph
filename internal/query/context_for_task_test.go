@@ -577,7 +577,16 @@ func walkRaisingBudget(t *testing.T, fx *contextFixture, task string, opts Conte
 		raised = false
 		keys = append(keys, symbolKeys(res)...)
 		if !res.HasMore {
+			if res.NextCursor != "" {
+				t.Fatalf("final page at max_tokens=%d carries next_cursor %q", opts.MaxTokens, res.NextCursor)
+			}
+			if res.RemainingSymbols != 0 {
+				t.Fatalf("final page at max_tokens=%d reports %d remaining", opts.MaxTokens, res.RemainingSymbols)
+			}
 			return keys
+		}
+		if res.NextCursor == "" {
+			t.Fatalf("has_more is set at max_tokens=%d but next_cursor is empty", opts.MaxTokens)
 		}
 		cursor = res.NextCursor
 	}
