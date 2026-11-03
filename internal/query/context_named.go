@@ -73,7 +73,17 @@ func splitIdentifierRuns(text string) []string {
 			// editors and autocorrect turn quotes into “ ” and dashes into —,
 			// and a reference glued to one of those would be lost entirely.
 			// Those stay separators.
-			return !(unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Mn, r))
+			//
+			// Marks and the two zero-width joiners are letters' tails: a
+			// Tamil vowel sign is Mc rather than Mn, and Persian and Hindi
+			// identifiers join through U+200C/U+200D, which are Cf. Treating
+			// any of them as a boundary splits the identifier and leaves the
+			// ASCII half behind as its own apparent reference -- `நி_handler`
+			// yielding `_handler` is the same bug as `café_handler` yielding
+			// it, one script over. This admits what UAX #31 ID_Continue plus
+			// the joiner rules admit.
+			return !(unicode.IsLetter(r) || unicode.In(r, unicode.N, unicode.M) ||
+				r == '\u200C' || r == '\u200D')
 		default:
 			return true
 		}

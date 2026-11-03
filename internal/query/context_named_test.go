@@ -45,6 +45,11 @@ func TestExtractNamedReferences(t *testing.T) {
 			want: []string{"CacheInterceptor", "RealCall.execute"},
 		},
 		{
+			name: "a mixed-script identifier is rejected whole, in any script",
+			task: "fix \u0BA8\u0BBF_handler and \u0646\u0627\u0645\u200Cmy_handler and \u216B_handler",
+			want: nil,
+		},
+		{
 			name: "abbreviated prose is not a dotted reference",
 			task: "e.g. the handler, i.e. the U.S. one",
 			want: nil,
