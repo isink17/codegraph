@@ -26,6 +26,11 @@ const (
 // leaves no room for a single context symbol while candidates remain. Reporting
 // an empty page with has_more set would be a continuation an agent could never
 // make progress on.
+//
+// The error is recoverable and never consumes the candidate it could not
+// serve. The offset the request arrived with is left untouched, so replaying
+// the same cursor with a larger max_tokens returns that candidate rather than
+// skipping it.
 var ErrContextBudgetTooSmall = errors.New("max_tokens too small for a context page")
 
 // normalizeContextTokens applies the token-budget contract: negative is
@@ -97,76 +102,42 @@ func buildBudgetedContext(in budgetInput) (*graph.TaskContext, error) {
 			ErrContextBudgetTooSmall, tokenest.FromBytes(envelopeBytes), in.maxTokens)
 	}
 
-	// Selection, with one retry per candidate the budget can never serve.
-	//
-	// A single candidate can be wider than max_tokens on its own. Before the
-	// ranking change that exposed it, no fixture ordered such a candidate
-	// after a servable one, so the case only ever arose on the first page --
-	// where an error is actionable, because the caller can raise max_tokens.
-	// Reached through a cursor it is not actionable: the offset is fixed, no
-	// larger budget changes which candidate comes next, and the agent holds a
-	// token it can never spend.
-	//
-	// The page therefore steps over a candidate that cannot fit at this
-	// budget and continues from the next one. Both published guarantees hold
-	// -- a page never exceeds max_tokens, and a cursor always advances -- at
-	// the cost of omitting, at this budget only, a symbol no page at this
-	// budget could have carried. A larger max_tokens replayed from the start
-	// of the stream returns it.
-	offset := in.offset
-	for {
-		usedBytes := envelopeBytes
-		fileSeen := map[string]bool{}
-		count := 0
-		for i := offset; i < total; i++ {
-			cost, err := candidateCostBytes(in.candidates[i], fileSeen)
-			if err != nil {
-				return nil, err
-			}
-			if usedBytes+cost > budgetBytes {
-				break
-			}
-			usedBytes += cost
-			fileSeen[in.candidates[i].sym.FilePath] = true
-			count++
+	// Cheap fill pass.
+	usedBytes := envelopeBytes
+	fileSeen := map[string]bool{}
+	count := 0
+	for i := in.offset; i < total; i++ {
+		cand := in.candidates[i]
+		cost, err := candidateCostBytes(cand, fileSeen)
+		if err != nil {
+			return nil, err
 		}
+		if usedBytes+cost > budgetBytes {
+			break
+		}
+		usedBytes += cost
+		fileSeen[cand.sym.FilePath] = true
+		count++
+	}
 
-		// Exact measurement: the estimate ignores nothing today, but a future
-		// field could make it optimistic, so the assembled response is
-		// measured and the last item dropped until it fits.
-		paged := in
-		paged.offset = offset
-		var result *graph.TaskContext
-		for {
-			var err error
-			result, err = assembleContext(paged, count)
-			if err != nil {
-				return nil, err
-			}
-			if result.EstimatedTokens <= in.maxTokens || count == 0 {
-				break
-			}
-			count--
+	// Exact measurement pass.
+	for {
+		result, err := assembleContext(in, count)
+		if err != nil {
+			return nil, err
 		}
-		if count > 0 {
-			// The measured document is the one to return: assembling it again
-			// would re-serialize the whole page for an identical result.
+		if result.EstimatedTokens <= in.maxTokens || count == 0 {
+			if count == 0 && in.offset < total {
+				// The next ranked candidate is wider than the whole budget.
+				// Skipping it would drop it from the stream for good, so the
+				// offset stays where it is and the caller is told to retry
+				// this same cursor with a larger max_tokens.
+				return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but not the next context symbol; retry the same cursor with a larger max_tokens",
+					ErrContextBudgetTooSmall, in.maxTokens)
+			}
 			return result, nil
 		}
-		if offset >= total {
-			// Nothing remains; the terminal empty page is a legitimate end of
-			// the stream, not a budget failure.
-			return assembleContext(paged, 0)
-		}
-		if offset == in.offset && offset == 0 {
-			// The very first candidate of the whole stream does not fit and
-			// no cursor has been issued yet. Raising max_tokens is the
-			// caller's move, so say so instead of silently skipping context
-			// from a request that asked for the start of it.
-			return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but no context symbol",
-				ErrContextBudgetTooSmall, in.maxTokens)
-		}
-		offset++
+		count--
 	}
 }
 
