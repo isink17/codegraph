@@ -1,0 +1,151 @@
+package query
+
+import (
+	"strings"
+	"unicode"
+)
+
+const (
+	// maxNamedReferences bounds how many symbol references one task may spend
+	// on the named-reference leg. Each costs one statement of a few capped
+	// indexed lookups; see Store.SymbolsForNamedReferences.
+	maxNamedReferences = 12
+	// namedReferenceFanout bounds the symbols one reference may contribute. A
+	// reference matching more than this is ambiguous evidence and contributes
+	// nothing; see Store.SymbolsForNamedReferences.
+	namedReferenceFanout = 3
+)
+
+// extractNamedReferences pulls the symbol references a task spelled out of its
+// text, in first-appearance order, deduplicated and capped.
+//
+// It is deliberately conservative, because a reference becomes a top-ranked
+// seed and prose must not. Two shapes qualify:
+//
+//   - a dotted reference whose every segment is identifier-shaped and at
+//     least two characters long (`RealCall.execute`, `OkHttpClient.newCall`;
+//     not `e.g`, `i.e` or `U.S`), and
+//   - a bare identifier carrying an uppercase letter somewhere other than its
+//     first position (`CacheInterceptor`, `newCall`) or an underscore
+//     (`process_payment`).
+//
+// The second rule is what keeps ordinary capitalized prose out: `Trace`,
+// `Explain` and `Exchange` open sentences or name concepts and are
+// indistinguishable from a one-hump type name, so they are not admitted on
+// their own. A task that means such a symbol still reaches it through semantic
+// search and through graph expansion from the references that did qualify.
+//
+// Nothing here decides relevance: a reference is only a lookup key, and a key
+// that resolves to no indexed symbol contributes nothing at all.
+func extractNamedReferences(task string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, word := range splitIdentifierRuns(task) {
+		word = strings.Trim(word, ".")
+		if word == "" || seen[word] || !isNamedReference(word) {
+			continue
+		}
+		seen[word] = true
+		out = append(out, word)
+		if len(out) == maxNamedReferences {
+			break
+		}
+	}
+	return out
+}
+
+// splitIdentifierRuns cuts the text into maximal runs of characters that can
+// occur inside a dotted identifier reference.
+func splitIdentifierRuns(text string) []string {
+	return strings.FieldsFunc(text, func(r rune) bool {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return false
+		case r == '_' || r == '.':
+			return false
+		case r >= 0x80:
+			// A non-ASCII letter is part of the identifier it was written in,
+			// not a boundary. Cutting there would hand `café_handler` back as
+			// the fragment `_handler`, which then qualifies as a reference on
+			// its underscore and spends one of the few slots this task has.
+			// Kept whole, isIdentifier rejects the run outright.
+			//
+			// Non-ASCII punctuation is the opposite case and far more common:
+			// editors and autocorrect turn quotes into “ ” and dashes into —,
+			// and a reference glued to one of those would be lost entirely.
+			// Those stay separators.
+			//
+			// Marks and the two zero-width joiners are letters' tails: a
+			// Tamil vowel sign is Mc rather than Mn, and Persian and Hindi
+			// identifiers join through U+200C/U+200D, which are Cf. Treating
+			// any of them as a boundary splits the identifier and leaves the
+			// ASCII half behind as its own apparent reference -- `நி_handler`
+			// yielding `_handler` is the same bug as `café_handler` yielding
+			// it, one script over.
+			//
+			// The categories are UAX #31 ID_Continue, plus the joiners. Not
+			// quite all of it: Other_ID_Start and Other_ID_Continue (U+2118,
+			// U+00B7 and a handful more) are left out as not worth the table.
+			// Taking all of N and M instead would be looser than the standard
+			// and lose references the other way: a circled list marker (No) or
+			// an enclosing mark (Me) written flush against a name would be
+			// absorbed into it, and `①CacheInterceptor` would extract nothing.
+			//
+			// Ceiling: a reference written flush against the letters of a
+			// script that does not space its words -- `CacheInterceptorクラス`,
+			// `请跟踪RequestGateway.Dispatch的调用` -- is not extracted, because
+			// those letters are L, and keeping `café` whole necessarily keeps
+			// these whole too. Closing that needs a script policy, not a
+			// character property. The cost is a miss that falls back to
+			// semantic search, never a wrong reference.
+			return !(unicode.IsLetter(r) ||
+				unicode.In(r, unicode.Nl, unicode.Nd, unicode.Mn, unicode.Mc, unicode.Pc) ||
+				r == '\u200C' || r == '\u200D')
+		default:
+			return true
+		}
+	})
+}
+
+func isNamedReference(word string) bool {
+	if strings.Contains(word, ".") {
+		for _, seg := range strings.Split(word, ".") {
+			// A one-character segment is abbreviated prose far more often than
+			// it is a qualified name: `e.g`, `i.e`, `U.S`.
+			if len(seg) < 2 || !isIdentifier(seg) {
+				return false
+			}
+		}
+		return true
+	}
+	if !isIdentifier(word) {
+		return false
+	}
+	if strings.Contains(word, "_") {
+		return true
+	}
+	for i := 1; i < len(word); i++ {
+		if word[i] >= 'A' && word[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func isIdentifier(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	c := seg[0]
+	if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(seg); i++ {
+		c := seg[i]
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}

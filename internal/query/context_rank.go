@@ -291,3 +291,20 @@ func normalizeTaskSignal(hits []searchHit) []float64 {
 	}
 	return signals
 }
+
+// Task signal is shared by two kinds of evidence, and they are not equal.
+//
+// namedReferenceSignal is what a symbol the task spelled out by name carries:
+// the request names it and the index holds it, which is the strongest
+// statement a request can make about relevance. searchSignalCeiling caps what
+// the semantic engine's own top hit carries, so an explicitly named symbol
+// always outranks a merely well-scoring one instead of tying with it and
+// falling back to a path comparison.
+//
+// Both stay inside the published direct_match band (0.60..1.05): the ceiling
+// only narrows what a search-only hit can reach, to 0.60+0.40*0.9 = 0.96
+// before the file-support bonus.
+const (
+	namedReferenceSignal = 1.0
+	searchSignalCeiling  = 0.9
+)
