@@ -7,7 +7,8 @@ import (
 
 const (
 	// maxNamedReferences bounds how many symbol references one task may spend
-	// on the named-reference leg. Each costs one indexed lookup.
+	// on the named-reference leg. Each costs one statement of a few capped
+	// indexed lookups; see Store.SymbolsForNamedReferences.
 	maxNamedReferences = 12
 	// namedReferenceFanout bounds the symbols one reference may contribute. A
 	// reference matching more than this is ambiguous evidence and contributes
@@ -82,7 +83,9 @@ func splitIdentifierRuns(text string) []string {
 			// yielding `_handler` is the same bug as `café_handler` yielding
 			// it, one script over.
 			//
-			// The categories are UAX #31's own ID_Continue, plus the joiners.
+			// The categories are UAX #31 ID_Continue, plus the joiners. Not
+			// quite all of it: Other_ID_Start and Other_ID_Continue (U+2118,
+			// U+00B7 and a handful more) are left out as not worth the table.
 			// Taking all of N and M instead would be looser than the standard
 			// and lose references the other way: a circled list marker (No) or
 			// an enclosing mark (Me) written flush against a name would be
