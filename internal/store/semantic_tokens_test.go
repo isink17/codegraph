@@ -216,3 +216,54 @@ func contains(haystack, needle string) bool {
 	}
 	return false
 }
+
+// RefreshSemanticTokens claims the rewrite and the version stamp are one
+// transaction, so a refresh that does not reach its commit leaves the old
+// index exactly as it was. That claim is what stops a half-rewritten table
+// from ever being served: the version still says stale, so the read paths
+// still refuse.
+//
+// The failure is injected before the first statement rather than between the
+// DELETE and the commit. Interrupting mid-transaction is not deterministic
+// without a hook in production code, and a flaky test of an invariant is
+// worse than an honest one: what is pinned here is that a failed refresh
+// moves neither the rows nor the version, together with the successful case
+// below it, which shows both move together. The single transaction in
+// RefreshSemanticTokens is what connects the two.
+func TestRefreshSemanticTokensLeavesTheOldIndexIntactOnFailure(t *testing.T) {
+	ctx := context.Background()
+	s, repoID := seedSemanticTokenRepo(t, true)
+	before := dumpTokens(t, s, repoID)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.RefreshSemanticTokens(cancelled, repoID); err == nil {
+		t.Fatal("RefreshSemanticTokens with a cancelled context returned no error")
+	}
+
+	if after := dumpTokens(t, s, repoID); after != before {
+		t.Errorf("a failed refresh changed the token index:\n got %s\nwant %s", after, before)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT semantic_token_version FROM repos WHERE id = ?`, repoID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 0 {
+		t.Errorf("a failed refresh stamped version %d", version)
+	}
+	if err := s.requireCurrentSemanticTokens(ctx, repoID); !errors.Is(err, ErrSemanticTokensStale) {
+		t.Errorf("index not still refused after a failed refresh: %v", err)
+	}
+
+	// And the successful case moves both.
+	if _, err := s.RefreshSemanticTokens(ctx, repoID); err != nil {
+		t.Fatal(err)
+	}
+	if after := dumpTokens(t, s, repoID); after == before {
+		t.Error("a successful refresh left the token index unchanged")
+	}
+	if err := s.requireCurrentSemanticTokens(ctx, repoID); err != nil {
+		t.Errorf("still refused after a successful refresh: %v", err)
+	}
+}

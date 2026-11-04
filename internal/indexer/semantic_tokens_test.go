@@ -287,10 +287,14 @@ func TestIncrementalUpdateSemanticTokenParity(t *testing.T) {
 	}
 }
 
-// The invariant the whole design rests on: however a scan ends other than in
-// success, the stored version does not advance. A half-refreshed token table
-// must stay unreadable rather than become readable under a version that says
-// it is current.
+// A scan that returns an error does not advance the stored version, and the
+// index stays refused until an ordinary scan migrates it.
+//
+// The cancellation lands early -- `UpsertRepo` is the first context-carrying
+// statement in `run`, well before the staleness probe -- so what this pins is
+// the error path, not an interrupted rewrite. The rewrite's own atomicity is
+// `RefreshSemanticTokens`'s claim and is tested where it lives, in
+// store.TestRefreshSemanticTokensLeavesTheOldIndexIntactOnFailure.
 func TestFailedScanLeavesSemanticTokensStale(t *testing.T) {
 	ctx := context.Background()
 	repoRoot := t.TempDir()
@@ -329,7 +333,7 @@ func TestFailedScanLeavesSemanticTokensStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !stale {
-		t.Error("a failed scan advanced the semantic token version")
+		t.Error("a scan that returned an error advanced the semantic token version")
 	}
 	if _, err := s.SemanticSearch(ctx, repo.ID, "connection pool", 10, 0); !errors.Is(err, store.ErrSemanticTokensStale) {
 		t.Errorf("SemanticSearch after a failed scan: err = %v, want ErrSemanticTokensStale", err)
