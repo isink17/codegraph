@@ -1,0 +1,1 @@
+ALTER TABLE repos ADD COLUMN semantic_token_version INTEGER NOT NULL DEFAULT 0;

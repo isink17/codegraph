@@ -68,6 +68,15 @@ func (c *tokenStatsCache) get(repoID, scan int64) (corpusTokenStats, bool) {
 	return got, ok && got.Scan == scan
 }
 
+// forget drops a repository's entry. A token refresh rewrites document
+// lengths without moving the scan generation the cache is keyed by, so the
+// key alone would keep serving an average computed over the old tokenization.
+func (c *tokenStatsCache) forget(repoID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.by, repoID)
+}
+
 func (c *tokenStatsCache) put(repoID int64, stats corpusTokenStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
