@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/isink17/codegraph/internal/texttoken"
 )
@@ -66,15 +65,11 @@ func (s *Store) semanticTokenVersion(ctx context.Context, repoID int64) (int, er
 	// migration 013 is opened with no such column at all. That is not an
 	// error to report as SQL: it is the oldest legacy state there is, and it
 	// has to reach the caller as the refusal that names the fix.
-	has, err := s.hasSemanticTokenVersionColumn(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if !has {
+	if !s.semanticTokenColumn {
 		return 0, nil
 	}
 	var version int
-	err = s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
 		`SELECT semantic_token_version FROM repos WHERE id = ?`, repoID).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return texttoken.SemanticTokenVersion, nil
@@ -95,17 +90,26 @@ func (s *Store) semanticTokenVersion(ctx context.Context, repoID int64) (int, er
 	return version, nil
 }
 
-// hasSemanticTokenVersionColumn reports whether migration 013 has been
-// applied to this database. Migrations run during Open, before any query, so
-// the answer cannot change under a live Store and is resolved once.
-func (s *Store) hasSemanticTokenVersionColumn(ctx context.Context) (bool, error) {
-	s.semanticTokenColumn.once.Do(func() {
-		var n int
-		s.semanticTokenColumn.err = s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pragma_table_info('repos') WHERE name = 'semantic_token_version'`).Scan(&n)
-		s.semanticTokenColumn.present = n > 0
-	})
-	return s.semanticTokenColumn.present, s.semanticTokenColumn.err
+// resolveSemanticTokenColumn records whether migration 013 has been applied to
+// this database. Both constructors call it once, with a background context,
+// before the Store is handed to anyone.
+//
+// Resolving it at open rather than lazily on the first query is the point. A
+// lazy probe would run under a caller's request context, so a client cancel,
+// a disconnect or a SQLITE_BUSY while an index commits would decide the
+// answer -- and a cached failure would then refuse every semantic search for
+// the life of the process, reporting "context canceled" as though the index
+// were stale. A writable Store has already migrated by the time it gets here,
+// so the column is present; a read-only Store is a frozen snapshot, so the
+// answer genuinely cannot change under either.
+func (s *Store) resolveSemanticTokenColumn(ctx context.Context) error {
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('repos') WHERE name = 'semantic_token_version'`).Scan(&n); err != nil {
+		return fmt.Errorf("resolve semantic token version column: %w", err)
+	}
+	s.semanticTokenColumn = n > 0
+	return nil
 }
 
 // requireCurrentSemanticTokens is the guard every retrieval read path takes
@@ -176,6 +180,11 @@ func (s *Store) RefreshSemanticTokens(ctx context.Context, repoID int64) (int64,
 		return 0, fmt.Errorf("clear symbol tokens: %w", err)
 	}
 
+	// This cursor stays open across the inserts below, which is safe only
+	// because the loop writes `symbol_tokens` and never `symbols`: SQLite
+	// does not promise a stable scan over a table being modified under it.
+	// Do not add a write to `symbols` inside this loop; page the scan by id
+	// first if one is ever needed.
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, name, COALESCE(qualified_name, ''), COALESCE(signature, ''), COALESCE(doc_summary, '')
 		 FROM symbols WHERE repo_id = ? ORDER BY id`, repoID)
@@ -238,11 +247,4 @@ func (s *Store) RefreshSemanticTokens(ctx context.Context, repoID int64) (int64,
 	// is dropped rather than left to be served until the next index.
 	s.tokenStats.forget(repoID)
 	return written, nil
-}
-
-// semanticTokenColumnState resolves migration 013's presence once per Store.
-type semanticTokenColumnState struct {
-	once    sync.Once
-	present bool
-	err     error
 }

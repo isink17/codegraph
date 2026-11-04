@@ -163,10 +163,11 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 type Store struct {
 	db *sql.DB
 
-	// semanticTokenColumn caches whether migration 013 is applied, so a
+	// semanticTokenColumn records whether migration 013 is applied, so a
 	// read-only handle on a legacy database answers the version question
-	// without a per-query pragma.
-	semanticTokenColumn semanticTokenColumnState
+	// without a per-query pragma. Resolved once by each constructor; see
+	// resolveSemanticTokenColumn.
+	semanticTokenColumn bool
 	// path is the database file; scan locks live beside it. Empty for stores
 	// built in tests without a file, which take no scan lock.
 	path string
@@ -264,6 +265,14 @@ type ScanSummary struct {
 	// is enrichment only and never part of the semantic graph.
 	History   *githistory.State `json:"history,omitempty"`
 	HistoryMS int64             `json:"history_ms,omitempty"`
+	// SemanticTokensRefreshed is the number of `symbol_tokens` rows this scan
+	// rewrote because the repository's tokenization predated this binary.
+	// Zero, and omitted, on every scan of an already-current repository --
+	// which is every scan but the first after an upgrade. It is reported
+	// because the refresh is otherwise invisible: it rewrites a derived table
+	// without touching a file, so the run it happens in reports zero files
+	// changed and nothing else would say the migration ran.
+	SemanticTokensRefreshed int64 `json:"semantic_tokens_refreshed,omitempty"`
 	// ParserProfileLanguages are the languages this scan reconverged because
 	// their persisted parser profile differed from the running binary's. Empty
 	// on every scan of an already-current repository.
@@ -666,6 +675,10 @@ func finishOpen(db *sql.DB, path string, isNewDB bool, opts OpenOptions) (*Store
 	}
 	s := &Store{db: db, path: path}
 	if err := s.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.resolveSemanticTokenColumn(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

@@ -1279,9 +1279,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// scan owns, so an interrupted run leaves the stored version untouched
 	// and the next run does it again.
 	if tokensStale {
-		if _, err := i.store.RefreshSemanticTokens(ctx, repo.ID); err != nil {
+		refreshed, err := i.store.RefreshSemanticTokens(ctx, repo.ID)
+		if err != nil {
 			return summary, i.failScan(ctx, scanID, summary, started, fmt.Errorf("refresh semantic tokens: %w", err))
 		}
+		summary.SemanticTokensRefreshed = refreshed
 	} else if err := i.store.MarkSemanticTokensCurrent(ctx, repo.ID); err != nil {
 		return summary, i.failScan(ctx, scanID, summary, started, fmt.Errorf("record semantic token version: %w", err))
 	}

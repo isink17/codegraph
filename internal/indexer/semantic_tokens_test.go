@@ -3,10 +3,12 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/parser"
@@ -40,10 +42,14 @@ func indexSemanticTokenFixture(t *testing.T, s *store.Store, repoRoot string, op
 
 // openIndexedDatabase opens the sqlite file the indexer just wrote, directly.
 // The tests below assert on `symbol_tokens`, which is deliberately not public
-// store API, and reaching it through database/sql keeps it that way. The
-// driver name differs between the cgo and the modernc build, so it is
-// resolved from the ones actually registered rather than hard-coded.
-func openIndexedDatabase(t *testing.T, dbPath string) *sql.DB {
+// store API, and reaching it through database/sql keeps it that way.
+//
+// The DSN comes from store.BuildSQLiteDSN rather than from concatenating a
+// `file:` prefix onto the path: a Windows path is `C:\dir\graph.sqlite`, which
+// is not a URI, and the builder is the thing that knows about drive letters,
+// UNC paths and escaping. The driver name differs between the cgo and the
+// modernc build, so it is resolved from the ones actually registered.
+func openIndexedDatabase(t *testing.T, dbPath string, readOnly bool) *sql.DB {
 	t.Helper()
 	drivers := sql.Drivers()
 	name := ""
@@ -56,7 +62,11 @@ func openIndexedDatabase(t *testing.T, dbPath string) *sql.DB {
 	if name == "" {
 		t.Fatalf("no sqlite driver registered, have %v", drivers)
 	}
-	db, err := sql.Open(name, "file:"+dbPath+"?mode=ro")
+	dsn, err := store.BuildSQLiteDSN(dbPath, store.OpenOptions{}, false, readOnly)
+	if err != nil {
+		t.Fatalf("build dsn for %s: %v", dbPath, err)
+	}
+	db, err := sql.Open(name, dsn)
 	if err != nil {
 		t.Fatalf("open %s: %v", dbPath, err)
 	}
@@ -67,7 +77,7 @@ func openIndexedDatabase(t *testing.T, dbPath string) *sql.DB {
 func semanticTokenDump(t *testing.T, dbPath string) (string, int) {
 	t.Helper()
 	ctx := context.Background()
-	db := openIndexedDatabase(t, dbPath)
+	db := openIndexedDatabase(t, dbPath, true)
 	rows, err := db.QueryContext(ctx, `
 		SELECT sym.qualified_name, st.token, st.weight
 		FROM symbol_tokens st JOIN symbols sym ON sym.id = st.symbol_id
@@ -101,19 +111,7 @@ func semanticTokenDump(t *testing.T, dbPath string) (string, int) {
 func makeSemanticTokensLegacy(t *testing.T, dbPath string) {
 	t.Helper()
 	ctx := context.Background()
-	drivers := sql.Drivers()
-	name := ""
-	for _, candidate := range []string{"sqlite", "sqlite3"} {
-		if slices.Contains(drivers, candidate) {
-			name = candidate
-			break
-		}
-	}
-	db, err := sql.Open(name, "file:"+dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := openIndexedDatabase(t, dbPath, false)
 	rows, err := db.QueryContext(ctx, `SELECT id, name, COALESCE(qualified_name,''), COALESCE(signature,''), COALESCE(doc_summary,'') FROM symbols`)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +168,7 @@ func TestIndexWritesCurrentSemanticTokenVersion(t *testing.T) {
 		t.Errorf("semantic_token_version = %d, want %d", version, texttoken.SemanticTokenVersion)
 	}
 	for _, want := range []string{"|connection|", "|pool|", "|real|", "|parse|", "|short|", "|arg|"} {
-		if !containsSubstring(dump, want) {
+		if !strings.Contains(dump, want) {
 			t.Errorf("fresh index missing component token %q", want)
 		}
 	}
@@ -281,19 +279,119 @@ func TestIncrementalUpdateSemanticTokenParity(t *testing.T) {
 	if gotDump != wantDump {
 		t.Errorf("incremental tokens differ from a rebuild:\n got %s\nwant %s", gotDump, wantDump)
 	}
-	if containsSubstring(gotDump, "|pool|") {
+	if strings.Contains(gotDump, "|pool|") {
 		t.Error("tokens of the deleted file survived the update")
 	}
-	if !containsSubstring(gotDump, "|lru|") {
+	if !strings.Contains(gotDump, "|lru|") {
 		t.Error("tokens of the added file are missing")
 	}
 }
 
-func containsSubstring(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+// The invariant the whole design rests on: however a scan ends other than in
+// success, the stored version does not advance. A half-refreshed token table
+// must stay unreadable rather than become readable under a version that says
+// it is current.
+func TestFailedScanLeavesSemanticTokensStale(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	writeFile(t, filepath.Join(repoRoot, "main.go"), semanticTokenFixture)
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return false
+	indexSemanticTokenFixture(t, s, repoRoot, Options{})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	makeSemanticTokensLegacy(t, dbPath)
+
+	if s, err = store.Open(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Cancelled before the first read, so the scan cannot reach its success
+	// path whichever statement it dies on.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	idx := New(s, parser.NewRegistry(goparser.New()), nil)
+	if _, err := idx.Index(cancelled, Options{RepoRoot: repoRoot}); err == nil {
+		t.Fatal("Index with a cancelled context returned no error")
+	}
+
+	stale, err := s.SemanticTokensStale(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale {
+		t.Error("a failed scan advanced the semantic token version")
+	}
+	if _, err := s.SemanticSearch(ctx, repo.ID, "connection pool", 10, 0); !errors.Is(err, store.ErrSemanticTokensStale) {
+		t.Errorf("SemanticSearch after a failed scan: err = %v, want ErrSemanticTokensStale", err)
+	}
+
+	// And the next ordinary run still migrates it.
+	indexSemanticTokenFixture(t, s, repoRoot, Options{})
+	if _, err := s.SemanticSearch(ctx, repo.ID, "connection pool", 10, 0); err != nil {
+		t.Errorf("SemanticSearch after the recovering scan: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A legacy repository row that holds no symbols reads as current rather than
+// stale -- there is nothing written under any rules to refuse -- so the
+// refresh branch never runs for it. MarkSemanticTokensCurrent at the end of a
+// successful scan exists for exactly this case: without it the row would keep
+// its stored 0 the moment a later scan gave it symbols, and the read paths
+// would refuse an index that is in fact correct.
+func TestLegacyEmptyRepositoryBecomesCurrentWhenItGainsSymbols(t *testing.T) {
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+
+	dbPath := filepath.Join(t.TempDir(), "graph.sqlite")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexSemanticTokenFixture(t, s, repoRoot, Options{})
+	repo, err := s.UpsertRepo(ctx, repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// An empty repository has no tokens to rewrite, so this is the whole of
+	// what a legacy row looks like here.
+	makeSemanticTokensLegacy(t, dbPath)
+
+	if s, err = store.Open(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.SemanticTokensStale(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatal("a repository with no symbols reported a stale token index")
+	}
+
+	writeFile(t, filepath.Join(repoRoot, "main.go"), semanticTokenFixture)
+	indexSemanticTokenFixture(t, s, repoRoot, Options{})
+	if _, err := s.SemanticSearch(ctx, repo.ID, "connection pool", 10, 0); err != nil {
+		t.Errorf("SemanticSearch after the repository gained symbols: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, version := semanticTokenDump(t, dbPath); version != texttoken.SemanticTokenVersion {
+		t.Errorf("semantic_token_version = %d, want %d", version, texttoken.SemanticTokenVersion)
+	}
 }
