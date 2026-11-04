@@ -162,6 +162,12 @@ func (s *Store) EnsureCanonicalRepositoryPaths(ctx context.Context, repoID int64
 
 type Store struct {
 	db *sql.DB
+
+	// semanticTokenColumn records whether migration 013 is applied, so a
+	// read-only handle on a legacy database answers the version question
+	// without a per-query pragma. Resolved once by each constructor; see
+	// resolveSemanticTokenColumn.
+	semanticTokenColumn bool
 	// path is the database file; scan locks live beside it. Empty for stores
 	// built in tests without a file, which take no scan lock.
 	path string
@@ -259,6 +265,14 @@ type ScanSummary struct {
 	// is enrichment only and never part of the semantic graph.
 	History   *githistory.State `json:"history,omitempty"`
 	HistoryMS int64             `json:"history_ms,omitempty"`
+	// SemanticTokensRefreshed is the number of `symbol_tokens` rows this scan
+	// rewrote because the repository's tokenization predated this binary.
+	// Zero, and omitted, on every scan of an already-current repository --
+	// which is every scan but the first after an upgrade. It is reported
+	// because the refresh is otherwise invisible: it rewrites a derived table
+	// without touching a file, so the run it happens in reports zero files
+	// changed and nothing else would say the migration ran.
+	SemanticTokensRefreshed int64 `json:"semantic_tokens_refreshed,omitempty"`
 	// ParserProfileLanguages are the languages this scan reconverged because
 	// their persisted parser profile differed from the running binary's. Empty
 	// on every scan of an already-current repository.
@@ -661,6 +675,10 @@ func finishOpen(db *sql.DB, path string, isNewDB bool, opts OpenOptions) (*Store
 	}
 	s := &Store{db: db, path: path}
 	if err := s.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.resolveSemanticTokenColumn(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -1509,11 +1527,16 @@ func (s *Store) UpsertRepo(ctx context.Context, rootPath string) (graph.Repo, er
 		return graph.Repo{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	// A repository row created by this binary is born current: every token
+	// ever written against it will have been written by this binary, under
+	// these rules. The column's DEFAULT 0 is for the rows migration 013 found
+	// already there, which is exactly the population that needs refreshing,
+	// and the conflict branch leaves an existing row's version alone.
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO repos(root_path, canonical_path, created_at, updated_at)
-		VALUES(?, ?, ?, ?)
+		INSERT INTO repos(root_path, canonical_path, created_at, updated_at, semantic_token_version)
+		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT(canonical_path) DO UPDATE SET root_path=excluded.root_path, updated_at=excluded.updated_at
-	`, rootPath, canonical, now, now); err != nil {
+	`, rootPath, canonical, now, now, texttoken.SemanticTokenVersion); err != nil {
 		return graph.Repo{}, err
 	}
 	var repo graph.Repo
@@ -2870,7 +2893,7 @@ func insertParsedFileGraph(
 				tokenStart = time.Now()
 				stats.SymbolTokenizeCalls++
 			}
-			texttoken.WeightsStringsInto(symbolTokenWeights, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
+			texttoken.SemanticSymbolWeightsInto(symbolTokenWeights, sym.Name, sym.QualifiedName, sym.Signature, sym.DocSummary)
 			if stats != nil {
 				stats.SymbolTokenizeNS += time.Since(tokenStart).Nanoseconds()
 			}
@@ -8517,17 +8540,15 @@ func StrongerRelatedTest(a, b RelatedTest) bool {
 // codegraph-evidence/v2-cg142-scoring-20261103 and, for the baseline it is
 // measured against, v2-semantic-retrieval-benchmark-20261103.
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
-	tokens := texttoken.WeightsString(query)
-	if len(tokens) == 0 {
+	if err := s.requireCurrentSemanticTokens(ctx, repoID); err != nil {
+		return nil, err
+	}
+	tokenList := texttoken.SemanticWeightsString(query)
+	if len(tokenList) == 0 {
 		return nil, nil
 	}
 	limitVal := safeLimit(limit)
 	offsetVal := safeOffset(offset)
-	tokenList := make([]string, 0, len(tokens))
-	for token := range tokens {
-		tokenList = append(tokenList, token)
-	}
-	sort.Strings(tokenList)
 
 	stats, err := s.corpusTokenStatsFor(ctx, repoID)
 	if err != nil {

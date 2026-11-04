@@ -157,14 +157,16 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 	// the request carries: the task wrote an identifier, and the index either
 	// holds a symbol with that exact name or it does not.
 	//
-	// Semantic search cannot stand in for it. Its score is a sum of token
-	// weights over a symbol's name, qualified name, signature and doc, so it
-	// rewards a symbol with a large token vocabulary; a long test method
-	// repeating a common word outscores the small implementation the task
-	// named. Worse, the tokenizer treats '.' as a token character, so the
-	// reference `RealCall.execute` is one token that the stored qualified name
-	// `okhttp3.internal.connection.RealCall.execute` tokenizes as a different
-	// one: spelling a symbol out contributes nothing to the token score at all.
+	// Semantic search does not stand in for it. It scores a symbol's whole
+	// token vocabulary, so a long test method repeating a common word can
+	// still outweigh the small implementation the task named. Since CG-144
+	// its tokenizer does decompose a symbol's identity, so the reference
+	// `RealCall.execute` and the stored qualified name
+	// `okhttp3.internal.connection.RealCall.execute` share `realcall` and
+	// `execute` where they used to share nothing -- the measured effect is
+	// that query going from recall 0 to 1 -- but a shared token is evidence
+	// of the same strength as any other token, and an identifier the task
+	// spelled out is stronger than that.
 	named, err := s.ctxStore.SymbolsForNamedReferences(ctx, repoID,
 		extractNamedReferences(task), namedReferenceFanout)
 	if err != nil {

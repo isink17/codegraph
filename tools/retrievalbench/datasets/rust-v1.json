@@ -1,0 +1,176 @@
+{
+  "schema": "codegraph.retrieval_bench_dataset/v1",
+  "id": "semantic-retrieval-rust-v1",
+  "frozen": "2026-11-04",
+  "notes": "A third query set over a fifth corpus and a language none of the first four cover. axios, cobra, click and okhttp are JavaScript, Go, Python and Kotlin/Java; clap is Rust, whose paths (crate::module::Type::method) and snake_case method names exercise identifier decomposition differently from every corpus already in the suite. All six queries were written against the source at the pinned revision and frozen before any tokenizer code was written; none was selected, worded or re-worded by looking at what a candidate implementation retrieves. Grades are the same scale the other two sets use. Truth is partial everywhere except the negative query, so precision and nDCG stay withheld.",
+  "corpora": [
+    {
+      "name": "clap",
+      "upstream": "clap-rs/clap",
+      "tag": "master@2026-11-04",
+      "commit": "ec93e71255c0b833a34f50662a3fdb22f53f6ded",
+      "tree": "0d831f9e719ec38881405bf8a0df10e2b9dd102d",
+      "files": 625,
+      "symbols": 3895,
+      "references": 23824,
+      "edges": 23756
+    }
+  ],
+  "queries": [
+    {
+      "id": "clap_conflicting_arguments_validation",
+      "corpus": "clap",
+      "category": "natural_language_architecture",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "partial",
+      "query": "What rejects a command line that supplies two options which are not allowed together, and where is that mutual exclusion recorded?",
+      "relevant": [
+        {
+          "file": "clap_builder/src/parser/validator.rs",
+          "grade": 3,
+          "symbols": [
+            "crate::parser::validator::Validator<'cmd>::validate_conflicts",
+            "crate::parser::validator::Validator<'cmd>::validate_exclusive"
+          ],
+          "evidence": "validate_conflicts at :62 and validate_exclusive at :84 are the rejection path; Conflicts::gather_conflicts at :457 resolves the set"
+        },
+        {
+          "file": "clap_builder/src/builder/arg_group.rs",
+          "grade": 2,
+          "evidence": "ArgGroup records which arguments are mutually exclusive (multiple/required at :8)"
+        },
+        {
+          "file": "clap_builder/src/builder/debug_asserts.rs",
+          "grade": 1,
+          "evidence": "asserts the declared conflict ids exist on the command"
+        }
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "clap_shell_completion_script_generation",
+      "corpus": "clap",
+      "category": "architecture_discovery",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "partial",
+      "query": "How does this crate emit the script a user sources so their shell can complete subcommands and flags?",
+      "relevant": [
+        {
+          "file": "clap_complete/src/aot/generator/mod.rs",
+          "grade": 3,
+          "symbols": ["crate::aot::generator::generate"],
+          "evidence": "the Generator trait at :70 and the free generate function at :284 are the entry point"
+        },
+        {
+          "file": "clap_complete/src/aot/shells/bash.rs",
+          "grade": 2,
+          "evidence": "impl Generator for Bash at :14 writes the bash script"
+        },
+        {
+          "file": "clap_complete/src/aot/shells/zsh.rs",
+          "grade": 2,
+          "evidence": "the zsh emitter"
+        },
+        {
+          "file": "clap_complete/src/aot/shells/shell.rs",
+          "grade": 1,
+          "evidence": "the Shell enum the caller selects an emitter with"
+        }
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "clap_explicit_help_template_method",
+      "corpus": "clap",
+      "category": "explicit_symbol_reference",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "partial",
+      "query": "HelpTemplate.write_templated_help",
+      "relevant": [
+        {
+          "file": "clap_builder/src/output/help_template.rs",
+          "grade": 3,
+          "symbols": [
+            "crate::output::help_template::HelpTemplate<'cmd, 'writer>::write_templated_help"
+          ],
+          "evidence": "the named method is defined in this file"
+        }
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "clap_help_text_wrapping",
+      "corpus": "clap",
+      "category": "common_term_heavy",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Where is long help text broken into lines that fit the terminal width, and how is the displayed width of a string measured?",
+      "relevant": [
+        {
+          "file": "clap_builder/src/output/textwrap/mod.rs",
+          "grade": 3,
+          "symbols": ["crate::output::textwrap::wrap"],
+          "evidence": "wrap at :14 is the line-breaking entry point"
+        },
+        {
+          "file": "clap_builder/src/output/textwrap/core.rs",
+          "grade": 3,
+          "symbols": ["crate::output::textwrap::core::display_width"],
+          "evidence": "display_width at :55 measures the rendered width"
+        },
+        {
+          "file": "clap_builder/src/output/textwrap/wrap_algorithms.rs",
+          "grade": 2,
+          "evidence": "LineWrapper::wrap at :24 is the greedy algorithm wrap delegates to"
+        },
+        {
+          "file": "clap_builder/src/output/help_template.rs",
+          "grade": 1,
+          "evidence": "will_args_wrap and term_w decide the width help is wrapped at"
+        }
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "clap_short_flag_cluster_parsing",
+      "corpus": "clap",
+      "category": "short_implementation_symbols",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Which code reads several single-letter switches written after one dash, and how does it tell a value apart from the next switch?",
+      "relevant": [
+        {
+          "file": "clap_builder/src/parser/parser.rs",
+          "grade": 3,
+          "symbols": [
+            "crate::parser::parser::Parser<'cmd>::parse_short_arg",
+            "crate::parser::parser::Parser<'cmd>::parse_long_arg"
+          ],
+          "evidence": "parse_short_arg at :882 walks the cluster; parse_long_arg at :763 is its long-form counterpart"
+        },
+        {
+          "file": "clap_builder/src/parser/matches/arg_matches.rs",
+          "grade": 1,
+          "evidence": "receives the values the short parser extracts"
+        }
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "clap_negative_http_routing",
+      "corpus": "clap",
+      "category": "negative",
+      "origin": "rust set 2026-11-04",
+      "held_out": false,
+      "truth": "negative",
+      "query": "Where is the HTTP server's request routing table registered and how are middleware layers applied to an incoming request?",
+      "relevant": [],
+      "irrelevant": []
+    }
+  ]
+}

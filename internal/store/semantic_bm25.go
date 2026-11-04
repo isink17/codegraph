@@ -68,6 +68,26 @@ func (c *tokenStatsCache) get(repoID, scan int64) (corpusTokenStats, bool) {
 	return got, ok && got.Scan == scan
 }
 
+// forget drops a repository's entry. A token refresh rewrites document
+// lengths without moving the scan generation the cache is keyed by, so the
+// key alone would keep serving an average computed over the old tokenization.
+//
+// What makes this sufficient, rather than a race, is that a refresh only ever
+// runs on a repository whose stored version is stale, and every reader of
+// these statistics passes requireCurrentSemanticTokens first and is refused
+// while that is true. So no reader can be holding a pre-refresh aggregate to
+// put back after the forget. If that ever stops holding -- a refresh on a
+// current repository, or a reader that reaches corpusTokenStatsFor without
+// the guard -- this needs a generation counter checked by put, not a delete.
+// The consequence would be a stale average rather than an inverted ranking;
+// the max(symbols, df) floor in SemanticSearch keeps idf non-negative however
+// this cache behaves.
+func (c *tokenStatsCache) forget(repoID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.by, repoID)
+}
+
 func (c *tokenStatsCache) put(repoID int64, stats corpusTokenStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

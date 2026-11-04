@@ -92,8 +92,13 @@ func OpenReadOnly(dbPath string, opts OpenOptions) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	s := &Store{db: db, cleanup: cleanup, liveDB: dbPath, liveArtifacts: artifacts}
+	if err := s.resolveSemanticTokenColumn(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	keepSnapshot = true
-	return &Store{db: db, cleanup: cleanup, liveDB: dbPath, liveArtifacts: artifacts}, nil
+	return s, nil
 }
 
 // FindRepo looks up a repository by root path without creating it.

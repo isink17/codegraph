@@ -383,6 +383,18 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	} else if filtered {
 		scope = store.ScanScopeFiltered
 	}
+	// Asked before the scan writes anything. An index built by an older
+	// binary holds symbol tokens under tokenization rules this one does not
+	// score against, and an incremental update that re-tokenizes only the
+	// changed files would leave the repository half under each. Answering it
+	// here, rather than after the scan, is also what keeps a fresh database
+	// off the rebuild path: it has no symbols, so it is not stale, and the
+	// scan itself writes every token under the current rules.
+	tokensStale, err := i.store.SemanticTokensStale(ctx, repo.ID)
+	if err != nil {
+		return store.ScanSummary{}, fmt.Errorf("semantic token version: %w", err)
+	}
+
 	scanID, started, err := i.store.BeginScanWithScope(ctx, repo.ID, scanKind, scope, headAtStart)
 	if err != nil {
 		return store.ScanSummary{}, err
@@ -1260,6 +1272,20 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	}
 	if err := i.store.ReplaceGoModuleEvidence(ctx, repo.ID, goModules); err != nil {
 		return summary, i.failScan(ctx, scanID, summary, started, err)
+	}
+	// Derived rows only: symbol_tokens is rewritten from the symbols already
+	// in the database, so nothing is re-read, re-parsed or re-resolved. It
+	// runs before the scan row is closed, with the rest of the writes the
+	// scan owns, so an interrupted run leaves the stored version untouched
+	// and the next run does it again.
+	if tokensStale {
+		refreshed, err := i.store.RefreshSemanticTokens(ctx, repo.ID)
+		if err != nil {
+			return summary, i.failScan(ctx, scanID, summary, started, fmt.Errorf("refresh semantic tokens: %w", err))
+		}
+		summary.SemanticTokensRefreshed = refreshed
+	} else if err := i.store.MarkSemanticTokensCurrent(ctx, repo.ID); err != nil {
+		return summary, i.failScan(ctx, scanID, summary, started, fmt.Errorf("record semantic token version: %w", err))
 	}
 	summary.HeadAtFinish = scanHead(ctx, opts.RepoRoot)
 	if semanticTransition {
