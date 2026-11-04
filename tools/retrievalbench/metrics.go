@@ -19,8 +19,9 @@ type Metrics struct {
 	RelevantAt5  int `json:"relevant_at_5"`
 	RelevantAt10 int `json:"relevant_at_10"`
 
-	RecallAt5  float64 `json:"recall_at_5"`
-	RecallAt10 float64 `json:"recall_at_10"`
+	// Recall is nil for a negative query, where the denominator is zero.
+	RecallAt5  *float64 `json:"recall_at_5"`
+	RecallAt10 *float64 `json:"recall_at_10"`
 
 	// Precision is defined only for a complete truth set. Denominator is the
 	// number of files actually returned in the window, reported beside it.
@@ -32,9 +33,10 @@ type Metrics struct {
 	// NDCGAt10 needs graded labels and a complete truth set.
 	NDCGAt10 *float64 `json:"ndcg_at_10"`
 
-	// FirstRelevantRank is zero-based; nil when no relevant file was returned.
-	FirstRelevantRank *int    `json:"first_relevant_rank"`
-	ReciprocalRank    float64 `json:"reciprocal_rank"`
+	// FirstRelevantRank is zero-based; nil when no relevant file was returned
+	// and on a negative query, where there is nothing to find.
+	FirstRelevantRank *int     `json:"first_relevant_rank"`
+	ReciprocalRank    *float64 `json:"reciprocal_rank"`
 
 	// ProductionFiles and TestFiles count distinct returned files over the
 	// whole stage output, not over a top-k window: 30 candidates for the
@@ -149,17 +151,22 @@ func Evaluate(q Query, files []string, returnedSymbols map[string]bool) Metrics 
 		}
 		if m.FirstRelevantRank == nil {
 			rank := i
-			m.FirstRelevantRank = &rank
-			m.ReciprocalRank = 1 / float64(i+1)
+			rr := 1 / float64(i+1)
+			m.FirstRelevantRank, m.ReciprocalRank = &rank, &rr
 		}
 	}
 
 	if m.RelevantLabeled > 0 {
-		m.RecallAt5 = float64(m.RelevantAt5) / float64(m.RelevantLabeled)
-		m.RecallAt10 = float64(m.RelevantAt10) / float64(m.RelevantLabeled)
+		r5 := float64(m.RelevantAt5) / float64(m.RelevantLabeled)
+		r10 := float64(m.RelevantAt10) / float64(m.RelevantLabeled)
+		m.RecallAt5, m.RecallAt10 = &r5, &r10
+		if m.ReciprocalRank == nil {
+			zero := 0.0
+			m.ReciprocalRank = &zero
+		}
 	}
 
-	if q.Truth == TruthComplete {
+	if q.Truth == TruthComplete && m.RelevantLabeled > 0 {
 		m.PrecisionDenom5 = min(5, m.ReturnedFiles)
 		m.PrecisionDenom10 = min(10, m.ReturnedFiles)
 		if m.PrecisionDenom5 > 0 {

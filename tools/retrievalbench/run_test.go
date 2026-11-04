@@ -136,7 +136,7 @@ func TestSelectQueriesKeepsDatasetOrder(t *testing.T) {
 
 func TestSummarizeIsDeterministicAndSeparatesHeldOut(t *testing.T) {
 	mk := func(id string, heldOut bool, recall float64) QueryResult {
-		m := Metrics{RecallAt5: recall, RecallAt10: recall, RelevantLabeled: 1}
+		m := Metrics{RecallAt5: &recall, RecallAt10: &recall, RelevantLabeled: 1}
 		return QueryResult{ID: id, Category: "execution_path", HeldOut: heldOut,
 			Search: StageResult{Metrics: m}, Context: StageResult{Metrics: m}}
 	}
@@ -159,7 +159,8 @@ func TestSummarizeIsDeterministicAndSeparatesHeldOut(t *testing.T) {
 }
 
 func TestAggregateWithholdsUndefinedMeans(t *testing.T) {
-	a := aggregate([]Metrics{{RelevantLabeled: 1}}, 0)
+	zero := 0.0
+	a := aggregate([]Metrics{{RelevantLabeled: 1, RecallAt5: &zero, RecallAt10: &zero, ReciprocalRank: &zero}}, 0)
 	if a.ScoredPrecision != 0 || a.MeanPrecisionAt10 != 0 || a.ScoredNDCG != 0 {
 		t.Fatalf("a partial-truth metric set must contribute no precision or nDCG: %+v", a)
 	}
@@ -177,7 +178,8 @@ func baseReport() Report {
 	c := CorpusCheck{Name: "cobra", Match: true}
 	c.Observed.Commit = "c1"
 	r.Corpora = []CorpusCheck{c}
-	m := Metrics{RecallAt10: 0.5, ReciprocalRank: 0.5}
+	half := 0.5
+	m := Metrics{RecallAt10: &half, ReciprocalRank: &half, RelevantLabeled: 1}
 	r.Queries = []QueryResult{{ID: "q1", Search: StageResult{Metrics: m},
 		Context: StageResult{Files: []string{"a.go", "b.go"}, Metrics: m}}}
 	r.Summary = summarize(r.Queries)
@@ -210,7 +212,8 @@ func TestCompareReportsRefusesIncomparablePairs(t *testing.T) {
 func TestCompareReportsReportsRankingChange(t *testing.T) {
 	candidate := baseReport()
 	candidate.Queries[0].Context.Files = []string{"b.go", "a.go"}
-	candidate.Queries[0].Context.Metrics.ReciprocalRank = 1
+	one := 1.0
+	candidate.Queries[0].Context.Metrics.ReciprocalRank = &one
 	candidate.Summary = summarize(candidate.Queries)
 	cmp, err := CompareReports(baseReport(), candidate)
 	if err != nil {

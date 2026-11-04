@@ -171,7 +171,7 @@ func TestToolRowsAreTrimmedNotFalsified(t *testing.T) {
 	m := New("full", fixedClock())
 	const rows = DefaultToolRows + 7
 	for i := 0; i < rows; i++ {
-		m.RecordToolCall(Key{Tool: string(rune('a'+i)), Via: ViaDirect}, 10, 100+i, false)
+		m.RecordToolCall(Key{Tool: string(rune('a' + i)), Via: ViaDirect}, 10, 100+i, false)
 	}
 	report := m.Snapshot(false, 0)
 	if len(report.Tools) != DefaultToolRows {

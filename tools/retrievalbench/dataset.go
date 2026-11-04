@@ -20,9 +20,15 @@ const DatasetSchema = "codegraph.retrieval_bench_dataset/v1"
 // unlabelled returned file a false positive and precision a defined quantity.
 // TruthPartial withholds precision and nDCG rather than computing them against
 // a denominator the labels do not support.
+// TruthNegative is a query the corpus cannot answer: no file in it is
+// relevant. Recall, precision and nDCG are all undefined there -- the
+// denominator is zero -- so they are withheld, and what the query measures
+// instead is what the engine returns anyway, and whether any of it was
+// verified irrelevant.
 const (
 	TruthComplete = "complete"
 	TruthPartial  = "partial"
+	TruthNegative = "negative"
 )
 
 // Label is one relevance judgement about a file, with the source evidence that
@@ -132,9 +138,12 @@ func (d *Dataset) Validate() error {
 			return fmt.Errorf("query %q has empty query text", q.ID)
 		case q.Category == "":
 			return fmt.Errorf("query %q has no category", q.ID)
-		case q.Truth != TruthComplete && q.Truth != TruthPartial:
-			return fmt.Errorf("query %q: truth %q must be %q or %q", q.ID, q.Truth, TruthComplete, TruthPartial)
-		case len(q.Relevant) == 0:
+		case q.Truth != TruthComplete && q.Truth != TruthPartial && q.Truth != TruthNegative:
+			return fmt.Errorf("query %q: truth %q must be %q, %q or %q", q.ID, q.Truth,
+				TruthComplete, TruthPartial, TruthNegative)
+		case q.Truth == TruthNegative && len(q.Relevant) != 0:
+			return fmt.Errorf("query %q is negative but carries %d relevant label(s)", q.ID, len(q.Relevant))
+		case q.Truth != TruthNegative && len(q.Relevant) == 0:
 			return fmt.Errorf("query %q has no relevant labels", q.ID)
 		}
 		ids[q.ID] = true

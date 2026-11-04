@@ -516,6 +516,12 @@ func TestFileRelevanceScoreSerializesCompactly(t *testing.T) {
 // Every budget at which a page can be built must be walkable to exhaustion: a
 // cursor an under-charged estimate turns into a permanent error is worse than a
 // page that carries one symbol.
+//
+// One budget can legitimately fail to carry one candidate -- a symbol wider
+// than max_tokens on its own. That is reported rather than skipped, so the walk
+// accepts the refusal and resumes the same cursor at a budget that fits; what
+// it refuses to accept is a cursor no budget can get past. The budget-raising
+// contract itself is asserted in context_budget_oversized_test.go.
 func TestEveryWalkableBudgetTerminates(t *testing.T) {
 	fx := newContextFixture(t)
 	ctx := context.Background()
@@ -529,7 +535,7 @@ func TestEveryWalkableBudgetTerminates(t *testing.T) {
 			}
 			t.Fatalf("first page at max_tokens=%d error = %v", budget, err)
 		}
-		keys, _ := pageAll(t, fx, taskPayment, opts)
+		keys := walkRaisingBudget(t, fx, taskPayment, opts)
 		if len(keys) == 0 {
 			t.Fatalf("walk at max_tokens=%d returned nothing", budget)
 		}
@@ -537,6 +543,52 @@ func TestEveryWalkableBudgetTerminates(t *testing.T) {
 	}
 	if walked < 100 {
 		t.Fatalf("only %d budgets were walkable; the sweep proved little", walked)
+	}
+}
+
+// walkRaisingBudget pages to exhaustion at opts.MaxTokens, raising the budget
+// for exactly the page a too-wide candidate refuses and dropping back after it.
+func walkRaisingBudget(t *testing.T, fx *contextFixture, task string, opts ContextForTaskOptions) []string {
+	t.Helper()
+	ctx := context.Background()
+	var keys []string
+	cursor, raised := "", false
+	for pages := 0; ; pages++ {
+		if pages > 100 {
+			t.Fatalf("walk at max_tokens=%d did not terminate", opts.MaxTokens)
+		}
+		call := opts
+		call.Cursor = cursor
+		if raised {
+			call.MaxTokens = MaxContextMaxTokens
+		}
+		res, err := fx.svc.ContextForTask(ctx, fx.repoID, task, call)
+		if err != nil {
+			if errors.Is(err, ErrContextBudgetTooSmall) && !raised {
+				raised = true
+				pages--
+				continue
+			}
+			t.Fatalf("walk at max_tokens=%d page %d error = %v", opts.MaxTokens, pages+1, err)
+		}
+		if res.EstimatedTokens > call.MaxTokens {
+			t.Fatalf("page at max_tokens=%d reported %d tokens", call.MaxTokens, res.EstimatedTokens)
+		}
+		raised = false
+		keys = append(keys, symbolKeys(res)...)
+		if !res.HasMore {
+			if res.NextCursor != "" {
+				t.Fatalf("final page at max_tokens=%d carries next_cursor %q", opts.MaxTokens, res.NextCursor)
+			}
+			if res.RemainingSymbols != 0 {
+				t.Fatalf("final page at max_tokens=%d reports %d remaining", opts.MaxTokens, res.RemainingSymbols)
+			}
+			return keys
+		}
+		if res.NextCursor == "" {
+			t.Fatalf("has_more is set at max_tokens=%d but next_cursor is empty", opts.MaxTokens)
+		}
+		cursor = res.NextCursor
 	}
 }
 

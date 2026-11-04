@@ -26,6 +26,11 @@ const (
 // leaves no room for a single context symbol while candidates remain. Reporting
 // an empty page with has_more set would be a continuation an agent could never
 // make progress on.
+//
+// The error is recoverable and never consumes the candidate it could not
+// serve. The offset the request arrived with is left untouched, so replaying
+// the same cursor with a larger max_tokens returns that candidate rather than
+// skipping it.
 var ErrContextBudgetTooSmall = errors.New("max_tokens too small for a context page")
 
 // normalizeContextTokens applies the token-budget contract: negative is
@@ -123,7 +128,11 @@ func buildBudgetedContext(in budgetInput) (*graph.TaskContext, error) {
 		}
 		if result.EstimatedTokens <= in.maxTokens || count == 0 {
 			if count == 0 && in.offset < total {
-				return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but no context symbol",
+				// The next ranked candidate is wider than the whole budget.
+				// Skipping it would drop it from the stream for good, so the
+				// offset stays where it is and the caller is told to retry
+				// this same cursor with a larger max_tokens.
+				return nil, fmt.Errorf("%w: max_tokens is %d, which fits the envelope but not the next context symbol; retry with a larger max_tokens, replaying the same cursor if you hold one",
 					ErrContextBudgetTooSmall, in.maxTokens)
 			}
 			return result, nil

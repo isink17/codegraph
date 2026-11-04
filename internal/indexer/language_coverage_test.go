@@ -60,4 +60,3 @@ func TestUpdateLanguageCoverage_KnownLanguageUnchanged(t *testing.T) {
 		t.Fatalf("go.extensions=%v, want nil", got.Extensions)
 	}
 }
-

@@ -176,6 +176,9 @@ type Store struct {
 	scanLockMu      sync.Mutex
 	scanLocks       map[int64]*os.File
 	orphanScanLocks []*os.File
+	// tokenStats caches the per-repository BM25 corpus statistics, keyed by
+	// the scan generation they were computed from.
+	tokenStats tokenStatsCache
 	// resolverPolicies overrides resolverPolicyRegistry; nil outside tests.
 	resolverPolicies map[string]int
 	// parserProfiles is the reading binary's parser registry, which freshness
@@ -8491,6 +8494,28 @@ func StrongerRelatedTest(a, b RelatedTest) bool {
 	return a.Reason < b.Reason
 }
 
+// SemanticSearch ranks symbols against a free-text query with BM25 over the
+// persisted per-symbol token weights.
+//
+// The score was a plain SUM of term frequencies, which had two consequences
+// the retrieval benchmark measured rather than guessed at: a stopword decided
+// the ranking (83% of the top hit's score for one task came from `the`,
+// `and`, `be` and `this`), and the longest symbol won, because a Kotlin or
+// Java `signature` column carries the method body while a Go one does not.
+// BM25 answers both with one formula -- inverse document frequency for the
+// first, length normalization for the second, and k1 saturation so one word
+// repeated many times stops counting linearly.
+//
+// Three statements, not one. The corpus statistics are cached per graph
+// generation, the document frequency of the query's own tokens is a small
+// index-only count, and the scoring query is the original one with a
+// different expression in its SUM. Inverse document frequency is computed in
+// Go rather than in SQL so the query needs no math extension.
+//
+// Every figure quoted here and below was produced by tools/retrievalbench
+// against the pinned corpora; the reports, query plans and timings are in
+// codegraph-evidence/v2-cg142-scoring-20261103 and, for the baseline it is
+// measured against, v2-semantic-retrieval-benchmark-20261103.
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	tokens := texttoken.WeightsString(query)
 	if len(tokens) == 0 {
@@ -8502,19 +8527,84 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	for token := range tokens {
 		tokenList = append(tokenList, token)
 	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(tokenList)), ",")
+	sort.Strings(tokenList)
+
+	stats, err := s.corpusTokenStatsFor(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	if stats.Symbols == 0 || stats.AvgLen <= 0 {
+		return []map[string]any{}, nil
+	}
+	df, err := s.tokenDocumentFrequencies(ctx, repoID, tokenList)
+	if err != nil {
+		return nil, err
+	}
+
+	// A token no live symbol carries contributes nothing and is dropped here,
+	// so it costs nothing in the scoring query either.
+	type weighted struct {
+		token string
+		idf   float64
+	}
+	scored := make([]weighted, 0, len(tokenList))
+	for _, token := range tokenList {
+		if n := df[token]; n > 0 {
+			// The corpus size is cached per graph generation and the document
+			// frequency is counted now, so the two can disagree if an index
+			// commits between them. df > N would drive the idf term negative
+			// and invert the ranking, which is a far worse failure than a
+			// slightly stale corpus size, so the count is floored at df.
+			scored = append(scored, weighted{token: token, idf: bm25IDF(max(stats.Symbols, n), n)})
+		}
+	}
+	if len(scored) == 0 {
+		return []map[string]any{}, nil
+	}
+
+	pairs := strings.TrimRight(strings.Repeat("(?,?),", len(scored)), ",")
 	sqlQuery := `
-		SELECT s.id, f.path, COALESCE(s.qualified_name, ''), SUM(st.weight) AS score
-		FROM symbol_tokens st
-		JOIN symbols s ON s.id = st.symbol_id
-		-- Active owning file, before GROUP BY/ORDER BY/LIMIT: a ghost symbol
-		-- must not score, rank or consume a page slot.
-		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
-		WHERE s.repo_id = ? AND st.token IN (` + placeholders + `)
+		WITH q(token, idf) AS (VALUES ` + pairs + `),
+		-- The candidate symbols and their query-token weights, already
+		-- restricted to this repository and to live files: a ghost symbol must
+		-- not score, rank or consume a page slot.
+		-- MATERIALIZED is load bearing, not decoration. The hit CTE is
+		-- referenced twice, by len and by the scoring join, and without
+		-- the hint SQLite inlines it into both, re-running the whole
+		-- token-index pipeline per reference and rebuilding an automatic
+		-- index over the result. Measured on the pinned OkHttp index with a
+		-- 19-token query: 74.7 ms inlined, 6.0 ms materialized, against
+		-- 28.2 ms for the term-frequency sum this replaces. SQLite has
+		-- honoured the hint since 3.35; modernc.org/sqlite is well past it.
+		hit AS MATERIALIZED (
+			SELECT st.symbol_id AS sid, st.token AS token, st.weight AS tf
+			FROM symbol_tokens st
+			JOIN q ON q.token = st.token
+			JOIN symbols s ON s.id = st.symbol_id
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+			WHERE s.repo_id = ?
+		),
+		-- Document length is the symbol's whole token mass, not the part the
+		-- query matched; that is what makes a long signature pay for its
+		-- length. Only candidate symbols are summed.
+		len AS MATERIALIZED (
+			SELECT st.symbol_id AS sid, SUM(st.weight) AS dl
+			FROM symbol_tokens st
+			WHERE st.symbol_id IN (SELECT sid FROM hit)
+			GROUP BY st.symbol_id
+		)
+		SELECT s.id, f.path, COALESCE(s.qualified_name, ''),
+		       ROUND(SUM(q.idf * (hit.tf * (? + 1.0)) /
+		                 (hit.tf + ? * (1.0 - ? + ? * len.dl / ?))), ?) AS score
+		FROM hit
+		JOIN q ON q.token = hit.token
+		JOIN len ON len.sid = hit.sid
+		JOIN symbols s ON s.id = hit.sid
+		JOIN files f ON f.id = s.file_id
 		GROUP BY s.id, f.path, s.qualified_name
-		-- Score alone is not a total order: weights come from a small fixed set,
-		-- so ties are the rule rather than the exception and a LIMIT/OFFSET page
-		-- boundary would fall in an arbitrary place. The grouping keys are
+		-- Score alone is not a total order: BM25 ties are rarer than
+		-- term-frequency ties but still occur, and a LIMIT/OFFSET page
+		-- boundary must not fall in an arbitrary place. The grouping keys are
 		-- already computed, so using them as the tie-break is free.
 		--
 		-- files.path is already the logical repository identity, so it is the
@@ -8525,13 +8615,13 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 		LIMIT ?
 		OFFSET ?
 	`
-	args := make([]any, 0, len(tokenList)+2)
-	args = append(args, repoID)
-	for _, token := range tokenList {
-		args = append(args, token)
+	args := make([]any, 0, len(scored)*2+8)
+	for _, w := range scored {
+		args = append(args, w.token, w.idf)
 	}
-	args = append(args, limitVal)
-	args = append(args, offsetVal)
+	args = append(args, repoID,
+		bm25K1, bm25K1, bm25B, bm25B, stats.AvgLen, bm25ScorePrecision,
+		limitVal, offsetVal)
 	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return nil, err
@@ -8557,6 +8647,38 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 			"score":     item.score,
 			"why":       []string{"token_overlap"},
 		})
+	}
+	return out, rows.Err()
+}
+
+// tokenDocumentFrequencies counts, per token, the live symbols of this
+// repository that carry it. A token absent from the result occurs nowhere.
+func (s *Store) tokenDocumentFrequencies(ctx context.Context, repoID int64, tokens []string) (map[string]int64, error) {
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(tokens)), ",")
+	args := make([]any, 0, len(tokens)+1)
+	args = append(args, repoID)
+	for _, token := range tokens {
+		args = append(args, token)
+	}
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
+		SELECT st.token, COUNT(*)
+		FROM symbol_tokens st
+		JOIN symbols s ON s.id = st.symbol_id
+		JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+		WHERE s.repo_id = ? AND st.token IN (`+placeholders+`)
+		GROUP BY st.token`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int64, len(tokens))
+	for rows.Next() {
+		var token string
+		var n int64
+		if err := rows.Scan(&token, &n); err != nil {
+			return nil, err
+		}
+		out[token] = n
 	}
 	return out, rows.Err()
 }

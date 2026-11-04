@@ -1,0 +1,239 @@
+{
+  "schema": "codegraph.retrieval_bench_dataset/v1",
+  "id": "semantic-retrieval-challenge-v1",
+  "frozen": "2026-11-03",
+  "notes": "A second, independent query set, frozen before any scoring change was written. The v1 held-out queries already influenced the BM25 recommendation and are therefore previously inspected evaluation data; these twelve were never looked at through a candidate implementation. Query shapes are chosen to stress the known failure modes -- common-term-heavy prose, short implementation symbols, long test methods, ambiguous names -- not chosen by observing any implementation's output. Axios is a fourth corpus and a fourth language family, added so the set is not only the three repositories the v1 labels were read from.",
+  "corpora": [
+    {
+      "name": "axios",
+      "upstream": "axios/axios",
+      "tag": "v1.7.9",
+      "commit": "b2cb45d5a533a5465c99559b16987e4d5fc08cbc",
+      "tree": "6834fd9c3894749281ac8eb55d4ab250ba27d574",
+      "files": 221,
+      "symbols": 759,
+      "references": 9653,
+      "edges": 2417
+    },
+    {
+      "name": "cobra",
+      "upstream": "spf13/cobra",
+      "tag": "v1.9.1",
+      "commit": "40b5bc1437a564fc795d388b23835e84f54cd1d1",
+      "tree": "cefed611a4b3df9b3ca2aff2ec1f689346835665",
+      "files": 60,
+      "symbols": 675,
+      "references": 4064,
+      "edges": 4063
+    },
+    {
+      "name": "click",
+      "upstream": "pallets/click",
+      "tag": "8.2.1",
+      "commit": "fd183b2ced1cb5857784fe7fb22f4982f671f098",
+      "tree": "9d603ea306b13bd10ef094a845b3bbb16f520bc7",
+      "files": 128,
+      "symbols": 1480,
+      "references": 4435,
+      "edges": 3947
+    },
+    {
+      "name": "okhttp",
+      "upstream": "square/okhttp",
+      "tag": "pinned commit",
+      "commit": "4984568367caaf359b82c452bd28b5e192824d1c",
+      "tree": "f62723df79553c220dcca74d998ad8d52f860482",
+      "files": 492,
+      "symbols": 6081,
+      "references": 36394,
+      "edges": 38260
+    }
+  ],
+  "queries": [
+    {
+      "id": "axios_request_dispatch_chain",
+      "corpus": "axios",
+      "category": "cross_file_navigation",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Trace how a request config travels from the public request method through the interceptor chain to the adapter that actually performs it.",
+      "relevant": [
+        {"file": "lib/core/Axios.js", "grade": 3, "symbols": ["lib/core/Axios.Axios.request", "lib/core/Axios.Axios._request"], "evidence": "Axios.js:146 builds the chain from dispatchRequest plus the request/response interceptor chains; :178 is the synchronous path"},
+        {"file": "lib/core/dispatchRequest.js", "grade": 3, "symbols": ["lib/core/dispatchRequest.dispatchRequest"], "evidence": "dispatchRequest.js:34; :49 resolves the adapter and :51 calls it"},
+        {"file": "lib/core/InterceptorManager.js", "grade": 2, "evidence": "InterceptorManager.js:5 holds the handlers Axios.request walks"},
+        {"file": "lib/core/transformData.js", "grade": 1, "evidence": "called from dispatchRequest.js:40 before the adapter runs"},
+        {"file": "lib/adapters/adapters.js", "grade": 1, "evidence": "getAdapter, called from dispatchRequest.js:49"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "axios_url_joining_short_symbols",
+      "corpus": "axios",
+      "category": "short_implementation_symbols",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "complete",
+      "query": "Which helper joins a base address with a relative one, and what decides whether joining is needed at all?",
+      "relevant": [
+        {"file": "lib/helpers/combineURLs.js", "grade": 3, "symbols": ["lib/helpers/combineURLs.combineURLs"], "evidence": "the only function in the corpus that concatenates a base and a relative URL"},
+        {"file": "lib/core/buildFullPath.js", "grade": 3, "evidence": "buildFullPath.js:17-18 is the decision point: combine only when a baseURL exists and the requested URL is not absolute"},
+        {"file": "lib/helpers/isAbsoluteURL.js", "grade": 2, "symbols": ["lib/helpers/isAbsoluteURL.isAbsoluteURL"], "evidence": "the predicate buildFullPath:17 consults"}
+      ],
+      "irrelevant": [
+        {"file": "lib/helpers/buildURL.js", "evidence": "serializes query parameters onto a URL; it does not join a base with a relative path"}
+      ]
+    },
+    {
+      "id": "axios_negative_graphql",
+      "corpus": "axios",
+      "category": "negative",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "negative",
+      "query": "Where is the GraphQL subscription resolver registered and how are its schema directives applied?",
+      "relevant": [],
+      "irrelevant": [
+        {"file": "lib/core/Axios.js", "evidence": "grep -ril graphql over lib/ and test/ returns nothing: this corpus has no GraphQL code at all, so every returned file is a non-answer"}
+      ]
+    },
+    {
+      "id": "axios_explicit_interceptor_eject",
+      "corpus": "axios",
+      "category": "explicit_symbol_reference",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "complete",
+      "query": "InterceptorManager.eject",
+      "relevant": [
+        {"file": "lib/core/InterceptorManager.js", "grade": 3, "symbols": ["lib/core/InterceptorManager.InterceptorManager.eject"], "evidence": "InterceptorManager.js:71 exports the class; eject is declared in it and nowhere else in the corpus"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "cobra_error_and_usage_output",
+      "corpus": "cobra",
+      "category": "common_term_heavy",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "When a command returns an error, how does the library decide what error text and what usage output to print, and where does that output go?",
+      "relevant": [
+        {"file": "command.go", "grade": 3, "symbols": ["cobra.Command.ExecuteC", "cobra.Command.PrintErrln", "cobra.Command.UsageString", "cobra.Command.ErrOrStderr"], "evidence": "command.go:1131 prints ErrPrefix plus the error, :1165-1166 prints UsageString unless SilenceUsage, :1450 PrintErrln, :526 UsageString"}
+      ],
+      "irrelevant": [
+        {"file": "command_test.go", "evidence": "test file"}
+      ]
+    },
+    {
+      "id": "cobra_help_template_rendering",
+      "corpus": "cobra",
+      "category": "natural_language_architecture",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "How is the text a user sees when they ask for help assembled, and how can a program replace the way it looks?",
+      "relevant": [
+        {"file": "command.go", "grade": 3, "symbols": ["cobra.Command.HelpTemplate", "cobra.Command.UsageTemplate", "cobra.Command.SetHelpTemplate", "cobra.Command.SetUsageTemplate", "cobra.Command.InitDefaultHelpCmd"], "evidence": "the template fields, their setters and the default help command all live in command.go"},
+        {"file": "cobra.go", "grade": 2, "evidence": "cobra.go holds tmpl/rpad and the template function map the help text is rendered through"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_parameter_declaration_architecture",
+      "corpus": "click",
+      "category": "natural_language_architecture",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "How does a program declare the inputs its command accepts, and how is a raw string from the command line turned into the value the callback receives?",
+      "relevant": [
+        {"file": "src/click/core.py", "grade": 3, "symbols": ["Parameter", "Option", "Argument", "Parameter.handle_parse_result", "Parameter.process_value"], "evidence": "core.py:1984 Parameter, :2465 Option, :3036 Argument hold declaration and value processing"},
+        {"file": "src/click/types.py", "grade": 3, "symbols": ["ParamType", "ParamType.convert"], "evidence": "types.py:30 ParamType and its convert() are the string-to-value conversion"},
+        {"file": "src/click/decorators.py", "grade": 2, "evidence": "the @option and @argument decorators that attach the declarations"},
+        {"file": "src/click/parser.py", "grade": 1, "evidence": "the option parser that splits the raw argv before conversion"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "click_negative_database_migrations",
+      "corpus": "click",
+      "category": "negative",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "negative",
+      "query": "Where are database migrations applied and how is the schema version table updated?",
+      "relevant": [],
+      "irrelevant": [
+        {"file": "src/click/core.py", "evidence": "Click is a command-line parsing library; it has no database, no schema and no migration code, so every returned file is a non-answer"}
+      ]
+    },
+    {
+      "id": "okhttp_connection_reuse_architecture",
+      "corpus": "okhttp",
+      "category": "natural_language_architecture",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "How does the client avoid opening a fresh socket for every request, and what decides that an existing one may be reused?",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnectionPool.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealConnectionPool.callAcquirePooledConnection", "okhttp3.internal.connection.RealConnectionPool.put"], "evidence": "RealConnectionPool.kt:77 acquires a pooled connection, :94 returns one to the pool"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealConnection.isEligible"], "evidence": "isEligible is the per-connection reuse predicate"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/ConnectionPool.kt", "grade": 2, "evidence": "the public pool the client is configured with"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/ExchangeFinder.kt", "grade": 2, "evidence": "findConnection consults the pool before dialing"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RouteSelector.kt", "grade": 1, "evidence": "supplies the routes a new connection would be opened on"}
+      ],
+      "irrelevant": []
+    },
+    {
+      "id": "okhttp_event_callbacks_long_test_decoy",
+      "corpus": "okhttp",
+      "category": "long_test_methods",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Which callbacks does the client fire as a call progresses, and from where are they invoked?",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/EventListener.kt", "grade": 3, "evidence": "declares every call-progress callback"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt", "grade": 3, "symbols": ["okhttp3.internal.connection.RealCall.callStart"], "evidence": "RealCall.kt:171 eventListener.callStart, :142 canceled, :354 connectionReleased, :362 callFailed, :364 callEnd"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt", "grade": 2, "evidence": "fires the request/response body and header events"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/test/java/okhttp3/KotlinSourceModernTest.kt", "evidence": "its eventListener member is a 2051-byte compile-only API stub, the longest EventListener-named symbol in the index and the known term-frequency decoy"},
+        {"file": "okhttp-testing-support/src/main/kotlin/okhttp3/RecordingEventListener.kt", "evidence": "test support: records events rather than firing them"},
+        {"file": "android-test/src/androidTest/java/okhttp/android/test/OkHttpTest.kt", "evidence": "an androidTest method, not production behaviour"}
+      ]
+    },
+    {
+      "id": "okhttp_builder_build_ambiguous",
+      "corpus": "okhttp",
+      "category": "ambiguous_names",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "partial",
+      "query": "Where is an immutable Request assembled from its builder, and what does the builder check before it hands one back?",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/Request.kt", "grade": 3, "symbols": ["okhttp3.Request.Builder.build"], "evidence": "Request.kt holds Request.Builder.build, which requires a url before constructing the immutable Request"}
+      ],
+      "irrelevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/OkHttpClient.kt", "evidence": "OkHttpClient.Builder.build is one of 16 symbols named build in this index; it assembles a client, not a request"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/Headers.kt", "evidence": "Headers.Builder.build, same name collision"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/HttpUrl.kt", "evidence": "HttpUrl.Builder.build, same name collision"},
+        {"file": "okhttp/src/main/kotlin/okhttp3/FormBody.kt", "evidence": "FormBody.Builder.build, same name collision"}
+      ]
+    },
+    {
+      "id": "okhttp_explicit_http2_writer_headers",
+      "corpus": "okhttp",
+      "category": "explicit_symbol_reference",
+      "origin": "challenge 2026-11-03",
+      "held_out": false,
+      "truth": "complete",
+      "query": "Http2Writer.headers",
+      "relevant": [
+        {"file": "okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Writer.kt", "grade": 3, "symbols": ["okhttp3.internal.http2.Http2Writer.headers"], "evidence": "Http2Writer.kt:290 is the only declaration of this member"}
+      ],
+      "irrelevant": []
+    }
+  ]
+}
