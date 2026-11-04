@@ -341,7 +341,7 @@ var toolRegistry = []toolDescriptor{
 	// would charge every default session for a surface it does not need.
 	{
 		name:        "tool_search",
-		description: "Find a CodeGraph tool that is not listed here. Returns name, description, and category; add include_schema with an exact name for its arguments.",
+		description: "Find a CodeGraph tool that is not listed here. Query is a tool name, comma-separated names, or keywords; there is no directive syntax. Returns name, description, and category; add include_schema with one exact name for its arguments.",
 		properties:  []string{"query", "limit", "include_schema"},
 		required:    []string{"query"},
 		category:    "gateway",
@@ -378,6 +378,11 @@ func init() {
 		desc := &toolRegistry[i]
 		if _, dup := toolByName[desc.name]; dup {
 			panic("mcp: duplicate tool " + desc.name)
+		}
+		if strings.Contains(desc.name, "__") {
+			// unqualifyToolName strips an MCP client's server prefix at the last "__",
+			// which is only the prefix if no canonical name carries one.
+			panic("mcp: tool name must not contain __: " + desc.name)
 		}
 		if desc.gatewayMeta == (desc.handler != nil) {
 			panic("mcp: tool " + desc.name + " must have exactly one of a handler or gatewayMeta")
