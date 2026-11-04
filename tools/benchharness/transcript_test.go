@@ -409,3 +409,54 @@ func TestValidateIngestRejectsTampering(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAcceptsBothClientVersionFields(t *testing.T) {
+	init := func(fields string) string {
+		return `{"type":"system","subtype":"init","model":"m"` + fields + `}`
+	}
+	for name, tc := range map[string]struct {
+		lines []string
+		want  []string
+	}{
+		"legacy version only": {
+			[]string{init(`,"version":"2.1.316"`), asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"x"}`)},
+			[]string{"1", "2.1.316"},
+		},
+		"native claude_code_version only": {
+			[]string{init(`,"claude_code_version":"2.1.318"`), `{"type":"assistant","message":{"id":"a","model":"m","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}}`},
+			[]string{"2.1.318"},
+		},
+		"both fields agreeing": {
+			[]string{init(`,"version":"2.1.318","claude_code_version":"2.1.318"`), `{"type":"assistant","message":{"id":"a","model":"m","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}}`},
+			[]string{"2.1.318"},
+		},
+		"no version declared": {
+			[]string{`{"type":"assistant","message":{"id":"a","model":"m","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}}`},
+			[]string{},
+		},
+		"mixed events": {
+			[]string{init(`,"claude_code_version":"2.1.318"`), asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"x"}`)},
+			[]string{"1", "2.1.318"},
+		},
+	} {
+		tr, err := parse(t, tc.lines...)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		got := tr.Metrics().ClientVersions
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("%s: client versions %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestParseRejectsConflictingClientVersions(t *testing.T) {
+	_, err := parse(t,
+		`{"type":"system","subtype":"init","version":"2.1.316","claude_code_version":"2.1.318"}`,
+		asstLine("a", false, 1, 0, 0, 1, `{"type":"text","text":"x"}`),
+	)
+	if err == nil || !strings.Contains(err.Error(), "claude_code_version") {
+		t.Fatalf("want conflicting client version error, got %v", err)
+	}
+}
