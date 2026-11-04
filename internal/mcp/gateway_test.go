@@ -1264,14 +1264,19 @@ func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
 		}
 	}
 
-	// An empty remainder is answered as an empty result. The note says the prefix
-	// was not a directive and stops there, because nothing was searched or
-	// resolved and a note claiming otherwise would be false.
+	// A directive with nothing after it is the shape most likely to be invented
+	// syntax, so it is the one that most needs the note. It returns no tools --
+	// there is nothing left to match -- and the note says what a query may be
+	// instead, without claiming anything was searched or resolved.
 	empty := searchTools(t, server, map[string]any{"query": "select:"})
 	if got := searchNames(t, empty); len(got) != 0 {
 		t.Errorf("tool_search(\"select:\") = %v, want nothing", got)
 	}
-	if note, _ := empty["note"].(string); strings.Contains(note, "searched") {
+	note, _ := empty["note"].(string)
+	if !strings.Contains(note, "select:") {
+		t.Errorf("tool_search(\"select:\") note = %q, want it to name the directive", note)
+	}
+	if strings.Contains(note, "searched") {
 		t.Errorf("tool_search(\"select:\") note = %q, want no claim about searching", note)
 	}
 
@@ -1282,7 +1287,6 @@ func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
 		{"find symbols: callers", "find_callers"},
 		{"okhttp3: trace dependencies", "trace_dependencies"},
 		{"terraform: the blocks that reference it", "find_callers"},
-		{"python: who calls this function", "index_repo"},
 	} {
 		data := searchTools(t, server, map[string]any{"query": tc.query})
 		names := searchNames(t, data)
@@ -1292,6 +1296,14 @@ func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
 		if note, _ := data["note"].(string); strings.Contains(note, "directive") {
 			t.Errorf("tool_search(%q) reported a directive: %q", tc.query, note)
 		}
+	}
+
+	// A prose query whose top match is weak is still prose: the directive note is
+	// about syntax, and the absence of it here is the property, not whatever
+	// happens to rank first.
+	prose := searchTools(t, server, map[string]any{"query": "python: who calls this function"})
+	if note, _ := prose["note"].(string); strings.Contains(note, "directive") {
+		t.Errorf("tool_search(prose with a colon) reported a directive: %q", note)
 	}
 
 	// The first word of such a query is still scored. Two registry descriptions

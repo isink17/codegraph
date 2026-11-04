@@ -281,10 +281,12 @@ func marshalToolSearch(results []toolSearchResult, total, limit int, note string
 // word and a colon ("terraform: the blocks that reference it") is a query whose
 // first word is a search term -- and two registry descriptions contain exactly
 // that word, so stripping it would lose a real match and claim a syntax error
-// the caller did not make.
+// the caller did not make. A bare "select:" with nothing after it has no prose
+// reading at all, so it keeps the directive and gets the note: it is the shape
+// most likely to be an invented syntax and the one with least else to go on.
 func splitQueryDirective(query string) (rest, directive string) {
 	idx := strings.Index(query, ":")
-	if idx <= 0 || idx+1 >= len(query) || query[idx+1] == ' ' || query[idx+1] == '\t' {
+	if idx <= 0 || (idx+1 < len(query) && (query[idx+1] == ' ' || query[idx+1] == '\t')) {
 		return query, ""
 	}
 	word := query[:idx]
@@ -343,7 +345,7 @@ func unqualifyToolName(name string) string {
 // a word once makes the score measure which words the query used, not how often.
 func searchTerms(query string) []string {
 	fields := strings.FieldsFunc(query, func(r rune) bool {
-		return r == ' ' || r == '_' || r == '-' || r == '\t' || r == '.' || r == ','
+		return unicode.IsSpace(r) || r == '_' || r == '-' || r == '.' || r == ','
 	})
 	terms := make([]string, 0, len(fields))
 	seen := make(map[string]bool, len(fields))
