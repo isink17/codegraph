@@ -341,7 +341,7 @@ var toolRegistry = []toolDescriptor{
 	// would charge every default session for a surface it does not need.
 	{
 		name:        "tool_search",
-		description: "Find a CodeGraph tool that is not listed here. Returns name, description, and category; add include_schema with an exact name for its arguments.",
+		description: "Find a CodeGraph tool that is not listed here. Query is a tool name, comma-separated names, or keywords; there is no directive syntax. Returns name, description, and category; add include_schema with one exact name for its arguments.",
 		properties:  []string{"query", "limit", "include_schema"},
 		required:    []string{"query"},
 		category:    "gateway",

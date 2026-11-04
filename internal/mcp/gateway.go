@@ -28,6 +28,12 @@ const (
 	// maxToolSearchLimit is a hard ceiling. This is a new API, so it is bounded at
 	// the source rather than inheriting an unbounded limit convention.
 	maxToolSearchLimit = 20
+	// weakMatchFloor is the score below which nothing matched a tool's name or
+	// category and the whole ranking rests on description words. Ordering such a
+	// list is still deterministic, but presenting it without a word of warning
+	// reads as a recommendation; one exact name segment scores 40, so anything
+	// under that floor is keyword residue.
+	weakMatchFloor = 40
 )
 
 // callToolText produces the model-visible text of one `tools/call`.
@@ -120,7 +126,6 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return "", fmt.Errorf("invalid arguments payload: %w", err)
 	}
-	query := strings.ToLower(strings.TrimSpace(req.Query))
 	limit := req.Limit
 	if limit <= 0 {
 		limit = defaultToolSearchLimit
@@ -129,11 +134,36 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 		limit = maxToolSearchLimit
 	}
 
+	query, directive := splitQueryDirective(strings.ToLower(strings.TrimSpace(req.Query)))
+	notes := []string{}
+	if directive != "" {
+		notes = append(notes, "tool_search has no "+directive+": directive; it takes a tool name, a comma-separated list of names, or plain keywords. The rest of the query was searched.")
+	}
+
+	// A query that is nothing but tool names is answered as a lookup rather than a
+	// ranking. An agent that already knows what it wants -- including by the
+	// client-qualified mcp__<server>__<tool> spelling -- gets exactly those tools
+	// in the order asked for, and never a neighbour that merely shares a word.
+	if named, ok := exactToolNames(query); ok {
+		total := len(named)
+		if len(named) > limit {
+			named = named[:limit]
+		}
+		results := make([]toolSearchResult, 0, len(named))
+		for _, desc := range named {
+			results = append(results, searchResult(desc, req.IncludeSchema && total == 1))
+		}
+		if req.IncludeSchema && total != 1 {
+			notes = append(notes, "include_schema needs a single exact tool name; call tool_search again with one of the names above")
+		}
+		return marshalToolSearch(results, total, limit, strings.Join(notes, " "))
+	}
+
 	// An exact name is the one query that can be answered with a schema: it names
 	// a single tool, so there is no ambiguity about whose arguments to return.
 	if req.IncludeSchema {
 		if desc, ok := toolByName[query]; ok && !desc.gatewayMeta {
-			return marshalToolSearch([]toolSearchResult{searchResult(desc, true)}, 1, limit, "")
+			return marshalToolSearch([]toolSearchResult{searchResult(desc, true)}, 1, limit, strings.Join(notes, " "))
 		}
 	}
 
@@ -186,11 +216,16 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 	for _, m := range matches {
 		results = append(results, searchResult(m.desc, false))
 	}
-	note := ""
 	if req.IncludeSchema {
-		note = "include_schema needs an exact tool name; call tool_search again with one of the names above"
+		notes = append(notes, "include_schema needs an exact tool name; call tool_search again with one of the names above")
 	}
-	return marshalToolSearch(results, total, limit, note)
+	if total > 0 && matches[0].score < weakMatchFloor {
+		// Nothing matched a name or a category. The list is still returned, because
+		// a weak match is better evidence than silence, but it is labelled so it is
+		// not read as a recommendation.
+		notes = append(notes, "no tool matched this query by name or category; these are weak description-word matches and may all be irrelevant.")
+	}
+	return marshalToolSearch(results, total, limit, strings.Join(notes, " "))
 }
 
 func searchResult(desc *toolDescriptor, withSchema bool) toolSearchResult {
@@ -229,17 +264,85 @@ func marshalToolSearch(results []toolSearchResult, total, limit int, note string
 	return string(payload), nil
 }
 
-// searchTerms splits a query into lowercase terms. Underscores split too, so
-// "find related tests" and "find_related_tests" are the same query.
+// splitQueryDirective strips a leading `word:` directive from a query.
+//
+// tool_search has no query language, and an agent carrying a convention from
+// another tool ("select:a,b") used to have its directive silently tokenized into
+// the search. The prefix is removed so the names behind it can still be resolved,
+// and the caller says so in a note rather than answering as though the syntax
+// were understood. A colon inside the query proper is left alone: only a single
+// leading word followed by a colon counts.
+func splitQueryDirective(query string) (rest, directive string) {
+	idx := strings.Index(query, ":")
+	if idx <= 0 {
+		return query, ""
+	}
+	word := query[:idx]
+	for _, r := range word {
+		if !(r >= 'a' && r <= 'z') {
+			return query, ""
+		}
+	}
+	return strings.TrimSpace(query[idx+1:]), word
+}
+
+// exactToolNames resolves a query that is nothing but tool names.
+//
+// Every token must name a real non-meta tool, so one unknown word makes the
+// whole query ordinary keywords again and it is ranked as before. Names may be
+// client-qualified (mcp__codegraph__find_symbol), because that is the spelling an
+// agent reads in its own tool list. Order is the caller's, duplicates collapse.
+func exactToolNames(query string) ([]*toolDescriptor, bool) {
+	fields := strings.FieldsFunc(query, func(r rune) bool {
+		return r == ' ' || r == ',' || r == '\t' || r == '\n'
+	})
+	if len(fields) == 0 {
+		return nil, false
+	}
+	out := make([]*toolDescriptor, 0, len(fields))
+	seen := make(map[string]bool, len(fields))
+	for _, field := range fields {
+		desc, ok := toolByName[unqualifyToolName(field)]
+		if !ok || desc.gatewayMeta {
+			return nil, false
+		}
+		if seen[desc.name] {
+			continue
+		}
+		seen[desc.name] = true
+		out = append(out, desc)
+	}
+	return out, true
+}
+
+// unqualifyToolName drops an MCP client's server prefix. No canonical tool name
+// contains a double underscore, so the last one is the end of the prefix.
+func unqualifyToolName(name string) string {
+	if idx := strings.LastIndex(name, "__"); idx >= 0 {
+		return name[idx+2:]
+	}
+	return name
+}
+
+// searchTerms splits a query into distinct lowercase terms. Underscores split
+// too, so "find related tests" and "find_related_tests" are the same query.
+//
+// Terms are deduplicated because the score is a sum: a query naming several
+// tools of one family repeats their shared word, and an unrelated tool holding
+// that word once would collect the repeat as many times as it appears. Counting
+// a word once makes the score measure which words the query used, not how often.
 func searchTerms(query string) []string {
 	fields := strings.FieldsFunc(query, func(r rune) bool {
 		return r == ' ' || r == '_' || r == '-' || r == '\t' || r == '.' || r == ','
 	})
 	terms := make([]string, 0, len(fields))
+	seen := make(map[string]bool, len(fields))
 	for _, field := range fields {
-		if field != "" {
-			terms = append(terms, field)
+		if field == "" || seen[field] {
+			continue
 		}
+		seen[field] = true
+		terms = append(terms, field)
 	}
 	return terms
 }

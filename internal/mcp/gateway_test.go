@@ -324,6 +324,11 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // estimated tokens). It is not gateway core, so the gateway payload is
 // unchanged; gateway clients reach it through tool_search and tool_call.
 // CG-120 adds compact-v2: full +180 bytes/+45 estimated tokens; gateway +60/+15.
+//
+// tool_search's description now states the query forms it accepts, because an
+// agent that invents a directive syntax learns otherwise only from a bad result:
+// gateway 4211 -> 4300 bytes (+89 bytes, +22 estimated tokens per session). The
+// full surface is unchanged -- tool_search exists only in gateway mode.
 const (
 	fullToolsListBytes  = 13941
 	fullToolsListTokens = 3486
@@ -331,8 +336,8 @@ const (
 	// once a registry row could be hidden from a list: a hidden tool that leaked
 	// into the gateway surface would show up here as a byte count, not as a name
 	// nobody happened to assert on.
-	gatewayToolsListBytes  = 4211
-	gatewayToolsListTokens = 1053
+	gatewayToolsListBytes  = 4300
+	gatewayToolsListTokens = 1075
 )
 
 // TestGatewayToolsListIsByteIdentical pins the reduced surface's exact size.
@@ -1092,4 +1097,255 @@ func BenchmarkGatewayDispatchOverhead(b *testing.B) {
 			}
 		}
 	})
+}
+
+// recordedSelectDirectiveQuery is the query a guided agent actually sent: the
+// client-qualified names it wanted, behind a `select:` directive borrowed from a
+// different tool. It used to be tokenized into keywords, and the repeated word
+// "find" then carried find_dead_code -- a tool the agent had not asked for and
+// could not use -- to the top of a confident, unannotated list.
+const recordedSelectDirectiveQuery = "select:mcp__codegraph__context_for_task," +
+	"mcp__codegraph__find_symbol,mcp__codegraph__find_callers,mcp__codegraph__find_callees"
+
+// TestToolSearchResolvesTheRecordedDirectiveQuery is the regression for that
+// session. The names behind the directive are returned exactly, in the order
+// asked for, and the unsupported syntax is named rather than silently absorbed.
+func TestToolSearchResolvesTheRecordedDirectiveQuery(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	data := searchTools(t, server, map[string]any{"query": recordedSelectDirectiveQuery})
+
+	want := []string{"context_for_task", "find_symbol", "find_callers", "find_callees"}
+	if got := searchNames(t, data); !reflect.DeepEqual(got, want) {
+		t.Errorf("tool_search(recorded query) = %v, want %v", got, want)
+	}
+	if total, _ := data["total_matches"].(float64); int(total) != len(want) {
+		t.Errorf("total_matches = %v, want %d", data["total_matches"], len(want))
+	}
+	note, _ := data["note"].(string)
+	if !strings.Contains(note, "select:") {
+		t.Errorf("note = %q, want it to name the unsupported directive", note)
+	}
+	if strings.Contains(mustJSON(t, data), "find_dead_code") {
+		t.Errorf("tool_search(recorded query) still returns find_dead_code: %s", mustJSON(t, data))
+	}
+}
+
+// TestToolSearchResolvesExactNames covers name lookup in the spellings an agent
+// has: bare, client-qualified, and a comma- or space-separated list of either.
+func TestToolSearchResolvesExactNames(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{"find_symbol", []string{"find_symbol"}},
+		{"mcp__codegraph__find_symbol", []string{"find_symbol"}},
+		{"trace_dependencies,find_related_tests", []string{"trace_dependencies", "find_related_tests"}},
+		{"find_related_tests trace_dependencies", []string{"find_related_tests", "trace_dependencies"}},
+		{"find_symbol, mcp__codegraph__find_symbol", []string{"find_symbol"}},
+		{"audit", []string{"audit"}},
+	} {
+		data := searchTools(t, server, map[string]any{"query": tc.query})
+		if got := searchNames(t, data); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("tool_search(%q) = %v, want %v", tc.query, got, tc.want)
+		}
+		if note, ok := data["note"]; ok {
+			t.Errorf("tool_search(%q) carried a note: %v", tc.query, note)
+		}
+	}
+
+	// One unknown token makes the whole query ordinary keywords again rather than
+	// silently dropping what it could not resolve.
+	mixed := searchTools(t, server, map[string]any{"query": "find_symbol dead"})
+	if got := searchNames(t, mixed); len(got) < 2 {
+		t.Errorf("tool_search(name + keyword) = %v, want a keyword ranking", got)
+	}
+
+	// The meta tools are not resolvable names: they are already listed, and
+	// tool_call refuses them, so returning one as a discovery would be a dead end.
+	meta := searchTools(t, server, map[string]any{"query": "tool_call"})
+	for _, name := range searchNames(t, meta) {
+		if name == "tool_call" || name == "tool_search" {
+			t.Errorf("tool_search(%q) returned a meta tool: %v", "tool_call", searchNames(t, meta))
+		}
+	}
+}
+
+// TestToolSearchExactNameListCarriesSchemasOnlyForOne keeps the schema contract
+// where it was: a schema is returned for one unambiguous name, and a list says
+// what to ask for instead rather than returning four schemas into the budget
+// gateway mode exists to protect.
+func TestToolSearchExactNameListCarriesSchemasOnlyForOne(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+
+	one := searchTools(t, server, map[string]any{
+		"query": "mcp__codegraph__trace_dependencies", "include_schema": true,
+	})
+	entry := one["tools"].([]any)[0].(map[string]any)
+	if entry["name"] != "trace_dependencies" {
+		t.Fatalf("qualified name with include_schema returned %q", entry["name"])
+	}
+	full := listedTools(t, newGatewayTestServer(t, ToolModeFull))
+	var canonical any
+	for _, def := range full {
+		if def["name"] == "trace_dependencies" {
+			canonical = def["inputSchema"]
+		}
+	}
+	if !reflect.DeepEqual(entry["input_schema"], canonical) {
+		t.Errorf("schema for a qualified name differs from tools/list:\n%v\n%v", entry["input_schema"], canonical)
+	}
+
+	many := searchTools(t, server, map[string]any{
+		"query": "trace_dependencies,audit", "include_schema": true,
+	})
+	if strings.Contains(mustJSON(t, many), "input_schema") {
+		t.Errorf("a name list returned schemas: %s", mustJSON(t, many))
+	}
+	if note, _ := many["note"].(string); !strings.Contains(note, "exact tool name") {
+		t.Errorf("name-list note = %q, want it to ask for a single name", note)
+	}
+}
+
+// TestToolSearchLabelsWeakEvidence is the honesty requirement: a query no tool
+// answers still returns its description-word residue, because silence is worse
+// evidence than a weak match, but it is labelled so it does not read as a
+// recommendation.
+func TestToolSearchLabelsWeakEvidence(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+
+	weak := searchTools(t, server, map[string]any{"query": "how do I make an omelette"})
+	if note, _ := weak["note"].(string); !strings.Contains(note, "weak") {
+		t.Errorf("irrelevant query note = %q, want it to say the matches are weak", note)
+	}
+
+	// A real intent carries no such warning.
+	for _, query := range []string{"dependency trace", "tests", "impact radius", "dead code"} {
+		data := searchTools(t, server, map[string]any{"query": query})
+		if note, _ := data["note"].(string); strings.Contains(note, "weak") {
+			t.Errorf("tool_search(%q) was labelled weak: %q", query, note)
+		}
+	}
+
+	// A query that matches nothing at all is still an empty result, not a note
+	// about weakness -- there is nothing to warn about.
+	miss := searchTools(t, server, map[string]any{"query": "zzzznotatool"})
+	if note, _ := miss["note"].(string); note != "" {
+		t.Errorf("empty result carried note %q", note)
+	}
+}
+
+// TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed covers directive-like syntax
+// generally, not only the one spelling that was recorded.
+func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	for _, tc := range []struct {
+		query, directive string
+		want             []string
+	}{
+		{"select:find_symbol", "select:", []string{"find_symbol"}},
+		{"load:mcp__codegraph__audit", "load:", []string{"audit"}},
+		{"tool:trace_dependencies", "tool:", []string{"trace_dependencies"}},
+	} {
+		data := searchTools(t, server, map[string]any{"query": tc.query})
+		if got := searchNames(t, data); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("tool_search(%q) = %v, want %v", tc.query, got, tc.want)
+		}
+		if note, _ := data["note"].(string); !strings.Contains(note, tc.directive) {
+			t.Errorf("tool_search(%q) note = %q, want it to name %q", tc.query, note, tc.directive)
+		}
+	}
+
+	// Only a leading lowercase word followed by a colon is a directive. A colon
+	// anywhere else leaves the query alone, and a first word that is not a bare
+	// lowercase word is not treated as one.
+	for _, tc := range []struct{ query, want string }{
+		{"find symbols: callers", "find_callers"},
+		{"okhttp3: trace dependencies", "trace_dependencies"},
+	} {
+		data := searchTools(t, server, map[string]any{"query": tc.query})
+		names := searchNames(t, data)
+		if len(names) == 0 || names[0] != tc.want {
+			t.Errorf("tool_search(%q) = %v, want %q first", tc.query, names, tc.want)
+		}
+		if note, _ := data["note"].(string); strings.Contains(note, "directive") {
+			t.Errorf("tool_search(%q) reported a directive: %q", tc.query, note)
+		}
+	}
+}
+
+// TestToolSearchTermsAreCountedOnce pins the scoring property behind the recorded
+// failure: a repeated word is query vocabulary, not query emphasis.
+func TestToolSearchTermsAreCountedOnce(t *testing.T) {
+	once := toolSearchScore(toolByName["find_dead_code"], "find", searchTerms("find"))
+	thrice := toolSearchScore(toolByName["find_dead_code"], "find find find", searchTerms("find find find"))
+	if once != thrice {
+		t.Errorf("repeating a term changed the score: %d then %d", once, thrice)
+	}
+	if got := searchTerms("find find symbol"); !reflect.DeepEqual(got, []string{"find", "symbol"}) {
+		t.Errorf("searchTerms deduplication = %v", got)
+	}
+}
+
+// TestToolSearchNaturalLanguageIntentIsUnchanged is the no-regression half: the
+// recorded query is fixed through name resolution, so ordinary keyword queries
+// must rank exactly as they did.
+func TestToolSearchNaturalLanguageIntentIsUnchanged(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	for _, tc := range []struct{ query, want string }{
+		{"find tests related to this change", "find_related_tests"},
+		{"trace the dependencies of a symbol", "trace_dependencies"},
+		{"blast radius of a change", "get_impact_radius"},
+		{"architecture overview", "architecture_overview"},
+		{"semantic search", "search_semantic"},
+		{"list files", "list_files"},
+		{"index the repository", "index_repo"},
+	} {
+		names := searchNames(t, searchTools(t, server, map[string]any{"query": tc.query}))
+		if len(names) == 0 || names[0] != tc.want {
+			t.Errorf("tool_search(%q) = %v, want %q first", tc.query, names, tc.want)
+		}
+	}
+}
+
+// TestToolSearchNameResolutionIsGatewayOnly guards the mode boundary: the meta
+// tools do not exist in full mode, so neither does any of this.
+func TestToolSearchNameResolutionIsGatewayOnly(t *testing.T) {
+	full := newGatewayTestServer(t, ToolModeFull)
+	isError, text := callResult(t, full, "tool_search", map[string]any{"query": recordedSelectDirectiveQuery})
+	if !isError {
+		t.Fatalf("tool_search answered in full mode: %s", text)
+	}
+	if !strings.Contains(text, "unknown tool") {
+		t.Errorf("full-mode tool_search error = %q, want the unknown-tool message", text)
+	}
+}
+
+// TestToolSearchNameListIsBoundedAndDeterministic: name resolution is still a
+// bounded, repeatable page, not an escape hatch around the limit.
+func TestToolSearchNameListIsBoundedAndDeterministic(t *testing.T) {
+	server := newGatewayTestServer(t, ToolModeGateway)
+	names := make([]string, 0, len(toolRegistry))
+	for i := range toolRegistry {
+		if !toolRegistry[i].gatewayMeta {
+			names = append(names, toolRegistry[i].name)
+		}
+	}
+	query := strings.Join(names, ",")
+
+	data := searchTools(t, server, map[string]any{"query": query})
+	got := searchNames(t, data)
+	if len(got) != defaultToolSearchLimit {
+		t.Errorf("name list returned %d tools, want the default limit %d", len(got), defaultToolSearchLimit)
+	}
+	if total, _ := data["total_matches"].(float64); int(total) != len(names) {
+		t.Errorf("total_matches = %v, want %d", data["total_matches"], len(names))
+	}
+	if again := searchNames(t, searchTools(t, server, map[string]any{"query": query})); !reflect.DeepEqual(got, again) {
+		t.Errorf("name resolution is not deterministic: %v then %v", got, again)
+	}
+	capped := searchTools(t, server, map[string]any{"query": query, "limit": 100000000})
+	if n := len(searchNames(t, capped)); n > maxToolSearchLimit {
+		t.Errorf("name list with a huge limit returned %d tools, want at most %d", n, maxToolSearchLimit)
+	}
 }
