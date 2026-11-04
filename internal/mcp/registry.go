@@ -379,6 +379,11 @@ func init() {
 		if _, dup := toolByName[desc.name]; dup {
 			panic("mcp: duplicate tool " + desc.name)
 		}
+		if strings.Contains(desc.name, "__") {
+			// unqualifyToolName strips an MCP client's server prefix at the last "__",
+			// which is only the prefix if no canonical name carries one.
+			panic("mcp: tool name must not contain __: " + desc.name)
+		}
 		if desc.gatewayMeta == (desc.handler != nil) {
 			panic("mcp: tool " + desc.name + " must have exactly one of a handler or gatewayMeta")
 		}

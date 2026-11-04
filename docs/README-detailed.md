@@ -476,8 +476,8 @@ are already configured, it prints the `args` to change (`["serve", "--tool-mode"
 
 | Mode | `tools/list` | Estimated tokens |
 |---|---|---|
-| `full` (default) | all 32 tools | 3,441 (13,761 bytes) |
-| `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,038 (4,151 bytes; about 70% fewer) |
+| `full` (default) | all 32 tools | 3,486 (13,941 bytes) |
+| `gateway` | 4 core tools + `tool_search` + `tool_call` | 1,075 (4,300 bytes; about 69% fewer) |
 
 `full` remains the default and advertises all 32 tools. The two gateway tools
 appear only in gateway mode.
@@ -499,6 +499,22 @@ by default, 20 at most) and deterministic — it is a local name-and-description
 search, with no index, embeddings, or network. Add `include_schema` with an exact
 tool name to get that tool's argument schema, which is the same schema `tools/list`
 advertises in full mode.
+
+A query is one of three things, and there is no directive syntax:
+
+```
+tool_search(query="dependency trace")                    # keywords, ranked
+tool_search(query="trace_dependencies")                  # one name, that tool alone
+tool_search(query="find_symbol,find_callers")            # a list of names, in order
+tool_search(query="mcp__codegraph__find_symbol")         # the client's own spelling
+```
+
+A query that is nothing but tool names is resolved rather than ranked: it returns
+exactly those tools, in the order asked for, and a name may carry the client's
+`mcp__<server>__` prefix. One unrecognized token makes the whole query keywords
+again. A leading `word:` prefix borrowed from another tool is reported in `note`
+rather than searched for literally, and a result that reached no tool's name or
+category says so in `note` instead of reading as a recommendation.
 
 `tool_call` invokes the canonical tool: the same argument validation, the same
 handler, and the same result. `detail`, `format=compact`, `max_tokens`, and

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Gateway mode trades tool-definition context for one level of indirection.
@@ -28,12 +29,6 @@ const (
 	// maxToolSearchLimit is a hard ceiling. This is a new API, so it is bounded at
 	// the source rather than inheriting an unbounded limit convention.
 	maxToolSearchLimit = 20
-	// weakMatchFloor is the score below which nothing matched a tool's name or
-	// category and the whole ranking rests on description words. Ordering such a
-	// list is still deterministic, but presenting it without a word of warning
-	// reads as a recommendation; one exact name segment scores 40, so anything
-	// under that floor is keyword residue.
-	weakMatchFloor = 40
 )
 
 // callToolText produces the model-visible text of one `tools/call`.
@@ -137,7 +132,10 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 	query, directive := splitQueryDirective(strings.ToLower(strings.TrimSpace(req.Query)))
 	notes := []string{}
 	if directive != "" {
-		notes = append(notes, "tool_search has no "+directive+": directive; it takes a tool name, a comma-separated list of names, or plain keywords. The rest of the query was searched.")
+		// What happened to the rest of the query depends on which branch answers it,
+		// so the note says only what is true of every branch: the prefix was not a
+		// directive, and here is what a query may be instead.
+		notes = append(notes, "tool_search has no "+directive+": directive; it takes a tool name, a comma-separated list of names, or plain keywords.")
 	}
 
 	// A query that is nothing but tool names is answered as a lookup rather than a
@@ -179,6 +177,7 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 		order   int
 	}
 	matches := make([]scored, 0, len(toolRegistry))
+	identified := false
 	for i := range toolRegistry {
 		desc := &toolRegistry[i]
 		if desc.gatewayMeta {
@@ -186,7 +185,9 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 			// would spend context restating what the client can already see.
 			continue
 		}
-		if score := toolSearchScore(desc, query, terms); score > 0 {
+		score, named := toolSearchScore(desc, query, terms)
+		if score > 0 {
+			identified = identified || named
 			matches = append(matches, scored{
 				desc:    desc,
 				demoted: desc.diagnostic && query != desc.name,
@@ -219,10 +220,12 @@ func (s *Server) gatewayToolSearch(raw json.RawMessage) (string, error) {
 	if req.IncludeSchema {
 		notes = append(notes, "include_schema needs an exact tool name; call tool_search again with one of the names above")
 	}
-	if total > 0 && matches[0].score < weakMatchFloor {
-		// Nothing matched a name or a category. The list is still returned, because
-		// a weak match is better evidence than silence, but it is labelled so it is
-		// not read as a recommendation.
+	if total > 0 && !identified {
+		// No term reached any tool's name or category, so the whole ranking rests on
+		// words that happen to appear in prose. The list is still returned, because a
+		// weak match is better evidence than silence, but it is labelled so it is not
+		// read as a recommendation. The condition is the claim the note makes, rather
+		// than a threshold on a score that sums evidence of different kinds.
 		notes = append(notes, "no tool matched this query by name or category; these are weak description-word matches and may all be irrelevant.")
 	}
 	return marshalToolSearch(results, total, limit, strings.Join(notes, " "))
@@ -271,10 +274,17 @@ func marshalToolSearch(results []toolSearchResult, total, limit int, note string
 // the search. The prefix is removed so the names behind it can still be resolved,
 // and the caller says so in a note rather than answering as though the syntax
 // were understood. A colon inside the query proper is left alone: only a single
-// leading word followed by a colon counts.
+// leading word followed immediately by a colon and a non-space counts.
+//
+// The space is what separates a borrowed directive from ordinary prose. A
+// directive is written closed up ("select:a,b"); a sentence that opens with a
+// word and a colon ("terraform: the blocks that reference it") is a query whose
+// first word is a search term -- and two registry descriptions contain exactly
+// that word, so stripping it would lose a real match and claim a syntax error
+// the caller did not make.
 func splitQueryDirective(query string) (rest, directive string) {
 	idx := strings.Index(query, ":")
-	if idx <= 0 {
+	if idx <= 0 || idx+1 >= len(query) || query[idx+1] == ' ' || query[idx+1] == '\t' {
 		return query, ""
 	}
 	word := query[:idx]
@@ -283,7 +293,7 @@ func splitQueryDirective(query string) (rest, directive string) {
 			return query, ""
 		}
 	}
-	return strings.TrimSpace(query[idx+1:]), word
+	return query[idx+1:], word
 }
 
 // exactToolNames resolves a query that is nothing but tool names.
@@ -294,7 +304,7 @@ func splitQueryDirective(query string) (rest, directive string) {
 // agent reads in its own tool list. Order is the caller's, duplicates collapse.
 func exactToolNames(query string) ([]*toolDescriptor, bool) {
 	fields := strings.FieldsFunc(query, func(r rune) bool {
-		return r == ' ' || r == ',' || r == '\t' || r == '\n'
+		return unicode.IsSpace(r) || r == ','
 	})
 	if len(fields) == 0 {
 		return nil, false
@@ -354,10 +364,15 @@ func searchTerms(query string) []string {
 // description carries real weight because these descriptions are the only prose
 // in the registry -- "dependency trace" finds trace_dependencies through its
 // description even though no name segment of it is the word "dependency".
-func toolSearchScore(desc *toolDescriptor, query string, terms []string) int {
-	score := 0
+//
+// identified reports the kind of evidence rather than its amount: true when some
+// term reached this tool's name or category, false when the whole score came
+// from words appearing in its description. A caller cannot recover that from the
+// number, because the number adds the two together.
+func toolSearchScore(desc *toolDescriptor, query string, terms []string) (score int, identified bool) {
 	if query != "" && query == desc.name {
 		score += 100
+		identified = true
 	}
 	segments := strings.Split(desc.name, "_")
 	lowerDesc := strings.ToLower(desc.description)
@@ -366,18 +381,21 @@ func toolSearchScore(desc *toolDescriptor, query string, terms []string) int {
 			switch {
 			case segment == term:
 				score += 40
+				identified = true
 			case sharesPrefix(segment, term):
 				score += 30
+				identified = true
 			}
 		}
 		if term == desc.category {
 			score += 20
+			identified = true
 		}
 		if strings.Contains(lowerDesc, term) {
 			score += 10
 		}
 	}
-	return score
+	return score, identified
 }
 
 // sharesPrefix reports whether one word is a prefix of the other, which is the

@@ -1219,6 +1219,14 @@ func TestToolSearchLabelsWeakEvidence(t *testing.T) {
 		t.Errorf("irrelevant query note = %q, want it to say the matches are weak", note)
 	}
 
+	// A category match is not labelled weak, however low it scores: "inventory"
+	// is the category of four list tools and nothing else. Under a score
+	// threshold it scored 20 and was labelled; the claim is now the condition.
+	category := searchTools(t, server, map[string]any{"query": "inventory"})
+	if note, _ := category["note"].(string); strings.Contains(note, "weak") {
+		t.Errorf("category-match query was labelled weak: %q", note)
+	}
+
 	// A real intent carries no such warning.
 	for _, query := range []string{"dependency trace", "tests", "impact radius", "dead code"} {
 		data := searchTools(t, server, map[string]any{"query": query})
@@ -1256,12 +1264,25 @@ func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
 		}
 	}
 
-	// Only a leading lowercase word followed by a colon is a directive. A colon
-	// anywhere else leaves the query alone, and a first word that is not a bare
-	// lowercase word is not treated as one.
+	// An empty remainder is answered as an empty result. The note says the prefix
+	// was not a directive and stops there, because nothing was searched or
+	// resolved and a note claiming otherwise would be false.
+	empty := searchTools(t, server, map[string]any{"query": "select:"})
+	if got := searchNames(t, empty); len(got) != 0 {
+		t.Errorf("tool_search(\"select:\") = %v, want nothing", got)
+	}
+	if note, _ := empty["note"].(string); strings.Contains(note, "searched") {
+		t.Errorf("tool_search(\"select:\") note = %q, want no claim about searching", note)
+	}
+
+	// Only a leading lowercase word closed up against a colon is a directive. A
+	// directive is written without a space; a sentence that opens with a word and
+	// a colon is prose, and its first word is a search term like any other.
 	for _, tc := range []struct{ query, want string }{
 		{"find symbols: callers", "find_callers"},
 		{"okhttp3: trace dependencies", "trace_dependencies"},
+		{"terraform: the blocks that reference it", "find_callers"},
+		{"python: who calls this function", "index_repo"},
 	} {
 		data := searchTools(t, server, map[string]any{"query": tc.query})
 		names := searchNames(t, data)
@@ -1272,13 +1293,20 @@ func TestToolSearchDirectiveSyntaxIsNamedNotAbsorbed(t *testing.T) {
 			t.Errorf("tool_search(%q) reported a directive: %q", tc.query, note)
 		}
 	}
+
+	// The first word of such a query is still scored. Two registry descriptions
+	// contain the word "Terraform", and both must still be reachable by it.
+	tf := searchNames(t, searchTools(t, server, map[string]any{"query": "terraform: the blocks that reference it"}))
+	if len(tf) < 2 || tf[0] != "find_callers" || tf[1] != "find_callees" {
+		t.Errorf("tool_search(terraform prose) = %v, want find_callers then find_callees", tf)
+	}
 }
 
 // TestToolSearchTermsAreCountedOnce pins the scoring property behind the recorded
 // failure: a repeated word is query vocabulary, not query emphasis.
 func TestToolSearchTermsAreCountedOnce(t *testing.T) {
-	once := toolSearchScore(toolByName["find_dead_code"], "find", searchTerms("find"))
-	thrice := toolSearchScore(toolByName["find_dead_code"], "find find find", searchTerms("find find find"))
+	once, _ := toolSearchScore(toolByName["find_dead_code"], "find", searchTerms("find"))
+	thrice, _ := toolSearchScore(toolByName["find_dead_code"], "find find find", searchTerms("find find find"))
 	if once != thrice {
 		t.Errorf("repeating a term changed the score: %d then %d", once, thrice)
 	}
@@ -1300,6 +1328,9 @@ func TestToolSearchNaturalLanguageIntentIsUnchanged(t *testing.T) {
 		{"semantic search", "search_semantic"},
 		{"list files", "list_files"},
 		{"index the repository", "index_repo"},
+		// A term repeated by the query, which deduplication changes the arithmetic
+		// for: the top match must not move.
+		{"search for symbols by name and search docs", "search_symbols"},
 	} {
 		names := searchNames(t, searchTools(t, server, map[string]any{"query": tc.query}))
 		if len(names) == 0 || names[0] != tc.want {
@@ -1344,6 +1375,13 @@ func TestToolSearchNameListIsBoundedAndDeterministic(t *testing.T) {
 	if again := searchNames(t, searchTools(t, server, map[string]any{"query": query})); !reflect.DeepEqual(got, again) {
 		t.Errorf("name resolution is not deterministic: %v then %v", got, again)
 	}
+	// Names may arrive separated by any whitespace, including a CRLF-joined list
+	// pasted out of a tool listing.
+	crlf := searchNames(t, searchTools(t, server, map[string]any{"query": "find_symbol\r\nfind_callers"}))
+	if !reflect.DeepEqual(crlf, []string{"find_symbol", "find_callers"}) {
+		t.Errorf("CRLF-separated name list = %v", crlf)
+	}
+
 	capped := searchTools(t, server, map[string]any{"query": query, "limit": 100000000})
 	if n := len(searchNames(t, capped)); n > maxToolSearchLimit {
 		t.Errorf("name list with a huge limit returned %d tools, want at most %d", n, maxToolSearchLimit)
