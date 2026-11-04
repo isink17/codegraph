@@ -28,8 +28,11 @@ type rawEvent struct {
 	IsSidechain bool   `json:"isSidechain"`
 	IsMeta      bool   `json:"isMeta"`
 	Timestamp   string `json:"timestamp"`
-	Version     string `json:"version"`
-	AgentID     string `json:"agentId"`
+	// Claude Code wrote the client version as "version" through 2.1.316 and as
+	// "claude_code_version" on the init event from 2.1.318.
+	Version           string `json:"version"`
+	ClaudeCodeVersion string `json:"claude_code_version"`
+	AgentID           string `json:"agentId"`
 	// ToolUseResult on a Task/Agent tool_result names the spawned agent.
 	ToolUseResult json.RawMessage `json:"toolUseResult"`
 	Message       *struct {
@@ -150,8 +153,13 @@ func (t *Transcript) addEvent(b []byte, byID map[string]*request, seenTool map[s
 	if t.own {
 		ev.IsSidechain = false
 	}
-	if ev.Version != "" {
-		t.versions[ev.Version] = true
+	if ev.Version != "" && ev.ClaudeCodeVersion != "" && ev.Version != ev.ClaudeCodeVersion {
+		return fmt.Errorf("event declares version %q and claude_code_version %q", ev.Version, ev.ClaudeCodeVersion)
+	}
+	for _, v := range [...]string{ev.Version, ev.ClaudeCodeVersion} {
+		if v != "" {
+			t.versions[v] = true
+		}
 	}
 	if ev.AgentID != "" {
 		t.agentIDs[ev.AgentID] = true
