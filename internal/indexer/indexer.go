@@ -123,6 +123,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
+	releaseScan, err := i.store.AcquireRepositoryScan(ctx, opts.RepoRoot)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	defer releaseScan()
 	// HEAD is read before the first read of the tree (repository config,
 	// manifests, the walk), so head_at_start bounds everything the scan saw.
 	// A Git read writes nothing, so a refused run still leaves the database
@@ -162,6 +167,11 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 			return store.ScanSummary{}, err
 		}
 	}
+	previousScans, err := i.store.ListScans(ctx, repo.ID, 1, 0)
+	if err != nil {
+		return store.ScanSummary{}, err
+	}
+	repairGraph := len(previousScans) > 0 && previousScans[0].Status != "completed"
 	scanKind := opts.ScanKind
 	if scanKind == "" {
 		scanKind = "index"
@@ -269,7 +279,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
-	if !pathScoped && (scanKind != "update" || !xlangCurrent) {
+	if repairGraph || !pathScoped && (scanKind != "update" || !xlangCurrent) {
 		indexedLanguages, err := i.store.IndexedLanguages(ctx, repo.ID)
 		if err != nil {
 			return store.ScanSummary{}, err
@@ -288,7 +298,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	if err != nil {
 		return store.ScanSummary{}, err
 	}
-	if !pathScoped && (scanKind != "update" || !xlangCurrent) {
+	if repairGraph || !pathScoped && (scanKind != "update" || !xlangCurrent) {
 		for _, language := range semanticStale {
 			if !affectedLanguage(language) {
 				return store.ScanSummary{}, &store.ParserSemanticError{Reason: store.ErrParserSemanticUpgradeRequired, Language: language, Current: semanticEpochs[language]}
@@ -314,7 +324,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// language's semantic marker before the first scan write, including markers
 	// outside a path-scoped request.
 	semanticTransition := pendingTransition || len(profilePlan.reparseLanguages) > 0
-	if semanticTransition {
+	if semanticTransition || repairGraph {
 		allIndexed := func(language string) bool {
 			_, ok := indexedLanguages[language]
 			_, pending := pendingLanguages[language]
@@ -354,7 +364,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// Its policy coverage is therefore every language, so a newer or unreadable
 	// marker of an unselected language refuses it too.
 	policyAffected := affectedLanguage
-	if semanticTransition || (!pathScoped && scanKind != "update") {
+	if semanticTransition || repairGraph || (!pathScoped && scanKind != "update") {
 		policyAffected = func(string) bool { return true }
 	}
 	policyStale, err := i.store.PlanResolverPolicies(ctx, repo.ID, policyAffected)
@@ -631,7 +641,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// repo-wide and re-decides everything anyway, so the extra read would be
 	// pure cost.
 	removedSymbolNameSet := make(map[string]struct{}, 64)
-	incrementalResolve := pathScoped || scanKind == "update"
+	incrementalResolve := !repairGraph && (pathScoped || scanKind == "update")
 	collectRemovedNames := func(paths []string) error {
 		if !incrementalResolve || len(paths) == 0 {
 			return nil
@@ -1096,7 +1106,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	resolveStart := time.Now()
 	repoWideResolve := false
 
-	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 && !semanticTransition {
+	// A failed scan may have committed file hashes before relationship resolution.
+	// Unchanged bytes on the retry still need that unfinished second pass.
+	if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 && !semanticTransition && !repairGraph {
 		summary.ResolveMS = 0
 		summary.ResolveMode = "none"
 	} else if incrementalResolve && !semanticTransition {
@@ -1180,9 +1192,9 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// replacement, retirement, or deletion clears the durable currentness marker
 	// in the same store transaction; an absent marker also covers pre-P22.37
 	// databases and incomplete prior scans.
-	if !xlangCurrent || len(changedPathSet) > 0 || pathScoped {
+	if repairGraph || !xlangCurrent || len(changedPathSet) > 0 || pathScoped {
 		var resolveErr error
-		shouldResolve := scanKind != "update" || !pathScoped
+		shouldResolve := repairGraph || scanKind != "update" || !pathScoped
 		if !shouldResolve && len(candidatePaths) > 0 {
 			paths := candidatePaths
 			shouldResolve, resolveErr = i.store.CrossLanguageLinksAffectedByPaths(ctx, repo.ID, paths)
@@ -1203,7 +1215,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 	// its tests were bound to) and unconditionally on a full `index` run.
 	// Only a no-op incremental update skips
 	// it, keeping watch loops cheap.
-	if scanKind != "update" || len(changedPathSet) > 0 || summary.FilesDeleted > 0 {
+	if repairGraph || scanKind != "update" || len(changedPathSet) > 0 || summary.FilesDeleted > 0 {
 		testLinkStart := time.Now()
 		testLinkStats, resolveErr := i.store.ResolveTestLinks(ctx, repo.ID)
 		if resolveErr != nil {
@@ -1213,7 +1225,7 @@ func (i *Indexer) run(ctx context.Context, opts Options) (store.ScanSummary, err
 		summary.ResolveTestLinksFileBound = testLinkStats.FilesBound
 		summary.ResolveTestLinksMS = time.Since(testLinkStart).Milliseconds()
 		summary.ResolveMS = time.Since(resolveStart).Milliseconds()
-		if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 {
+		if len(changedPathSet) == 0 && len(removedSymbolNameSet) == 0 && !repoWideResolve {
 			// Edge resolution did not run; the timings above are the test-link
 			// pass alone, and the mode should say so instead of "none". The
 			// removed-name condition matches the dispatch above: since P22.12 a

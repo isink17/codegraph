@@ -185,6 +185,8 @@ type Store struct {
 	// tokenStats caches the per-repository BM25 corpus statistics, keyed by
 	// the scan generation they were computed from.
 	tokenStats tokenStatsCache
+	// semanticSearchAfterStats is a deterministic inter-statement test barrier.
+	semanticSearchAfterStats func()
 	// resolverPolicies overrides resolverPolicyRegistry; nil outside tests.
 	resolverPolicies map[string]int
 	// parserProfiles is the reading binary's parser registry, which freshness
@@ -8540,6 +8542,13 @@ func StrongerRelatedTest(a, b RelatedTest) bool {
 // codegraph-evidence/v2-cg142-scoring-20261103 and, for the baseline it is
 // measured against, v2-semantic-retrieval-benchmark-20261103.
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
+	ctx, readTx, err := s.beginParserSemanticGraphRead(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	if readTx != nil {
+		defer readTx.Rollback()
+	}
 	if err := s.requireCurrentSemanticTokens(ctx, repoID); err != nil {
 		return nil, err
 	}
@@ -8553,6 +8562,9 @@ func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, 
 	stats, err := s.corpusTokenStatsFor(ctx, repoID)
 	if err != nil {
 		return nil, err
+	}
+	if s.semanticSearchAfterStats != nil {
+		s.semanticSearchAfterStats()
 	}
 	if stats.Symbols == 0 || stats.AvgLen <= 0 {
 		return []map[string]any{}, nil
