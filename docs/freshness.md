@@ -175,6 +175,46 @@ richer build wrote is not stale for that build. A build without CGO
 therefore never calls tree-sitter data obsolete or current. It is one
 aggregate query, the one `parser_profile` already runs.
 
+## Concurrent scans and retrieval
+
+An `index` or `update` takes a separate exclusive, per-repository OS lock
+before reading configuration or planning changes. Another operation on that
+repository is refused with a retryable active-scan error. Retry after the
+owner finishes. CLI `index --rebuild` retains the same ownership from before
+database removal through opening, indexing and closing its replacement.
+Scans of other repositories and ordinary reads do not take
+this lock. The lock file remains beside the database; its existence is not
+ownership, and process exit releases ownership. Older binaries do not follow
+this protocol: stop old indexers and watchers before upgrading.
+
+A scan is not one transaction. File replacements, deletion, relationship
+resolution, token refresh and completion commit separately. Failure retains
+already committed batches. The next scan after a recorded failure reruns
+repository-wide relationship resolution even if all file hashes are unchanged.
+An abandoned `running` row still requires `codegraph recover-scans`; a later
+scan does not erase it or certify coverage. Recovery records failure and does
+not certify completeness.
+
+Token-based `search_semantic` uses one SQLite read snapshot for its version
+guard, corpus statistics, document frequencies and scoring. It can see a
+committed partial scan, but those reads agree with that snapshot. BM25 skips
+its corpus cache while any repository scan is running; between scans the
+cache generation counts finished scans, including failures, so out-of-order
+completion also invalidates it. This does not change the embedding-enabled
+FTS/vector search branch, which does not consume semantic token rows.
+
+`context_for_task` assembles several queries and therefore refuses a running
+scan at either generation check. It also refuses a generation change between
+those checks. A running scan ID alone cannot identify a stable candidate
+stream because multiple file batches can commit under that same ID.
+
+`TestConcurrentScansCannotOverwriteNewerBytes`,
+`TestFailedScanRetainsCommittedWritesAndRecovers`,
+`TestTokenMigrationOverlapsCommittedScan`, `TestCorpusStatsFollow*`,
+`TestSemanticSearchPinsOneSnapshotAcrossCommittedBatch` and
+`TestContextForTaskCannotMixBatchesOfOneRunningScan` exercise these boundaries
+with temporary databases and explicit barriers, without timing sleeps.
+
 ## Writer liveness
 
 Every scan holds a shared OS lock on `<db>.scan.lock` from before its row is

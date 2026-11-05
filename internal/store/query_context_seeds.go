@@ -259,15 +259,19 @@ func (s *Store) SymbolNameCounts(ctx context.Context, repoID int64, names []stri
 // it has never been scanned. It is the cheap graph-generation identity: Stats
 // reports the same number but pays for several COUNT(*) scans to do it.
 //
-// Every scan row counts, including a failed or in-progress one. A failed scan
-// can still have written rows before it gave up, so treating it as a new
-// generation invalidates outstanding context cursors rather than letting one
-// resume against a graph that may have moved underneath it.
+// Failed scans count because they can have committed writes. A running scan
+// refuses context selection: its file batches can commit without changing its
+// id, so before/after MAX(id) checks alone cannot detect that movement.
 func (s *Store) LastScanID(ctx context.Context, repoID int64) (int64, error) {
-	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM scans WHERE repo_id = ?`, repoID).Scan(&id)
+	var id, running int64
+	err := s.parserSemanticQueryer(ctx).QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0), COUNT(CASE WHEN status = 'running' THEN 1 END)
+		 FROM scans WHERE repo_id = ?`, repoID).Scan(&id, &running)
 	if err != nil {
 		return 0, err
+	}
+	if running > 0 {
+		return 0, ErrScanActive
 	}
 	return id, nil
 }
