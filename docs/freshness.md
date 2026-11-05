@@ -180,7 +180,9 @@ aggregate query, the one `parser_profile` already runs.
 An `index` or `update` takes a separate exclusive, per-repository OS lock
 before reading configuration or planning changes. Another operation on that
 repository is refused with a retryable active-scan error. Retry after the
-owner finishes. Scans of other repositories and ordinary reads do not take
+owner finishes. CLI `index --rebuild` retains the same ownership from before
+database removal through opening, indexing and closing its replacement.
+Scans of other repositories and ordinary reads do not take
 this lock. The lock file remains beside the database; its existence is not
 ownership, and process exit releases ownership. Older binaries do not follow
 this protocol: stop old indexers and watchers before upgrading.

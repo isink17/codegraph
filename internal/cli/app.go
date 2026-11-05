@@ -824,6 +824,16 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 	}
 	removedDBFiles := []string{}
 	if rebuild {
+		paths, pathErr := repoDBPathsForRepo(cfg, repoRoot, canonical)
+		if pathErr != nil {
+			return pathErr
+		}
+		var release func()
+		ctx, release, err = store.AcquireRepositoryScan(ctx, paths[0], canonical)
+		if err != nil {
+			return err
+		}
+		defer release()
 		removedDBFiles, err = removeRepoDBFiles(cfg, repoRoot, canonical)
 		if err != nil {
 			return err

@@ -96,3 +96,66 @@ func TestRepositoryScanLockProcessExit(t *testing.T) {
 	}
 	release()
 }
+
+func TestRepositoryScanLockInheritedOwnershipIsScopedAndExpires(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(t.TempDir(), "new", "graph.sqlite")
+	owned, release, err := AcquireRepositoryScan(ctx, path, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	nested, err := s.AcquireRepositoryScan(owned, root)
+	if err != nil {
+		t.Fatalf("ownership did not survive database creation: %v", err)
+	}
+	nested()
+	if unlock, err := s.AcquireRepositoryScan(ctx, root); !errors.Is(err, ErrScanActive) {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatalf("nested release dropped the outer lock: %v", err)
+	}
+	other, _ := newQueryTestStore(t)
+	otherRelease, err := other.AcquireRepositoryScan(owned, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlock, err := other.AcquireRepositoryScan(ctx, root); !errors.Is(err, ErrScanActive) {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatalf("inherited context bypassed database identity: %v", err)
+	}
+	otherRelease()
+	otherRoot := t.TempDir()
+	otherRelease, err = s.AcquireRepositoryScan(owned, otherRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlock, err := s.AcquireRepositoryScan(ctx, otherRoot); !errors.Is(err, ErrScanActive) {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatalf("inherited context bypassed repository identity: %v", err)
+	}
+	otherRelease()
+	release()
+	newOwner, err := s.AcquireRepositoryScan(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newOwner()
+	if unlock, err := s.AcquireRepositoryScan(owned, root); !errors.Is(err, ErrScanActive) {
+		if unlock != nil {
+			unlock()
+		}
+		t.Fatalf("expired ownership bypassed a new owner: %v", err)
+	}
+}
