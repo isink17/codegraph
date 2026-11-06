@@ -154,6 +154,26 @@ func TestRegistryAmbiguousExtensionFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSvelteExtensionCollisionAndCapabilities(t *testing.T) {
+	registry := NewRegistry(
+		profiled("svelte", ".svelte", "treesitter:svelte:v1"),
+		profiled("other", ".SVELTE", "test:other:v1"),
+	)
+	if registry.AdapterFor("Panel.SVELTE") != nil {
+		t.Fatal("ambiguous Svelte extension selected an adapter")
+	}
+	want := []ExtensionCollision{{Extension: ".svelte", Languages: []string{"other", "svelte"}}}
+	if got := registry.ExtensionCollisions(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("collisions = %+v", got)
+	}
+	registry.SetNoCGOCapabilities(map[string]NoCGOCapability{"svelte": {}})
+	for _, capability := range registry.Capabilities() {
+		if capability.ID == "svelte" && (capability.DisplayName != "Svelte" || capability.NoCGOParser == nil || *capability.NoCGOParser || capability.NoCGOCallGraph == nil || *capability.NoCGOCallGraph) {
+			t.Fatalf("Svelte no-CGO capability = %+v", capability)
+		}
+	}
+}
+
 func TestLanguageCapabilitiesAreSortedAndExplicit(t *testing.T) {
 	registry := NewRegistry(profiled("java", ".java", "treesitter:java:v12"))
 	got := registry.Capabilities()

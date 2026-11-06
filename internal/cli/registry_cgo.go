@@ -15,6 +15,7 @@ func newDefaultRegistry() *parser.Registry {
 		tsparser.NewKotlin(),
 		tsparser.NewCSharp(),
 		tsparser.NewTypeScript(),
+		tsparser.NewSvelte(),
 		tsparser.NewRust(),
 		tsparser.NewRuby(),
 		tsparser.NewSwift(),

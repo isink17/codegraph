@@ -93,9 +93,9 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 	}
 	availability := noCGOCapabilities()
 	for language, available := range availability {
-		if language == "solidity" {
-			if available.Parser || available.CallGraph || registry.AdapterFor("contracts/Token.sol") != nil {
-				t.Errorf("Solidity no-CGO state = %+v, adapter = %v; want explicitly unavailable", available, registry.AdapterFor("contracts/Token.sol"))
+		if !available.Parser {
+			if _, registered := registry.ProfileForLanguage(language); registered || available.CallGraph {
+				t.Errorf("unavailable %s has a parser profile or call graph", language)
 			}
 			continue
 		}
@@ -156,6 +156,21 @@ func TestNoCgoRegistryProfiles(t *testing.T) {
 		}
 		if observed != profile.EmitsCallEdges {
 			t.Errorf("%s profile call-edge claim = %v, parsed fixture emitted calls = %v", language, profile.EmitsCallEdges, observed)
+		}
+	}
+}
+
+func TestSvelteNoCgoProductionUnavailable(t *testing.T) {
+	registry := newDefaultRegistry()
+	if adapter := registry.AdapterFor("Panel.SVELTE"); adapter != nil {
+		t.Fatalf("no-CGO Svelte adapter = %v, want unavailable", adapter)
+	}
+	if profile, ok := registry.ProfileForLanguage("svelte"); ok {
+		t.Fatalf("no-CGO advertised Svelte profile: %+v", profile)
+	}
+	for _, language := range registry.SupportedLanguages() {
+		if language.Language == "svelte" || slices.Contains(language.Extensions, ".svelte") {
+			t.Fatalf("no-CGO advertised Svelte support: %+v", language)
 		}
 	}
 }
