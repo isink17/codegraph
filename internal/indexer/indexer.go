@@ -1440,7 +1440,7 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	if task.adapter != nil {
 		parseStarted := time.Now()
 		parsePath := task.path
-		if task.language == "typescript" {
+		if task.language == "typescript" || task.language == "svelte" {
 			parsePath = task.rel
 		}
 		parsed, err = task.adapter.Parse(ctx, parsePath, content)

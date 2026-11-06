@@ -35,17 +35,20 @@ component exports contribute no symbols or references. No name matching connects
 template expressions to script declarations. File token weights still cover the
 whole file, as they do for other adapters.
 
-## Serialized integration handoff
+## Production registration and capabilities
 
-The worker's allowed file scope excludes `internal/cli`. The coordinator must
-add `tsparser.NewSvelte()` to `internal/cli/registry_cgo.go` and add
-`"svelte": {Parser: false, CallGraph: false}` to `noCGOCapabilities()` in
-`internal/cli/registry_capabilities.go`. Do not register a no-CGO fallback.
-Until that integration, the shipped default registry does not recognize Svelte.
-The adapter registry tests explicitly report symbols available, calls false,
-no-CGO parser/calls false, with resolver dimensions unknown. `.svelte` is not
-claimed by the TS/JS adapter. The standard registry collision rule fails closed
-when another language claims `.svelte`.
+The CGO default registry registers `tsparser.NewSvelte()` for `.svelte` files.
+It reports symbols available, calls false, and no-CGO parser/calls false,
+with resolver dimensions unknown. CLI doctor lists Svelte among symbols-only
+languages; MCP `supported_languages` exposes the same effective registry and
+its versioned profile. Indexing persists `treesitter:svelte:v1`, semantic epoch 1,
+and `parser_call_edges=false` on Svelte files.
+
+The no-CGO build has no Svelte adapter or profile and omits Svelte from its
+supported language, extension and MCP capability lists. The shared no-CGO
+availability table explicitly records parser/calls false; it does not advertise
+a fallback parser. `.svelte` is not claimed by the TS/JS adapter. The standard
+registry collision rule fails closed when another language claims `.svelte`.
 
 ## Upstream fixture
 
