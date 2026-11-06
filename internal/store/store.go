@@ -466,6 +466,9 @@ type SymbolSearchResult struct {
 }
 
 type NeighborResult struct {
+	// HasMore describes page continuation, independently of source/transport truncation.
+	HasMore         bool           `json:"has_more"`
+	NextOffset      *int           `json:"next_offset,omitempty"`
 	TargetFound     bool           `json:"target_found"`
 	Callers         []graph.Symbol `json:"callers"`
 	Callees         []graph.Symbol `json:"callees"`

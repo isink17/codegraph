@@ -192,6 +192,7 @@ func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol stri
 	if tx != nil {
 		defer tx.Rollback()
 	}
+	limit, offset = safeLimit(limit), safeOffset(offset)
 	var ids []int64
 	if symbolID != 0 {
 		identity, ok, err := s.lookupSymbolIdentity(ctx, repoID, symbolID)
@@ -210,11 +211,18 @@ func (s *Store) FindCalleesResult(ctx context.Context, repoID int64, symbol stri
 			return NeighborResult{}, err
 		}
 	}
-	items, err := s.findCalleesResolved(ctx, repoID, ids, limit, offset)
+	items, err := s.findCalleesRows(ctx, repoID, ids, limit+1, offset)
 	if err != nil {
 		return NeighborResult{}, err
 	}
-	return NeighborResult{TargetFound: len(ids) > 0, Callees: items}, nil
+	result := NeighborResult{TargetFound: len(ids) > 0, Callees: items}
+	if len(items) > limit {
+		result.HasMore = true
+		next := offset + limit
+		result.NextOffset = &next
+		result.Callees = items[:limit]
+	}
+	return result, nil
 }
 
 func (s *Store) RelatedTestsResult(ctx context.Context, repoID int64, symbol, file string, limit, offset int) (RelatedTestsResult, error) {

@@ -105,7 +105,7 @@ func TestRichGraphRelationshipResponsesAreByteStable(t *testing.T) {
 	// A pinned literal for one tool, so a change to the bare handler shape is
 	// caught too, not only a change in what wraps it.
 	text, _ := callToolRaw(t, server, ctx, "find_callees", map[string]any{"symbol": "Helper"})
-	if text != `{"data":{"callees":[],"target_found":true},"ok":true}` {
+	if text != `{"data":{"callees":[],"has_more":false,"target_found":true},"ok":true}` {
 		t.Fatalf("find_callees(Helper) = %s", text)
 	}
 }

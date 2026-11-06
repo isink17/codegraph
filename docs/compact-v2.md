@@ -1,7 +1,8 @@
 # Compact v2 MCP contract
 
 `format=compact-v2` explicitly selects `codegraph.compact/v2`. JSON remains the
-omitted/default format; `format=compact` remains byte-compatible v1. There is no
+omitted/default format; `format=compact` retains v1 encoding. The additive
+callee pagination section described below changes callee response bytes. There is no
 automatic upgrade or fallback. V1's comma-joined list cells are ambiguous (for
 example `["a,b","c"]` and `["a","b,c"]` collide); use JSON or v2 for exact lists.
 
@@ -82,7 +83,8 @@ unknown format selectors are errors.
 | Tool | Sections in wire order |
 |---|---|
 | `find_symbol`, `search_symbols` | `matches`, `presence` |
-| `find_callers`, `find_callees` | `callers`/`callees`, `presence`, optional `unresolved_hints`, optional `limitations` |
+| `find_callers` | `callers`, `presence`, optional `unresolved_hints`, optional `limitations` |
+| `find_callees` | `callees`, `presence`, `pagination`, optional `limitations` |
 | `get_impact_radius` | `symbols`, `files`, `summary`, `presence`, optional `limitations` |
 | `find_related_tests` | `tests`, `presence`, optional `limitations` |
 | `find_dead_code` | `dead_code`, optional `limitations` |
@@ -149,3 +151,14 @@ V2 adds schema typing and exact array boundaries. Small tables can exceed JSON;
 there is no universal saving claim. The format advertisement adds 180 bytes
 (45 estimated tokens) to full tools/list and 60 bytes (15 estimated tokens) to
 gateway tools/list. These estimates use ceil(bytes/4), not provider tokenization.
+
+### Callee continuation
+
+`find_callees` adds JSON `has_more` and, only when true, `next_offset`.
+Pass `next_offset` as the next request’s `offset`, keeping the symbol and limit
+unchanged. Compact v1 and v2 carry the same fields in a `pagination` section;
+the terminal `next_offset` cell is empty. Existing sections retain their schemas.
+Continuation describes the distinct resolved relationship page, independently
+of source-detail or transport truncation. Each request uses one database
+snapshot; separate requests can observe indexing changes. Complete traversal
+without skips or duplicates requires an unchanged graph between requests.
