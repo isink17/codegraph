@@ -16,14 +16,52 @@ type ImpactSeedPresence struct {
 }
 
 func (s *Store) SearchSymbolsResult(ctx context.Context, repoID int64, query string, limit, offset int) (SymbolSearchResult, error) {
-	return s.searchSymbolsWithPresence(ctx, repoID, query, limit, offset)
+	return s.searchSymbolsWithPresence(ctx, repoID, query, limit, offset, false)
+}
+
+// FindSymbolPreferredResult prefers literal qualified identities, retaining all
+// exact candidates and falling back to search only when that identity is absent.
+func (s *Store) FindSymbolPreferredResult(ctx context.Context, repoID int64, query string, limit, offset int) (SymbolSearchResult, error) {
+	return s.searchSymbolsWithPresence(ctx, repoID, query, limit, offset, true)
 }
 
 // searchSymbolsWithPresence evaluates the candidate CTE once. The metadata
 // row keeps presence available even when the requested page is empty.
-func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, query string, limit, offset int) (SymbolSearchResult, error) {
-	search := func(sqlText string, args ...any) (SymbolSearchResult, error) {
-		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, sqlText, args...)
+func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, query string, limit, offset int, preferQualified bool) (SymbolSearchResult, error) {
+	var exactCTE string
+	if preferQualified {
+		exactCTE = `exact_matches AS MATERIALIZED (
+			SELECT s.id FROM symbols s
+			JOIN files f ON f.id = s.file_id AND f.repo_id = s.repo_id AND f.is_deleted = 0
+			WHERE s.repo_id = ? AND s.qualified_name = ?
+		), `
+	}
+	search := func(candidates string, args ...any) (SymbolSearchResult, error) {
+		if preferQualified {
+			// Choose the tier before pagination, in the same snapshot as presence
+			// and rows. An exhausted exact page must not become a fuzzy page.
+			candidates = `SELECT id FROM exact_matches UNION ALL ` + candidates + ` AND NOT EXISTS (SELECT 1 FROM exact_matches)`
+			args = append([]any{repoID, query}, args...)
+		}
+		args = append(args, safeLimit(limit), safeOffset(offset))
+		rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
+		WITH `+exactCTE+`matches AS MATERIALIZED (`+candidates+`), page AS (
+			SELECT matches.id FROM matches
+			JOIN symbols s ON s.id = matches.id
+			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
+			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
+			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
+			LIMIT ? OFFSET ?
+		), meta AS (SELECT EXISTS(SELECT 1 FROM matches) AS matched)
+		SELECT meta.matched, s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
+		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
+		FROM meta
+		LEFT JOIN page p ON 1 = 1
+		LEFT JOIN symbols s ON s.id = p.id
+		LEFT JOIN files f ON f.id = s.file_id
+		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, f.path ASC, s.qualified_name ASC, s.kind ASC,
+		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC, s.stable_key ASC
+		`, args...)
 		if err != nil {
 			return SymbolSearchResult{}, err
 		}
@@ -53,58 +91,23 @@ func (s *Store) searchSymbolsWithPresence(ctx context.Context, repoID int64, que
 		return result, rows.Err()
 	}
 
-	args := []any{repoID, quoteFTS(query), safeLimit(limit), safeOffset(offset)}
 	result, err := search(`
-		WITH matches AS MATERIALIZED (
 			SELECT s.id
 			FROM symbol_fts fts JOIN symbols s ON s.id = fts.symbol_id
 			-- Presence and the page share one candidate domain, so the
 			-- matched flag can never claim a symbol the page may not show.
 			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND symbol_fts MATCH ?
-		), page AS (
-			SELECT matches.id FROM matches
-			JOIN symbols s ON s.id = matches.id
-			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
-			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
-			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
-			LIMIT ? OFFSET ?
-		), meta AS (SELECT EXISTS(SELECT 1 FROM matches) AS matched)
-		SELECT meta.matched, s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM meta
-		LEFT JOIN page p ON 1 = 1
-		LEFT JOIN symbols s ON s.id = p.id
-		LEFT JOIN files f ON f.id = s.file_id
-		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, f.path ASC, s.qualified_name ASC, s.kind ASC,
-		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC, s.stable_key ASC
-	`, args...)
+	`, repoID, quoteFTS(query))
 	if err == nil {
 		return result, nil
 	}
 
 	return search(`
-		WITH matches AS MATERIALIZED (
 			SELECT s.id FROM symbols s
 			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
 			WHERE s.repo_id = ? AND (s.name LIKE ? OR s.qualified_name LIKE ?)
-		), page AS (
-			SELECT matches.id FROM matches
-			JOIN symbols s ON s.id = matches.id
-			JOIN files f ON f.id = s.file_id AND f.is_deleted = 0
-			ORDER BY f.path ASC, s.qualified_name ASC, s.kind ASC, s.start_line ASC, s.start_col ASC,
-			         s.end_line ASC, s.end_col ASC, s.stable_key ASC
-			LIMIT ? OFFSET ?
-		), meta AS (SELECT EXISTS(SELECT 1 FROM matches) AS matched)
-		SELECT meta.matched, s.id, s.file_id, s.language, s.kind, s.name, s.qualified_name, s.container_name, s.signature, s.visibility,
-		       s.start_line, s.start_col, s.end_line, s.end_col, s.doc_summary, s.stable_key, f.path
-		FROM meta
-		LEFT JOIN page p ON 1 = 1
-		LEFT JOIN symbols s ON s.id = p.id
-		LEFT JOIN files f ON f.id = s.file_id
-		ORDER BY CASE WHEN s.id IS NULL THEN 0 ELSE 1 END, f.path ASC, s.qualified_name ASC, s.kind ASC,
-		         s.start_line ASC, s.start_col ASC, s.end_line ASC, s.end_col ASC, s.stable_key ASC
-	`, repoID, "%"+query+"%", "%"+query+"%", safeLimit(limit), safeOffset(offset))
+	`, repoID, "%"+query+"%", "%"+query+"%")
 }
 
 func (s *Store) FindSymbolExactResult(ctx context.Context, repoID int64, query string, limit, offset int) (SymbolSearchResult, error) {
