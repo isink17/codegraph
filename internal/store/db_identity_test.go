@@ -571,6 +571,11 @@ func TestV2WALCurrentMetadataAccepted(t *testing.T) {
 }
 
 func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
+	// Other package test processes may keep validation snapshots in the shared temp root.
+	privateTemp := t.TempDir()
+	for _, variable := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(variable, privateTemp)
+	}
 	path, reader, writer, tx := v2PinnedWALFixture(t)
 	defer tx.Rollback()
 	defer reader.Close()
@@ -605,6 +610,11 @@ func TestOpenReadOnlyUsesAcceptedSnapshot(t *testing.T) {
 }
 
 func TestOpenReadOnlyFailedSnapshotCleansTempDirectory(t *testing.T) {
+	// Other package test processes may keep validation snapshots in the shared temp root.
+	privateTemp := t.TempDir()
+	for _, variable := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(variable, privateTemp)
+	}
 	path, reader, writer, tx := v2PinnedWALFixture(t)
 	defer tx.Rollback()
 	defer reader.Close()
