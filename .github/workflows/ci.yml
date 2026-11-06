@@ -16,6 +16,12 @@ on:
     # No workflow_dispatch or schedule can accidentally run against master.
     types: [opened, synchronize, reopened, edited, labeled]
 
+# A newer PR run supersedes its predecessor. Pushes get unique groups so
+# required branch validation is never cancelled by another CI run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Classifies the change. Only a change limited to CHANGELOG.md, README.md
   # and docs/**/*.md, without the windows-stress label, is docs-only; it gets
