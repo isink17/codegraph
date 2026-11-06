@@ -159,6 +159,9 @@ func serviceRepositoryCalls() []serviceCall {
 		{"SearchSymbolsResult", "SearchSymbolsResult", func(ctx context.Context, s *Service, r int64) (any, error) {
 			return s.SearchSymbolsResult(ctx, r, sym, 10, 0)
 		}},
+		{"FindSymbolPreferredResult", "FindSymbolPreferredResult", func(ctx context.Context, s *Service, r int64) (any, error) {
+			return s.FindSymbolPreferredResult(ctx, r, sym, 10, 0)
+		}},
 		{"FindCallers", "FindCallers", func(ctx context.Context, s *Service, r int64) (any, error) {
 			return s.FindCallers(ctx, r, sym, 0, 10, 0)
 		}},

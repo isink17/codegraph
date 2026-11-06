@@ -832,7 +832,12 @@ func (s *Server) symbolMatches(ctx context.Context, raw json.RawMessage, search 
 	if err != nil {
 		return false, nil, err
 	}
-	result, err := s.query.SearchSymbolsResult(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	var result store.SymbolSearchResult
+	if search {
+		result, err = s.query.SearchSymbolsResult(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	} else {
+		result, err = s.query.FindSymbolPreferredResult(ctx, s.repoID, req.Query, req.Limit, req.Offset)
+	}
 	if err != nil {
 		return false, nil, err
 	}

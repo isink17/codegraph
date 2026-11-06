@@ -85,6 +85,13 @@ func (s *Service) SearchSymbolsResult(ctx context.Context, repoID int64, query s
 	return s.store.SearchSymbolsResult(ctx, repoID, query, limit, offset)
 }
 
+func (s *Service) FindSymbolPreferredResult(ctx context.Context, repoID int64, query string, limit, offset int) (store.SymbolSearchResult, error) {
+	if err := s.requirePaths(ctx, repoID); err != nil {
+		return store.SymbolSearchResult{}, err
+	}
+	return s.store.FindSymbolPreferredResult(ctx, repoID, query, limit, offset)
+}
+
 func (s *Service) FindCallers(ctx context.Context, repoID int64, symbol string, symbolID int64, limit, offset int) ([]graph.Symbol, error) {
 	if err := s.requirePaths(ctx, repoID); err != nil {
 		return nil, err
