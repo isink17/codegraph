@@ -81,7 +81,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test -timeout ${{ matrix.go_test_timeout }} ./...
+        run: go test -timeout ${{ matrix.go_test_timeout }} ./internal/store ./...
 
   quality:
     needs: changes
