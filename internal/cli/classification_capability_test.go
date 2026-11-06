@@ -18,8 +18,8 @@ func TestClassificationCapabilitiesMatchLiveParserRegistry(t *testing.T) {
 		seen[language.Language] = true
 	}
 	for language := range seen {
-		if language == "solidity" {
-			continue // syntax-only pilot records no graph edges to classify
+		if language == "solidity" || language == "svelte" {
+			continue // syntax-only adapters record no graph edges to classify
 		}
 		found := false
 		for _, capability := range capabilities {
