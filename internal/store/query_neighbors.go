@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/isink17/codegraph/internal/graph"
+	"github.com/isink17/codegraph/internal/limits"
 )
 
 // Caller/callee neighbourhood queries.
@@ -215,6 +216,12 @@ func edgeIDBranch(selectCol, matchCol, setSQL, extra string) string {
 // connection, so the two transports cannot disagree about semantics: they
 // differ only in how a value set is spelled.
 func (s *Store) neighborPage(ctx context.Context, repoID int64, limit, offset int, build neighborCandidateBuilder) ([]graph.Symbol, error) {
+	return s.neighborPageRows(ctx, repoID, safeLimit(limit), offset, build)
+}
+
+// neighborPageRows permits one internal continuation probe beyond the page ceiling.
+func (s *Store) neighborPageRows(ctx context.Context, repoID int64, rows, offset int, build neighborCandidateBuilder) ([]graph.Symbol, error) {
+	limit := min(max(rows, 1), limits.StoreMaxRows+1)
 	inline := &neighborSets{target: s.neighborTarget(s.parserSemanticQueryer(ctx))}
 	cte, args, err := build(ctx, inline)
 	if err != nil {
@@ -271,7 +278,7 @@ func (s *Store) neighborPage(ctx context.Context, repoID int64, limit, offset in
 func (s *Store) symbolPage(ctx context.Context, target execQuerier, repoID int64, candidateCTE string, cteArgs []any, limit, offset int) ([]graph.Symbol, error) {
 	args := make([]any, 0, len(cteArgs)+symbolPageFixedArgs)
 	args = append(args, cteArgs...)
-	args = append(args, repoID, safeLimit(limit), safeOffset(offset))
+	args = append(args, repoID, limit, safeOffset(offset))
 	rows, err := target.QueryContext(ctx, symbolPageSQL(candidateCTE), args...)
 	if err != nil {
 		return nil, err
@@ -505,10 +512,14 @@ func (s *Store) FindCallees(ctx context.Context, repoID int64, symbol string, sy
 }
 
 func (s *Store) findCalleesResolved(ctx context.Context, repoID int64, srcIDs []int64, limit, offset int) ([]graph.Symbol, error) {
+	return s.findCalleesRows(ctx, repoID, srcIDs, safeLimit(limit), offset)
+}
+
+func (s *Store) findCalleesRows(ctx context.Context, repoID int64, srcIDs []int64, limit, offset int) ([]graph.Symbol, error) {
 	if len(srcIDs) == 0 {
 		return []graph.Symbol{}, nil
 	}
-	return s.neighborPage(ctx, repoID, limit, offset, func(ctx context.Context, sets *neighborSets) (string, []any, error) {
+	return s.neighborPageRows(ctx, repoID, limit, offset, func(ctx context.Context, sets *neighborSets) (string, []any, error) {
 		set, setArgs, err := sets.refInt64s(ctx, srcIDs)
 		if err != nil {
 			return "", nil, err

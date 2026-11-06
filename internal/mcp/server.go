@@ -806,6 +806,10 @@ func (s *Server) handleCallGraph(ctx context.Context, raw json.RawMessage, calle
 		}
 	} else {
 		data["callees"] = s.projector(level).Symbols(ctx, result.Callees)
+		data["has_more"] = result.HasMore
+		if result.NextOffset != nil {
+			data["next_offset"] = *result.NextOffset
+		}
 	}
 	return map[string]any{"ok": true, "data": data}, nil
 }

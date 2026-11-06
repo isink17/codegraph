@@ -153,6 +153,13 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 		}
 		detail.WriteCards(doc, key, cards)
 		writePresence(doc, map[string]any{"target_found": result.TargetFound})
+		if name == "find_callees" {
+			var next compactfmt.Cell
+			if result.NextOffset != nil {
+				next = compactfmt.Int(*result.NextOffset)
+			}
+			doc.Section(compactfmt.Schema{Section: "pagination", Columns: []string{"has_more", "next_offset"}}).Row([]compactfmt.Cell{compactfmt.Bool(result.HasMore), next})
+		}
 		if len(result.UnresolvedHints) > 0 {
 			detail.WriteCards(doc, "unresolved_hints", s.projector(defaultToolDetail).Symbols(ctx, result.UnresolvedHints))
 		}

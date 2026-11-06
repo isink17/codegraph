@@ -7,3 +7,6 @@
 @section presence
 @columns matched	target_found	requested	found	missing	total	offset	truncated
 	true						
+@section pagination
+@columns has_more	next_offset
+false	
