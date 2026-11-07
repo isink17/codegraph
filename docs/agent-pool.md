@@ -26,12 +26,37 @@ Leases live in `~/Projekti/codegraph-evidence/pool/<slot>.lease`.
 
 ```sh
 scripts/agent-pool/pool.sh status
+scripts/agent-pool/pool.sh assess <slot>
 scripts/agent-pool/pool.sh acquire --slot auto --task <branch> --agent <name> [--pr N] [--pid PID]
 scripts/agent-pool/pool.sh release --slot <slot> --token <token>
 scripts/agent-pool/pool.sh review-checkout --slot codegraph-review --token <token> --branch <branch> --head <sha>
 scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 ```
 
+- A lease record carries `version=1`, a non-secret `lease_id`, the slot,
+  task, agent, PR, owner, host, an optional PID, the time, and the token. A
+  lease written before versioning has no `version` field: it stays
+  recognizable and busy. A
+  `version` this script does not know, or a lease missing a required field,
+  makes the slot `inconsistent`, and `release`, `review-checkout` and
+  `reclaim` refuse it; such a lease is never reinterpreted or removed on the
+  owner's behalf. `status` still prints its fields, and every slot reports
+  `lease=present`, `lease=absent` or `lease=unknown`, so a reader never
+  mistakes an unreadable record for no record at all: `inconsistent` on its
+  own cannot tell them apart. A lease is called absent only when the lease
+  directory can be searched (or does not exist and its nearest existing
+  ancestor can be searched); otherwise `status` refuses and `assess` reports
+  the lease as unknown. `status` and `assess` count a dangling link at the
+  lease path as present. Until the recovery protocol lands, a corrupted or unsupported lease
+  has no `pool.sh` remedy at all — `release` and `reclaim` both refuse it, and
+  clearing it means inspecting the file by hand.
+- `assess <slot>` prints read-only evidence about one slot: its state, the
+  lease without its token, whether any process has its cwd there, counts of
+  changed, untracked and ignored files, HEAD, branch, and whether HEAD is in
+  the base or held by any local or remote-tracking ref. It never fetches,
+  locks, or changes anything, and it authorizes nothing: recovering a lease still needs
+  the owner. Every unavailable observation prints as unknown, never as
+  absence.
 - Every check fails closed: a failed fetch, a Git error, a slot that is not
   a worktree of this repository, or process inspection that cannot run
   (`lsof` missing or failing) leaves the slot unleased and not free.
@@ -94,8 +119,9 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 - `stale-suspected`: leased, the recorded process on this host is gone, and
   no process uses the slot. Never freed automatically.
 - `inconsistent`: unleased but not idle (dirty, on a branch, behind
-  `origin/v2.0`, or in use by a process), or the lease is malformed. Treat as
-  busy; its owner is the task named by its branch or open PR.
+  `origin/v2.0`, or in use by a process), or the lease is malformed or of an
+  unsupported schema version. The `lease=` line says which of the two it is.
+  Treat as busy; its owner is the task named by its branch or open PR.
 
 There is no time-based expiry.
 

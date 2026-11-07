@@ -2,13 +2,16 @@
 # Lease manager for the CodeGraph agent pool. Policy: docs/agent-pool.md.
 #
 #   pool.sh status [slot]
+#   pool.sh assess <slot>
 #   pool.sh acquire --slot <slot|auto> --task <task> --agent <agent> [--pr N] [--owner who] [--pid PID] [--review]
 #   pool.sh release --slot <slot> --token <token>
 #   pool.sh review-checkout --slot codegraph-review --token <token> --branch <branch> --head SHA
 #   pool.sh reclaim --slot <slot> --token <token> --reason <text>
 #   pool.sh prepare --slot <slot> | --all
 #
-# Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY.
+# Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY. acquire exits 0
+# only after it has linked a lease; any other exit it chooses means it linked
+# none. The coordinator relies on this to settle an interrupted acquire.
 set -euo pipefail
 cd /
 
@@ -20,12 +23,16 @@ BASE=${CG_POOL_BASE:-v2.0}
 REPO=${CG_POOL_REPO:-$HOME/Projekti/codegraph}
 WORKERS=(codegraph-worker-a codegraph-worker-b)
 REVIEW=codegraph-review
+# Lease record schema. A lease written before versioning has no version field
+# and stays recognizable and busy; a version this script does not know is
+# refused rather than reinterpreted.
+LEASE_VERSION=1
 
 die() { echo "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
 lease_file() { echo "$LEASES/$1.lease"; }
 slot_path() { echo "$POOL_ROOT/$1"; }
-field() { sed -n "s/^$2=//p" "$1" | head -n 1; }
+field() { sed -n "/^$2=/{s/^$2=//p;q;}" "$1" 2>/dev/null; }
 
 known_slot() {
 	local s
@@ -108,33 +115,95 @@ slot_problems() {
 }
 
 lease_valid() {
-	local f=$1
+	local f=$1 v
+	v=$(field "$f" version)
+	[[ -z $v || $v == "$LEASE_VERSION" ]] || return 1
 	[[ -n $(field "$f" token) && -n $(field "$f" task) && $(field "$f" slot) == "$2" ]]
 }
 
 pid_alive() { kill -0 "$1" 2>/dev/null; }
 
+# The lease fields a reader may see. A record of an unknown schema may name
+# its secret anything, so this is an allowlist, not a token filter.
+PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|pid|utc'
+public_lease() {
+	awk -v keys="$PUBLIC_FIELDS" '
+		BEGIN { n = split(keys, k, "|"); for (i = 1; i <= n; i++) allowed[k[i]] = 1 }
+		{ at = index($0, "="); if (at < 2) next
+		  key = substr($0, 1, at - 1)
+		  if (allowed[key] && !seen[key]++) print "  " $0 }'
+}
+
+# The lease as one bounded read, empty when there is nothing to read. A real
+# lease is a dozen lines, and only the first value of each field is ever
+# reported, so nothing past the bound was readable anyway.
+lease_text() { head -n 200 "$1" 2>/dev/null || true; }
+
+# A lease file can be called absent only when the directory that would hold
+# it can be searched. A missing directory whose nearest existing ancestor can
+# be searched is a pool that has never leased anything.
+leases_observable() {
+	local d=$LEASES
+	while [[ ! -e $d && ! -L $d && $d != / && $d != . ]]; do d=$(dirname "$d"); done
+	if [[ $d == "$LEASES" ]]; then [[ -d $d && -r $d && -x $d ]]; else [[ -d $d && -x $d ]]; fi
+}
+
+# present | absent | unknown for the lease file $1. A path that cannot be
+# searched also fails -e, so absent needs the directory observable on both
+# sides of the test.
+lease_seen() {
+	if leases_observable; then
+		if [[ -e $1 || -L $1 ]]; then echo present; return; fi
+		if leases_observable; then echo absent; return; fi
+	fi
+	echo unknown
+}
+
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
-	local slot=$1 f problems pid
+	local slot=$1 f problems pid version lease seen
 	f=$(lease_file "$slot")
-	problems=$(slot_problems "$slot")
-	if [[ ! -e $f ]]; then
-		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
+	seen=$(lease_seen "$f")
+	if [[ $seen == unknown ]]; then
+		echo inconsistent
+		echo "lease directory $LEASES cannot be observed"
+		echo "  lease=unknown"
 		return
 	fi
-	if ! lease_valid "$f" "$slot"; then echo inconsistent; echo "malformed lease $f"; return; fi
+	problems=$(slot_problems "$slot")
+	if [[ $seen == absent ]]; then
+		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
+		echo "  lease=absent"
+		return
+	fi
+	lease=$(lease_text "$f")
+	if ! lease_valid "$f" "$slot"; then
+		echo inconsistent
+		version=$(field "$f" version) || version=""
+		if [[ -n $version && $version != "$LEASE_VERSION" ]]; then
+			echo "lease schema version $version unsupported; this pool.sh writes $LEASE_VERSION"
+		else
+			echo "malformed lease $f"
+		fi
+		# The fields follow even here: a reader that sees a state but no lease
+		# concludes the slot is unheld and discards the token that still guards it.
+		echo "  lease=present"
+		printf '%s\n' "$lease" | public_lease
+		return
+	fi
 	pid=$(field "$f" pid)
 	if [[ -n $pid && $(field "$f" host) == "$(hostname)" ]] && ! pid_alive "$pid" && ! slot_in_use "$slot"; then
 		echo stale-suspected
 	else
 		echo busy
 	fi
-	sed -e '/^token=/d' -e 's/^/  /' "$f"
+	echo "  lease=present"
+	printf '%s\n' "$lease" | public_lease
 }
 
 cmd_status() {
 	local slots=("${WORKERS[@]}" "$REVIEW") s state
+	leases_observable || die "lease directory $LEASES cannot be observed; no lease can be called absent"
 	[[ $# -gt 0 ]] && slots=("$@")
 	for s in "${slots[@]}"; do
 		known_slot "$s" || die "unknown slot $s" 2
@@ -169,6 +238,8 @@ try_acquire_locked() {
 	token=$(random_token)
 	tmp=$(mktemp "$LEASES/.$slot.XXXXXX") || return 1
 	{
+		echo "version=$LEASE_VERSION"
+		echo "lease_id=$(random_token)"
 		echo "slot=$slot"
 		echo "task=$TASK"
 		echo "agent=$AGENT"
@@ -226,6 +297,7 @@ own_lease() {
 	f=$(lease_file "$slot")
 	lock_slot "$slot" || die "$slot lock held: $LEASES/.$slot.lock"
 	[[ -e $f ]] || die "$slot has no lease"
+	lease_valid "$f" "$slot" || die "the $slot lease is malformed or of an unsupported schema; owner must inspect"
 	[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
 }
 
@@ -325,6 +397,78 @@ cmd_reclaim() {
 	echo "reclaimed $slot; slot state now: $(slot_state "$slot" | sed -n 1p)"
 }
 
+# Read-only evidence about one slot: who holds it, whether a process uses it,
+# and what the worktree contains. It
+# prints observations and explicit unknowns, never a verdict, never a token,
+# and it mutates nothing (no fetch, no lock, no lease change). It grants no
+# recovery authorization: recovering a lease still needs the owner.
+cmd_assess() {
+	local slot=${1:-} f p head branch changes ignored base refs lease seen
+	[[ $# -eq 1 ]] || die "assess needs one slot" 2
+	known_slot "$slot" || die "unknown slot $slot" 2
+	f=$(lease_file "$slot")
+	p=$(slot_path "$slot")
+	echo "slot: $slot"
+	echo "path: $p"
+	echo "state: $(slot_state "$slot" | sed -n 1p)"
+	echo "host: $(hostname)"
+	# One snapshot: a lease released mid-report must read as gone, not abort.
+	lease=$(lease_text "$f")
+	seen=$(lease_seen "$f")
+	if [[ $seen == unknown ]]; then
+		echo "lease: unknown; lease directory cannot be observed"
+	elif [[ $seen == absent ]]; then
+		echo "lease: absent"
+	elif [[ -z $lease ]]; then
+		# The file is there and nothing came back from it: it is empty, or it
+		# could not be read. Both are unknown, neither is absent.
+		echo "lease: present but empty or unreadable"
+	else
+		echo "lease: present"
+		printf '%s\n' "$lease" | public_lease
+		[[ $'\n'$lease == *$'\n'version=* ]] || echo "lease-schema: absent (written before versioning); treated as busy"
+	fi
+	read_cwds
+	if ((CWDS_FAILED != 0)); then
+		echo "process-cwd: unknown; inspection unavailable"
+	elif slot_in_use "$slot"; then
+		echo "process-cwd: a process has its cwd in the slot"
+	else
+		echo "process-cwd: none observed; this does not prove no writer"
+	fi
+	if changes=$(git --no-optional-locks -C "$p" status --porcelain --untracked-files=all 2>/dev/null); then
+		echo "changed-or-untracked-files: $(printf '%s' "$changes" | grep -c . || true)"
+	else
+		echo "changed-or-untracked-files: unknown; git status failed"
+	fi
+	if ignored=$(git --no-optional-locks -C "$p" status --porcelain --ignored=matching --untracked-files=all 2>/dev/null); then
+		echo "ignored-files: $(printf '%s' "$ignored" | grep -c '^!!' || true)"
+	else
+		echo "ignored-files: unknown; git status failed"
+	fi
+	head=$(git -C "$p" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) || head=""
+	echo "head: ${head:-unknown}"
+	branch=$(git -C "$p" symbolic-ref -q --short HEAD 2>/dev/null) || branch=""
+	echo "branch: ${branch:-detached}"
+	base=$(git -C "$p" rev-parse -q --verify "$REMOTE/$BASE^{commit}" 2>/dev/null) || base=""
+	echo "base: ${base:-unknown} ($REMOTE/$BASE as last fetched; assess does not fetch)"
+	# Only the checks that read: release's merge-tree leg writes an object, and
+	# assess never writes to the store of a slot someone else may be using.
+	if [[ -n $head && -n $base ]] && git -C "$p" merge-base --is-ancestor "$head" "$base" 2>/dev/null; then
+		echo "head-in-base: yes"
+	else
+		echo "head-in-base: no or unknown"
+	fi
+	if [[ -n $head ]] && refs=$(git -C "$p" for-each-ref --contains "$head" --format='%(refname)' \
+		"refs/remotes/$REMOTE/" refs/heads/ 2>/dev/null) && [[ -n $refs ]]; then
+		echo "head-in-refs: $(printf '%s' "$refs" | grep -c . || true) ref(s): $(printf '%s\n' "$refs" |
+			sed -n '1,5p' | tr '\n' ' ')"
+	else
+		echo "head-in-refs: none or unknown"
+	fi
+	echo "note: observations only; no recovery authorization is implied"
+}
+
 # Moves an idle, unleased slot forward to the freshly fetched base. Only a
 # fast-forward of a clean detached HEAD; anything else is refused unchanged.
 prepare_locked() {
@@ -372,10 +516,11 @@ cmd_prepare() {
 
 case ${1:-} in
 status) shift; cmd_status "$@" ;;
+assess) shift; cmd_assess "$@" ;;
 acquire) shift; cmd_acquire "$@" ;;
 release) shift; cmd_release "$@" ;;
 review-checkout) shift; cmd_review_checkout "$@" ;;
 reclaim) shift; cmd_reclaim "$@" ;;
 prepare) shift; cmd_prepare "$@" ;;
-*) die "usage: pool.sh status|acquire|review-checkout|release|reclaim|prepare (see header)" 2 ;;
+*) die "usage: pool.sh status|assess|acquire|review-checkout|release|reclaim|prepare (see header)" 2 ;;
 esac

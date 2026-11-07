@@ -5,7 +5,7 @@ set -euo pipefail
 POOL=$(cd "$(dirname "$0")" && pwd)/pool.sh
 T=$(mktemp -d "${TMPDIR:-/tmp}/pool-test.XXXXXX") || exit 1
 T=$(cd "$T" && pwd -P) || exit 1
-trap 'rm -rf "$T"' EXIT
+trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds CG_POOL_REPO=$T/seed
 : >"$T/cwds"
 fails=0
@@ -453,6 +453,268 @@ before=$(shasum "$idx")
 "$POOL" status >/dev/null
 [[ $(shasum "$idx") == "$before" ]] || fail "status rewrote the index of leased $A"
 "$POOL" release --slot $A --token "$(token $A)" >/dev/null || fail "release of $A after status check"
+
+
+# Lease records carry the schema version and a non-secret lease id; the token
+# stays out of every report.
+"$POOL" acquire --slot $A --task versioned --agent x >/dev/null
+TA=$(token $A)
+[[ $(sed -n 's/^version=//p' "$CG_POOL_LEASES/$A.lease") == 1 ]] || fail "lease has no schema version"
+[[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") =~ ^[0-9a-f]{32}$ ]] || fail "lease has no lease id"
+[[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") != "$TA" ]] || fail "lease id reuses the token"
+[[ $(state $A) == busy ]] || fail "versioned lease state $(state $A)"
+
+# assess is read-only, hides the token, and reports what it cannot know.
+before=$(shasum "$CG_POOL_LEASES/$A.lease") ; beforehead=$(head_of $A)
+expect 2 "$POOL" assess
+expect 2 "$POOL" assess codegraph-worker-z
+expect 0 "$POOL" assess $A
+grep -q "$TA" "$T/out" && fail "assess printed the lease token"
+grep -q "^state: busy$" "$T/out" || fail "assess did not report the state"
+grep -q "^lease: present$" "$T/out" || fail "assess did not report the lease"
+grep -q "^process-cwd: none observed" "$T/out" || fail "assess did not report cwd evidence"
+grep -q "^changed-or-untracked-files: 0$" "$T/out" || fail "assess did not count changes"
+grep -q "^ignored-files: 0$" "$T/out" || fail "assess did not count ignored files"
+grep -q "^note: observations only" "$T/out" || fail "assess did not disclaim authorization"
+[[ $(shasum "$CG_POOL_LEASES/$A.lease") == "$before" && $(head_of $A) == "$beforehead" ]] ||
+	fail "assess mutated the slot"
+
+# Dirty and ignored files are reported, not acted on.
+echo dirt >"$CG_POOL_ROOT/$A/dirt.txt"
+printf 'ignored.txt\n' >"$CG_POOL_ROOT/$A/.gitignore"
+echo hidden >"$CG_POOL_ROOT/$A/ignored.txt"
+expect 0 "$POOL" assess $A
+grep -q "^changed-or-untracked-files: 2$" "$T/out" || fail "assess miscounted changes: $(cat "$T/out")"
+grep -q "^ignored-files: 1$" "$T/out" || fail "assess miscounted ignored files"
+[[ -e $CG_POOL_ROOT/$A/dirt.txt && -e $CG_POOL_ROOT/$A/ignored.txt ]] || fail "assess removed files"
+rm "$CG_POOL_ROOT/$A/dirt.txt" "$CG_POOL_ROOT/$A/ignored.txt" "$CG_POOL_ROOT/$A/.gitignore"
+
+# Process inspection that cannot run is unknown, never "no process".
+CG_POOL_CWD_FILE=$T/missing-cwds "$POOL" assess $A >"$T/out" 2>&1 || fail "assess without cwd data failed"
+grep -q "^process-cwd: unknown" "$T/out" || fail "assess claimed no process when inspection failed"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease written before versioning stays recognizable and busy.
+"$POOL" acquire --slot $A --task legacy --agent x >/dev/null
+TA=$(token $A)
+grep -v '^version=' "$CG_POOL_LEASES/$A.lease" >"$T/legacy" && cp "$T/legacy" "$CG_POOL_LEASES/$A.lease"
+[[ $(state $A) == busy ]] || fail "pre-versioning lease state $(state $A)"
+expect 1 "$POOL" acquire --slot $A --task take --agent y
+expect 0 "$POOL" assess $A
+grep -q "^lease-schema: absent" "$T/out" || fail "assess did not flag the pre-versioning lease"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A schema this pool.sh does not know is refused, never reinterpreted.
+"$POOL" acquire --slot $A --task future --agent x >/dev/null
+TA=$(token $A)
+sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
+[[ $(state $A) == inconsistent ]] || fail "unknown lease schema state $(state $A)"
+# Never pipe pool.sh into grep -q: it closes the pipe on the first match and
+# pipefail then turns the match into a failure.
+"$POOL" status $A >"$T/out"
+grep -q "version 99 unsupported" "$T/out" || fail "status did not name the unsupported schema"
+grep -q "^  owner=" "$T/out" || fail "status of an unsupported lease hid its owner; a reader would see no lease"
+grep -q "^  task=future$" "$T/out" || fail "status of an unsupported lease hid its task"
+grep -q "$TA" "$T/out" && fail "status printed the token of an unsupported lease"
+expect 0 "$POOL" assess $A
+grep -q "^  owner=" "$T/out" || fail "assess of an unsupported lease hid its owner"
+expect 1 "$POOL" acquire --slot $A --task take --agent y
+expect 1 "$POOL" release --slot $A --token "$TA"
+expect 1 "$POOL" reclaim --slot $A --token "$TA" --reason test
+[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "unknown schema lease was removed"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
+# A lease missing a required field is refused by the token-guarded mutators
+# too, and is never removed on the owner's behalf.
+"$POOL" acquire --slot $A --task malformed --agent x >/dev/null
+TA=$(token $A)
+grep -v '^task=' "$CG_POOL_LEASES/$A.lease" >"$T/bad" && cp "$T/bad" "$CG_POOL_LEASES/$A.lease"
+[[ $(state $A) == inconsistent ]] || fail "lease without a task state $(state $A)"
+expect 1 "$POOL" release --slot $A --token "$TA"
+expect 1 "$POOL" reclaim --slot $A --token "$TA" --reason test
+[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "malformed lease was removed"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+"$POOL" acquire --slot $R --task malformed --agent x --review >/dev/null
+TR=$(token $R)
+grep -v '^task=' "$CG_POOL_LEASES/$R.lease" >"$T/bad" && cp "$T/bad" "$CG_POOL_LEASES/$R.lease"
+RBEFORE=$(head_of $R)
+expect 1 "$POOL" review-checkout --slot $R --token "$TR" --branch review-head --head "$RHEAD"
+[[ $(head_of $R) == "$RBEFORE" ]] || fail "a malformed lease authorized a review checkout"
+[[ -e $CG_POOL_LEASES/$R.lease ]] || fail "malformed review lease was removed"
+rm "$CG_POOL_LEASES/$R.lease"
+"$POOL" prepare --slot $R >/dev/null
+
+# assess writes nothing: not the index of a busy slot, not a git object.
+"$POOL" acquire --slot $A --task nomutation --agent x >/dev/null
+TA=$(token $A)
+change $A assessed
+f=$(git -C "$CG_POOL_ROOT/$A" ls-files | head -n 1)
+idx=$(git -C "$CG_POOL_ROOT/$A" rev-parse --path-format=absolute --git-path index)
+touch -t 202001010000 "$CG_POOL_ROOT/$A/$f"
+before=$(shasum "$idx")
+objects=$(find "$T/seed/.git/objects" -type f | wc -l | tr -d ' ')
+expect 0 "$POOL" assess $A
+[[ $(shasum "$idx") == "$before" ]] || fail "assess rewrote the index of busy $A"
+[[ $(find "$T/seed/.git/objects" -type f | wc -l | tr -d ' ') == "$objects" ]] ||
+	fail "assess wrote a git object into the shared store"
+grep -q "^head-in-base: no or unknown$" "$T/out" || fail "assess miscalled an unpushed head"
+git -C "$CG_POOL_ROOT/$A" switch -q --detach "$(base_of)"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A slot with no lease reports it as absent.
+expect 0 "$POOL" assess $A
+grep -q "^lease: absent$" "$T/out" || fail "assess did not report the missing lease"
+grep -q "^state: free$" "$T/out" || fail "assess did not report a free slot"
+
+# A record of an unknown schema may name its secret anything, so only known
+# fields are printed.
+"$POOL" acquire --slot $A --task allowlist --agent x >/dev/null
+TA=$(token $A)
+{ echo "secret_v2=s3cr3t-value"; echo "version=99"; } >>"$CG_POOL_LEASES/$A.lease"
+for cmd in status assess; do
+	"$POOL" $cmd $A >"$T/out" 2>&1 || true
+	grep -q "s3cr3t-value" "$T/out" && fail "$cmd printed an unknown secret field"
+	grep -q "^  task=allowlist$" "$T/out" || fail "$cmd dropped a known field: $(cat "$T/out")"
+	grep -q "$TA" "$T/out" && fail "$cmd printed the token"
+done
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
+# status says whether a record is there at all: "inconsistent" alone cannot
+# tell an unreadable lease from a slot that is merely not idle.
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=absent$" "$T/out" || fail "status of a free slot did not report the lease as absent"
+"$POOL" acquire --slot $A --task marker --agent x >/dev/null
+TA=$(token $A)
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "status of a leased slot did not report the lease as present"
+sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "an unreadable lease was not reported as present"
+rm "$CG_POOL_LEASES/$A.lease"
+change $A notidle
+"$POOL" status $A >"$T/out"
+[[ $(state $A) == inconsistent ]] || fail "a slot off the base is not inconsistent"
+grep -q "^  lease=absent$" "$T/out" ||
+	fail "a slot that is merely not idle was not reported as unleased: $(cat "$T/out")"
+git -C "$CG_POOL_ROOT/$A" switch -q --detach "$(base_of)"
+"$POOL" prepare --slot $A >/dev/null
+
+# A lease whose contents cannot be read is unknown, never absent.
+"$POOL" acquire --slot $A --task unreadable --agent x >/dev/null
+TA=$(token $A)
+: >"$CG_POOL_LEASES/$A.lease"  # present, nothing readable in it
+expect 0 "$POOL" assess $A
+grep -q "^lease: present but empty or unreadable$" "$T/out" ||
+	fail "an unreadable lease was reported as absent: $(cat "$T/out")"
+grep -q "^lease: absent$" "$T/out" && fail "an existing lease was called absent"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
+# A lease with far more lines than a pipe buffer holds must not abort status:
+# a reader that stops at the first match used to kill sed with SIGPIPE, which
+# pipefail reported as a failure of the whole command.
+"$POOL" acquire --slot $A --task bigfile --agent x >/dev/null
+TA=$(token $A)
+awk 'BEGIN { for (i = 0; i < 100000; i++) print "task=bigfile" }' >>"$CG_POOL_LEASES/$A.lease"
+# bash 3.2 does not apply errexit to a failed assignment inside a function, so
+# the broken pipe shows up as a message on stderr rather than a failed command;
+# on bash 4.4 and later the same pipeline aborts the whole report.
+for cmd in status assess; do
+	"$POOL" $cmd $A >"$T/out" 2>"$T/err" || fail "$cmd of a huge lease exited non-zero"
+	[[ -s $T/err ]] && fail "$cmd of a huge lease wrote to stderr: $(cat "$T/err")"
+done
+"$POOL" status $A >"$T/out"
+grep -q "^  task=bigfile$" "$T/out" || fail "status of a huge lease lost its fields"
+[[ $(grep -c "^  task=bigfile$" "$T/out") == 1 ]] ||
+	fail "a repeated field was printed more than once: $(grep -c "^  task=bigfile$" "$T/out") times"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# The key an assess reads may be missing entirely — a pre-versioning lease, or
+# the corrupted record assess exists to look at — so a reader that scans the
+# whole file pays for every line of it. Bound by wall clock: the failure this
+# guards against is a hang, not a wrong answer.
+"$POOL" acquire --slot $A --task slowscan --agent x >/dev/null
+TA=$(token $A)
+grep -v '^version=' "$CG_POOL_LEASES/$A.lease" >"$T/noversion" && cp "$T/noversion" "$CG_POOL_LEASES/$A.lease"
+awk 'BEGIN { for (i = 0; i < 100000; i++) print "junk=line" }' >>"$CG_POOL_LEASES/$A.lease"
+started=$(date +%s)
+expect 0 "$POOL" assess $A
+elapsed=$(($(date +%s) - started))
+((elapsed < 20)) || fail "assess of a 100k-line lease took ${elapsed}s"
+grep -q "^lease-schema: absent" "$T/out" || fail "assess lost the pre-versioning lease report"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease directory that cannot be searched hides whether a lease exists:
+# status refuses, assess reports unknown, and nothing is called absent.
+"$POOL" acquire --slot $A --task hidden --agent x >/dev/null
+TA=$(token $A)
+chmod 000 "$CG_POOL_LEASES"
+if [[ -x $CG_POOL_LEASES ]]; then
+	echo "skip: unsearchable lease directory (running as root)"
+else
+	for args in "status" "status $A" "status $B"; do
+		expect 1 "$POOL" $args
+		grep -q "lease=absent" "$T/out" && fail "status $args called a lease absent behind an unsearchable directory"
+	done
+	expect 0 "$POOL" assess $A
+	grep -q "^lease: unknown" "$T/out" || fail "assess did not report the lease as unknown: $(cat "$T/out")"
+	grep -q "^lease: absent$\|^state: free$" "$T/out" && fail "assess called a hidden lease absent"
+	expect 1 "$POOL" release --slot $A --token "$TA"
+	expect 1 "$POOL" acquire --slot $B --task behind --agent x
+fi
+chmod 755 "$CG_POOL_LEASES"
+[[ $(token $A) == "$TA" ]] || fail "the hidden lease changed"
+[[ ! -e $CG_POOL_LEASES/$B.lease ]] || fail "a slot was leased behind an unsearchable directory"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease directory that does not exist is only known absent when its parent
+# can be searched.
+mkdir "$T/locked"
+chmod 000 "$T/locked"
+if [[ ! -x $T/locked ]]; then
+	CG_POOL_LEASES=$T/locked/leases expect 1 "$POOL" status
+	grep -q "lease=absent" "$T/out" && fail "status called a lease absent under an unsearchable parent"
+fi
+chmod 755 "$T/locked"
+CG_POOL_LEASES=$T/locked/leases expect 0 "$POOL" status $A
+grep -q "^  lease=absent$" "$T/out" || fail "a pool that never leased did not report its leases absent"
+CG_POOL_LEASES=$T/fresh/pool/leases expect 0 "$POOL" status $A
+grep -q "^  lease=absent$" "$T/out" || fail "a fresh pool with no lease directory chain refused: $(cat "$T/out")"
+
+# A dangling link at the lease path is a record nobody can read, not an absence.
+ln -s "$T/nowhere" "$CG_POOL_LEASES/$B.lease"
+"$POOL" status $B >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "a dangling lease link was reported absent: $(cat "$T/out")"
+expect 1 "$POOL" acquire --slot $B --task overlink --agent x
+rm "$CG_POOL_LEASES/$B.lease"
+
+# The acquire exit contract the coordinator settles on: every refusal exits
+# non-zero and links no lease.
+leases_now() { ls -A "$CG_POOL_LEASES" | grep -v '^\.[^.]*\.lock$' || true; }
+"$POOL" acquire --slot $A --task held --agent x >/dev/null
+TA=$(token $A)
+refuse() { # refuse <expected exit> <acquire args...>
+	local want=$1 before
+	shift
+	before=$(leases_now)
+	expect "$want" "$POOL" acquire "$@"
+	[[ $(leases_now) == "$before" ]] || fail "refused acquire $* linked a lease: $(leases_now)"
+}
+refuse 1 --slot $A --task again --agent y
+refuse 2 --slot codegraph-worker-z --task z --agent y
+refuse 1 --slot $R --task notreview --agent y
+mkdir "$CG_POOL_LEASES/.$B.lock"
+refuse 1 --slot $B --task locked --agent y
+refuse 3 --slot auto --task locked --agent y
+rmdir "$CG_POOL_LEASES/.$B.lock"
+echo dirt >"$CG_POOL_ROOT/$B/dirt.txt"
+refuse 1 --slot $B --task dirty --agent y
+rm "$CG_POOL_ROOT/$B/dirt.txt"
+CG_POOL_REMOTE=nowhere refuse 1 --slot $B --task nofetch --agent y
+expect 0 "$POOL" release --slot $A --token "$TA"
 
 if ((fails)); then
 	echo "$fails failure(s)"

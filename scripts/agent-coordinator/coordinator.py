@@ -714,6 +714,20 @@ ADAPTERS = {"claude": claude_argv, "codex": codex_argv, "command": command_argv}
 
 # ---------------------------------------------------------------- state
 
+def read_rc(f):
+    """pool.sh's recorded exit status, or None when there is none to read."""
+    try:
+        return int(f.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def lease_unreadable(v):
+    """True when a slot holds a record nothing identifying can be read from.
+    Such a record may be ours, so no token of ours may be discarded over it."""
+    return v.get("lease") != "absent" and not (v.get("owner") or v.get("task"))
+
+
 class Coordinator:
     def __init__(self, state_dir=STATE_DIR):
         self.dir = Path(state_dir)
@@ -816,14 +830,17 @@ class Coordinator:
                 cur.setdefault(k, v)
         return slots
 
-    def lease_held(self, t):
-        """True when the task's own lease is still on its slot. Leases are
-        matched by the transaction id written as their owner, so a lease
-        someone else took on the same slot is never mistaken for ours."""
-        lease = self.pool_status().get(t["slot"], {})
+    def lease_matches(self, t, lease):
+        """True when this lease record is the task's own. Leases are matched
+        by the transaction id written as their owner, so a lease someone else
+        took on the same slot is never mistaken for ours."""
         if t.get("lease_txn"):
             return lease.get("owner") == f"coordinator:{t['lease_txn']}"
         return lease.get("task") == t["id"]  # lease taken by a v1 coordinator
+
+    def lease_held(self, t):
+        """True when the task's own lease is still on its slot."""
+        return self.lease_matches(t, self.pool_status().get(t["slot"], {}))
 
     # An acquire is a transaction: the marker (with a fresh id passed to
     # pool.sh as the lease owner) is saved first, pool.sh writes its output,
@@ -864,7 +881,29 @@ class Coordinator:
             return None, None, "pool.sh acquire is still running"
         slots = WORKERS if m["slot"] == "auto" else [m["slot"]]
         locked = not files["rc"].exists() and any((LEASES / f".{s}.lock").exists() for s in slots)
-        held = next((s for s, v in self.pool_status().items() if v.get("owner") == owner), None)
+        status = self.pool_status()
+        mine = [(s, v) for s, v in status.items() if v.get("owner") == owner]
+        held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
+        # pool.sh exits 0 only after linking a lease, so a normal refusal
+        # (1-127) proves this transaction leased nothing, and a record nobody
+        # can read then quarantines only its own slot. Otherwise (no status, a
+        # signal, or 0) such a record on a candidate slot may be ours, and the
+        # token here may be the only one that clears it. With 0 and every
+        # record readable but none ours, ours is gone: the owner released it.
+        rc = read_rc(files["rc"])
+        refused = rc is not None and 0 < rc < 128
+        unreadable = None if refused else next((s for s in slots if lease_unreadable(status.get(s, {}))), None)
+        if not held and unreadable:
+            return None, None, (f"{unreadable} holds a lease whose owner cannot be read, so this "
+                                f"acquire cannot be ruled out; no slot is taken and the token files "
+                                f"are kept; owner must inspect")
+        # A lease carrying our id that pool.sh cannot read is not nothing: it
+        # is a slot no release can clear. Leaving the transaction open keeps
+        # the marker and the file holding the only copy of its token.
+        if not held and mine:
+            s, v = mine[0]
+            return None, None, (f"{s} carries owner={owner} but its lease is "
+                                f"{v.get('state') or 'unreported'}; token kept, owner must inspect")
         if held:
             out = files["out"].read_text() if files["out"].exists() else ""
             got = re.search(r"^leased (\S+) token=([0-9a-f]{32})$", out, re.M)
@@ -884,7 +923,7 @@ class Coordinator:
         else:
             # pool.sh finished, never ran, or died outside a slot lock, and
             # no lease carries the id: nothing was leased.
-            rc = (int(files["rc"].read_text().strip() or 1) if files["rc"].exists() else 1) or 1
+            rc = rc or 1
             err = files["err"].read_text().strip() if files["err"].exists() else "pool.sh did not run"
             t.pop("starting")
             self.save()
@@ -905,13 +944,23 @@ class Coordinator:
         p = self.pool("release", "--slot", t["slot"], "--token", token)
         fault("release_before_save")
         try:
-            held = self.lease_held(t)
+            lease = self.pool_status().get(t["slot"], {})
         except Refused as e:
             return False, f"release outcome unknown ({e}); intent kept for reconcile"
-        if held:
+        if self.lease_matches(t, lease):
             t.pop("releasing")
             self.save()
             return False, p.stderr.strip() or "lease still held after release"
+        # The token is discarded only once our own lease is observably gone: no
+        # record at all, or a readable one naming somebody else, since a slot
+        # holds one lease at a time. A record nothing can be read from may be
+        # ours, and dropping the token there would strand the slot for everyone.
+        if p.returncode != 0 and lease_unreadable(lease):
+            t.pop("releasing")
+            self.save()
+            return False, (p.stderr.strip() or
+                           f"{t['slot']} still holds a lease (state {lease.get('state') or 'unreported'}); "
+                           f"token kept, owner must inspect")
         self.finish_release(t)
         return True, ""
 
@@ -1532,11 +1581,23 @@ def recover_release(c, t):
     normal checks continue. Released: the recorded next status applies, but
     a released slot proves only the release, so a published head must still
     be the PR's head on GitHub; otherwise the owner decides."""
-    if c.lease_held(t):
+    lease = c.pool_status().get(t["slot"], {})
+    if c.lease_matches(t, lease):
         t.pop("releasing")
         c.save()
         c.event(t["id"], "release_not_done", slot=t["slot"])
         return
+    # Not ours is not the same as gone: a record we cannot read reports a state
+    # without a matching owner, and finishing here would discard the token that
+    # is the only way to release it. Only pool.sh's own marker settles whether
+    # a record is there; a slot that is merely not idle was released, and so
+    # was one whose record is readable and names somebody else, since a slot
+    # holds one lease at a time. release() can be surer still: it also has
+    # pool.sh's exit status, which this path does not.
+    if lease_unreadable(lease):
+        return c.block(t, f"{t['slot']} still holds a lease that is not this task's "
+                          f"(state {lease.get('state') or 'unreported'}); token kept, owner must inspect",
+                       INTERRUPTED)
     if t["releasing"]["next"] == AWAITING_REVIEW:
         try:
             pr = c.pr_view(t["pr"])
@@ -1602,9 +1663,7 @@ def reconcile(c):
             c.block(t, "running task has no recorded slot or token", INTERRUPTED)
             continue
         lease = status.get(t["slot"], {})
-        ours = (lease.get("owner") == f"coordinator:{t['lease_txn']}" if t.get("lease_txn")
-                else lease.get("task") == t["id"])
-        if lease.get("state") not in ("busy", "stale-suspected") or not ours:
+        if lease.get("state") not in ("busy", "stale-suspected") or not c.lease_matches(t, lease):
             c.block(t, f"{t['slot']} is {lease.get('state')} and not leased by this task; owner must inspect",
                     INTERRUPTED)
             continue

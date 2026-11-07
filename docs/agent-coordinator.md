@@ -164,9 +164,15 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
     owner and a matching token in the output is adopted and the task
     continues; no live pool.sh for the transaction, no slot lock and no
     lease with that owner means nothing was leased, so the marker is
-    cleared. Anything else (malformed output, a lease without a readable
-    token, a slot lock left by a killed pool.sh) keeps the marker, marks
-    the task `interrupted` and names the owner id to inspect. While any
+    cleared. pool.sh acquire exits 0 only after linking a lease, so a
+    recorded exit status of 1-127 proves nothing was linked; a candidate
+    slot holding a lease nobody can read then stays quarantined on its own
+    and does not hold the marker open. With no recorded status, death by a
+    signal, or exit 0, such a lease may be this transaction's, so it keeps
+    the marker. Anything else (malformed output, a lease without a readable
+    token, a lease with our owner that pool.sh calls `inconsistent`, a slot
+    lock left by a killed pool.sh) keeps the marker, marks the task
+    `interrupted` and names the owner id to inspect. While any
     marker is open, no slot is acquired for any task. A lease is never
     deleted or overwritten.
   - *Launch.* The task is saved as `running`/`reviewing` with its run
