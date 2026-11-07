@@ -187,6 +187,14 @@ The only path to reassignment, one transition at a time:
   same operation, with the same evidence, can finish it.
 - A record that is unreadable, inconsistent with its journal, or missing an
   evidence gate is refused, never read as available.
+- The journal is replayed on every read. It must show every transition from
+  adoption, one legal step at a time, with the right generation and
+  operation. Every completion must repeat its latest intent: the same
+  operation, states, generation and evidence. Adoption records the lease
+  identity.
+- Intents that never completed, left by a crash or a refused write, are
+  allowed. The state must equal the last completion, or the intent after it
+  when that transition was interrupted. Anything else is corrupt.
 - A lock left by a crash is never broken automatically.
 - A journal that records transitions whose state file is gone is never
   re-adopted.

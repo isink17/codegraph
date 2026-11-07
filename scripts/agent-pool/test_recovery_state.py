@@ -414,6 +414,121 @@ class ReviewRegressions(Store):
         self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
 
 
+class JournalConsistency(Store):
+    """The record is trusted only when the journal shows every transition from
+    adoption, each completion matching its intent."""
+
+    def journal(self):
+        return [json.loads(line) for line in (self.root / SLOT / "journal.jsonl").read_text().splitlines()]
+
+    def rewrite(self, entries):
+        (self.root / SLOT / "journal.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def assertCorrupt(self):
+        self.assertFalse(self.s.ready_for_reassignment(SLOT))
+        self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
+        with self.assertRaises(rs.Corrupt):
+            self.s.state(SLOT)
+        with self.assertRaises(rs.Corrupt):
+            self.attempts()["ready"]()
+
+    def tampered(self, mutate):
+        self.setUp()
+        self.to(rs.READY)
+        entries = self.journal()
+        mutate(entries)
+        self.rewrite(entries)
+        self.assertCorrupt()
+
+    def last(self, entries, kind, seq=None):
+        return [e for e in entries if e["kind"] == kind and (seq is None or e["seq"] == seq)][-1]
+
+    def test_a_journal_of_only_the_final_completion_is_corrupt(self):
+        self.tampered(lambda es: es.__setitem__(slice(None), [self.last(es, "complete")]))
+
+    def test_a_completion_must_match_its_intent(self):
+        for field, value in (("op_id", "op-2"), ("evidence", "0" * 64), ("generation", 3), ("from", rs.ACTIVE)):
+            with self.subTest(field=field):
+                self.tampered(lambda es: self.last(es, "complete").__setitem__(field, value))
+
+    def test_a_missing_earlier_completion_is_corrupt(self):
+        for seq in range(5):
+            with self.subTest(seq=seq):
+                self.tampered(lambda es: es.remove(self.last(es, "complete", seq)))
+
+    def test_a_missing_or_mismatched_intent_is_corrupt(self):
+        self.tampered(lambda es: es.remove(self.last(es, "intent", 5)))
+        self.tampered(lambda es: self.last(es, "intent", 5).__setitem__("evidence", "0" * 64))
+        self.tampered(lambda es: self.last(es, "intent", 5).__setitem__("op_id", "op-2"))
+
+    def test_reordered_duplicated_or_unknown_entries_are_corrupt(self):
+        self.tampered(lambda es: es.reverse())
+        self.tampered(lambda es: es.append(dict(self.last(es, "complete"))))
+        self.tampered(lambda es: es.insert(0, {"kind": "note", "seq": 0}))
+        self.tampered(lambda es: es.insert(2, dict(self.last(es, "intent", 3))))
+
+    def test_state_gates_must_match_the_journal(self):
+        self.to(rs.READY)
+        state = self.root / SLOT / "state.json"
+        rec = json.loads(state.read_text())
+        rec["gates"]["quiescence"] = "0" * 64
+        state.write_text(json.dumps(rec))
+        self.assertCorrupt()
+
+    def test_adoption_records_the_lease_identity(self):
+        self.to(rs.READY)
+        state = self.root / SLOT / "state.json"
+        rec = json.loads(state.read_text())
+        rec["lease_id"] = "2" * 32
+        state.write_text(json.dumps(rec))
+        self.assertCorrupt()
+
+    def test_no_single_edit_of_the_journal_yields_ready(self):
+        """Every single-line deletion, duplication, adjacent swap and field
+        corruption is refused; only a duplicated intent, which changes
+        nothing, may still read as ready."""
+        self.to(rs.READY)
+        original = self.journal()
+        edits = []
+        for i in range(len(original)):
+            edits.append(("delete", i, original[:i] + original[i + 1:]))
+            edits.append(("duplicate", i, original[:i + 1] + [original[i]] + original[i + 1:]))
+            if i + 1 < len(original):
+                edits.append(("swap", i, original[:i] + [original[i + 1], original[i]] + original[i + 2:]))
+            for key in rs.ENTRY_KEYS + ("kind",):
+                for bad in (None, 7, [], "x"):
+                    if original[i].get(key) != bad:
+                        edits.append((f"{key}={bad!r}", i, original[:i] + [dict(original[i], **{key: bad})]
+                                      + original[i + 1:]))
+        for name, i, entries in edits:
+            with self.subTest(edit=name, line=i):
+                self.rewrite(entries)
+                ready = self.s.ready_for_reassignment(SLOT)
+                if not (name == "duplicate" and original[i]["kind"] == "intent"):
+                    self.assertFalse(ready)
+        self.rewrite(original)
+        self.assertTrue(self.s.ready_for_reassignment(SLOT))
+
+    def test_abandoned_intents_and_resumed_completions_stay_valid(self):
+        self.s.adopt(SLOT, lease())
+
+        def at(point):
+            def fault(p):
+                if p == point:
+                    raise OSError("crash")
+            return rs.RecoveryStore(self.root, fault=fault)
+        with self.assertRaises(rs.Refused):
+            at("before_state_rename").request(SLOT, op_id="op-0", lease_id=LEASE_ID, generation=1)
+        self.s.request(SLOT, op_id=OP, lease_id=LEASE_ID, generation=1)
+        with self.assertRaises(rs.Refused):
+            at("after_state").quarantine(SLOT, op_id=OP, authorization=authorization(), recovery_token=RTOKEN)
+        self.attempts()["quarantine"]()  # resumed completion
+        for name in ("quiescence", "preservation", "ready"):
+            self.attempts()[name]()
+        self.assertTrue(self.s.ready_for_reassignment(SLOT))
+        self.assertEqual(sum(1 for e in self.journal() if e.get("resumed")), 1)
+
+
 class Idempotency(Store):
     def test_repeating_the_last_step_changes_nothing(self):
         """Only the step that produced the current state is repeatable; an
@@ -540,6 +655,22 @@ class Crashes(Store):
         self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
         self.s.adopt(SLOT, lease())
         self.assertTrue(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
+
+
+    def test_interrupted_adoption_never_adopts_a_different_lease(self):
+        other = lease(lease_id="2" * 32, token="d" * 32)
+        for point in ("after_intent", "after_state"):
+            with self.subTest(point=point):
+                self.setUp()
+                self.root.mkdir(parents=True)
+                self.crash("s.adopt(t.SLOT, t.lease())", point)
+                before = self.files()
+                with self.assertRaises(rs.Refused):
+                    self.s.adopt(SLOT, other)
+                self.assertEqual(self.files(), before)
+                self.assertFalse(self.s.lease_action_allowed(SLOT, "2" * 32, 1, "d" * 32))
+                self.s.adopt(SLOT, lease())
+                self.assertTrue(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
 
 
 class NotWired(unittest.TestCase):

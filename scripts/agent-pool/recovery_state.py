@@ -43,6 +43,15 @@ GATES = {
     READY: ("request", "authorization", "quiescence", "preservation", "final_check"),
 }
 
+# The step that leads into each state, and the evidence gate it records.
+NEXT = {None: ACTIVE, ACTIVE: REQUESTED, REQUESTED: QUARANTINED, QUARANTINED: QUIESCENT, QUIESCENT: PRESERVED,
+        PRESERVED: READY}
+GATE_OF = {REQUESTED: "request", QUARANTINED: "authorization", QUIESCENT: "quiescence", PRESERVED: "preservation",
+           READY: "final_check"}
+# The fields a completion must share with its intent. A resumed completion
+# adds "resumed" and its own time; both are ignored when they are compared.
+ENTRY_KEYS = ("seq", "op_id", "from", "to", "generation", "evidence")
+
 SCHEMA = 1
 LEASE_VERSION = "1"
 QUIESCENCE_METHODS = ("containment-teardown", "owner-quiescence", "reboot-runbook")
@@ -217,37 +226,73 @@ class RecoveryStore:
             raise
         self._fsync_dir(d)
 
-    def _read(self, slot):
-        """(record, incomplete). incomplete is True when the last transition
-        replaced the state but its completion entry was never written."""
-        d = self._dir(slot)
+    def _journal(self, slot):
         try:
-            raw = (d / "state.json").read_text()
+            lines = (self._dir(slot) / "journal.jsonl").read_text().splitlines()
+            return [json.loads(line) for line in lines]
+        except (OSError, ValueError) as e:
+            raise Corrupt(f"{slot} recovery journal unreadable: {e}") from None
+
+    @staticmethod
+    def _replay(slot, journal):
+        """(committed, pending): the completed transitions, which must run from
+        adoption one legal step at a time, each completing its latest intent;
+        and the latest intent after the last completion, if any. Intents that
+        never completed are allowed: a crash or a refused write leaves them."""
+        committed, pending = [], None
+        for e in journal:
+            if not isinstance(e, dict) or e.get("kind") not in ("intent", "complete"):
+                raise Corrupt(f"{slot} journal has a malformed entry")
+            head = committed[-1] if committed else None
+            frm = head["to"] if head else None
+            gen = 1 if head is None else head["generation"] + (e.get("to") == QUARANTINED)
+            op_ok = (e.get("op_id") is None if e.get("to") == ACTIVE else
+                     isinstance(e.get("op_id"), str) and NAME.match(e["op_id"]) if e.get("to") == REQUESTED else
+                     head is not None and e.get("op_id") == head["op_id"])
+            if e.get("seq") != len(committed) or e.get("from") != frm or e.get("to") != NEXT.get(frm) \
+                    or e.get("generation") != gen or not op_ok or not isinstance(e.get("evidence"), str):
+                raise Corrupt(f"{slot} journal entry {e.get('seq')!r} is not the next legal transition")
+            if e["kind"] == "intent":
+                pending = e
+            elif pending is None or any(pending.get(k) != e.get(k) for k in ENTRY_KEYS):
+                raise Corrupt(f"{slot} journal completion {e['seq']} has no matching intent")
+            else:
+                committed.append(e)
+                pending = None
+        return committed, pending
+
+    @staticmethod
+    def _matches(rec, history):
+        """True when the record is exactly the state the history ends in."""
+        last = history[-1]
+        if (rec["seq"], rec["state"], rec["generation"], rec["op_id"]) != \
+                (last["seq"], last["to"], last["generation"], last["op_id"]):
+            return False
+        if history[0]["evidence"] != digest({"lease_id": rec["lease_id"]}):
+            return False
+        return all(rec["gates"].get(GATE_OF[e["to"]]) == e["evidence"] for e in history[1:])
+
+    def _read(self, slot):
+        """(record, pending). pending is the intent of a transition that
+        replaced the state but whose completion was never written; such a
+        record is never ready, and only that operation's retry finishes it."""
+        try:
+            raw = (self._dir(slot) / "state.json").read_text()
         except FileNotFoundError:
             raise Refused(f"{slot} has no recovery record") from None
         except OSError as e:
             raise Corrupt(f"{slot} recovery record unreadable: {e}") from None
         try:
             rec = json.loads(raw)
-            lines = (d / "journal.jsonl").read_text().splitlines()
-            journal = [json.loads(line) for line in lines]
-        except (OSError, ValueError) as e:
-            raise Corrupt(f"{slot} recovery record or journal unreadable: {e}") from None
+        except ValueError as e:
+            raise Corrupt(f"{slot} recovery record unreadable: {e}") from None
         self._validate(slot, rec)
-        if not all(isinstance(e, dict) and isinstance(e.get("seq"), int) for e in journal):
-            raise Corrupt(f"{slot} journal has a malformed entry")
-        complete = [e["seq"] for e in journal if e.get("kind") == "complete"]
-        if len(complete) != len(set(complete)) or complete != sorted(complete):
-            raise Corrupt(f"{slot} journal completions are out of order")
-        last = complete[-1] if complete else -1
-        if rec["seq"] == last:
-            return rec, False
-        intent = next((e for e in reversed(journal) if e.get("kind") == "intent" and e.get("seq") == rec["seq"]),
-                      None)
-        if rec["seq"] == last + 1 and intent and intent.get("op_id") == rec["op_id"] \
-                and intent.get("to") == rec["state"] and intent.get("generation") == rec["generation"]:
-            return rec, True
-        raise Corrupt(f"{slot} state seq {rec['seq']} does not match its journal")
+        committed, pending = self._replay(slot, self._journal(slot))
+        if committed and self._matches(rec, committed):
+            return rec, None
+        if pending and self._matches(rec, committed + [pending]):
+            return rec, pending
+        raise Corrupt(f"{slot} recovery record does not match its journal")
 
     @staticmethod
     def _validate(slot, rec):
@@ -284,14 +329,13 @@ class RecoveryStore:
             raise Refused(f"{slot} recovery storage failed: {e}") from e
         return new
 
-    def _finish(self, slot, rec):
+    def _finish(self, slot, pending):
         """Writes the completion a crash left out, for the operation's own retry.
         The state replacement is made durable first: its directory sync may be
         the step that failed."""
         try:
             self._fsync_dir(self._dir(slot))
-            self._append(slot, {"seq": rec["seq"], "op_id": rec["op_id"], "to": rec["state"],
-                                "generation": rec["generation"], "kind": "complete", "resumed": True,
+            self._append(slot, {**{k: pending[k] for k in ENTRY_KEYS}, "kind": "complete", "resumed": True,
                                 "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         except OSError as e:
             raise Refused(f"{slot} recovery storage failed: {e}") from e
@@ -305,13 +349,13 @@ class RecoveryStore:
         except (TypeError, ValueError):
             raise Refused(f"{gate} evidence is not plain data") from None
         with self._lock(slot):
-            rec, incomplete = self._read(slot)
+            rec, pending = self._read(slot)
             if rec["state"] == to and rec["op_id"] == op_id and rec["gates"].get(gate) == evidence_digest:
                 check(rec, repeat=True)
-                if incomplete:
-                    self._finish(slot, rec)
+                if pending:
+                    self._finish(slot, pending)
                 return rec
-            if incomplete:
+            if pending:
                 raise Refused(f"{slot} has an unfinished transition of operation {rec['op_id']}; "
                               f"only its own retry can finish it")
             if rec["state"] != frm:
@@ -340,22 +384,21 @@ class RecoveryStore:
             self._mkdir(self.root)
         except OSError as e:
             raise Refused(f"cannot create the recovery store: {e}") from e
+        identity = digest({"lease_id": lease_id})
         with self._lock(slot):
             if (d / "state.json").exists():
-                rec, incomplete = self._read(slot)
-                if rec["seq"] == 0 and incomplete and rec["lease_id"] == lease_id \
+                rec, pending = self._read(slot)
+                if pending and rec["seq"] == 0 and pending["evidence"] == identity \
                         and hmac.compare_digest(_verifier(rec["salt"], token), rec["verifier"]):
-                    self._finish(slot, rec)
+                    self._finish(slot, pending)
                     return rec
                 raise Refused(f"{slot} already has a recovery record")
-            journal = d / "journal.jsonl"
-            try:
-                lost = journal.exists() and any(json.loads(line).get("kind") == "complete"
-                                                for line in journal.read_text().splitlines())
-            except (OSError, ValueError, AttributeError) as e:
-                raise Corrupt(f"{slot} journal unreadable: {e}") from None
-            if lost:
-                raise Corrupt(f"{slot} journal records transitions but its state is gone; owner must inspect")
+            if (d / "journal.jsonl").exists():
+                committed, _ = self._replay(slot, self._journal(slot))
+                if committed:
+                    raise Corrupt(f"{slot} journal records transitions but its state is gone; owner must inspect")
+                if any(e["evidence"] != identity for e in self._journal(slot)):
+                    raise Refused(f"{slot} has an interrupted adoption of a different lease; owner must inspect")
             try:
                 self._mkdir(d)
             except OSError as e:
@@ -363,7 +406,7 @@ class RecoveryStore:
             salt = secrets.token_hex(16)
             rec = {"schema": SCHEMA, "slot": slot, "lease_id": lease_id, "generation": 1, "state": ACTIVE,
                    "op_id": None, "seq": 0, "salt": salt, "verifier": _verifier(salt, token), "gates": {}}
-            return self._commit(slot, None, rec, None)
+            return self._commit(slot, None, rec, identity)
 
     def request(self, slot, *, op_id, lease_id, generation):
         """ACTIVE -> RECOVERY_REQUESTED. Records that recovery was asked for
@@ -475,8 +518,8 @@ class RecoveryStore:
     def state(self, slot):
         """(state, generation, incomplete) for a readable record. Raises
         Refused or Corrupt otherwise."""
-        rec, incomplete = self._read(slot)
-        return rec["state"], rec["generation"], incomplete
+        rec, pending = self._read(slot)
+        return rec["state"], rec["generation"], pending is not None
 
     def ready_for_reassignment(self, slot):
         """True only for a complete, consistent READY_FOR_REASSIGNMENT record."""
