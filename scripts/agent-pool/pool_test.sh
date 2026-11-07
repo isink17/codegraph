@@ -647,6 +647,73 @@ elapsed=$(($(date +%s) - started))
 grep -q "^lease-schema: absent" "$T/out" || fail "assess lost the pre-versioning lease report"
 expect 0 "$POOL" release --slot $A --token "$TA"
 
+# A lease directory that cannot be searched hides whether a lease exists:
+# status refuses, assess reports unknown, and nothing is called absent.
+"$POOL" acquire --slot $A --task hidden --agent x >/dev/null
+TA=$(token $A)
+chmod 000 "$CG_POOL_LEASES"
+if [[ -x $CG_POOL_LEASES ]]; then
+	echo "skip: unsearchable lease directory (running as root)"
+else
+	for args in "status" "status $A" "status $B"; do
+		expect 1 "$POOL" $args
+		grep -q "lease=absent" "$T/out" && fail "status $args called a lease absent behind an unsearchable directory"
+	done
+	expect 0 "$POOL" assess $A
+	grep -q "^lease: unknown" "$T/out" || fail "assess did not report the lease as unknown: $(cat "$T/out")"
+	grep -q "^lease: absent$\|^state: free$" "$T/out" && fail "assess called a hidden lease absent"
+	expect 1 "$POOL" release --slot $A --token "$TA"
+	expect 1 "$POOL" acquire --slot $B --task behind --agent x
+fi
+chmod 755 "$CG_POOL_LEASES"
+[[ $(token $A) == "$TA" ]] || fail "the hidden lease changed"
+[[ ! -e $CG_POOL_LEASES/$B.lease ]] || fail "a slot was leased behind an unsearchable directory"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease directory that does not exist is only known absent when its parent
+# can be searched.
+mkdir "$T/locked"
+chmod 000 "$T/locked"
+if [[ ! -x $T/locked ]]; then
+	CG_POOL_LEASES=$T/locked/leases expect 1 "$POOL" status
+	grep -q "lease=absent" "$T/out" && fail "status called a lease absent under an unsearchable parent"
+fi
+chmod 755 "$T/locked"
+CG_POOL_LEASES=$T/locked/leases expect 0 "$POOL" status $A
+grep -q "^  lease=absent$" "$T/out" || fail "a pool that never leased did not report its leases absent"
+
+# A dangling link at the lease path is a record nobody can read, not an absence.
+ln -s "$T/nowhere" "$CG_POOL_LEASES/$B.lease"
+"$POOL" status $B >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "a dangling lease link was reported absent: $(cat "$T/out")"
+expect 1 "$POOL" acquire --slot $B --task overlink --agent x
+rm "$CG_POOL_LEASES/$B.lease"
+
+# The acquire exit contract the coordinator settles on: every refusal exits
+# non-zero and links no lease.
+leases_now() { ls -A "$CG_POOL_LEASES" | grep -v '^\.[^.]*\.lock$' || true; }
+"$POOL" acquire --slot $A --task held --agent x >/dev/null
+TA=$(token $A)
+refuse() { # refuse <expected exit> <acquire args...>
+	local want=$1 before
+	shift
+	before=$(leases_now)
+	expect "$want" "$POOL" acquire "$@"
+	[[ $(leases_now) == "$before" ]] || fail "refused acquire $* linked a lease: $(leases_now)"
+}
+refuse 1 --slot $A --task again --agent y
+refuse 2 --slot codegraph-worker-z --task z --agent y
+refuse 1 --slot $R --task notreview --agent y
+mkdir "$CG_POOL_LEASES/.$B.lock"
+refuse 1 --slot $B --task locked --agent y
+refuse 3 --slot auto --task locked --agent y
+rmdir "$CG_POOL_LEASES/.$B.lock"
+echo dirt >"$CG_POOL_ROOT/$B/dirt.txt"
+refuse 1 --slot $B --task dirty --agent y
+rm "$CG_POOL_ROOT/$B/dirt.txt"
+CG_POOL_REMOTE=nowhere refuse 1 --slot $B --task nofetch --agent y
+expect 0 "$POOL" release --slot $A --token "$TA"
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1

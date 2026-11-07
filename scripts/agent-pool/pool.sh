@@ -9,7 +9,9 @@
 #   pool.sh reclaim --slot <slot> --token <token> --reason <text>
 #   pool.sh prepare --slot <slot> | --all
 #
-# Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY.
+# Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY. acquire exits 0
+# only after it has linked a lease; any other exit it chooses means it linked
+# none. The coordinator relies on this to settle an interrupted acquire.
 set -euo pipefail
 cd /
 
@@ -137,12 +139,29 @@ public_lease() {
 # reported, so nothing past the bound was readable anyway.
 lease_text() { head -n 200 "$1" 2>/dev/null || true; }
 
+# A lease file can be called absent only when the directory that would hold
+# it can be searched; otherwise its absence is unknown. A missing directory
+# under a searchable parent is a pool that has never leased anything.
+leases_observable() {
+	if [[ -e $LEASES || -L $LEASES ]]; then
+		[[ -d $LEASES && -r $LEASES && -x $LEASES ]]
+	else
+		[[ -d $(dirname "$LEASES") && -x $(dirname "$LEASES") ]]
+	fi
+}
+
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
 	local slot=$1 f problems pid version lease
 	f=$(lease_file "$slot")
+	if ! leases_observable; then
+		echo inconsistent
+		echo "lease directory $LEASES cannot be observed"
+		echo "  lease=unknown"
+		return
+	fi
 	problems=$(slot_problems "$slot")
-	if [[ ! -e $f ]]; then
+	if [[ ! -e $f && ! -L $f ]]; then
 		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
 		echo "  lease=absent"
 		return
@@ -174,6 +193,7 @@ slot_state() {
 
 cmd_status() {
 	local slots=("${WORKERS[@]}" "$REVIEW") s state
+	leases_observable || die "lease directory $LEASES cannot be observed; no lease can be called absent"
 	[[ $# -gt 0 ]] && slots=("$@")
 	for s in "${slots[@]}"; do
 		known_slot "$s" || die "unknown slot $s" 2
@@ -384,7 +404,9 @@ cmd_assess() {
 	echo "host: $(hostname)"
 	# One snapshot: a lease released mid-report must read as gone, not abort.
 	lease=$(lease_text "$f")
-	if [[ ! -e $f ]]; then
+	if ! leases_observable; then
+		echo "lease: unknown; lease directory cannot be observed"
+	elif [[ ! -e $f && ! -L $f ]]; then
 		echo "lease: absent"
 	elif [[ -z $lease ]]; then
 		# The file is there and nothing came back from it: it is empty, or it

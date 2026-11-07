@@ -697,6 +697,38 @@ class Pool(Fixture):
         self.assertTrue(token_file.exists(), "token discarded for a lease nothing can be read from")
         self.assertEqual(self.lease(A), "")  # the record is untouched
 
+    def test_release_behind_an_unsearchable_lease_directory_keeps_the_token(self):
+        """pool.sh release fails and the lease directory cannot be searched:
+        nothing can show the lease is gone, so neither release() nor the
+        recovery pass after it may discard the token."""
+        hide = self.t / "bin/pool-hide"
+        hide.write_text(f'#!/bin/sh\n[ "$1" = release ] && chmod 000 "{self.leases}"\nexec "{POOL}" "$@"\n')
+        hide.chmod(0o755)
+        self.addCleanup(lambda: self.leases.exists() and self.leases.chmod(0o755))
+        self.plan(self.task("x", commit("x")))
+        for _ in range(150):
+            self.coord("run", "--once", CG_COORD_POOL=str(hide))
+            if self.leases.exists() and not os.access(self.leases, os.X_OK):
+                break
+            time.sleep(0.2)
+        else:
+            self.fail(f"release never ran; status: {self.st()}\n{self.out}")
+        token_file = self.state / "tokens" / f"x.{A}.token"
+        for _ in range(2):  # release() itself, then reconcile's recover_release
+            t = self.st()["x"]
+            self.assertTrue(token_file.exists(), f"token discarded: {t}\n{self.out}")
+            self.assertIn("releasing", t)
+            self.assertEqual(t["slot"], A)
+            self.coord("run", "--once")
+            self.assertIn("cannot be observed", self.out)
+        self.leases.chmod(0o755)
+        self.coord("run", "--once")  # the lease is visibly still ours: not released, owner decides
+        t = self.st()["x"]
+        self.assertNotIn("releasing", t)
+        self.assertEqual(t["status"], "blocked")
+        self.assertEqual(self.lease_field(A, "token"), token_file.read_text().strip())
+        self.assertIn("release_not_done", [e["event"] for e in self.events()])
+
     def test_release_recovery_completes_when_another_lease_holds_the_slot(self):
         """A slot holds one lease at a time, so a readable record naming
         somebody else proves ours was removed and our token is worthless."""
