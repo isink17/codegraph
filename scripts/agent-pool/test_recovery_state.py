@@ -45,7 +45,7 @@ def authorization(generation=1, **over):
 
 
 def quiescence(generation=2, **over):
-    q = {"slot": SLOT, "op_id": OP, "generation": generation, "method": "reboot-runbook", "actor": "owner",
+    q = {"slot": SLOT, "op_id": OP, "generation": generation, "method": "owner-quiescence", "actor": "owner",
          "evidence_refs": ["evidence/reboot.md"], "accounted": {c: True for c in rs.QUIESCENCE_ACCOUNTED}}
     q.update(over)
     return {k: v for k, v in q.items() if v is not None}
@@ -188,7 +188,8 @@ class Quiescence(Store):
         bad = [quiescence(method=None), quiescence(method="pid-absent"), quiescence(method="heartbeat-expired"),
                quiescence(method="no-process-cwd"), quiescence(method="token-rotated"), quiescence(actor=None),
                quiescence(evidence_refs=[]), quiescence(evidence_refs="x"), quiescence(accounted=None),
-               quiescence(generation=1), quiescence(op_id="op-2"), quiescence(slot="codegraph-worker-b")]
+               quiescence(generation=1), quiescence(op_id="op-2"), quiescence(slot="codegraph-worker-b"),
+               quiescence(method="reboot-runbook"), quiescence(method="containment-teardown")]
         for c in rs.QUIESCENCE_ACCOUNTED:
             bad.append(quiescence(accounted={k: k != c for k in rs.QUIESCENCE_ACCOUNTED}))
             bad.append(quiescence(accounted={k: "yes" for k in rs.QUIESCENCE_ACCOUNTED}))
@@ -239,6 +240,7 @@ class Preservation(Store):
             preservation(inventory={"dirty": []}),
             preservation(head="HEAD"),
             preservation(complete=False),  # interrupted preservation
+            preservation(inventory={**{k: [] for k in rs.INVENTORY}, "dirty": [["x"]]}),
         ]
         for p in cases:
             with self.subTest(evidence=p):
@@ -252,7 +254,7 @@ class Preservation(Store):
     def test_final_check_must_show_clean_unleased_preserved_slot(self):
         self.to(rs.PRESERVED)
         for f in (self.final(clean=False), self.final(lease_absent=False), self.final(head=None),
-                  self.final(preservation="0" * 64), self.final(generation=1)):
+                  self.final(head="d" * 40), self.final(preservation="0" * 64), self.final(generation=1)):
             with self.subTest(final=f):
                 self.assertRefusedUnchanged(lambda: self.s.mark_ready(
                     SLOT, op_id=OP, generation=2, recovery_token=RTOKEN, final_check=f))
@@ -262,7 +264,7 @@ class Leases(Store):
     def test_legacy_unsupported_and_malformed_leases_are_refused(self):
         bad = [lease(version=None), lease(version="99"), lease(token=None), lease(lease_id=None),
                lease(lease_id="xyz"), lease(slot="codegraph-worker-b"), lease(task=""), lease() + "task=again\n",
-               lease() + "garbage\n", ""]
+               lease() + "garbage\n", "", None, b"version=1"]
         for text in bad:
             with self.subTest(lease=text):
                 with self.assertRaises(rs.Refused):
@@ -348,6 +350,68 @@ class Storage(Store):
             evidence=quiescence(evidence_refs=[{"secret": "x"}])))
         self.assertRefusedUnchanged(lambda: self.s.verify_quiescence(
             SLOT, op_id=OP, generation=2, recovery_token=RTOKEN, evidence=quiescence(actor=object())))
+
+
+class ReviewRegressions(Store):
+    def test_lease_token_cannot_become_the_recovery_token(self):
+        self.to(rs.REQUESTED)
+        self.assertRefusedUnchanged(lambda: self.s.quarantine(SLOT, op_id=OP, authorization=authorization(),
+                                                             recovery_token=TOKEN))
+
+    def test_quiescence_method_must_be_the_authorized_one(self):
+        self.to(rs.REQUESTED)
+        self.s.quarantine(SLOT, op_id=OP, recovery_token=RTOKEN,
+                          authorization=authorization(quiescence_method="containment-teardown"))
+        self.assertRefusedUnchanged(lambda: self.s.verify_quiescence(
+            SLOT, op_id=OP, generation=2, recovery_token=RTOKEN, evidence=quiescence(method="owner-quiescence")))
+        self.s.verify_quiescence(SLOT, op_id=OP, generation=2, recovery_token=RTOKEN,
+                                 evidence=quiescence(method="containment-teardown"))
+
+    def test_a_commit_after_preservation_never_reaches_ready(self):
+        self.to(rs.PRESERVED)
+        self.assertRefusedUnchanged(lambda: self.s.mark_ready(
+            SLOT, op_id=OP, generation=2, recovery_token=RTOKEN, final_check=self.final(head="d" * 40)))
+        self.assertFalse(self.s.ready_for_reassignment(SLOT))
+
+    def test_failed_directory_sync_never_completes_a_transition(self):
+        class NoDirSync(rs.RecoveryStore):
+            def _fsync_dir(self, path):
+                raise OSError("directory sync unavailable")
+        broken = NoDirSync(self.root)
+        self.root.mkdir(parents=True)
+        for _ in range(3):
+            with self.assertRaises(rs.Refused):
+                broken.adopt(SLOT, lease())
+        self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
+        self.s.adopt(SLOT, lease())  # the same operation finishes once sync works
+        self.assertEqual(self.s.state(SLOT), (rs.ACTIVE, 1, False))
+        for _ in range(3):
+            with self.assertRaises(rs.Refused):
+                broken.request(SLOT, op_id=OP, lease_id=LEASE_ID, generation=1)
+            self.assertNotEqual(self.s.state(SLOT), (rs.REQUESTED, 1, False))
+
+    def test_a_dangling_intent_does_not_wedge_a_later_operation(self):
+        self.s.adopt(SLOT, lease())
+
+        def at(point):
+            def fault(p):
+                if p == point:
+                    raise OSError("crash")
+            return rs.RecoveryStore(self.root, fault=fault)
+        with self.assertRaises(rs.Refused):
+            at("before_state_rename").request(SLOT, op_id="op-1", lease_id=LEASE_ID, generation=1)
+        with self.assertRaises(rs.Refused):
+            at("after_state").request(SLOT, op_id="op-2", lease_id=LEASE_ID, generation=1)
+        self.assertEqual(self.s.state(SLOT), (rs.REQUESTED, 1, True))
+        self.s.request(SLOT, op_id="op-2", lease_id=LEASE_ID, generation=1)
+        self.assertEqual(self.s.state(SLOT), (rs.REQUESTED, 1, False))
+
+    def test_a_lost_state_file_is_never_readopted(self):
+        self.to(rs.QUARANTINED)
+        (self.root / SLOT / "state.json").unlink()
+        with self.assertRaises(rs.Corrupt):
+            self.s.adopt(SLOT, lease())
+        self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
 
 
 class Idempotency(Store):

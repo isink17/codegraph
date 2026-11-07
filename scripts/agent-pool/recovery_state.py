@@ -20,6 +20,7 @@ import hmac
 import json
 import os
 import re
+import sys
 import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -59,7 +60,9 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 class Refused(Exception):
-    """The transition was not made; the record and journal are as they were."""
+    """The transition was not made. A refusal on validation changes nothing; a
+    storage failure may leave an unfinished transition, which never
+    authorizes reassignment and only the same operation can finish."""
 
 
 class Busy(Refused):
@@ -101,6 +104,8 @@ def _bound(evidence, where, **expect):
 def parse_lease(text, slot):
     """The identity of a version 1 lease. Legacy, unsupported, malformed or
     ambiguous records are refused."""
+    if not isinstance(text, str):
+        raise Refused("lease text is missing")
     fields = {}
     for line in text.splitlines():
         if not line:
@@ -157,20 +162,39 @@ class RecoveryStore:
             os.rmdir(lock)
 
     @staticmethod
-    def _fsync_dir(path):
+    def _sync(fd):
+        # fsync alone leaves data in the drive cache on macOS.
+        if sys.platform == "darwin":
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        else:
+            os.fsync(fd)
+
+    @staticmethod
+    def _write_all(fd, data):
+        while data:
+            data = data[os.write(fd, data):]
+
+    def _fsync_dir(self, path):
+        # Windows cannot open a directory, so every transition is refused there.
         fd = os.open(path, os.O_RDONLY)
         try:
-            os.fsync(fd)
+            self._sync(fd)
         finally:
             os.close(fd)
+
+    def _mkdir(self, path):
+        if not path.is_dir():
+            path.mkdir(mode=0o700)
+            self._fsync_dir(path.parent)
 
     def _append(self, slot, entry):
         path = self._dir(slot) / "journal.jsonl"
         new = not path.exists()
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode())
-            os.fsync(fd)
+            self._write_all(fd, (json.dumps(entry, sort_keys=True) + "\n").encode())
+            self._sync(fd)
         finally:
             os.close(fd)
         if new:
@@ -182,8 +206,8 @@ class RecoveryStore:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
-                os.write(fd, json.dumps(record, sort_keys=True).encode())
-                os.fsync(fd)
+                self._write_all(fd, json.dumps(record, sort_keys=True).encode())
+                self._sync(fd)
             finally:
                 os.close(fd)
             self.fault("before_state_rename")
@@ -218,7 +242,8 @@ class RecoveryStore:
         last = complete[-1] if complete else -1
         if rec["seq"] == last:
             return rec, False
-        intent = next((e for e in journal if e.get("kind") == "intent" and e.get("seq") == rec["seq"]), None)
+        intent = next((e for e in reversed(journal) if e.get("kind") == "intent" and e.get("seq") == rec["seq"]),
+                      None)
         if rec["seq"] == last + 1 and intent and intent.get("op_id") == rec["op_id"] \
                 and intent.get("to") == rec["state"] and intent.get("generation") == rec["generation"]:
             return rec, True
@@ -237,6 +262,11 @@ class RecoveryStore:
             raise Corrupt(f"{slot} recovery record is malformed or of an unsupported schema")
         if sorted(rec["gates"]) != sorted(GATES[rec["state"]]):
             raise Corrupt(f"{slot} recovery record in {rec['state']} lacks or adds evidence gates")
+        bound = (("quiescence_method", "authorization", lambda v: v in QUIESCENCE_METHODS),
+                 ("preserved_head", "preservation", lambda v: bool(HEX40.match(str(v)))))
+        for field, gate, valid in bound:
+            if (field in rec) != (gate in rec["gates"]) or (field in rec and not valid(rec[field])):
+                raise Corrupt(f"{slot} recovery record has an inconsistent {field}")
 
     def _commit(self, slot, rec, new, evidence_digest):
         entry = {"seq": new["seq"], "op_id": new["op_id"], "from": rec["state"] if rec else None,
@@ -255,8 +285,11 @@ class RecoveryStore:
         return new
 
     def _finish(self, slot, rec):
-        """Writes the completion a crash left out, for the operation's own retry."""
+        """Writes the completion a crash left out, for the operation's own retry.
+        The state replacement is made durable first: its directory sync may be
+        the step that failed."""
         try:
+            self._fsync_dir(self._dir(slot))
             self._append(slot, {"seq": rec["seq"], "op_id": rec["op_id"], "to": rec["state"],
                                 "generation": rec["generation"], "kind": "complete", "resumed": True,
                                 "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
@@ -302,7 +335,11 @@ class RecoveryStore:
         """Records a version 1 lease as ACTIVE at generation 1."""
         lease_id, token = parse_lease(lease_text, slot)
         d = self._dir(slot)
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            self.root.parent.mkdir(parents=True, exist_ok=True)
+            self._mkdir(self.root)
+        except OSError as e:
+            raise Refused(f"cannot create the recovery store: {e}") from e
         with self._lock(slot):
             if (d / "state.json").exists():
                 rec, incomplete = self._read(slot)
@@ -311,15 +348,27 @@ class RecoveryStore:
                     self._finish(slot, rec)
                     return rec
                 raise Refused(f"{slot} already has a recovery record")
-            d.mkdir(mode=0o700, exist_ok=True)
+            journal = d / "journal.jsonl"
+            try:
+                lost = journal.exists() and any(json.loads(line).get("kind") == "complete"
+                                                for line in journal.read_text().splitlines())
+            except (OSError, ValueError, AttributeError) as e:
+                raise Corrupt(f"{slot} journal unreadable: {e}") from None
+            if lost:
+                raise Corrupt(f"{slot} journal records transitions but its state is gone; owner must inspect")
+            try:
+                self._mkdir(d)
+            except OSError as e:
+                raise Refused(f"cannot create the {slot} record directory: {e}") from e
             salt = secrets.token_hex(16)
             rec = {"schema": SCHEMA, "slot": slot, "lease_id": lease_id, "generation": 1, "state": ACTIVE,
                    "op_id": None, "seq": 0, "salt": salt, "verifier": _verifier(salt, token), "gates": {}}
             return self._commit(slot, None, rec, None)
 
     def request(self, slot, *, op_id, lease_id, generation):
-        """ACTIVE -> RECOVERY_REQUESTED. Records that recovery was asked for;
-        it authorizes nothing and the lease still belongs to its owner."""
+        """ACTIVE -> RECOVERY_REQUESTED. Records that recovery was asked for
+        and authorizes nothing. From here on lease_action_allowed refuses the
+        lease's own actions, and this phase has no way back to ACTIVE."""
         request = {"slot": slot, "op_id": op_id, "lease_id": lease_id, "generation": generation}
         if not isinstance(op_id, str) or not NAME.match(op_id):
             raise Refused("invalid operation id")
@@ -348,10 +397,15 @@ class RecoveryStore:
                 raise Refused(f"authorization names an unknown quiescence method")
             if repeat:
                 self._recovery_token(rec, op_id, rec["generation"], recovery_token)
+                if rec["quiescence_method"] != authorization["quiescence_method"]:
+                    raise Refused("authorization names a different quiescence method")
             elif rec["op_id"] != op_id:
                 raise Refused("authorization is for a different recovery operation")
+            elif hmac.compare_digest(_verifier(rec["salt"], recovery_token), rec["verifier"]):
+                raise Refused("recovery token must not be the lease token")
 
         def update(new):
+            new["quiescence_method"] = authorization["quiescence_method"]
             new["generation"] += 1
             new["salt"] = secrets.token_hex(16)
             new["verifier"] = _verifier(new["salt"], recovery_token)
@@ -366,6 +420,8 @@ class RecoveryStore:
             _bound(evidence, "quiescence evidence", slot=slot, op_id=op_id, generation=generation)
             if evidence.get("method") not in QUIESCENCE_METHODS:
                 raise Refused("quiescence evidence names no accepted method")
+            if evidence["method"] != rec["quiescence_method"]:
+                raise Refused("quiescence evidence uses a different method than the owner authorized")
             if not evidence.get("actor") or not evidence.get("evidence_refs") \
                     or not isinstance(evidence["evidence_refs"], list):
                 raise Refused("quiescence evidence lacks an actor or evidence references")
@@ -387,14 +443,18 @@ class RecoveryStore:
                 raise Refused("preservation is not complete")
             inventory, preserved = evidence.get("inventory"), evidence.get("preserved")
             if not isinstance(inventory, dict) or not isinstance(preserved, dict) \
-                    or any(not isinstance(inventory.get(k), list) for k in INVENTORY):
+                    or any(not isinstance(inventory.get(k), list) for k in INVENTORY) \
+                    or any(not isinstance(item, str) for k in INVENTORY for item in inventory[k]):
                 raise Refused("preservation evidence has no full inventory")
             unsaved = [item for k in INVENTORY for item in inventory[k]
                        if not (isinstance(preserved.get(item), dict) and preserved[item].get("verified") is True
                                and preserved[item].get("to"))]
             if unsaved:
                 raise Refused(f"not preserved and verified: {', '.join(map(str, unsaved[:5]))}")
-        return self._step(slot, op_id, QUIESCENT, PRESERVED, "preservation", evidence, check)
+
+        def update(new):
+            new["preserved_head"] = evidence["head"]
+        return self._step(slot, op_id, QUIESCENT, PRESERVED, "preservation", evidence, check, update)
 
     def mark_ready(self, slot, *, op_id, generation, recovery_token, final_check):
         """PRESERVED -> READY_FOR_REASSIGNMENT, on a final observation that the
@@ -404,8 +464,8 @@ class RecoveryStore:
             _bound(final_check, "final check", slot=slot, op_id=op_id, generation=generation)
             if final_check.get("clean") is not True or final_check.get("lease_absent") is not True:
                 raise Refused("final check does not show a clean, unleased slot")
-            if not HEX40.match(str(final_check.get("head", ""))):
-                raise Refused("final check has no exact HEAD")
+            if final_check.get("head") != rec["preserved_head"]:
+                raise Refused("final check HEAD is not the preserved HEAD")
             if final_check.get("preservation") != rec["gates"].get("preservation"):
                 raise Refused("final check is not bound to the recorded preservation")
         return self._step(slot, op_id, PRESERVED, READY, "final_check", final_check, check)
