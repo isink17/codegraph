@@ -523,8 +523,10 @@ expect 0 "$POOL" release --slot $A --token "$TA"
 TA=$(token $A)
 sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
 [[ $(state $A) == inconsistent ]] || fail "unknown lease schema state $(state $A)"
-"$POOL" status $A | grep -q "version 99 unsupported" || fail "status did not name the unsupported schema"
+# Never pipe pool.sh into grep -q: it closes the pipe on the first match and
+# pipefail then turns the match into a failure.
 "$POOL" status $A >"$T/out"
+grep -q "version 99 unsupported" "$T/out" || fail "status did not name the unsupported schema"
 grep -q "^  owner=" "$T/out" || fail "status of an unsupported lease hid its owner; a reader would see no lease"
 grep -q "^  task=future$" "$T/out" || fail "status of an unsupported lease hid its task"
 grep -q "$TA" "$T/out" && fail "status printed the token of an unsupported lease"
