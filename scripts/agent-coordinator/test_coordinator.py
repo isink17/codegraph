@@ -683,24 +683,32 @@ class Pool(Fixture):
         self.assertNotIn("releasing", self.st()["x"])
         self.assertEqual(list((self.state / "tokens").glob(f"x.{A}.token")), [])
 
-    def test_release_recovery_keeps_the_token_of_an_unreadable_lease(self):
-        """A crash between pool.sh release and the status read, with a lease
-        the pool cannot read: not ours is not gone, so the token stays."""
+    def test_release_recovery_keeps_the_token_of_a_lease_it_cannot_read(self):
+        """A crash between pool.sh release and the status read, with a record
+        on the slot that yields nothing: that may be ours, so the token stays."""
         self.plan(self.task("x", commit("x")))
         self.crash_at("release_before_save")
-        t = self.st()["x"]
-        self.assertIn("releasing", t)
         token_file = next((self.state / "tokens").glob(f"x.{A}.token"))
-        self.assertTrue(token_file.exists())
-        self.foreign_lease(A)  # the slot was released; another record is on it now
-        f = self.leases / f"{A}.lease"
-        f.write_text(f.read_text().replace("version=1", "version=99"))
+        (self.leases / f"{A}.lease").write_text("")  # present, nothing readable in it
         self.assertEqual(self.pool_state(A), "inconsistent")
         self.coord("run", "--once")
         self.assertEqual(self.status("x"), "interrupted")
         self.assertIn("owner must inspect", self.st()["x"]["reason"])
-        self.assertTrue(token_file.exists(), "token discarded for a lease the pool cannot read")
-        self.assertEqual(self.lease_field(A, "version"), "99")  # the record is untouched
+        self.assertTrue(token_file.exists(), "token discarded for a lease nothing can be read from")
+        self.assertEqual(self.lease(A), "")  # the record is untouched
+
+    def test_release_recovery_completes_when_another_lease_holds_the_slot(self):
+        """A slot holds one lease at a time, so a readable record naming
+        somebody else proves ours was removed and our token is worthless."""
+        self.plan(self.task("x", commit("x")))
+        self.crash_at("release_before_save")
+        self.assertIsNone(self.lease(A))  # pool.sh did release
+        self.foreign_lease(A)
+        self.coord("run", "--once")
+        self.assertIn(self.status("x"), ("awaiting_review", "reviewing"))
+        self.assertNotIn("releasing", self.st()["x"])
+        self.assertEqual(list((self.state / "tokens").glob(f"x.{A}.token")), [])
+        self.assertEqual(self.lease_field(A, "task"), "other")  # the other lease is untouched
 
     # ------------------------------------------------------------ v1.1 helpers
 
@@ -1529,11 +1537,10 @@ class Units(unittest.TestCase):
             c.finish_release = c.finished.append
             return c
         task = {"id": "x", "slot": "w", "lease_txn": "mine"}
+        # Ours, or a record nothing can be read from: the token stays.
         for state, owner, marker in (("inconsistent", None, "present"),
                                      ("inconsistent", "coordinator:mine", "present"),
                                      ("busy", "coordinator:mine", "present"),
-                                     ("busy", "coordinator:other", "present"),
-                                     ("stale-suspected", "coordinator:other", "present"),
                                      ("inconsistent", None, None)):  # no marker: unknown
             c = coordinator_with(state, owner, marker)
             t = dict(task)
@@ -1542,13 +1549,17 @@ class Units(unittest.TestCase):
             self.assertEqual(c.finished, [], f"{state}/{owner}/{marker} discarded the token")
             self.assertNotIn("releasing", t)
             self.assertTrue(err)
-        # pool.sh removes the lease last, so exit 0 proves the record is gone
-        # even where the slot is no longer idle.
-        for state, marker, rc in (("free", "absent", 1), ("inconsistent", "absent", 1),
-                                  ("inconsistent", "present", 0), ("busy", "present", 0)):
-            c = coordinator_with(state, "coordinator:other", marker, rc=rc)
+        # Gone: no record, or a readable one naming somebody else. pool.sh also
+        # removes the lease last, so exit 0 alone proves the record is gone.
+        for state, owner, marker, rc in (("free", None, "absent", 1),
+                                         ("inconsistent", None, "absent", 1),
+                                         ("busy", "coordinator:other", "present", 1),
+                                         ("stale-suspected", "coordinator:other", "present", 1),
+                                         ("inconsistent", "coordinator:other", "present", 0),
+                                         ("busy", "coordinator:other", "present", 0)):
+            c = coordinator_with(state, owner, marker, rc=rc)
             ok, err = c.release(dict(task), "next")
-            self.assertTrue(ok, f"{state}/{marker}/rc={rc}: {err}")
+            self.assertTrue(ok, f"{state}/{owner}/{marker}/rc={rc}: {err}")
             self.assertEqual(len(c.finished), 1)
 
     def test_agent_text(self):

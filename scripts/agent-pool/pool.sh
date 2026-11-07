@@ -30,7 +30,7 @@ die() { echo "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
 lease_file() { echo "$LEASES/$1.lease"; }
 slot_path() { echo "$POOL_ROOT/$1"; }
-field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | { head -n 1 || true; }; }
+field() { sed -n "/^$2=/{s/^$2=//p;q;}" "$1" 2>/dev/null; }
 
 known_slot() {
 	local s
@@ -143,10 +143,14 @@ boot_id() {
 # its secret anything, so this is an allowlist, not a token filter.
 PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
 # Reads a field of the lease snapshot $lease that cmd_assess holds.
-from_lease() { printf '%s\n' "$lease" | sed -n "s/^$1=//p" | { head -n 1 || true; }; }
+from_lease() { sed -n "/^$1=/{s/^$1=//p;q;}" <<<"$lease"; }
 
 public_lease() {
-	sed -n -E "s/^($PUBLIC_FIELDS)=/  \\1=/p"
+	awk -v keys="$PUBLIC_FIELDS" '
+		BEGIN { n = split(keys, k, "|"); for (i = 1; i <= n; i++) allowed[k[i]] = 1 }
+		{ at = index($0, "="); if (at < 2) next
+		  key = substr($0, 1, at - 1)
+		  if (allowed[key] && !seen[key]++) print "  " $0 }'
 }
 
 # The lease as one read, empty when there is nothing to read.
@@ -174,7 +178,7 @@ slot_state() {
 		# The fields follow even here: a reader that sees a state but no lease
 		# concludes the slot is unheld and discards the token that still guards it.
 		echo "  lease=present"
-		printf '%s\n' "$lease" | public_lease
+		public_lease <<<"$lease"
 		return
 	fi
 	# Boot identity is recorded for evidence only: a mismatch never widens
@@ -186,7 +190,7 @@ slot_state() {
 		echo busy
 	fi
 	echo "  lease=present"
-	printf '%s\n' "$lease" | public_lease
+	public_lease <<<"$lease"
 }
 
 cmd_status() {
@@ -412,7 +416,7 @@ cmd_assess() {
 		echo "lease: present but empty or unreadable"
 	else
 		echo "lease: present"
-		printf '%s\n' "$lease" | public_lease
+		public_lease <<<"$lease"
 		version=$(from_lease version)
 		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
 		pid=$(from_lease pid)
@@ -469,7 +473,8 @@ cmd_assess() {
 	fi
 	if [[ -n $head ]] && refs=$(git -C "$p" for-each-ref --contains "$head" --format='%(refname)' \
 		"refs/remotes/$REMOTE/" refs/heads/ 2>/dev/null) && [[ -n $refs ]]; then
-		echo "head-in-refs: ${refs//$'\n'/ }"
+		echo "head-in-refs: $(printf '%s' "$refs" | grep -c . || true) ref(s): $(printf '%s\n' "$refs" |
+			sed -n '1,5p' | tr '\n' ' ')"
 	else
 		echo "head-in-refs: none or unknown"
 	fi

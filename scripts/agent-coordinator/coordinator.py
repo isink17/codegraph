@@ -867,8 +867,16 @@ class Coordinator:
             return None, None, "pool.sh acquire is still running"
         slots = WORKERS if m["slot"] == "auto" else [m["slot"]]
         locked = not files["rc"].exists() and any((LEASES / f".{s}.lock").exists() for s in slots)
-        mine = [(s, v) for s, v in self.pool_status().items() if v.get("owner") == owner]
+        status = self.pool_status()
+        mine = [(s, v) for s, v in status.items() if v.get("owner") == owner]
         held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
+        # A candidate slot holding a record nothing can be read from is not an
+        # absent record either: the token here may be the only one that clears it.
+        unreadable = next((s for s in slots if status.get(s, {}).get("lease") == "present"
+                           and "owner" not in status.get(s, {})), None)
+        if not held and unreadable:
+            return None, None, (f"{unreadable} holds a lease whose owner cannot be read; "
+                                f"token kept, owner must inspect")
         # A lease carrying our id that pool.sh cannot read is not nothing: it
         # is a slot no release can clear. Leaving the transaction open keeps
         # the marker and the file holding the only copy of its token.
@@ -923,11 +931,11 @@ class Coordinator:
             t.pop("releasing")
             self.save()
             return False, p.stderr.strip() or "lease still held after release"
-        # The token is discarded only once the slot is observably free. A lease
-        # pool.sh could not read reports a state without its fields, and a
-        # record whose owner is unreadable must not be mistaken for no record:
-        # dropping the token there would strand the slot for everyone.
-        if p.returncode != 0 and lease.get("lease") != "absent":
+        # The token is discarded only once our own lease is observably gone: no
+        # record at all, or a readable one naming somebody else, since a slot
+        # holds one lease at a time. A record nothing can be read from may be
+        # ours, and dropping the token there would strand the slot for everyone.
+        if p.returncode != 0 and lease.get("lease") != "absent" and not (lease.get("owner") or lease.get("task")):
             t.pop("releasing")
             self.save()
             return False, (p.stderr.strip() or
@@ -1562,8 +1570,11 @@ def recover_release(c, t):
     # Not ours is not the same as gone: a record we cannot read reports a state
     # without a matching owner, and finishing here would discard the token that
     # is the only way to release it. Only pool.sh's own marker settles whether
-    # a record is there; a slot that is merely not idle was released.
-    if lease.get("lease") != "absent":
+    # a record is there; a slot that is merely not idle was released, and so
+    # was one whose record is readable and names somebody else, since a slot
+    # holds one lease at a time. release() can be surer still: it also has
+    # pool.sh's exit status, which this path does not.
+    if lease.get("lease") != "absent" and not (lease.get("owner") or lease.get("task")):
         return c.block(t, f"{t['slot']} still holds a lease that is not this task's "
                           f"(state {lease.get('state') or 'unreported'}); token kept, owner must inspect",
                        INTERRUPTED)

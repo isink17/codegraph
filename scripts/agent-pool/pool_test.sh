@@ -655,6 +655,25 @@ grep -q "^lease: absent$" "$T/out" && fail "an existing lease was called absent"
 rm "$CG_POOL_LEASES/$A.lease"
 "$POOL" prepare --slot $A >/dev/null
 
+# A lease with far more lines than a pipe buffer holds must not abort status:
+# a reader that stops at the first match used to kill sed with SIGPIPE, which
+# pipefail reported as a failure of the whole command.
+"$POOL" acquire --slot $A --task bigfile --agent x >/dev/null
+TA=$(token $A)
+awk 'BEGIN { for (i = 0; i < 100000; i++) print "task=bigfile" }' >>"$CG_POOL_LEASES/$A.lease"
+# bash 3.2 does not apply errexit to a failed assignment inside a function, so
+# the broken pipe shows up as a message on stderr rather than a failed command;
+# on bash 4.4 and later the same pipeline aborts the whole report.
+for cmd in status assess; do
+	"$POOL" $cmd $A >"$T/out" 2>"$T/err" || fail "$cmd of a huge lease exited non-zero"
+	[[ -s $T/err ]] && fail "$cmd of a huge lease wrote to stderr: $(cat "$T/err")"
+done
+"$POOL" status $A >"$T/out"
+grep -q "^  task=bigfile$" "$T/out" || fail "status of a huge lease lost its fields"
+[[ $(grep -c "^  task=bigfile$" "$T/out") == 1 ]] ||
+	fail "a repeated field was printed more than once: $(grep -c "^  task=bigfile$" "$T/out") times"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1
