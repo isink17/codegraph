@@ -524,12 +524,89 @@ TA=$(token $A)
 sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
 [[ $(state $A) == inconsistent ]] || fail "unknown lease schema state $(state $A)"
 "$POOL" status $A | grep -q "version 99 unsupported" || fail "status did not name the unsupported schema"
+"$POOL" status $A >"$T/out"
+grep -q "^  owner=" "$T/out" || fail "status of an unsupported lease hid its owner; a reader would see no lease"
+grep -q "^  task=future$" "$T/out" || fail "status of an unsupported lease hid its task"
+grep -q "$TA" "$T/out" && fail "status printed the token of an unsupported lease"
+expect 0 "$POOL" assess $A
+grep -q "^  owner=" "$T/out" || fail "assess of an unsupported lease hid its owner"
 expect 1 "$POOL" acquire --slot $A --task take --agent y
 expect 1 "$POOL" release --slot $A --token "$TA"
 expect 1 "$POOL" reclaim --slot $A --token "$TA" --reason test
 [[ -e $CG_POOL_LEASES/$A.lease ]] || fail "unknown schema lease was removed"
 rm "$CG_POOL_LEASES/$A.lease"
 "$POOL" prepare --slot $A >/dev/null
+
+# A lease missing a required field is refused by the token-guarded mutators
+# too, and is never removed on the owner's behalf.
+"$POOL" acquire --slot $A --task malformed --agent x >/dev/null
+TA=$(token $A)
+grep -v '^task=' "$CG_POOL_LEASES/$A.lease" >"$T/bad" && cp "$T/bad" "$CG_POOL_LEASES/$A.lease"
+[[ $(state $A) == inconsistent ]] || fail "lease without a task state $(state $A)"
+expect 1 "$POOL" release --slot $A --token "$TA"
+expect 1 "$POOL" reclaim --slot $A --token "$TA" --reason test
+[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "malformed lease was removed"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+"$POOL" acquire --slot $R --task malformed --agent x --review >/dev/null
+TR=$(token $R)
+grep -v '^task=' "$CG_POOL_LEASES/$R.lease" >"$T/bad" && cp "$T/bad" "$CG_POOL_LEASES/$R.lease"
+RBEFORE=$(head_of $R)
+expect 1 "$POOL" review-checkout --slot $R --token "$TR" --branch review-head --head "$RHEAD"
+[[ $(head_of $R) == "$RBEFORE" ]] || fail "a malformed lease authorized a review checkout"
+[[ -e $CG_POOL_LEASES/$R.lease ]] || fail "malformed review lease was removed"
+rm "$CG_POOL_LEASES/$R.lease"
+"$POOL" prepare --slot $R >/dev/null
+
+# Without an injected value the real boot identity is recorded; an empty one
+# would silently disable the evidence it exists for.
+"$POOL" acquire --slot $A --task realboot --agent x >/dev/null
+TA=$(token $A)
+rb=$(sed -n 's/^boot=//p' "$CG_POOL_LEASES/$A.lease")
+if [[ -r /proc/sys/kernel/random/boot_id ]] || sysctl -n kern.bootsessionuuid >/dev/null 2>&1 ||
+	sysctl -n kern.boottime >/dev/null 2>&1 || [[ -r /proc/stat ]]; then
+	[[ -n $rb ]] || fail "no boot identity recorded on a host that reports one"
+	[[ $rb != *" "* && $rb != *"usec"* ]] || fail "boot identity is not a single value: $rb"
+	"$POOL" assess $A >"$T/out" 2>&1 || fail "assess with a real boot identity failed"
+	grep -q "^boot: $rb$" "$T/out" || fail "assess read back a different boot identity: $(sed -n '/^boot: /p' "$T/out")"
+fi
+
+# A recorded pid that is gone still reports stale-suspected, and a boot
+# mismatch neither widens nor narrows that: the lease stays on the slot.
+dead2=$(sh -c 'echo $$')
+while kill -0 "$dead2" 2>/dev/null; do dead2=$((dead2 + 1)); done
+sed -i.bak "s/^pid=.*/pid=$dead2/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$A.lease" &&
+	rm "$CG_POOL_LEASES/$A.lease.bak"
+echo boot-elsewhere >"$T/boot"
+[[ $(CG_POOL_BOOT_FILE=$T/boot "$POOL" status $A | sed -n 1p) == "$A: stale-suspected" ]] ||
+	fail "dead pid with a boot mismatch is not stale-suspected"
+[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "stale-suspected lease was removed"
+CG_POOL_BOOT_FILE=$T/boot "$POOL" assess $A >"$T/out" 2>&1 || fail "assess of a stale-suspected lease failed"
+grep -q "recorded under an earlier boot" "$T/out" || fail "assess hid the boot mismatch"
+grep -q "^recorded-pid-signalable: no" "$T/out" || fail "assess hid that the pid is gone"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# assess writes nothing: not the index of a busy slot, not a git object.
+"$POOL" acquire --slot $A --task nomutation --agent x >/dev/null
+TA=$(token $A)
+change $A assessed
+f=$(git -C "$CG_POOL_ROOT/$A" ls-files | head -n 1)
+idx=$(git -C "$CG_POOL_ROOT/$A" rev-parse --path-format=absolute --git-path index)
+touch -t 202001010000 "$CG_POOL_ROOT/$A/$f"
+before=$(shasum "$idx")
+objects=$(find "$T/seed/.git/objects" -type f | wc -l | tr -d ' ')
+expect 0 "$POOL" assess $A
+[[ $(shasum "$idx") == "$before" ]] || fail "assess rewrote the index of busy $A"
+[[ $(find "$T/seed/.git/objects" -type f | wc -l | tr -d ' ') == "$objects" ]] ||
+	fail "assess wrote a git object into the shared store"
+grep -q "^head-in-base: no or unknown$" "$T/out" || fail "assess miscalled an unpushed head"
+git -C "$CG_POOL_ROOT/$A" switch -q --detach "$(base_of)"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A slot with no lease reports it as absent.
+expect 0 "$POOL" assess $A
+grep -q "^lease: absent$" "$T/out" || fail "assess did not report the missing lease"
+grep -q "^state: free$" "$T/out" || fail "assess did not report a free slot"
 
 if ((fails)); then
 	echo "$fails failure(s)"

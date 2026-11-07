@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import types
 import sys
 import tempfile
 import textwrap
@@ -666,6 +667,24 @@ class Pool(Fixture):
         self.coord("run", "--once")
         self.assertEqual(self.status("x"), "blocked")  # owner decides; nothing retried behind their back
         self.assertIsNotNone(self.lease(A))
+
+    def test_unreadable_lease_blocks_release_and_keeps_the_token(self):
+        """A lease pool.sh cannot read must not look like no lease: dropping
+        the token there leaves a record on disk that nobody can release."""
+        self.plan(self.task("x", sh(f'echo "$PWD" >{self.cwds}; mkdir -p work; echo 1 >work/x.txt; '
+                                    'git add work; git commit -qm x')))
+        self.run_until(lambda: self.status("x") == "blocked")
+        f = self.leases / f"{A}.lease"
+        self.assertIsNotNone(self.lease(A))
+        token_file = next((self.state / "tokens").glob(f"x.{A}.token"))
+        f.write_text(f.read_text().replace("version=1", "version=99"))
+        self.cwds.write_text("")  # the process is gone; only the unreadable lease remains
+        self.assertEqual(self.pool_state(A), "inconsistent")
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "blocked")
+        self.assertIsNotNone(self.lease(A))
+        self.assertTrue(token_file.exists(), "the token of an unreadable lease was discarded")
+        self.assertEqual(self.lease_field(A, "version"), "99")  # pool.sh left the record alone
 
     # ------------------------------------------------------------ v1.1 helpers
 
@@ -1447,6 +1466,33 @@ class Units(unittest.TestCase):
         sys.path.insert(0, str(HERE))
         import coordinator
         self.c = coordinator
+
+    def test_release_discards_the_token_only_when_the_slot_is_free(self):
+        """A refused release whose outcome is uncertain keeps the token: a
+        state without a matching lease may be an unreadable record, not an
+        absent one, and the slot would be unreleasable without its token."""
+        def coordinator_with(state, owner):
+            c = object.__new__(self.c.Coordinator)
+            c.read_token = lambda t: "tok"
+            c.save = lambda: None
+            c.pool = lambda *a: types.SimpleNamespace(returncode=1, stdout="", stderr="refused")
+            c.pool_status = lambda: {"w": {k: v for k, v in (("state", state), ("owner", owner)) if v}}
+            c.finished = []
+            c.finish_release = c.finished.append
+            return c
+        task = {"id": "x", "slot": "w", "lease_txn": "mine"}
+        for state, owner in (("inconsistent", None), ("inconsistent", "coordinator:mine"),
+                             ("busy", "coordinator:mine"), ("busy", "coordinator:other"),
+                             ("stale-suspected", "coordinator:other")):
+            c = coordinator_with(state, owner)
+            ok, err = c.release(dict(task), "next")
+            self.assertFalse(ok, f"{state}/{owner} released")
+            self.assertEqual(c.finished, [], f"{state}/{owner} discarded the token")
+            self.assertTrue(err)
+        c = coordinator_with("free", None)
+        ok, err = c.release(dict(task), "next")
+        self.assertTrue(ok, err)
+        self.assertEqual(len(c.finished), 1)
 
     def test_agent_text(self):
         claude = 'warning\n{"type":"result","result":"ok\\nVerdict: APPROVE\\nBlocking: 0"}\n'

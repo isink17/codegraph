@@ -122,15 +122,19 @@ lease_valid() {
 pid_alive() { kill -0 "$1" 2>/dev/null; }
 
 # Identity of the running kernel boot, recorded so a later reader can tell
-# that a recorded PID cannot still be the process it named. Empty when the
-# host reports none. Tests supply the value in a file.
+# that a recorded PID cannot still be the process it named. The per-boot UUIDs
+# are preferred: a boot time is recomputed on clock changes and would date a
+# lease to an earlier boot that never happened. Empty when the host reports
+# none. Tests supply the value in a file.
 boot_id() {
 	local v=""
 	if [[ -n ${CG_POOL_BOOT_FILE:-} ]]; then
 		v=$(sed -n 1p "$CG_POOL_BOOT_FILE" 2>/dev/null) || v=""
 	else
-		v=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\).*/\1/p') || v=""
-		[[ -n $v ]] || v=$(sed -n 's/^btime //p' /proc/stat 2>/dev/null | head -n 1)
+		v=$(sysctl -n kern.bootsessionuuid 2>/dev/null) || v=""
+		[[ -n $v ]] || v=$(sed -n 1p /proc/sys/kernel/random/boot_id 2>/dev/null) || v=""
+		[[ -n $v ]] || v=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec = \([0-9]*\).*/\1/p') || v=""
+		[[ -n $v ]] || v=$(sed -n 's/^btime //p' /proc/stat 2>/dev/null | head -n 1) || v=""
 	fi
 	printf '%s' "${v//[^[:print:]]/}"
 }
@@ -152,6 +156,9 @@ slot_state() {
 		else
 			echo "malformed lease $f"
 		fi
+		# The fields follow even here: a reader that sees a state but no lease
+		# concludes the slot is unheld and discards the token that still guards it.
+		sed -e '/^token=/d' -e 's/^/  /' "$f" 2>/dev/null || true
 		return
 	fi
 	# Boot identity is recorded for evidence only: a mismatch never widens
@@ -367,7 +374,7 @@ cmd_reclaim() {
 # and it mutates nothing (no fetch, no lock, no lease change). It grants no
 # recovery authorization: recovering a lease still needs the owner.
 cmd_assess() {
-	local slot=${1:-} f p pid lease_boot now_boot head branch changes ignored base version
+	local slot=${1:-} f p pid lease_boot now_boot head branch changes ignored base version refs
 	[[ $# -eq 1 ]] || die "assess needs one slot" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
 	f=$(lease_file "$slot")
@@ -380,7 +387,7 @@ cmd_assess() {
 	echo "boot: ${now_boot:-unknown}"
 	if [[ -e $f ]]; then
 		echo "lease: present"
-		sed -e '/^token=/d' -e 's/^/  /' "$f"
+		sed -e '/^token=/d' -e 's/^/  /' "$f" 2>/dev/null || true
 		version=$(field "$f" version)
 		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
 		pid=$(field "$f" pid)
@@ -430,10 +437,18 @@ cmd_assess() {
 	echo "branch: ${branch:-detached}"
 	base=$(git -C "$p" rev-parse -q --verify "$REMOTE/$BASE^{commit}" 2>/dev/null) || base=""
 	echo "base: ${base:-unknown} ($REMOTE/$BASE as last fetched; assess does not fetch)"
-	if [[ -n $head && -n $base ]] && head_integrated "$p" "$head" "$base"; then
-		echo "head-integrated: yes, by local refs"
+	# Only the checks that read: release's merge-tree leg writes an object, and
+	# assess never writes to the store of a slot someone else may be using.
+	if [[ -n $head && -n $base ]] && git -C "$p" merge-base --is-ancestor "$head" "$base" 2>/dev/null; then
+		echo "head-in-base: yes"
 	else
-		echo "head-integrated: no or unknown"
+		echo "head-in-base: no or unknown"
+	fi
+	if [[ -n $head ]] && refs=$(git -C "$p" for-each-ref --contains "$head" --format='%(refname)' \
+		"refs/remotes/$REMOTE/" refs/heads/ 2>/dev/null) && [[ -n $refs ]]; then
+		echo "head-in-refs: ${refs//$'\n'/ }"
+	else
+		echo "head-in-refs: none or unknown"
 	fi
 	echo "note: observations only; no recovery authorization is implied"
 }

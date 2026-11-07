@@ -33,18 +33,21 @@ scripts/agent-pool/pool.sh review-checkout --slot codegraph-review --token <toke
 scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 ```
 
-- A lease record carries `version=1`, a non-secret `lease_id`, the slot, task,
-  agent, PR, owner, host, the boot identity of the host it was written on, an
-  optional PID, the time, and the token. A lease written before versioning has
-  no `version` field: it stays recognizable and busy. A `version` this script
-  does not know makes the slot `inconsistent`, and `release`, `review-checkout`
-  and `reclaim` refuse it; an unreadable lease is never reinterpreted or
-  removed on the owner's behalf.
+- A lease record carries `version=1`, a non-secret `lease_id`, the slot,
+  task, agent, PR, owner, host, the boot identity of the host it was written
+  on, an optional PID, the time, and the token. A lease written before
+  versioning has no `version` field: it stays recognizable and busy. A
+  `version` this script does not know, or a lease missing a required field,
+  makes the slot `inconsistent`, and `release`, `review-checkout` and
+  `reclaim` refuse it; such a lease is never reinterpreted or removed on the
+  owner's behalf. `status` still prints its fields, so a reader never
+  mistakes an unreadable record for no record at all.
 - `assess <slot>` prints read-only evidence about one slot: its state, the
   lease without its token, what is and is not known about the recorded
   process (including whether it was recorded under an earlier boot), whether
   any process has its cwd there, counts of changed, untracked and ignored
-  files, HEAD, branch and local integration. It never fetches, locks, or
+  files, HEAD, branch, and whether HEAD is in the base or held by any local
+  or remote-tracking ref. It never fetches, locks, or
   changes anything, and it authorizes nothing: recovering a lease still needs
   the owner. Every unavailable observation prints as unknown, never as
   absence.
@@ -114,8 +117,9 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   unsupported schema version. Treat as busy; its owner is the task named by its branch or open PR.
 
 There is no time-based expiry. The recorded boot identity is evidence for
-`assess` only: a lease recorded under an earlier boot still reports `busy`,
-because a dead PID does not prove the processes it started are gone.
+`assess` only: the state still follows the recorded PID exactly as before,
+and a lease written under an earlier boot never changes it, because a dead
+PID does not prove the processes it started are gone.
 
 Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
 created with `mkdir`). A lock left behind by a crashed run blocks the slot

@@ -816,14 +816,17 @@ class Coordinator:
                 cur.setdefault(k, v)
         return slots
 
-    def lease_held(self, t):
-        """True when the task's own lease is still on its slot. Leases are
-        matched by the transaction id written as their owner, so a lease
-        someone else took on the same slot is never mistaken for ours."""
-        lease = self.pool_status().get(t["slot"], {})
+    def lease_matches(self, t, lease):
+        """True when this lease record is the task's own. Leases are matched
+        by the transaction id written as their owner, so a lease someone else
+        took on the same slot is never mistaken for ours."""
         if t.get("lease_txn"):
             return lease.get("owner") == f"coordinator:{t['lease_txn']}"
         return lease.get("task") == t["id"]  # lease taken by a v1 coordinator
+
+    def lease_held(self, t):
+        """True when the task's own lease is still on its slot."""
+        return self.lease_matches(t, self.pool_status().get(t["slot"], {}))
 
     # An acquire is a transaction: the marker (with a fresh id passed to
     # pool.sh as the lease owner) is saved first, pool.sh writes its output,
@@ -905,13 +908,23 @@ class Coordinator:
         p = self.pool("release", "--slot", t["slot"], "--token", token)
         fault("release_before_save")
         try:
-            held = self.lease_held(t)
+            lease = self.pool_status().get(t["slot"], {})
         except Refused as e:
             return False, f"release outcome unknown ({e}); intent kept for reconcile"
-        if held:
+        if self.lease_matches(t, lease):
             t.pop("releasing")
             self.save()
             return False, p.stderr.strip() or "lease still held after release"
+        # The token is discarded only once the slot is observably free. A lease
+        # pool.sh could not read reports a state without its fields, and a
+        # record whose owner is unreadable must not be mistaken for no record:
+        # dropping the token there would strand the slot for everyone.
+        if lease.get("state") != "free":
+            t.pop("releasing")
+            self.save()
+            return False, (p.stderr.strip() or
+                           f"{t['slot']} is {lease.get('state') or 'unreported'} after release; "
+                           f"token kept, owner must inspect")
         self.finish_release(t)
         return True, ""
 
