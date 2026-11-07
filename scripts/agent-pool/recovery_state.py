@@ -63,9 +63,9 @@ INVENTORY = ("dirty", "untracked", "ignored", "unpublished_commits")
 AUTHORIZATION_FIELDS = ("slot", "lease_id", "generation", "op_id", "actor", "reason",
                         "assessment_digest", "quiescence_method", "preservation_disposition", "utc")
 SECRET_KEY = re.compile(r"token|secret|password|verifier|salt", re.I)
-NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-HEX32 = re.compile(r"^[0-9a-f]{32}$")
-HEX40 = re.compile(r"^[0-9a-f]{40}$")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+HEX32 = re.compile(r"^[0-9a-f]{32}\Z")
+HEX40 = re.compile(r"^[0-9a-f]{40}\Z")
 
 
 class Refused(Exception):
@@ -230,7 +230,7 @@ class RecoveryStore:
         try:
             lines = (self._dir(slot) / "journal.jsonl").read_text().splitlines()
             return [json.loads(line) for line in lines]
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             raise Corrupt(f"{slot} recovery journal unreadable: {e}") from None
 
     @staticmethod
@@ -249,7 +249,9 @@ class RecoveryStore:
             op_ok = (e.get("op_id") is None if e.get("to") == ACTIVE else
                      isinstance(e.get("op_id"), str) and NAME.match(e["op_id"]) if e.get("to") == REQUESTED else
                      head is not None and e.get("op_id") == head["op_id"])
-            if e.get("seq") != len(committed) or e.get("from") != frm or e.get("to") != NEXT.get(frm) \
+            # READY_FOR_REASSIGNMENT is terminal: nothing may follow it.
+            if NEXT.get(frm) is None or e.get("to") != NEXT[frm] \
+                    or e.get("seq") != len(committed) or e.get("from") != frm \
                     or e.get("generation") != gen or not op_ok or not isinstance(e.get("evidence"), str):
                 raise Corrupt(f"{slot} journal entry {e.get('seq')!r} is not the next legal transition")
             if e["kind"] == "intent":
@@ -284,7 +286,7 @@ class RecoveryStore:
             raise Corrupt(f"{slot} recovery record unreadable: {e}") from None
         try:
             rec = json.loads(raw)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             raise Corrupt(f"{slot} recovery record unreadable: {e}") from None
         self._validate(slot, rec)
         committed, pending = self._replay(slot, self._journal(slot))
@@ -297,10 +299,10 @@ class RecoveryStore:
     @staticmethod
     def _validate(slot, rec):
         ok = (isinstance(rec, dict) and rec.get("schema") == SCHEMA and rec.get("slot") == slot
-              and rec.get("state") in GATES and HEX32.match(str(rec.get("lease_id", "")))
+              and rec.get("state") in ORDER and HEX32.match(str(rec.get("lease_id", "")))
               and isinstance(rec.get("generation"), int) and rec["generation"] >= 1
               and isinstance(rec.get("seq"), int) and rec["seq"] >= 0
-              and HEX32.match(str(rec.get("salt", ""))) and re.match(r"^[0-9a-f]{64}$", str(rec.get("verifier", "")))
+              and HEX32.match(str(rec.get("salt", ""))) and re.match(r"^[0-9a-f]{64}\Z", str(rec.get("verifier", "")))
               and isinstance(rec.get("gates"), dict)
               and (rec.get("op_id") is None if rec.get("state") == ACTIVE else NAME.match(str(rec.get("op_id")))))
         if not ok:
@@ -370,7 +372,8 @@ class RecoveryStore:
     def _recovery_token(self, rec, op_id, generation, token):
         if rec["op_id"] != op_id or rec["generation"] != generation:
             raise Refused("operation or generation does not match the recovery record")
-        if not isinstance(token, str) or not hmac.compare_digest(_verifier(rec["salt"], token), rec["verifier"]):
+        if not isinstance(token, str) or not HEX32.match(token) \
+                or not hmac.compare_digest(_verifier(rec["salt"], token), rec["verifier"]):
             raise Refused("recovery token does not match")
 
     # ------------------------------------------------------------ transitions
@@ -537,5 +540,5 @@ class RecoveryStore:
         except Refused:
             return False
         return (rec["state"] == ACTIVE and not incomplete and rec["lease_id"] == lease_id
-                and rec["generation"] == generation and isinstance(token, str)
+                and rec["generation"] == generation and isinstance(token, str) and bool(HEX32.match(token))
                 and hmac.compare_digest(_verifier(rec["salt"], token), rec["verifier"]))

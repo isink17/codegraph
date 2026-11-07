@@ -191,7 +191,8 @@ The only path to reassignment, one transition at a time:
   adoption, one legal step at a time, with the right generation and
   operation. Every completion must repeat its latest intent: the same
   operation, states, generation and evidence. Adoption records the lease
-  identity.
+  identity. `READY_FOR_REASSIGNMENT` is terminal: nothing may follow it in
+  the journal.
 - Intents that never completed, left by a crash or a refused write, are
   allowed. The state must equal the last completion, or the intent after it
   when that transition was interrupted. Anything else is corrupt.

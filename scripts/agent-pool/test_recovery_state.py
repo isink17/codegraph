@@ -509,6 +509,70 @@ class JournalConsistency(Store):
         self.rewrite(original)
         self.assertTrue(self.s.ready_for_reassignment(SLOT))
 
+    def test_nothing_may_follow_ready(self):
+        self.to(rs.READY)
+        original = self.journal()
+        last = self.last(original, "complete")
+        ghost = {"kind": "intent", "seq": 6, "from": rs.READY, "generation": 2, "op_id": OP, "evidence": "x"}
+        for extra in ([dict(ghost, to=None)], [{k: v for k, v in ghost.items()}],
+                      [dict(ghost, to=None), dict(ghost, to=None, kind="complete")],
+                      [dict(ghost, to=rs.ACTIVE)], [dict(ghost, to=rs.READY)]):
+            with self.subTest(extra=extra):
+                self.rewrite(original + extra)
+                self.assertCorrupt()
+        # A second chain after READY, with the record moved to its end.
+        second = [dict(e, seq=e["seq"] + 6, generation=e["generation"] + 1) for e in original]
+        second[0]["from"] = rs.READY
+        self.rewrite(original + second)
+        state = self.root / SLOT / "state.json"
+        rec = json.loads(state.read_text())
+        state.write_text(json.dumps(dict(rec, seq=last["seq"] + 6, generation=3)))
+        self.assertCorrupt()
+
+    def rewrite_history(self, change):
+        """Applies change(entry) to every journal entry and the same change to
+        the record, so only the replay's own rules can catch it."""
+        entries = self.journal()
+        for e in entries:
+            change(e)
+        self.rewrite(entries)
+        state = self.root / SLOT / "state.json"
+        rec = json.loads(state.read_text())
+        fake = {"seq": rec["seq"], "to": rec["state"], "generation": rec["generation"], "op_id": rec["op_id"]}
+        change(fake)
+        state.write_text(json.dumps(dict(rec, seq=fake["seq"], generation=fake["generation"], op_id=fake["op_id"])))
+
+    def test_consistent_forgeries_of_generation_and_operation_are_corrupt(self):
+        cases = {
+            "generation never moves on": lambda e: e.__setitem__("generation", 1),
+            "operation switches mid-chain": lambda e: e["seq"] >= 3 and e.__setitem__("op_id", "op-2"),
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                self.to(rs.READY)
+                self.rewrite_history(change)
+                self.assertCorrupt()
+
+    def test_operation_switch_at_request_completion_is_corrupt(self):
+        """Only the intent match catches a completion that names a different
+        operation than its own intent when every later step follows it."""
+        self.to(rs.READY)
+        entries = self.journal()
+        for e in entries:
+            if e["seq"] >= 1 and not (e["seq"] == 1 and e["kind"] == "intent"):
+                e["op_id"] = "op-2"
+        self.rewrite(entries)
+        state = self.root / SLOT / "state.json"
+        state.write_text(json.dumps(dict(json.loads(state.read_text()), op_id="op-2")))
+        self.assertCorrupt()
+
+    def test_sequence_and_source_state_are_checked(self):
+        self.to(rs.READY)
+        self.rewrite_history(lambda e: e.__setitem__("seq", e["seq"] + 1))  # record shifted too
+        self.assertCorrupt()
+        self.tampered(lambda es: [e.__setitem__("from", rs.ACTIVE) for e in es if e["seq"] == 2])
+
     def test_abandoned_intents_and_resumed_completions_stay_valid(self):
         self.s.adopt(SLOT, lease())
 
@@ -527,6 +591,43 @@ class JournalConsistency(Store):
             self.attempts()[name]()
         self.assertTrue(self.s.ready_for_reassignment(SLOT))
         self.assertEqual(sum(1 for e in self.journal() if e.get("resumed")), 1)
+
+
+class MalformedInput(Store):
+    """Malformed records, journals and arguments are refused, never raised as
+    another exception type."""
+
+    def test_malformed_state_values(self):
+        self.to(rs.READY)
+        state = self.root / SLOT / "state.json"
+        good = json.loads(state.read_text())
+        for bad in (dict(good, state=[]), dict(good, gates=[]), dict(good, op_id=[]), dict(good, lease_id={})):
+            with self.subTest(record=bad):
+                state.write_text(json.dumps(bad))
+                self.assertFalse(self.s.ready_for_reassignment(SLOT))
+                with self.assertRaises(rs.Corrupt):
+                    self.s.state(SLOT)
+        deep = "[" * 100000 + "]" * 100000
+        state.write_text(deep)
+        self.assertFalse(self.s.ready_for_reassignment(SLOT))
+        state.write_text(json.dumps(good))
+        (self.root / SLOT / "journal.jsonl").write_text(deep + "\n")
+        self.assertFalse(self.s.ready_for_reassignment(SLOT))
+
+    def test_malformed_tokens_and_names(self):
+        self.to(rs.QUARANTINED)
+        for token in ("\ud800", RTOKEN + "\n", RTOKEN.upper(), 7, b"b" * 32):
+            with self.subTest(token=token):
+                self.assertFalse(self.s.lease_action_allowed(SLOT, LEASE_ID, 2, token))
+                self.assertRefusedUnchanged(self.attempts(token=token)["quiescence"])
+        for name in ("w\n", "op\n", ".hidden", "a/b", ""):
+            with self.subTest(name=name):
+                self.assertFalse(self.s.ready_for_reassignment(name))
+                with self.assertRaises(rs.Refused):
+                    rs.RecoveryStore(self.root).request(name, op_id=OP, lease_id=LEASE_ID, generation=1)
+        self.setUp()
+        self.s.adopt(SLOT, lease())
+        self.assertRefusedUnchanged(lambda: self.s.request(SLOT, op_id="op\n", lease_id=LEASE_ID, generation=1))
 
 
 class Idempotency(Store):
@@ -656,6 +757,14 @@ class Crashes(Store):
         self.s.adopt(SLOT, lease())
         self.assertTrue(self.s.lease_action_allowed(SLOT, LEASE_ID, 1, TOKEN))
 
+
+    def test_resumed_adoption_needs_the_same_lease_id(self):
+        self.root.mkdir(parents=True)
+        self.crash("s.adopt(t.SLOT, t.lease())", "after_state")
+        before = self.files()
+        with self.assertRaises(rs.Refused):
+            self.s.adopt(SLOT, lease(lease_id="2" * 32))  # same token, different lease
+        self.assertEqual(self.files(), before)
 
     def test_interrupted_adoption_never_adopts_a_different_lease(self):
         other = lease(lease_id="2" * 32, token="d" * 32)
