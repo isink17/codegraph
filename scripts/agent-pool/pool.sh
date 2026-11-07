@@ -143,7 +143,15 @@ boot_id() {
 # its secret anything, so this is an allowlist, not a token filter.
 PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
 # Reads a field of the lease snapshot $lease that cmd_assess holds.
-from_lease() { sed -n "/^$1=/{s/^$1=//p;q;}" <<<"$lease"; }
+from_lease() {
+	local rest=$lease line
+	while [[ -n $rest ]]; do
+		line=${rest%%$'\n'*}
+		if [[ $line == "$1="* ]]; then printf '%s' "${line#"$1="}"; return 0; fi
+		[[ $rest == *$'\n'* ]] || return 0
+		rest=${rest#*$'\n'}
+	done
+}
 
 public_lease() {
 	awk -v keys="$PUBLIC_FIELDS" '
@@ -178,7 +186,7 @@ slot_state() {
 		# The fields follow even here: a reader that sees a state but no lease
 		# concludes the slot is unheld and discards the token that still guards it.
 		echo "  lease=present"
-		public_lease <<<"$lease"
+		printf '%s\n' "$lease" | public_lease
 		return
 	fi
 	# Boot identity is recorded for evidence only: a mismatch never widens
@@ -190,7 +198,7 @@ slot_state() {
 		echo busy
 	fi
 	echo "  lease=present"
-	public_lease <<<"$lease"
+	printf '%s\n' "$lease" | public_lease
 }
 
 cmd_status() {
@@ -416,7 +424,7 @@ cmd_assess() {
 		echo "lease: present but empty or unreadable"
 	else
 		echo "lease: present"
-		public_lease <<<"$lease"
+		printf '%s\n' "$lease" | public_lease
 		version=$(from_lease version)
 		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
 		pid=$(from_lease pid)
