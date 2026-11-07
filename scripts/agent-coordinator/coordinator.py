@@ -714,6 +714,12 @@ ADAPTERS = {"claude": claude_argv, "codex": codex_argv, "command": command_argv}
 
 # ---------------------------------------------------------------- state
 
+def lease_unreadable(v):
+    """True when a slot holds a record nothing identifying can be read from.
+    Such a record may be ours, so no token of ours may be discarded over it."""
+    return v.get("lease") != "absent" and not (v.get("owner") or v.get("task"))
+
+
 class Coordinator:
     def __init__(self, state_dir=STATE_DIR):
         self.dir = Path(state_dir)
@@ -872,11 +878,11 @@ class Coordinator:
         held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
         # A candidate slot holding a record nothing can be read from is not an
         # absent record either: the token here may be the only one that clears it.
-        unreadable = next((s for s in slots if status.get(s, {}).get("lease") == "present"
-                           and "owner" not in status.get(s, {})), None)
+        unreadable = next((s for s in slots if lease_unreadable(status.get(s, {}))), None)
         if not held and unreadable:
-            return None, None, (f"{unreadable} holds a lease whose owner cannot be read; "
-                                f"token kept, owner must inspect")
+            return None, None, (f"{unreadable} holds a lease whose owner cannot be read, so this "
+                                f"acquire cannot be ruled out; no slot is taken and the token files "
+                                f"are kept; owner must inspect")
         # A lease carrying our id that pool.sh cannot read is not nothing: it
         # is a slot no release can clear. Leaving the transaction open keeps
         # the marker and the file holding the only copy of its token.
@@ -935,7 +941,7 @@ class Coordinator:
         # record at all, or a readable one naming somebody else, since a slot
         # holds one lease at a time. A record nothing can be read from may be
         # ours, and dropping the token there would strand the slot for everyone.
-        if p.returncode != 0 and lease.get("lease") != "absent" and not (lease.get("owner") or lease.get("task")):
+        if p.returncode != 0 and lease_unreadable(lease):
             t.pop("releasing")
             self.save()
             return False, (p.stderr.strip() or
@@ -1574,7 +1580,7 @@ def recover_release(c, t):
     # was one whose record is readable and names somebody else, since a slot
     # holds one lease at a time. release() can be surer still: it also has
     # pool.sh's exit status, which this path does not.
-    if lease.get("lease") != "absent" and not (lease.get("owner") or lease.get("task")):
+    if lease_unreadable(lease):
         return c.block(t, f"{t['slot']} still holds a lease that is not this task's "
                           f"(state {lease.get('state') or 'unreported'}); token kept, owner must inspect",
                        INTERRUPTED)

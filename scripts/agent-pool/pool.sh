@@ -151,6 +151,7 @@ from_lease() {
 		[[ $rest == *$'\n'* ]] || return 0
 		rest=${rest#*$'\n'}
 	done
+	return 0
 }
 
 public_lease() {
@@ -161,8 +162,10 @@ public_lease() {
 		  if (allowed[key] && !seen[key]++) print "  " $0 }'
 }
 
-# The lease as one read, empty when there is nothing to read.
-lease_text() { cat "$1" 2>/dev/null || true; }
+# The lease as one bounded read, empty when there is nothing to read. A real
+# lease is a dozen lines, and only the first value of each field is ever
+# reported, so nothing past the bound was readable anyway.
+lease_text() { head -n 200 "$1" 2>/dev/null || true; }
 
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
@@ -177,7 +180,7 @@ slot_state() {
 	lease=$(lease_text "$f")
 	if ! lease_valid "$f" "$slot"; then
 		echo inconsistent
-		version=$(field "$f" version)
+		version=$(field "$f" version) || version=""
 		if [[ -n $version && $version != "$LEASE_VERSION" ]]; then
 			echo "lease schema version $version unsupported; this pool.sh writes $LEASE_VERSION"
 		else

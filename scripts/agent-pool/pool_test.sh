@@ -674,6 +674,21 @@ grep -q "^  task=bigfile$" "$T/out" || fail "status of a huge lease lost its fie
 	fail "a repeated field was printed more than once: $(grep -c "^  task=bigfile$" "$T/out") times"
 expect 0 "$POOL" release --slot $A --token "$TA"
 
+# The key an assess reads may be missing entirely — a pre-versioning lease, or
+# the corrupted record assess exists to look at — so a reader that scans the
+# whole file pays for every line of it. Bound by wall clock: the failure this
+# guards against is a hang, not a wrong answer.
+"$POOL" acquire --slot $A --task slowscan --agent x >/dev/null
+TA=$(token $A)
+grep -v '^version=' "$CG_POOL_LEASES/$A.lease" >"$T/noversion" && cp "$T/noversion" "$CG_POOL_LEASES/$A.lease"
+awk 'BEGIN { for (i = 0; i < 100000; i++) print "junk=line" }' >>"$CG_POOL_LEASES/$A.lease"
+started=$(date +%s)
+expect 0 "$POOL" assess $A
+elapsed=$(($(date +%s) - started))
+((elapsed < 20)) || fail "assess of a 100k-line lease took ${elapsed}s"
+grep -q "^lease-schema: absent" "$T/out" || fail "assess lost the pre-versioning lease report"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1
