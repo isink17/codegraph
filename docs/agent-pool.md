@@ -153,6 +153,63 @@ no `pool.sh` process is running.
   Old worktrees are removed with `git worktree remove` only after their
   content is verified integrated and the owner approved the exact list.
 
+## Recovery state machine
+
+`scripts/agent-pool/recovery_state.py` models orphan lease recovery
+(CG-150, phase 2a). It is a library with tests and nothing else.
+`pool.sh`, the coordinator and the campaign do not call it, and it has no
+command-line entry point. It cannot quarantine, reclaim or reassign a real
+slot. `reclaim` above is unchanged.
+
+The only path to reassignment, one transition at a time:
+
+| From | To | Requires |
+|---|---|---|
+| `ACTIVE` | `RECOVERY_REQUESTED` | the current lease ID and generation; authorizes nothing, but the lease can no longer act and there is no way back in this phase |
+| `RECOVERY_REQUESTED` | `QUARANTINED` | the owner's authorization for this exact slot, lease ID, generation and operation; the generation moves on, so the old lease's token can no longer act |
+| `QUARANTINED` | `QUIESCENCE_VERIFIED` | the owner's quiescence evidence, by the method the authorization named (containment teardown, owner-controlled quiescence or the reboot runbook), accounting for old coordinators, wrappers, escaped descendants, remote writers and automatic restarts |
+| `QUIESCENCE_VERIFIED` | `PRESERVED` | a complete inventory of dirty, untracked and ignored files and unpublished commits, each with a verified copy |
+| `PRESERVED` | `READY_FOR_REASSIGNMENT` | a final check showing the slot clean, unleased and at the preserved HEAD |
+
+- Every step after the request needs the operation ID, the current generation
+  and the recovery token the caller chose at quarantine. That token must not
+  be the lease token.
+- A missing PID, a stale heartbeat, no process cwd or a rotated token is
+  never quiescence evidence. The module records the owner's evidence and
+  checks that it is complete. It does not observe processes itself.
+- Each record lives in a store directory the caller names, with no default.
+- A transition takes a per-slot `mkdir` lock, appends a secret-free intent to
+  a journal, atomically replaces the state, and appends a completion. Each
+  write is flushed with `fsync`, or with `F_FULLFSYNC` on macOS, and so is
+  its directory. Finishing an interrupted transition syncs the directory
+  again before writing the completion.
+- A record whose last transition has no completion is not ready. Only the
+  same operation, with the same evidence, can finish it.
+- A record that is unreadable, inconsistent with its journal, or missing an
+  evidence gate is refused, never read as available.
+- The journal is replayed on every read. It must show every transition from
+  adoption, one legal step at a time, with the right generation and
+  operation. Every completion must repeat its latest intent: the same
+  operation, states, generation and evidence. Adoption records the lease
+  identity. `READY_FOR_REASSIGNMENT` is terminal: nothing may follow it in
+  the journal.
+- Intents that never completed, left by a crash or a refused write, are
+  allowed. The state must equal the last completion, or the intent after it
+  when that transition was interrupted. Anything else is corrupt.
+- A lock left by a crash is never broken automatically.
+- A journal that records transitions whose state file is gone is never
+  re-adopted.
+- The read-only queries do not take the lock. A read during a transition can
+  report a record as not ready or corrupt, never as ready. Phase 2b runs them
+  under the pool's slot lock.
+- Tokens are stored only as salted HMAC verifiers. Evidence carrying
+  secret-looking fields is refused.
+- Windows cannot open a directory to sync it, so every transition is refused
+  there. Tests simulate this; it has not been run on Windows.
+
+Tests use disposable stores only:
+`python3 -m unittest test_recovery_state` from `scripts/agent-pool`.
+
 ## Plane tracking
 
 The coordinator keeps the Plane ticket of every PR in step with GitHub.
