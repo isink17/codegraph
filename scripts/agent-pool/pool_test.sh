@@ -716,6 +716,56 @@ rm "$CG_POOL_ROOT/$B/dirt.txt"
 CG_POOL_REMOTE=nowhere refuse 1 --slot $B --task nofetch --agent y
 expect 0 "$POOL" release --slot $A --token "$TA"
 
+# A dangling link at a lease path occupies it: prepare and acquire refuse the
+# slot without touching it or the link, and auto acquisition passes over it.
+# The slot lock is advisory, so these checks guard pool.sh callers only.
+slot_snap() { # HEAD, index, files and lease-path identity of slot $1
+	local p=$CG_POOL_ROOT/$1
+	head_of "$1"
+	shasum "$(git -C "$p" rev-parse --path-format=absolute --git-path index)"
+	git -C "$p" status --porcelain --untracked-files=all --ignored=matching
+	ls -lid "$CG_POOL_LEASES/$1.lease" 2>&1 || true
+}
+"$POOL" prepare --all >/dev/null 2>&1 || true
+ln -s "$T/nowhere" "$CG_POOL_LEASES/$A.lease"
+advance_base dangling
+[[ $(head_of $A) != "$(base_of)" ]] || fail "worker A is not behind the base"
+before=$(slot_snap $A)
+expect 1 "$POOL" prepare --slot $A
+grep -q "is leased" "$T/out" || fail "prepare did not treat a dangling lease link as a lease: $(cat "$T/out")"
+[[ $(slot_snap $A) == "$before" ]] || fail "a refused prepare changed worker A"
+refuse 1 --slot $A --task dangling --agent y
+[[ $(slot_snap $A) == "$before" ]] || fail "a refused acquire changed worker A"
+expect 0 "$POOL" prepare --slot $B
+expect 0 "$POOL" acquire --slot auto --task healthy --agent y
+grep -q "^leased $B token=" "$T/out" || fail "auto acquisition did not take healthy $B: $(cat "$T/out")"
+[[ $(slot_snap $A) == "$before" ]] || fail "auto acquisition touched worker A"
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+ln -s "$T/nowhere" "$CG_POOL_LEASES/$B.lease"
+refuse 3 --slot auto --task none --agent y
+[[ -L $CG_POOL_LEASES/$A.lease && -L $CG_POOL_LEASES/$B.lease ]] || fail "a dangling lease link was replaced"
+rm "$CG_POOL_LEASES/$A.lease" "$CG_POOL_LEASES/$B.lease"
+
+# A regular lease stays protected from prepare in the same way.
+expect 0 "$POOL" prepare --slot $A
+"$POOL" acquire --slot $A --task regular --agent y >/dev/null
+TA=$(token $A)
+advance_base regular
+before=$(slot_snap $A)
+expect 1 "$POOL" prepare --slot $A
+grep -q "is leased" "$T/out" || fail "prepare did not refuse a regular lease: $(cat "$T/out")"
+refuse 1 --slot $A --task regular2 --agent y
+[[ $(slot_snap $A) == "$before" && $(token $A) == "$TA" ]] || fail "a regular lease or its slot changed"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease that is genuinely absent still allows both.
+advance_base absent
+expect 0 "$POOL" prepare --slot $A
+[[ $(head_of $A) == "$(base_of)" ]] || fail "prepare of an unleased slot did not fast-forward it"
+expect 0 "$POOL" acquire --slot $A --task normal --agent y
+grep -q "^leased $A token=" "$T/out" || fail "acquire of an unleased slot failed: $(cat "$T/out")"
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1

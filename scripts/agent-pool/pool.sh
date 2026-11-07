@@ -221,7 +221,7 @@ random_token() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
 try_acquire() {
 	local slot=$1 f
 	f=$(lease_file "$slot")
-	[[ -e $f ]] && return 1
+	[[ $(lease_seen "$f") == absent ]] || return 1
 	lock_slot "$slot" || { echo "$slot lock held: $LEASES/.$slot.lock" >&2; return 1; }
 	try_acquire_locked "$slot"
 	local rc=$?
@@ -232,6 +232,9 @@ try_acquire() {
 try_acquire_locked() {
 	local slot=$1 f tmp token problems
 	f=$(lease_file "$slot")
+	# Checked again under the lock: a dangling link or an unobservable lease
+	# directory is an occupied lease path, and the slot is not fetched into.
+	[[ $(lease_seen "$f") == absent ]] || { echo "$slot lease path is not absent" >&2; return 1; }
 	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" 2>/dev/null || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
@@ -472,9 +475,11 @@ cmd_assess() {
 # Moves an idle, unleased slot forward to the freshly fetched base. Only a
 # fast-forward of a clean detached HEAD; anything else is refused unchanged.
 prepare_locked() {
-	local slot=$1 p problems head base
+	local slot=$1 p problems head base seen
 	p=$(slot_path "$slot")
-	[[ ! -e $(lease_file "$slot") ]] || { echo "$slot is leased; not prepared" >&2; return 1; }
+	seen=$(lease_seen "$(lease_file "$slot")")
+	[[ $seen != present ]] || { echo "$slot is leased; not prepared" >&2; return 1; }
+	[[ $seen == absent ]] || { echo "$slot lease cannot be observed; not prepared" >&2; return 1; }
 	problems=$(slot_shape_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not prepared: ${problems//$'\n'/; }" >&2; return 1; }
 	git -C "$p" fetch -q "$REMOTE" || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
