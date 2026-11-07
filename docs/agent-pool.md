@@ -40,8 +40,12 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   `version` this script does not know, or a lease missing a required field,
   makes the slot `inconsistent`, and `release`, `review-checkout` and
   `reclaim` refuse it; such a lease is never reinterpreted or removed on the
-  owner's behalf. `status` still prints its fields, so a reader never
-  mistakes an unreadable record for no record at all.
+  owner's behalf. `status` still prints its fields, and every slot reports
+  `lease=present` or `lease=absent`, so a reader never mistakes an unreadable
+  record for no record at all: `inconsistent` on its own cannot tell the two
+  apart. Until the recovery protocol lands, a corrupted or unsupported lease
+  has no `pool.sh` remedy at all — `release` and `reclaim` both refuse it, and
+  clearing it means inspecting the file by hand.
 - `assess <slot>` prints read-only evidence about one slot: its state, the
   lease without its token, what is and is not known about the recorded
   process (including whether it was recorded under an earlier boot), whether
@@ -114,7 +118,8 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   no process uses the slot. Never freed automatically.
 - `inconsistent`: unleased but not idle (dirty, on a branch, behind
   `origin/v2.0`, or in use by a process), or the lease is malformed or of an
-  unsupported schema version. Treat as busy; its owner is the task named by its branch or open PR.
+  unsupported schema version. The `lease=` line says which of the two it is.
+  Treat as busy; its owner is the task named by its branch or open PR.
 
 There is no time-based expiry. The recorded boot identity is evidence for
 `assess` only: the state still follows the recorded PID exactly as before,

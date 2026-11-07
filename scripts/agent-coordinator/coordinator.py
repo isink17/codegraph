@@ -867,7 +867,10 @@ class Coordinator:
             return None, None, "pool.sh acquire is still running"
         slots = WORKERS if m["slot"] == "auto" else [m["slot"]]
         locked = not files["rc"].exists() and any((LEASES / f".{s}.lock").exists() for s in slots)
-        held = next((s for s, v in self.pool_status().items() if v.get("owner") == owner), None)
+        # A lease whose schema pool.sh cannot read now reports its fields too,
+        # so an owner match alone would adopt a slot no release can ever clear.
+        held = next((s for s, v in self.pool_status().items()
+                     if v.get("owner") == owner and v.get("state") in ("busy", "stale-suspected")), None)
         if held:
             out = files["out"].read_text() if files["out"].exists() else ""
             got = re.search(r"^leased (\S+) token=([0-9a-f]{32})$", out, re.M)
@@ -919,11 +922,11 @@ class Coordinator:
         # pool.sh could not read reports a state without its fields, and a
         # record whose owner is unreadable must not be mistaken for no record:
         # dropping the token there would strand the slot for everyone.
-        if p.returncode != 0 and lease.get("state") != "free":
+        if p.returncode != 0 and lease.get("lease") != "absent":
             t.pop("releasing")
             self.save()
             return False, (p.stderr.strip() or
-                           f"{t['slot']} is {lease.get('state') or 'unreported'} after release; "
+                           f"{t['slot']} still holds a lease (state {lease.get('state') or 'unreported'}); "
                            f"token kept, owner must inspect")
         self.finish_release(t)
         return True, ""
@@ -1551,12 +1554,14 @@ def recover_release(c, t):
         c.save()
         c.event(t["id"], "release_not_done", slot=t["slot"])
         return
-    # Not ours is not the same as gone: an unreadable record reports a state
-    # without a matching owner, and finishing here would discard the token
-    # that is the only way to release it.
-    if lease.get("state") != "free":
-        return c.block(t, f"{t['slot']} is {lease.get('state') or 'unreported'} after release and holds no "
-                          f"lease of this task; token kept, owner must inspect", INTERRUPTED)
+    # Not ours is not the same as gone: a record we cannot read reports a state
+    # without a matching owner, and finishing here would discard the token that
+    # is the only way to release it. Only pool.sh's own marker settles whether
+    # a record is there; a slot that is merely not idle was released.
+    if lease.get("lease") != "absent":
+        return c.block(t, f"{t['slot']} still holds a lease that is not this task's "
+                          f"(state {lease.get('state') or 'unreported'}); token kept, owner must inspect",
+                       INTERRUPTED)
     if t["releasing"]["next"] == AWAITING_REVIEW:
         try:
             pr = c.pr_view(t["pr"])

@@ -624,6 +624,37 @@ done
 rm "$CG_POOL_LEASES/$A.lease"
 "$POOL" prepare --slot $A >/dev/null
 
+# status says whether a record is there at all: "inconsistent" alone cannot
+# tell an unreadable lease from a slot that is merely not idle.
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=absent$" "$T/out" || fail "status of a free slot did not report the lease as absent"
+"$POOL" acquire --slot $A --task marker --agent x >/dev/null
+TA=$(token $A)
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "status of a leased slot did not report the lease as present"
+sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
+"$POOL" status $A >"$T/out"
+grep -q "^  lease=present$" "$T/out" || fail "an unreadable lease was not reported as present"
+rm "$CG_POOL_LEASES/$A.lease"
+change $A notidle
+"$POOL" status $A >"$T/out"
+[[ $(state $A) == inconsistent ]] || fail "a slot off the base is not inconsistent"
+grep -q "^  lease=absent$" "$T/out" ||
+	fail "a slot that is merely not idle was not reported as unleased: $(cat "$T/out")"
+git -C "$CG_POOL_ROOT/$A" switch -q --detach "$(base_of)"
+"$POOL" prepare --slot $A >/dev/null
+
+# A lease whose contents cannot be read is unknown, never absent.
+"$POOL" acquire --slot $A --task unreadable --agent x >/dev/null
+TA=$(token $A)
+: >"$CG_POOL_LEASES/$A.lease"  # present, nothing readable in it
+expect 0 "$POOL" assess $A
+grep -q "^lease: present but unreadable$" "$T/out" ||
+	fail "an unreadable lease was reported as absent: $(cat "$T/out")"
+grep -q "^lease: absent$" "$T/out" && fail "an existing lease was called absent"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1

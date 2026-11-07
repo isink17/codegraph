@@ -15,9 +15,9 @@ import signal
 import subprocess
 import sys
 import tempfile
-import types
 import textwrap
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -667,6 +667,21 @@ class Pool(Fixture):
         self.coord("run", "--once")
         self.assertEqual(self.status("x"), "blocked")  # owner decides; nothing retried behind their back
         self.assertIsNotNone(self.lease(A))
+
+    def test_release_recovery_completes_when_the_slot_is_only_not_idle(self):
+        """The release went through and the base then moved on, so the slot
+        reports inconsistent with no lease. That is released, not held."""
+        self.plan(self.task("x", commit("x")))
+        self.crash_at("release_before_save")
+        self.assertIsNone(self.lease(A))  # pool.sh did release
+        self.git("-C", str(self.seed), "switch", "-q", "--detach", "origin/v2.0")
+        self.git("-C", str(self.seed), "commit", "-q", "--allow-empty", "-m", "advance")
+        self.git("-C", str(self.seed), "push", "-q", "origin", "HEAD:v2.0")
+        self.assertEqual(self.pool_state(A), "inconsistent")
+        self.coord("run", "--once")
+        self.assertIn(self.status("x"), ("awaiting_review", "reviewing"))
+        self.assertNotIn("releasing", self.st()["x"])
+        self.assertEqual(list((self.state / "tokens").glob(f"x.{A}.token")), [])
 
     def test_release_recovery_keeps_the_token_of_an_unreadable_lease(self):
         """A crash between pool.sh release and the status read, with a lease
@@ -1472,28 +1487,38 @@ class Units(unittest.TestCase):
         """A refused release whose outcome is uncertain keeps the token: a
         state without a matching lease may be an unreadable record, not an
         absent one, and the slot would be unreleasable without its token."""
-        def coordinator_with(state, owner):
+        def coordinator_with(state, owner, marker="present", rc=1):
             c = object.__new__(self.c.Coordinator)
             c.read_token = lambda t: "tok"
             c.save = lambda: None
-            c.pool = lambda *a: types.SimpleNamespace(returncode=1, stdout="", stderr="refused")
-            c.pool_status = lambda: {"w": {k: v for k, v in (("state", state), ("owner", owner)) if v}}
+            c.pool = lambda *a: types.SimpleNamespace(returncode=rc, stdout="", stderr="refused")
+            c.pool_status = lambda: {"w": {k: v for k, v in (("state", state), ("owner", owner),
+                                                             ("lease", marker)) if v}}
             c.finished = []
             c.finish_release = c.finished.append
             return c
         task = {"id": "x", "slot": "w", "lease_txn": "mine"}
-        for state, owner in (("inconsistent", None), ("inconsistent", "coordinator:mine"),
-                             ("busy", "coordinator:mine"), ("busy", "coordinator:other"),
-                             ("stale-suspected", "coordinator:other")):
-            c = coordinator_with(state, owner)
-            ok, err = c.release(dict(task), "next")
-            self.assertFalse(ok, f"{state}/{owner} released")
-            self.assertEqual(c.finished, [], f"{state}/{owner} discarded the token")
+        for state, owner, marker in (("inconsistent", None, "present"),
+                                     ("inconsistent", "coordinator:mine", "present"),
+                                     ("busy", "coordinator:mine", "present"),
+                                     ("busy", "coordinator:other", "present"),
+                                     ("stale-suspected", "coordinator:other", "present"),
+                                     ("inconsistent", None, None)):  # no marker: unknown
+            c = coordinator_with(state, owner, marker)
+            t = dict(task)
+            ok, err = c.release(t, "next")
+            self.assertFalse(ok, f"{state}/{owner}/{marker} released")
+            self.assertEqual(c.finished, [], f"{state}/{owner}/{marker} discarded the token")
+            self.assertNotIn("releasing", t)
             self.assertTrue(err)
-        c = coordinator_with("free", None)
-        ok, err = c.release(dict(task), "next")
-        self.assertTrue(ok, err)
-        self.assertEqual(len(c.finished), 1)
+        # pool.sh removes the lease last, so exit 0 proves the record is gone
+        # even where the slot is no longer idle.
+        for state, marker, rc in (("free", "absent", 1), ("inconsistent", "absent", 1),
+                                  ("inconsistent", "present", 0), ("busy", "present", 0)):
+            c = coordinator_with(state, "coordinator:other", marker, rc=rc)
+            ok, err = c.release(dict(task), "next")
+            self.assertTrue(ok, f"{state}/{marker}/rc={rc}: {err}")
+            self.assertEqual(len(c.finished), 1)
 
     def test_agent_text(self):
         claude = 'warning\n{"type":"result","result":"ok\\nVerdict: APPROVE\\nBlocking: 0"}\n'

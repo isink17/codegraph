@@ -30,7 +30,7 @@ die() { echo "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
 lease_file() { echo "$LEASES/$1.lease"; }
 slot_path() { echo "$POOL_ROOT/$1"; }
-field() { sed -n "s/^$2=//p" "$1" | head -n 1; }
+field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
 
 known_slot() {
 	local s
@@ -146,18 +146,23 @@ PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
 from_lease() { printf '%s\n' "$lease" | sed -n "s/^$1=//p" | head -n 1; }
 
 public_lease() {
-	sed -n -E "s/^($PUBLIC_FIELDS)=/  \\1=/p" "$1" 2>/dev/null || true
+	sed -n -E "s/^($PUBLIC_FIELDS)=/  \\1=/p"
 }
+
+# The lease as one read, empty when there is nothing to read.
+lease_text() { cat "$1" 2>/dev/null || true; }
 
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
-	local slot=$1 f problems pid version
+	local slot=$1 f problems pid version lease
 	f=$(lease_file "$slot")
 	problems=$(slot_problems "$slot")
 	if [[ ! -e $f ]]; then
 		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
+		echo "  lease=absent"
 		return
 	fi
+	lease=$(lease_text "$f")
 	if ! lease_valid "$f" "$slot"; then
 		echo inconsistent
 		version=$(field "$f" version)
@@ -168,7 +173,8 @@ slot_state() {
 		fi
 		# The fields follow even here: a reader that sees a state but no lease
 		# concludes the slot is unheld and discards the token that still guards it.
-		public_lease "$f"
+		echo "  lease=present"
+		printf '%s\n' "$lease" | public_lease
 		return
 	fi
 	# Boot identity is recorded for evidence only: a mismatch never widens
@@ -179,7 +185,8 @@ slot_state() {
 	else
 		echo busy
 	fi
-	public_lease "$f"
+	echo "  lease=present"
+	printf '%s\n' "$lease" | public_lease
 }
 
 cmd_status() {
@@ -396,10 +403,15 @@ cmd_assess() {
 	echo "host: $(hostname)"
 	echo "boot: ${now_boot:-unknown}"
 	# One snapshot: a lease released mid-report must read as gone, not abort.
-	lease=$(cat "$f" 2>/dev/null) || lease=""
-	if [[ -n $lease ]]; then
+	lease=$(lease_text "$f")
+	if [[ ! -e $f ]]; then
+		echo "lease: absent"
+	elif [[ -z $lease ]]; then
+		# The file is there and its contents are not readable: unknown.
+		echo "lease: present but unreadable"
+	else
 		echo "lease: present"
-		public_lease "$f"
+		printf '%s\n' "$lease" | public_lease
 		version=$(from_lease version)
 		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
 		pid=$(from_lease pid)
@@ -422,8 +434,6 @@ cmd_assess() {
 				echo "recorded-pid-signalable: no; gone, owned by another user, or inspection refused"
 			fi
 		fi
-	else
-		echo "lease: absent"
 	fi
 	read_cwds
 	if ((CWDS_FAILED != 0)); then
