@@ -884,15 +884,14 @@ class Coordinator:
         status = self.pool_status()
         mine = [(s, v) for s, v in status.items() if v.get("owner") == owner]
         held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
-        # pool.sh exits 0 whenever it linked a lease, so a normal refusal
-        # (1-127) proves this transaction leased nothing; a record nobody can
-        # read then quarantines only its own slot. A missing status, 0 without
-        # a lease of ours, or death by a signal settles nothing.
+        # pool.sh exits 0 only after linking a lease, so a normal refusal
+        # (1-127) proves this transaction leased nothing, and a record nobody
+        # can read then quarantines only its own slot. Otherwise (no status, a
+        # signal, or 0) such a record on a candidate slot may be ours, and the
+        # token here may be the only one that clears it. With 0 and every
+        # record readable but none ours, ours is gone: the owner released it.
         rc = read_rc(files["rc"])
         refused = rc is not None and 0 < rc < 128
-        # Otherwise a candidate slot holding a record nothing can be read from is
-        # not an absent record either: the token here may be the only one that
-        # clears it.
         unreadable = None if refused else next((s for s in slots if lease_unreadable(status.get(s, {}))), None)
         if not held and unreadable:
             return None, None, (f"{unreadable} holds a lease whose owner cannot be read, so this "
