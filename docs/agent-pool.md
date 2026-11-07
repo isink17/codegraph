@@ -153,6 +153,46 @@ no `pool.sh` process is running.
   Old worktrees are removed with `git worktree remove` only after their
   content is verified integrated and the owner approved the exact list.
 
+## Recovery state machine
+
+`scripts/agent-pool/recovery_state.py` models orphan lease recovery
+(CG-150, phase 2a). It is a library with tests and nothing else.
+`pool.sh`, the coordinator and the campaign do not call it, and it has no
+command-line entry point. It cannot quarantine, reclaim or reassign a real
+slot. `reclaim` above is unchanged.
+
+The only path to reassignment, one transition at a time:
+
+| From | To | Requires |
+|---|---|---|
+| `ACTIVE` | `RECOVERY_REQUESTED` | the current lease ID and generation; authorizes nothing |
+| `RECOVERY_REQUESTED` | `QUARANTINED` | the owner's authorization for this exact slot, lease ID, generation and operation; the generation moves on, so the old lease's token can no longer act |
+| `QUARANTINED` | `QUIESCENCE_VERIFIED` | the owner's quiescence evidence: containment teardown, owner-controlled quiescence or the reboot runbook, accounting for old coordinators, wrappers, escaped descendants, remote writers and automatic restarts |
+| `QUIESCENCE_VERIFIED` | `PRESERVED` | a complete inventory of dirty, untracked and ignored files and unpublished commits, each with a verified copy |
+| `PRESERVED` | `READY_FOR_REASSIGNMENT` | a final check showing the slot clean, unleased and at the preserved HEAD |
+
+- Every step after the request needs the operation ID, the current generation
+  and the recovery token the caller chose at quarantine.
+- A missing PID, a stale heartbeat, no process cwd or a rotated token is
+  never quiescence evidence. The module records the owner's evidence and
+  checks that it is complete. It does not observe processes itself.
+- Each record lives in a store directory the caller names, with no default.
+- A transition takes a per-slot `mkdir` lock, appends a secret-free intent to
+  a journal, atomically replaces the state, and appends a completion. Each
+  write is `fsync`ed, including the directory.
+- A record whose last transition has no completion is not ready. Only the
+  same operation, with the same evidence, can finish it.
+- A record that is unreadable, inconsistent with its journal, or missing an
+  evidence gate is refused, never read as available.
+- A lock left by a crash is never broken automatically.
+- Tokens are stored only as salted HMAC verifiers. Evidence carrying
+  secret-looking fields is refused.
+- Durable directory sync is not available on Windows, so recording a
+  transition fails there. That is the intended outcome, but it is untested.
+
+Tests use disposable stores only:
+`python3 -m unittest test_recovery_state` from `scripts/agent-pool`.
+
 ## Plane tracking
 
 The coordinator keeps the Plane ticket of every PR in step with GitHub.
