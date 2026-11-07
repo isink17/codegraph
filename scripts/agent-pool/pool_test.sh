@@ -5,7 +5,7 @@ set -euo pipefail
 POOL=$(cd "$(dirname "$0")" && pwd)/pool.sh
 T=$(mktemp -d "${TMPDIR:-/tmp}/pool-test.XXXXXX") || exit 1
 T=$(cd "$T" && pwd -P) || exit 1
-trap 'rm -rf "$T"' EXIT
+trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds CG_POOL_REPO=$T/seed
 : >"$T/cwds"
 fails=0
@@ -681,6 +681,8 @@ fi
 chmod 755 "$T/locked"
 CG_POOL_LEASES=$T/locked/leases expect 0 "$POOL" status $A
 grep -q "^  lease=absent$" "$T/out" || fail "a pool that never leased did not report its leases absent"
+CG_POOL_LEASES=$T/fresh/pool/leases expect 0 "$POOL" status $A
+grep -q "^  lease=absent$" "$T/out" || fail "a fresh pool with no lease directory chain refused: $(cat "$T/out")"
 
 # A dangling link at the lease path is a record nobody can read, not an absence.
 ln -s "$T/nowhere" "$CG_POOL_LEASES/$B.lease"

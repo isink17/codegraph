@@ -140,28 +140,38 @@ public_lease() {
 lease_text() { head -n 200 "$1" 2>/dev/null || true; }
 
 # A lease file can be called absent only when the directory that would hold
-# it can be searched; otherwise its absence is unknown. A missing directory
-# under a searchable parent is a pool that has never leased anything.
+# it can be searched. A missing directory whose nearest existing ancestor can
+# be searched is a pool that has never leased anything.
 leases_observable() {
-	if [[ -e $LEASES || -L $LEASES ]]; then
-		[[ -d $LEASES && -r $LEASES && -x $LEASES ]]
-	else
-		[[ -d $(dirname "$LEASES") && -x $(dirname "$LEASES") ]]
+	local d=$LEASES
+	while [[ ! -e $d && ! -L $d && $d != / && $d != . ]]; do d=$(dirname "$d"); done
+	if [[ $d == "$LEASES" ]]; then [[ -d $d && -r $d && -x $d ]]; else [[ -d $d && -x $d ]]; fi
+}
+
+# present | absent | unknown for the lease file $1. A path that cannot be
+# searched also fails -e, so absent needs the directory observable on both
+# sides of the test.
+lease_seen() {
+	if leases_observable; then
+		if [[ -e $1 || -L $1 ]]; then echo present; return; fi
+		if leases_observable; then echo absent; return; fi
 	fi
+	echo unknown
 }
 
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
-	local slot=$1 f problems pid version lease
+	local slot=$1 f problems pid version lease seen
 	f=$(lease_file "$slot")
-	if ! leases_observable; then
+	seen=$(lease_seen "$f")
+	if [[ $seen == unknown ]]; then
 		echo inconsistent
 		echo "lease directory $LEASES cannot be observed"
 		echo "  lease=unknown"
 		return
 	fi
 	problems=$(slot_problems "$slot")
-	if [[ ! -e $f && ! -L $f ]]; then
+	if [[ $seen == absent ]]; then
 		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
 		echo "  lease=absent"
 		return
@@ -393,7 +403,7 @@ cmd_reclaim() {
 # and it mutates nothing (no fetch, no lock, no lease change). It grants no
 # recovery authorization: recovering a lease still needs the owner.
 cmd_assess() {
-	local slot=${1:-} f p head branch changes ignored base refs lease
+	local slot=${1:-} f p head branch changes ignored base refs lease seen
 	[[ $# -eq 1 ]] || die "assess needs one slot" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
 	f=$(lease_file "$slot")
@@ -404,9 +414,10 @@ cmd_assess() {
 	echo "host: $(hostname)"
 	# One snapshot: a lease released mid-report must read as gone, not abort.
 	lease=$(lease_text "$f")
-	if ! leases_observable; then
+	seen=$(lease_seen "$f")
+	if [[ $seen == unknown ]]; then
 		echo "lease: unknown; lease directory cannot be observed"
-	elif [[ ! -e $f && ! -L $f ]]; then
+	elif [[ $seen == absent ]]; then
 		echo "lease: absent"
 	elif [[ -z $lease ]]; then
 		# The file is there and nothing came back from it: it is empty, or it

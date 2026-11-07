@@ -41,12 +41,13 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   makes the slot `inconsistent`, and `release`, `review-checkout` and
   `reclaim` refuse it; such a lease is never reinterpreted or removed on the
   owner's behalf. `status` still prints its fields, and every slot reports
-  `lease=present` or `lease=absent`, so a reader never mistakes an unreadable
-  record for no record at all: `inconsistent` on its own cannot tell the two
-  apart. A lease is called absent only when the lease directory can be
-  searched (or does not exist under a searchable parent); otherwise `status`
-  refuses and `assess` reports the lease as unknown. A dangling link at the
-  lease path counts as present. Until the recovery protocol lands, a corrupted or unsupported lease
+  `lease=present`, `lease=absent` or `lease=unknown`, so a reader never
+  mistakes an unreadable record for no record at all: `inconsistent` on its
+  own cannot tell them apart. A lease is called absent only when the lease
+  directory can be searched (or does not exist and its nearest existing
+  ancestor can be searched); otherwise `status` refuses and `assess` reports
+  the lease as unknown. `status` and `assess` count a dangling link at the
+  lease path as present. Until the recovery protocol lands, a corrupted or unsupported lease
   has no `pool.sh` remedy at all — `release` and `reclaim` both refuse it, and
   clearing it means inspecting the file by hand.
 - `assess <slot>` prints read-only evidence about one slot: its state, the
