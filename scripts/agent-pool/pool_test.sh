@@ -454,6 +454,83 @@ before=$(shasum "$idx")
 [[ $(shasum "$idx") == "$before" ]] || fail "status rewrote the index of leased $A"
 "$POOL" release --slot $A --token "$(token $A)" >/dev/null || fail "release of $A after status check"
 
+
+# Lease records carry the schema version, a non-secret lease id and the boot
+# identity; the token stays out of every report.
+echo boot-one >"$T/boot"
+CG_POOL_BOOT_FILE=$T/boot "$POOL" acquire --slot $A --task versioned --agent x >/dev/null
+TA=$(token $A)
+[[ $(sed -n 's/^version=//p' "$CG_POOL_LEASES/$A.lease") == 1 ]] || fail "lease has no schema version"
+[[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") =~ ^[0-9a-f]{32}$ ]] || fail "lease has no lease id"
+[[ $(sed -n 's/^boot=//p' "$CG_POOL_LEASES/$A.lease") == boot-one ]] || fail "lease has no boot identity"
+[[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") != "$TA" ]] || fail "lease id reuses the token"
+[[ $(state $A) == busy ]] || fail "versioned lease state $(state $A)"
+
+# assess is read-only, hides the token, and reports what it cannot know.
+before=$(shasum "$CG_POOL_LEASES/$A.lease") ; beforehead=$(head_of $A)
+expect 2 "$POOL" assess
+expect 2 "$POOL" assess codegraph-worker-z
+expect 0 "$POOL" assess $A
+grep -q "$TA" "$T/out" && fail "assess printed the lease token"
+grep -q "^state: busy$" "$T/out" || fail "assess did not report the state"
+grep -q "^lease: present$" "$T/out" || fail "assess did not report the lease"
+grep -q "^recorded-process: none recorded" "$T/out" || fail "assess did not report the missing pid"
+grep -q "^process-cwd: none observed" "$T/out" || fail "assess did not report cwd evidence"
+grep -q "^changed-or-untracked-files: 0$" "$T/out" || fail "assess did not count changes"
+grep -q "^ignored-files: 0$" "$T/out" || fail "assess did not count ignored files"
+grep -q "^note: observations only" "$T/out" || fail "assess did not disclaim authorization"
+[[ $(shasum "$CG_POOL_LEASES/$A.lease") == "$before" && $(head_of $A) == "$beforehead" ]] ||
+	fail "assess mutated the slot"
+
+# Dirty and ignored files are reported, not acted on.
+echo dirt >"$CG_POOL_ROOT/$A/dirt.txt"
+printf 'ignored.txt\n' >"$CG_POOL_ROOT/$A/.gitignore"
+echo hidden >"$CG_POOL_ROOT/$A/ignored.txt"
+expect 0 "$POOL" assess $A
+grep -q "^changed-or-untracked-files: 2$" "$T/out" || fail "assess miscounted changes: $(cat "$T/out")"
+grep -q "^ignored-files: 1$" "$T/out" || fail "assess miscounted ignored files"
+[[ -e $CG_POOL_ROOT/$A/dirt.txt && -e $CG_POOL_ROOT/$A/ignored.txt ]] || fail "assess removed files"
+rm "$CG_POOL_ROOT/$A/dirt.txt" "$CG_POOL_ROOT/$A/ignored.txt" "$CG_POOL_ROOT/$A/.gitignore"
+
+# A recorded pid from an earlier boot is reported as evidence only: the lease
+# stays busy and never becomes stale-suspected on that ground.
+sed -i.bak "s/^pid=.*/pid=$$/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$A.lease" &&
+	rm "$CG_POOL_LEASES/$A.lease.bak"
+echo boot-two >"$T/boot"
+CG_POOL_BOOT_FILE=$T/boot "$POOL" assess $A >"$T/out" 2>&1 || fail "assess with boot mismatch failed"
+grep -q "recorded under an earlier boot" "$T/out" || fail "assess did not report the boot mismatch"
+[[ $(CG_POOL_BOOT_FILE=$T/boot "$POOL" status $A | sed -n 1p) == "$A: busy" ]] ||
+	fail "boot mismatch changed the slot state"
+echo boot-one >"$T/boot"
+
+# Process inspection that cannot run is unknown, never "no process".
+CG_POOL_CWD_FILE=$T/missing-cwds "$POOL" assess $A >"$T/out" 2>&1 || fail "assess without cwd data failed"
+grep -q "^process-cwd: unknown" "$T/out" || fail "assess claimed no process when inspection failed"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A lease written before versioning stays recognizable and busy.
+"$POOL" acquire --slot $A --task legacy --agent x >/dev/null
+TA=$(token $A)
+grep -v '^version=' "$CG_POOL_LEASES/$A.lease" >"$T/legacy" && cp "$T/legacy" "$CG_POOL_LEASES/$A.lease"
+[[ $(state $A) == busy ]] || fail "pre-versioning lease state $(state $A)"
+expect 1 "$POOL" acquire --slot $A --task take --agent y
+expect 0 "$POOL" assess $A
+grep -q "^lease-schema: absent" "$T/out" || fail "assess did not flag the pre-versioning lease"
+expect 0 "$POOL" release --slot $A --token "$TA"
+
+# A schema this pool.sh does not know is refused, never reinterpreted.
+"$POOL" acquire --slot $A --task future --agent x >/dev/null
+TA=$(token $A)
+sed -i.bak 's/^version=.*/version=99/' "$CG_POOL_LEASES/$A.lease" && rm "$CG_POOL_LEASES/$A.lease.bak"
+[[ $(state $A) == inconsistent ]] || fail "unknown lease schema state $(state $A)"
+"$POOL" status $A | grep -q "version 99 unsupported" || fail "status did not name the unsupported schema"
+expect 1 "$POOL" acquire --slot $A --task take --agent y
+expect 1 "$POOL" release --slot $A --token "$TA"
+expect 1 "$POOL" reclaim --slot $A --token "$TA" --reason test
+[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "unknown schema lease was removed"
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1
