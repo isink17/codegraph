@@ -649,7 +649,7 @@ git -C "$CG_POOL_ROOT/$A" switch -q --detach "$(base_of)"
 TA=$(token $A)
 : >"$CG_POOL_LEASES/$A.lease"  # present, nothing readable in it
 expect 0 "$POOL" assess $A
-grep -q "^lease: present but unreadable$" "$T/out" ||
+grep -q "^lease: present but empty or unreadable$" "$T/out" ||
 	fail "an unreadable lease was reported as absent: $(cat "$T/out")"
 grep -q "^lease: absent$" "$T/out" && fail "an existing lease was called absent"
 rm "$CG_POOL_LEASES/$A.lease"

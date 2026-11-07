@@ -867,10 +867,15 @@ class Coordinator:
             return None, None, "pool.sh acquire is still running"
         slots = WORKERS if m["slot"] == "auto" else [m["slot"]]
         locked = not files["rc"].exists() and any((LEASES / f".{s}.lock").exists() for s in slots)
-        # A lease whose schema pool.sh cannot read now reports its fields too,
-        # so an owner match alone would adopt a slot no release can ever clear.
-        held = next((s for s, v in self.pool_status().items()
-                     if v.get("owner") == owner and v.get("state") in ("busy", "stale-suspected")), None)
+        mine = [(s, v) for s, v in self.pool_status().items() if v.get("owner") == owner]
+        held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
+        # A lease carrying our id that pool.sh cannot read is not nothing: it
+        # is a slot no release can clear. Leaving the transaction open keeps
+        # the marker and the file holding the only copy of its token.
+        if not held and mine:
+            s, v = mine[0]
+            return None, None, (f"{s} carries owner={owner} but its lease is "
+                                f"{v.get('state') or 'unreported'}; token kept, owner must inspect")
         if held:
             out = files["out"].read_text() if files["out"].exists() else ""
             got = re.search(r"^leased (\S+) token=([0-9a-f]{32})$", out, re.M)

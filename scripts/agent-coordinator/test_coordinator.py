@@ -818,6 +818,17 @@ class Pool(Fixture):
 
     # ------------------------------------------------------------ acquire transactions
 
+    def unreadable_pool(self):
+        """pool.sh stand-in whose acquire really leases, then leaves the lease
+        at a schema version no pool.sh understands."""
+        f = self.t / "bin/pool-unreadable"
+        f.write_text(f'#!/bin/sh\nif [ "$1" = acquire ]; then out=$("{POOL}" "$@"); rc=$?; '
+                     f'if [ $rc -eq 0 ]; then for l in "{self.leases}"/*.lease; do '
+                     f'[ -e "$l" ] || continue; sed -i.bak "s/^version=.*/version=99/" "$l"; '
+                     f'rm -f "$l.bak"; done; fi\necho "$out"; exit $rc; fi\nexec "{POOL}" "$@"\n')
+        f.chmod(0o755)
+        return str(f)
+
     def mangling_pool(self):
         """pool.sh stand-in whose acquire really leases but prints garbage."""
         f = self.t / "bin/pool-mangle"
@@ -825,6 +836,26 @@ class Pool(Fixture):
                      f'echo garbage; exit $rc; fi\nexec "{POOL}" "$@"\n')
         f.chmod(0o755)
         return str(f)
+
+    def test_acquire_of_an_unreadable_lease_keeps_the_marker_and_the_token(self):
+        """A lease carrying our transaction that pool.sh cannot read is not
+        "nothing was leased": clearing the marker would delete the only copy
+        of the token and leave the slot leased for good."""
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", CG_COORD_POOL=self.unreadable_pool())
+        t = self.st()["x"]
+        self.assertEqual(t["status"], "interrupted")
+        self.assertIn("owner must inspect", t["reason"])
+        txn = t["starting"]["txn"]  # the marker is kept, so no other slot is taken
+        self.assertEqual(self.lease_field(A, "owner"), f"coordinator:{txn}")
+        self.assertTrue((self.state / "tokens" / f"acquire-{txn}.out").exists(),
+                        "the acquire output holding the token was deleted")
+        lease = self.lease(A)
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "interrupted")
+        self.assertEqual(self.lease(A), lease)
+        self.assertIsNone(self.lease(B))  # never a second slot
+        self.assert_no_token_leak()
 
     def test_acquire_with_malformed_output_fails_closed(self):
         self.plan(self.task("x", commit("x")))

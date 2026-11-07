@@ -30,7 +30,7 @@ die() { echo "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
 lease_file() { echo "$LEASES/$1.lease"; }
 slot_path() { echo "$POOL_ROOT/$1"; }
-field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | { head -n 1 || true; }; }
 
 known_slot() {
 	local s
@@ -143,7 +143,7 @@ boot_id() {
 # its secret anything, so this is an allowlist, not a token filter.
 PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
 # Reads a field of the lease snapshot $lease that cmd_assess holds.
-from_lease() { printf '%s\n' "$lease" | sed -n "s/^$1=//p" | head -n 1; }
+from_lease() { printf '%s\n' "$lease" | sed -n "s/^$1=//p" | { head -n 1 || true; }; }
 
 public_lease() {
 	sed -n -E "s/^($PUBLIC_FIELDS)=/  \\1=/p"
@@ -407,8 +407,9 @@ cmd_assess() {
 	if [[ ! -e $f ]]; then
 		echo "lease: absent"
 	elif [[ -z $lease ]]; then
-		# The file is there and its contents are not readable: unknown.
-		echo "lease: present but unreadable"
+		# The file is there and nothing came back from it: it is empty, or it
+		# could not be read. Both are unknown, neither is absent.
+		echo "lease: present but empty or unreadable"
 	else
 		echo "lease: present"
 		printf '%s\n' "$lease" | public_lease
