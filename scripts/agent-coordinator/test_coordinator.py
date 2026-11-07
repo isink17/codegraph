@@ -13,9 +13,9 @@ import re
 import shutil
 import signal
 import subprocess
-import types
 import sys
 import tempfile
+import types
 import textwrap
 import time
 import unittest
@@ -668,23 +668,24 @@ class Pool(Fixture):
         self.assertEqual(self.status("x"), "blocked")  # owner decides; nothing retried behind their back
         self.assertIsNotNone(self.lease(A))
 
-    def test_unreadable_lease_blocks_release_and_keeps_the_token(self):
-        """A lease pool.sh cannot read must not look like no lease: dropping
-        the token there leaves a record on disk that nobody can release."""
-        self.plan(self.task("x", sh(f'echo "$PWD" >{self.cwds}; mkdir -p work; echo 1 >work/x.txt; '
-                                    'git add work; git commit -qm x')))
-        self.run_until(lambda: self.status("x") == "blocked")
-        f = self.leases / f"{A}.lease"
-        self.assertIsNotNone(self.lease(A))
+    def test_release_recovery_keeps_the_token_of_an_unreadable_lease(self):
+        """A crash between pool.sh release and the status read, with a lease
+        the pool cannot read: not ours is not gone, so the token stays."""
+        self.plan(self.task("x", commit("x")))
+        self.crash_at("release_before_save")
+        t = self.st()["x"]
+        self.assertIn("releasing", t)
         token_file = next((self.state / "tokens").glob(f"x.{A}.token"))
+        self.assertTrue(token_file.exists())
+        self.foreign_lease(A)  # the slot was released; another record is on it now
+        f = self.leases / f"{A}.lease"
         f.write_text(f.read_text().replace("version=1", "version=99"))
-        self.cwds.write_text("")  # the process is gone; only the unreadable lease remains
         self.assertEqual(self.pool_state(A), "inconsistent")
         self.coord("run", "--once")
-        self.assertEqual(self.status("x"), "blocked")
-        self.assertIsNotNone(self.lease(A))
-        self.assertTrue(token_file.exists(), "the token of an unreadable lease was discarded")
-        self.assertEqual(self.lease_field(A, "version"), "99")  # pool.sh left the record alone
+        self.assertEqual(self.status("x"), "interrupted")
+        self.assertIn("owner must inspect", self.st()["x"]["reason"])
+        self.assertTrue(token_file.exists(), "token discarded for a lease the pool cannot read")
+        self.assertEqual(self.lease_field(A, "version"), "99")  # the record is untouched
 
     # ------------------------------------------------------------ v1.1 helpers
 

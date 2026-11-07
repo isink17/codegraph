@@ -919,7 +919,7 @@ class Coordinator:
         # pool.sh could not read reports a state without its fields, and a
         # record whose owner is unreadable must not be mistaken for no record:
         # dropping the token there would strand the slot for everyone.
-        if lease.get("state") != "free":
+        if p.returncode != 0 and lease.get("state") != "free":
             t.pop("releasing")
             self.save()
             return False, (p.stderr.strip() or
@@ -1545,11 +1545,18 @@ def recover_release(c, t):
     normal checks continue. Released: the recorded next status applies, but
     a released slot proves only the release, so a published head must still
     be the PR's head on GitHub; otherwise the owner decides."""
-    if c.lease_held(t):
+    lease = c.pool_status().get(t["slot"], {})
+    if c.lease_matches(t, lease):
         t.pop("releasing")
         c.save()
         c.event(t["id"], "release_not_done", slot=t["slot"])
         return
+    # Not ours is not the same as gone: an unreadable record reports a state
+    # without a matching owner, and finishing here would discard the token
+    # that is the only way to release it.
+    if lease.get("state") != "free":
+        return c.block(t, f"{t['slot']} is {lease.get('state') or 'unreported'} after release and holds no "
+                          f"lease of this task; token kept, owner must inspect", INTERRUPTED)
     if t["releasing"]["next"] == AWAITING_REVIEW:
         try:
             pr = c.pr_view(t["pr"])
@@ -1615,9 +1622,7 @@ def reconcile(c):
             c.block(t, "running task has no recorded slot or token", INTERRUPTED)
             continue
         lease = status.get(t["slot"], {})
-        ours = (lease.get("owner") == f"coordinator:{t['lease_txn']}" if t.get("lease_txn")
-                else lease.get("task") == t["id"])
-        if lease.get("state") not in ("busy", "stale-suspected") or not ours:
+        if lease.get("state") not in ("busy", "stale-suspected") or not c.lease_matches(t, lease):
             c.block(t, f"{t['slot']} is {lease.get('state')} and not leased by this task; owner must inspect",
                     INTERRUPTED)
             continue

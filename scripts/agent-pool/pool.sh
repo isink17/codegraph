@@ -139,6 +139,16 @@ boot_id() {
 	printf '%s' "${v//[^[:print:]]/}"
 }
 
+# The lease fields a reader may see. A record of an unknown schema may name
+# its secret anything, so this is an allowlist, not a token filter.
+PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
+# Reads a field of the lease snapshot $lease that cmd_assess holds.
+from_lease() { printf '%s\n' "$lease" | sed -n "s/^$1=//p" | head -n 1; }
+
+public_lease() {
+	sed -n -E "s/^($PUBLIC_FIELDS)=/  \\1=/p" "$1" 2>/dev/null || true
+}
+
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
 	local slot=$1 f problems pid version
@@ -158,7 +168,7 @@ slot_state() {
 		fi
 		# The fields follow even here: a reader that sees a state but no lease
 		# concludes the slot is unheld and discards the token that still guards it.
-		sed -e '/^token=/d' -e 's/^/  /' "$f" 2>/dev/null || true
+		public_lease "$f"
 		return
 	fi
 	# Boot identity is recorded for evidence only: a mismatch never widens
@@ -169,7 +179,7 @@ slot_state() {
 	else
 		echo busy
 	fi
-	sed -e '/^token=/d' -e 's/^/  /' "$f"
+	public_lease "$f"
 }
 
 cmd_status() {
@@ -374,7 +384,7 @@ cmd_reclaim() {
 # and it mutates nothing (no fetch, no lock, no lease change). It grants no
 # recovery authorization: recovering a lease still needs the owner.
 cmd_assess() {
-	local slot=${1:-} f p pid lease_boot now_boot head branch changes ignored base version refs
+	local slot=${1:-} f p pid lease_boot now_boot head branch changes ignored base version refs lease
 	[[ $# -eq 1 ]] || die "assess needs one slot" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
 	f=$(lease_file "$slot")
@@ -385,18 +395,20 @@ cmd_assess() {
 	echo "state: $(slot_state "$slot" | sed -n 1p)"
 	echo "host: $(hostname)"
 	echo "boot: ${now_boot:-unknown}"
-	if [[ -e $f ]]; then
+	# One snapshot: a lease released mid-report must read as gone, not abort.
+	lease=$(cat "$f" 2>/dev/null) || lease=""
+	if [[ -n $lease ]]; then
 		echo "lease: present"
-		sed -e '/^token=/d' -e 's/^/  /' "$f" 2>/dev/null || true
-		version=$(field "$f" version)
+		public_lease "$f"
+		version=$(from_lease version)
 		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
-		pid=$(field "$f" pid)
+		pid=$(from_lease pid)
 		if [[ -z $pid ]]; then
 			echo "recorded-process: none recorded; no automatic stale detection"
-		elif [[ $(field "$f" host) != "$(hostname)" ]]; then
-			echo "recorded-process: pid $pid recorded on host $(field "$f" host); not inspectable here"
+		elif [[ $(from_lease host) != "$(hostname)" ]]; then
+			echo "recorded-process: pid $pid recorded on host $(from_lease host); not inspectable here"
 		else
-			lease_boot=$(field "$f" boot)
+			lease_boot=$(from_lease boot)
 			if [[ -z $lease_boot || -z $now_boot ]]; then
 				echo "recorded-process: pid $pid, boot identity unknown"
 			elif [[ $lease_boot != "$now_boot" ]]; then

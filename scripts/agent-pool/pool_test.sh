@@ -610,6 +610,20 @@ expect 0 "$POOL" assess $A
 grep -q "^lease: absent$" "$T/out" || fail "assess did not report the missing lease"
 grep -q "^state: free$" "$T/out" || fail "assess did not report a free slot"
 
+# A record of an unknown schema may name its secret anything, so only known
+# fields are printed.
+"$POOL" acquire --slot $A --task allowlist --agent x >/dev/null
+TA=$(token $A)
+{ echo "secret_v2=s3cr3t-value"; echo "version=99"; } >>"$CG_POOL_LEASES/$A.lease"
+for cmd in status assess; do
+	"$POOL" $cmd $A >"$T/out" 2>&1 || true
+	grep -q "s3cr3t-value" "$T/out" && fail "$cmd printed an unknown secret field"
+	grep -q "^  task=allowlist$" "$T/out" || fail "$cmd dropped a known field: $(cat "$T/out")"
+	grep -q "$TA" "$T/out" && fail "$cmd printed the token"
+done
+rm "$CG_POOL_LEASES/$A.lease"
+"$POOL" prepare --slot $A >/dev/null
+
 if ((fails)); then
 	echo "$fails failure(s)"
 	exit 1
