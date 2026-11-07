@@ -865,6 +865,73 @@ class Pool(Fixture):
         self.assertIsNone(self.lease(B))  # never a second slot
         self.assert_no_token_leak()
 
+    def unreadable_lease(self, slot, text=""):
+        self.leases.mkdir(exist_ok=True)
+        (self.leases / f"{slot}.lease").write_text(text)
+
+    def assert_acquire_settled_none(self, tid):
+        t = self.st()[tid]
+        self.assertEqual(t["status"], "pending", t.get("reason"))
+        self.assertNotIn("starting", t)
+        self.assertIn("BLOCKED_POOL_BUSY", self.out)
+        self.assertEqual(list((self.state / "tokens").glob("acquire-*")), [])
+
+    def test_unreadable_lease_quarantines_only_its_own_slot(self):
+        """pool.sh refused normally, so this acquire leased nothing: a record
+        on A nobody can read keeps A out of use, never B."""
+        self.unreadable_lease(A)
+        tok_b = self.foreign_lease(B)
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once")
+        self.assert_acquire_settled_none("x")
+        self.assertIn(tok_b, self.lease(B))
+        self.pool_release(B, tok_b)
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "running")
+        self.assertEqual(self.st()["x"]["slot"], B)
+        self.assertEqual(self.lease(A), "")  # never touched, never reinterpreted
+        self.assert_no_token_leak()
+
+    def test_unreadable_leases_on_both_slots_take_nothing(self):
+        self.unreadable_lease(A)
+        self.unreadable_lease(B, "\x00garbage\n")
+        self.plan(self.task("x", commit("x")))
+        for _ in range(2):
+            self.coord("run", "--once")
+            self.assert_acquire_settled_none("x")
+        self.assertEqual(self.lease(A), "")
+        self.assertEqual(self.lease(B), "\x00garbage\n")
+
+    def test_unreadable_lease_with_failed_process_inspection_takes_nothing(self):
+        """Process inspection that cannot run makes every slot not idle: no slot
+        is taken, and the record on A is left as it was."""
+        self.unreadable_lease(A)
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", CG_POOL_CWD_FILE=str(self.t / "missing-cwds"))
+        self.assert_acquire_settled_none("x")
+        self.assertIsNone(self.lease(B))
+        self.assertEqual(self.lease(A), "")
+        self.coord("run", "--once")
+        self.assertEqual(self.st()["x"]["slot"], B)
+
+    def test_unreadable_lease_with_an_unsettled_acquire_stays_open(self):
+        """pool.sh killed by a signal settles nothing, so the record on A may
+        be this transaction's: the marker stays and no other slot is taken."""
+        f = self.t / "bin/pool-killed"
+        f.write_text(f'#!/bin/sh\n[ "$1" = acquire ] && kill -9 $$\nexec "{POOL}" "$@"\n')
+        f.chmod(0o755)
+        self.unreadable_lease(A)
+        self.plan(self.task("x", commit("x")))
+        self.coord("run", "--once", CG_COORD_POOL=str(f))
+        t = self.st()["x"]
+        self.assertEqual(t["status"], "interrupted")
+        self.assertIn("starting", t)
+        self.assertIn("cannot be ruled out", t["reason"])
+        self.coord("run", "--once")
+        self.assertEqual(self.status("x"), "interrupted")
+        self.assertIsNone(self.lease(B))
+        self.assertEqual(self.lease(A), "")
+
     def test_acquire_with_malformed_output_fails_closed(self):
         self.plan(self.task("x", commit("x")))
         self.coord("run", "--once", CG_COORD_POOL=self.mangling_pool())

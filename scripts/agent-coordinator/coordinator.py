@@ -714,6 +714,14 @@ ADAPTERS = {"claude": claude_argv, "codex": codex_argv, "command": command_argv}
 
 # ---------------------------------------------------------------- state
 
+def read_rc(f):
+    """pool.sh's recorded exit status, or None when there is none to read."""
+    try:
+        return int(f.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def lease_unreadable(v):
     """True when a slot holds a record nothing identifying can be read from.
     Such a record may be ours, so no token of ours may be discarded over it."""
@@ -876,9 +884,16 @@ class Coordinator:
         status = self.pool_status()
         mine = [(s, v) for s, v in status.items() if v.get("owner") == owner]
         held = next((s for s, v in mine if v.get("state") in ("busy", "stale-suspected")), None)
-        # A candidate slot holding a record nothing can be read from is not an
-        # absent record either: the token here may be the only one that clears it.
-        unreadable = next((s for s in slots if lease_unreadable(status.get(s, {}))), None)
+        # pool.sh exits 0 whenever it linked a lease, so a normal refusal
+        # (1-127) proves this transaction leased nothing; a record nobody can
+        # read then quarantines only its own slot. A missing status, 0 without
+        # a lease of ours, or death by a signal settles nothing.
+        rc = read_rc(files["rc"])
+        refused = rc is not None and 0 < rc < 128
+        # Otherwise a candidate slot holding a record nothing can be read from is
+        # not an absent record either: the token here may be the only one that
+        # clears it.
+        unreadable = None if refused else next((s for s in slots if lease_unreadable(status.get(s, {}))), None)
         if not held and unreadable:
             return None, None, (f"{unreadable} holds a lease whose owner cannot be read, so this "
                                 f"acquire cannot be ruled out; no slot is taken and the token files "
@@ -909,7 +924,7 @@ class Coordinator:
         else:
             # pool.sh finished, never ran, or died outside a slot lock, and
             # no lease carries the id: nothing was leased.
-            rc = (int(files["rc"].read_text().strip() or 1) if files["rc"].exists() else 1) or 1
+            rc = rc or 1
             err = files["err"].read_text().strip() if files["err"].exists() else "pool.sh did not run"
             t.pop("starting")
             self.save()

@@ -455,14 +455,12 @@ before=$(shasum "$idx")
 "$POOL" release --slot $A --token "$(token $A)" >/dev/null || fail "release of $A after status check"
 
 
-# Lease records carry the schema version, a non-secret lease id and the boot
-# identity; the token stays out of every report.
-echo boot-one >"$T/boot"
-CG_POOL_BOOT_FILE=$T/boot "$POOL" acquire --slot $A --task versioned --agent x >/dev/null
+# Lease records carry the schema version and a non-secret lease id; the token
+# stays out of every report.
+"$POOL" acquire --slot $A --task versioned --agent x >/dev/null
 TA=$(token $A)
 [[ $(sed -n 's/^version=//p' "$CG_POOL_LEASES/$A.lease") == 1 ]] || fail "lease has no schema version"
 [[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") =~ ^[0-9a-f]{32}$ ]] || fail "lease has no lease id"
-[[ $(sed -n 's/^boot=//p' "$CG_POOL_LEASES/$A.lease") == boot-one ]] || fail "lease has no boot identity"
 [[ $(sed -n 's/^lease_id=//p' "$CG_POOL_LEASES/$A.lease") != "$TA" ]] || fail "lease id reuses the token"
 [[ $(state $A) == busy ]] || fail "versioned lease state $(state $A)"
 
@@ -474,7 +472,6 @@ expect 0 "$POOL" assess $A
 grep -q "$TA" "$T/out" && fail "assess printed the lease token"
 grep -q "^state: busy$" "$T/out" || fail "assess did not report the state"
 grep -q "^lease: present$" "$T/out" || fail "assess did not report the lease"
-grep -q "^recorded-process: none recorded" "$T/out" || fail "assess did not report the missing pid"
 grep -q "^process-cwd: none observed" "$T/out" || fail "assess did not report cwd evidence"
 grep -q "^changed-or-untracked-files: 0$" "$T/out" || fail "assess did not count changes"
 grep -q "^ignored-files: 0$" "$T/out" || fail "assess did not count ignored files"
@@ -491,17 +488,6 @@ grep -q "^changed-or-untracked-files: 2$" "$T/out" || fail "assess miscounted ch
 grep -q "^ignored-files: 1$" "$T/out" || fail "assess miscounted ignored files"
 [[ -e $CG_POOL_ROOT/$A/dirt.txt && -e $CG_POOL_ROOT/$A/ignored.txt ]] || fail "assess removed files"
 rm "$CG_POOL_ROOT/$A/dirt.txt" "$CG_POOL_ROOT/$A/ignored.txt" "$CG_POOL_ROOT/$A/.gitignore"
-
-# A recorded pid from an earlier boot is reported as evidence only: the lease
-# stays busy and never becomes stale-suspected on that ground.
-sed -i.bak "s/^pid=.*/pid=$$/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$A.lease" &&
-	rm "$CG_POOL_LEASES/$A.lease.bak"
-echo boot-two >"$T/boot"
-CG_POOL_BOOT_FILE=$T/boot "$POOL" assess $A >"$T/out" 2>&1 || fail "assess with boot mismatch failed"
-grep -q "recorded under an earlier boot" "$T/out" || fail "assess did not report the boot mismatch"
-[[ $(CG_POOL_BOOT_FILE=$T/boot "$POOL" status $A | sed -n 1p) == "$A: busy" ]] ||
-	fail "boot mismatch changed the slot state"
-echo boot-one >"$T/boot"
 
 # Process inspection that cannot run is unknown, never "no process".
 CG_POOL_CWD_FILE=$T/missing-cwds "$POOL" assess $A >"$T/out" 2>&1 || fail "assess without cwd data failed"
@@ -559,34 +545,6 @@ expect 1 "$POOL" review-checkout --slot $R --token "$TR" --branch review-head --
 [[ -e $CG_POOL_LEASES/$R.lease ]] || fail "malformed review lease was removed"
 rm "$CG_POOL_LEASES/$R.lease"
 "$POOL" prepare --slot $R >/dev/null
-
-# Without an injected value the real boot identity is recorded; an empty one
-# would silently disable the evidence it exists for.
-"$POOL" acquire --slot $A --task realboot --agent x >/dev/null
-TA=$(token $A)
-rb=$(sed -n 's/^boot=//p' "$CG_POOL_LEASES/$A.lease")
-if [[ -r /proc/sys/kernel/random/boot_id ]] || sysctl -n kern.bootsessionuuid >/dev/null 2>&1 ||
-	sysctl -n kern.boottime >/dev/null 2>&1 || [[ -r /proc/stat ]]; then
-	[[ -n $rb ]] || fail "no boot identity recorded on a host that reports one"
-	[[ $rb != *" "* && $rb != *"usec"* ]] || fail "boot identity is not a single value: $rb"
-	"$POOL" assess $A >"$T/out" 2>&1 || fail "assess with a real boot identity failed"
-	grep -q "^boot: $rb$" "$T/out" || fail "assess read back a different boot identity: $(sed -n '/^boot: /p' "$T/out")"
-fi
-
-# A recorded pid that is gone still reports stale-suspected, and a boot
-# mismatch neither widens nor narrows that: the lease stays on the slot.
-dead2=$(sh -c 'echo $$')
-while kill -0 "$dead2" 2>/dev/null; do dead2=$((dead2 + 1)); done
-sed -i.bak "s/^pid=.*/pid=$dead2/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$A.lease" &&
-	rm "$CG_POOL_LEASES/$A.lease.bak"
-echo boot-elsewhere >"$T/boot"
-[[ $(CG_POOL_BOOT_FILE=$T/boot "$POOL" status $A | sed -n 1p) == "$A: stale-suspected" ]] ||
-	fail "dead pid with a boot mismatch is not stale-suspected"
-[[ -e $CG_POOL_LEASES/$A.lease ]] || fail "stale-suspected lease was removed"
-CG_POOL_BOOT_FILE=$T/boot "$POOL" assess $A >"$T/out" 2>&1 || fail "assess of a stale-suspected lease failed"
-grep -q "recorded under an earlier boot" "$T/out" || fail "assess hid the boot mismatch"
-grep -q "^recorded-pid-signalable: no" "$T/out" || fail "assess hid that the pid is gone"
-expect 0 "$POOL" release --slot $A --token "$TA"
 
 # assess writes nothing: not the index of a busy slot, not a git object.
 "$POOL" acquire --slot $A --task nomutation --agent x >/dev/null

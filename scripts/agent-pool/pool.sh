@@ -121,39 +121,9 @@ lease_valid() {
 
 pid_alive() { kill -0 "$1" 2>/dev/null; }
 
-# Identity of the running kernel boot, recorded so a later reader can tell
-# that a recorded PID cannot still be the process it named. The per-boot UUIDs
-# are preferred: a boot time is recomputed on clock changes and would date a
-# lease to an earlier boot that never happened. Empty when the host reports
-# none. Tests supply the value in a file.
-boot_id() {
-	local v=""
-	if [[ -n ${CG_POOL_BOOT_FILE:-} ]]; then
-		v=$(sed -n 1p "$CG_POOL_BOOT_FILE" 2>/dev/null) || v=""
-	else
-		v=$(sysctl -n kern.bootsessionuuid 2>/dev/null) || v=""
-		[[ -n $v ]] || v=$(sed -n 1p /proc/sys/kernel/random/boot_id 2>/dev/null) || v=""
-		[[ -n $v ]] || v=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec = \([0-9]*\).*/\1/p') || v=""
-		[[ -n $v ]] || v=$(sed -n 's/^btime //p' /proc/stat 2>/dev/null | head -n 1) || v=""
-	fi
-	printf '%s' "${v//[^[:print:]]/}"
-}
-
 # The lease fields a reader may see. A record of an unknown schema may name
 # its secret anything, so this is an allowlist, not a token filter.
-PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|boot|pid|utc'
-# Reads a field of the lease snapshot $lease that cmd_assess holds.
-from_lease() {
-	local rest=$lease line
-	while [[ -n $rest ]]; do
-		line=${rest%%$'\n'*}
-		if [[ $line == "$1="* ]]; then printf '%s' "${line#"$1="}"; return 0; fi
-		[[ $rest == *$'\n'* ]] || return 0
-		rest=${rest#*$'\n'}
-	done
-	return 0
-}
-
+PUBLIC_FIELDS='version|lease_id|slot|task|agent|pr|owner|host|pid|utc'
 public_lease() {
 	awk -v keys="$PUBLIC_FIELDS" '
 		BEGIN { n = split(keys, k, "|"); for (i = 1; i <= n; i++) allowed[k[i]] = 1 }
@@ -192,8 +162,6 @@ slot_state() {
 		printf '%s\n' "$lease" | public_lease
 		return
 	fi
-	# Boot identity is recorded for evidence only: a mismatch never widens
-	# stale-suspected, because a dead PID does not prove its children died.
 	pid=$(field "$f" pid)
 	if [[ -n $pid && $(field "$f" host) == "$(hostname)" ]] && ! pid_alive "$pid" && ! slot_in_use "$slot"; then
 		echo stale-suspected
@@ -248,7 +216,6 @@ try_acquire_locked() {
 		echo "pr=$PR"
 		echo "owner=$OWNER"
 		echo "host=$(hostname)"
-		echo "boot=$(boot_id)"
 		echo "pid=$LEASE_PID"
 		echo "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 		echo "token=$token"
@@ -400,23 +367,21 @@ cmd_reclaim() {
 	echo "reclaimed $slot; slot state now: $(slot_state "$slot" | sed -n 1p)"
 }
 
-# Read-only evidence about one slot: who holds it, what can and cannot be
-# observed about the recorded process, and what the worktree contains. It
+# Read-only evidence about one slot: who holds it, whether a process uses it,
+# and what the worktree contains. It
 # prints observations and explicit unknowns, never a verdict, never a token,
 # and it mutates nothing (no fetch, no lock, no lease change). It grants no
 # recovery authorization: recovering a lease still needs the owner.
 cmd_assess() {
-	local slot=${1:-} f p pid lease_boot now_boot head branch changes ignored base version refs lease
+	local slot=${1:-} f p head branch changes ignored base refs lease
 	[[ $# -eq 1 ]] || die "assess needs one slot" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
 	f=$(lease_file "$slot")
 	p=$(slot_path "$slot")
-	now_boot=$(boot_id)
 	echo "slot: $slot"
 	echo "path: $p"
 	echo "state: $(slot_state "$slot" | sed -n 1p)"
 	echo "host: $(hostname)"
-	echo "boot: ${now_boot:-unknown}"
 	# One snapshot: a lease released mid-report must read as gone, not abort.
 	lease=$(lease_text "$f")
 	if [[ ! -e $f ]]; then
@@ -428,28 +393,7 @@ cmd_assess() {
 	else
 		echo "lease: present"
 		printf '%s\n' "$lease" | public_lease
-		version=$(from_lease version)
-		[[ -n $version ]] || echo "lease-schema: absent (written before versioning); treated as busy"
-		pid=$(from_lease pid)
-		if [[ -z $pid ]]; then
-			echo "recorded-process: none recorded; no automatic stale detection"
-		elif [[ $(from_lease host) != "$(hostname)" ]]; then
-			echo "recorded-process: pid $pid recorded on host $(from_lease host); not inspectable here"
-		else
-			lease_boot=$(from_lease boot)
-			if [[ -z $lease_boot || -z $now_boot ]]; then
-				echo "recorded-process: pid $pid, boot identity unknown"
-			elif [[ $lease_boot != "$now_boot" ]]; then
-				echo "recorded-process: pid $pid recorded under an earlier boot; a live pid $pid is a different process"
-			else
-				echo "recorded-process: pid $pid recorded under this boot"
-			fi
-			if pid_alive "$pid"; then
-				echo "recorded-pid-signalable: yes"
-			else
-				echo "recorded-pid-signalable: no; gone, owned by another user, or inspection refused"
-			fi
-		fi
+		[[ $'\n'$lease == *$'\n'version=* ]] || echo "lease-schema: absent (written before versioning); treated as busy"
 	fi
 	read_cwds
 	if ((CWDS_FAILED != 0)); then
