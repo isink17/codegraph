@@ -46,8 +46,9 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
   own cannot tell them apart. A lease is called absent only when the lease
   directory can be searched (or does not exist and its nearest existing
   ancestor can be searched); otherwise `status` refuses and `assess` reports
-  the lease as unknown. `status` and `assess` count a dangling link at the
-  lease path as present. Until the recovery protocol lands, a corrupted or unsupported lease
+  the lease as unknown. A dangling link at the lease path counts as a
+  present lease everywhere: `status` and `assess` report it, and `acquire`
+  and `prepare` refuse the slot without touching it. Until the recovery protocol lands, a corrupted or unsupported lease
   has no `pool.sh` remedy at all — `release` and `reclaim` both refuse it, and
   clearing it means inspecting the file by hand.
 - `assess <slot>` prints read-only evidence about one slot: its state, the
@@ -126,9 +127,11 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 There is no time-based expiry.
 
 Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
-created with `mkdir`). A lock left behind by a crashed run blocks the slot
-and is reported; remove it by hand only after checking that no `pool.sh`
-process is running.
+created with `mkdir`). The lock is advisory: it serialises `pool.sh` runs
+and nothing else, so it does not fence a process that writes to the slot or
+the lease directory without taking it. A lock left behind by a crashed run
+blocks the slot and is reported; remove it by hand only after checking that
+no `pool.sh` process is running.
 
 ## Recovery
 
