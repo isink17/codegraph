@@ -76,6 +76,7 @@ def cas_hook(live, fail=None):
             os._exit(70)
         if fail == "raise-after":
             raise OSError(errno.ENOSPC, "No space left on device")
+        return post
     return hook
 
 
@@ -212,11 +213,32 @@ class Transitions(Store):
                     self.assertRefusedUnchanged(call)
                 self.assertEqual(self.s.ready_for_reassignment(SLOT, OP), state == rs.READY)
 
+    def test_an_adopted_operation_can_be_cancelled_once_its_lease_is_gone(self):
+        """An ACTIVE operation whose lease was released has an exit, so it
+        never blocks later recoveries of the slot."""
+        self.adopt()
+        if self.kind == "v2":
+            self.live.write_text(v2("free", self.gen0))
+        else:
+            self.live.unlink()
+        self.assertRefusedUnchanged(self.attempts()["request"])
+        self.assertRefusedUnchanged(lambda: self.adopt("op-2"))
+        self.assertRefusedUnchanged(lambda: self.s.cancel(SLOT, op_id=OP, authorization=self.auth("cancel"),
+                                                          record=self.record()))  # bound to the wrong seq
+        self.s.cancel(SLOT, op_id=OP, authorization=self.auth("cancel", seq=0), record=self.record())
+        self.assertEqual(self.s.terminal(SLOT, OP), rs.CANCELLED)
+        self.assertRefusedUnchanged(self.attempts()["request"])
+        self.set_lease(self.kind, generation=self.gen0 + 1, lease_id="2" * 32)
+        self.adopt("op-2")
+        self.assertEqual(self.s.state(SLOT, "op-2")[0], rs.ACTIVE)
+
     def test_stale_holder_cannot_act_after_request(self):
         self.adopt()
         self.assertTrue(self.s.lease_action_allowed(SLOT, OP, self.identity, self.gen0, TOKEN))
         self.assertFalse(self.s.lease_action_allowed(SLOT, OP, self.identity, self.gen0, "f" * 32))
         self.assertFalse(self.s.lease_action_allowed(SLOT, OP, self.identity, self.gen0 + 1, TOKEN))
+        self.assertFalse(self.s.lease_action_allowed(SLOT, OP, self.identity, float(self.gen0), TOKEN))
+        self.assertFalse(self.s.lease_action_allowed(SLOT, OP, self.identity, bool(self.gen0), TOKEN))
         self.attempts()["request"]()
         self.assertFalse(self.s.lease_action_allowed(SLOT, OP, self.identity, self.gen0, TOKEN))
         self.attempts()["quarantine"]()
@@ -244,6 +266,17 @@ class LegacyPath(Transitions):
             self.attempts()[name]()
         self.assertTrue(self.s.ready_for_reassignment(SLOT, OP))
         self.assertIn(f"legacy_digest={self.identity}\n", self.record())
+
+    def test_a_reacquired_legacy_lease_with_the_same_other_bytes_is_not_the_adopted_one(self):
+        self.to(rs.REQUESTED)
+        self.live.write_text(legacy(token="e" * 32))
+        self.assertEqual(rs.parse_record(self.record(), SLOT, legacy=True).identity, self.identity)
+        self.assertRefusedUnchanged(self.attempts()["quarantine"])
+        self.assertRefusedUnchanged(self.attempts()["cancel"])
+        self.setUp()
+        self.adopt()
+        self.live.write_text(legacy(token="e" * 32))
+        self.assertRefusedUnchanged(self.attempts()["request"])
 
 
 class V2Path(Transitions):
@@ -342,8 +375,16 @@ class Adoption(Store):
         (self.root / SLOT / OP / "TERMINAL").unlink()
         self.attempts()["cancel"]()
         self.adopt("op-2")
-        (self.root / SLOT / "op-3").mkdir(mode=0o700)  # a crash right after mkdir
+        (self.root / SLOT / ".adopt-op-5.0123456789abcdef").mkdir(mode=0o700)  # never published: ignored
+        self.attempts(op="op-2")["request"]()
         self.assertRefusedUnchanged(lambda: self.adopt("op-4"))
+        (self.root / SLOT / "op-9").mkdir(mode=0o700)  # a stray directory is never a finished operation
+        self.assertRefusedUnchanged(lambda: self.adopt("op-4"))
+
+    def test_a_corrupt_earlier_operation_stays_corrupt(self):
+        self.to(rs.REQUESTED)
+        (self.root / SLOT / OP / "state.json").write_text("{")
+        self.assertRefusedUnchanged(lambda: self.adopt("op-2"), rs.Corrupt)
 
     def test_invalid_names(self):
         for slot, op in (("../x", OP), (SLOT, "../x"), (SLOT, ".hidden"), ("a/b", OP), (SLOT, "op\n"), (SLOT, ""),
@@ -638,6 +679,16 @@ class UnfinishedQuarantine(Store):
         self.assertBlocked()
         self.retry_and_finish()
 
+    def test_a_hook_that_does_not_report_the_write_leaves_it_unfinished(self):
+        self.to(rs.REQUESTED)
+        with self.assertRaises(rs.Refused):
+            self.s.quarantine(SLOT, op_id=OP, authorization=self.auth("quarantine"), recovery_token=RTOKEN,
+                              record=self.record(), replace_record=lambda pre, post: None)
+        self.assertEqual(self.s.state(SLOT, OP), (rs.REQUESTED, self.gen0, True))
+        self.assertEqual(self.s.reconcile(SLOT, OP, self.record()), "pre")
+        self.assertBlocked()
+        self.retry_and_finish()
+
     def test_unexpected_live_record_needs_the_owner(self):
         for live in (None, v1(lease_id="2" * 32), v2("free", 0), "garbage"):
             with self.subTest(live=live):
@@ -834,9 +885,8 @@ class Storage(Store):
             def _fsync_dir(self, path):
                 synced.append(Path(path))
                 super()._fsync_dir(path)
-        (self.root / SLOT / OP).mkdir(mode=0o700, parents=True)
-        for p in (self.root, self.root / SLOT):
-            p.chmod(0o700)
+        (self.root / SLOT).mkdir(mode=0o700, parents=True)
+        self.root.chmod(0o700)
         self.adopt(store=Recording(self.root))
         for parent in (self.root.parent, self.root, self.root / SLOT):
             self.assertIn(parent, synced, f"{parent} was not synced although its child already existed")
@@ -868,8 +918,8 @@ class Storage(Store):
         self.to(rs.QUARANTINED)
         (self.root / SLOT / OP / "state.json").unlink()
         self.live.write_text(self.lease_text)
-        with self.assertRaises(rs.Corrupt):
-            self.adopt()
+        self.assertRefusedUnchanged(lambda: self.adopt())
+        self.assertRefusedUnchanged(lambda: self.adopt("op-2"))
 
 
 class Secrets(Store):
@@ -1198,18 +1248,19 @@ class Crashes(Store):
                 self.attempts()["cancel"]()
                 self.assertEqual(self.s.terminal(SLOT, OP), rs.CANCELLED)
 
-    def test_crash_while_adopting_can_be_finished_only_for_the_same_lease(self):
+    def test_an_interrupted_adoption_leaves_no_operation(self):
         other = v1(lease_id="2" * 32, token="d" * 32)
-        for point in ("after_intent", "before_state_rename", "after_state"):
+        for point in ("before_intent", "after_intent", "before_state_rename", "after_state", "after_complete",
+                      "before_publish"):
             with self.subTest(point=point):
                 self.setUp()
                 self.root.mkdir(mode=0o700)
                 self.crash("s.adopt(t.SLOT, t.OP, t.v1())", point)
-                self.assertRefusedUnchanged(lambda: self.s.adopt(SLOT, OP, other))
+                with self.assertRaises(rs.Refused):
+                    self.s.state(SLOT, OP)
                 self.assertFalse(self.s.lease_action_allowed(SLOT, OP, LEASE_ID, 0, TOKEN))
-                self.adopt()
-                self.assertTrue(self.s.lease_action_allowed(SLOT, OP, LEASE_ID, 0, TOKEN))
-                self.assertEqual(self.s.state(SLOT, OP), (rs.ACTIVE, 0, False))
+                self.s.adopt(SLOT, "op-2", other)  # nothing blocks a fresh operation, even of another lease
+                self.assertTrue(self.s.lease_action_allowed(SLOT, "op-2", "2" * 32, 0, "d" * 32))
 
 
 class NotWired(unittest.TestCase):

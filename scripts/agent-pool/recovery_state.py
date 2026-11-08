@@ -12,7 +12,7 @@ The only path to READY_FOR_REASSIGNMENT is
     ACTIVE -> RECOVERY_REQUESTED -> QUARANTINED -> QUIESCENCE_VERIFIED
            -> PRESERVED -> READY_FOR_REASSIGNMENT
 
-with one side exit, RECOVERY_REQUESTED -> CANCELLED. Each step needs its own
+with one side exit to CANCELLED from ACTIVE or RECOVERY_REQUESTED. Each step needs its own
 evidence. Every unreadable, inconsistent or half-written record is refused,
 never read as available.
 """
@@ -46,9 +46,11 @@ AFTER_QUARANTINE = (QUARANTINED, QUIESCENT, PRESERVED, READY)
 # The transition that leads into each state; its name is also the evidence gate it records.
 TRANSITION = {REQUESTED: "request", CANCELLED: "cancel", QUARANTINED: "quarantine", QUIESCENT: "quiescence",
               PRESERVED: "preservation", READY: "ready"}
-STEPS = {None: (ACTIVE,), ACTIVE: (REQUESTED,), REQUESTED: (QUARANTINED, CANCELLED), QUARANTINED: (QUIESCENT,),
+STEPS = {None: (ACTIVE,), ACTIVE: (REQUESTED, CANCELLED), REQUESTED: (QUARANTINED, CANCELLED), QUARANTINED: (QUIESCENT,),
          QUIESCENT: (PRESERVED,), PRESERVED: (READY,)}
-GATES = {ACTIVE: (), REQUESTED: ("request",), CANCELLED: ("request", "cancel"),
+# A cancelled operation was cancelled from ACTIVE or from RECOVERY_REQUESTED.
+CANCEL_GATES = (("cancel",), ("cancel", "request"))
+GATES = {ACTIVE: (), REQUESTED: ("request",), CANCELLED: ("cancel", "request"),
          QUARANTINED: ("request", "quarantine"), QUIESCENT: ("request", "quarantine", "quiescence"),
          PRESERVED: ("request", "quarantine", "quiescence", "preservation"),
          READY: ("request", "quarantine", "quiescence", "preservation", "ready")}
@@ -502,7 +504,8 @@ class RecoveryStore:
               and isinstance(rec.get("gates"), dict))
         if not ok:
             raise Corrupt(f"{slot} recovery record is malformed or of an unsupported schema")
-        if sorted(rec["gates"]) != sorted(GATES[rec["state"]]):
+        allowed = CANCEL_GATES if rec["state"] == CANCELLED else (GATES[rec["state"]],)
+        if tuple(sorted(rec["gates"])) not in [tuple(sorted(g)) for g in allowed]:
             raise Corrupt(f"{slot} recovery record in {rec['state']} lacks or adds evidence gates")
         bound = (("quiescence_method", "quarantine", lambda v: v in QUIESCENCE_METHODS),
                  ("preserved_head", "preservation", lambda v: bool(HEX40.match(str(v)))))
@@ -522,10 +525,13 @@ class RecoveryStore:
 
     def _run_hook(self, hook, pre, post):
         try:
-            hook(pre, post)
+            written = hook(pre, post)
         except Exception as e:
             raise Refused(f"slot record replace failed ({type(e).__name__}); the quarantine is unfinished "
                           f"until reconciled against the live record") from e
+        if written != post:
+            raise Refused("slot record replace did not report writing the quarantined record; the quarantine is "
+                          "unfinished until reconciled against the live record")
 
     def _complete(self, d, new, entry, *, hook=None, pre=None, post=None, state_written=False, resumed=False):
         """Everything after the intent: the slot record hook, the state, the
@@ -580,10 +586,16 @@ class RecoveryStore:
             raise Refused(f"{rec['slot']} live slot record is absent; the adopted lease is gone")
         obs = parse_record(record, rec["slot"], legacy=rec["identity_kind"] == "legacy")
         if obs.state != "leased" or obs.kind != rec["identity_kind"] or obs.identity != rec["identity"] \
-                or obs.generation != rec["slot_generation"]:
+                or obs.generation != rec["slot_generation"] or not self._same_token(rec, obs):
             raise Refused(f"{rec['slot']} live slot record is not the adopted lease at generation "
                           f"{rec['slot_generation']}")
         return obs
+
+    @staticmethod
+    def _same_token(rec, obs):
+        # A legacy identity leaves the token out, so a re-acquired lease with
+        # the same other bytes differs only here.
+        return hmac.compare_digest(_verifier(rec["salt"], obs.token), rec["verifier"])
 
     def _quarantine_matches(self, rec, record):
         """After quarantine: the live record is this operation's quarantined
@@ -613,9 +625,9 @@ class RecoveryStore:
                 return
             raise Refused(f"{slot} live slot record is free at an older generation")
         if obs.kind == kind and obs.identity == rec["identity"]:
-            if obs.generation == gen:
+            if obs.generation == gen and self._same_token(rec, obs):
                 return
-            raise Refused(f"{slot} live slot record carries the adopted lease at another generation")
+            raise Refused(f"{slot} live slot record carries the adopted identity with another generation or token")
         if obs.kind == "legacy":
             raise Refused(f"{slot} live slot record is a different legacy lease; release cannot be established")
         if kind == "legacy" or (kind == obs.kind == "v1") or obs.generation > gen:
@@ -675,7 +687,7 @@ class RecoveryStore:
             rec, pending = self._read(slot, op_id)
             if pending is not None:
                 if (pending["to"], pending["evidence"]) != (to, evidence_digest):
-                    raise Refused(f"{slot} operation {op_id} has an unfinished {TRANSITION.get(pending['to'])}; "
+                    raise Refused(f"{slot} operation {op_id} has an unfinished {TRANSITION.get(pending['to'], 'adoption')}; "
                                   f"only its exact retry may finish it")
                 try:
                     self._sync_journal(d)
@@ -748,12 +760,14 @@ class RecoveryStore:
         except OSError as e:
             raise Corrupt(f"{slot} recovery directory unreadable: {e}") from None
         for name in names:
-            if name == op_id:
-                continue
+            if name == op_id or name.startswith(".adopt-"):
+                continue  # an adoption that was never published is not an operation
             if not NAME.match(name):
                 raise Corrupt(f"{slot} recovery directory holds an unexpected entry")
             try:
                 done = self.terminal(slot, name)
+            except Corrupt as e:
+                raise Corrupt(f"{slot} operation {name} cannot be trusted: {e}") from None
             except Refused as e:
                 raise Refused(f"{slot} operation {name} is not finished: {e}") from None
             if done is None:
@@ -762,9 +776,9 @@ class RecoveryStore:
     def adopt(self, slot, op_id, record, *, legacy=False):
         """Records the live lease as ACTIVE for a new operation. Only a v1 or
         v2 leased record qualifies, or, when the owner passes legacy=True, a
-        lease written before versioning; its token-free digest proves only
-        that the bytes did not change. Every earlier operation of the slot
-        must be terminal."""
+        lease written before versioning; its digest proves only that the
+        bytes other than the token line did not change. Every earlier
+        operation of the slot must be terminal, and op_id must be new."""
         if type(legacy) is not bool:
             raise Refused("legacy must be True or False")
         lease = parse_record(record, slot, legacy=legacy)
@@ -784,34 +798,28 @@ class RecoveryStore:
             except OSError as e:
                 raise Refused(f"cannot create the {slot} record directory: {e}") from e
             self._others_terminal(slot, op_id)
-            try:
-                self._ensure_dir(d)
-            except OSError as e:
-                raise Refused(f"cannot create the {slot} record directory: {e}") from e
+            if os.path.lexists(d):
+                raise Refused(f"{slot} operation {op_id} already exists; a new recovery needs a new op_id")
+            # The operation is built in a private directory and renamed into
+            # place, so an interrupted adoption leaves no operation behind.
+            tmp = self.root / slot / f".adopt-{op_id}.{secrets.token_hex(8)}"
             salt = secrets.token_hex(16)
             rec = {"schema": SCHEMA, "slot": slot, "op_id": op_id, "identity_kind": lease.kind,
                    "identity": lease.identity, "slot_generation": lease.generation, "state": ACTIVE, "seq": 0,
                    "salt": salt, "verifier": _verifier(salt, lease.token), "gates": {}}
-            if os.path.lexists(d / "state.json"):
-                old, pending = self._read(slot, op_id)
-                if pending and old["seq"] == 0 and pending["evidence"] == identity \
-                        and old["slot_generation"] == lease.generation \
-                        and hmac.compare_digest(_verifier(old["salt"], lease.token), old["verifier"]):
-                    return self._complete(d, old, pending, state_written=True, resumed=True)
-                raise Refused(f"{slot} operation {op_id} already has a recovery record")
-            if os.path.lexists(d / "journal.jsonl"):
-                committed, pending = self._replay(slot, op_id, self._journal(d, slot))
-                if committed:
-                    raise Corrupt(f"{slot} journal records transitions but its state is gone; owner must inspect")
-                if pending is not None:
-                    if pending["evidence"] != identity or pending["slot_generation"] != lease.generation:
-                        raise Refused(f"{slot} has an interrupted adoption of a different lease; owner must inspect")
-                    try:
-                        self._sync_journal(d)
-                    except OSError as e:
-                        raise Refused(f"{slot} recovery storage failed: {e}") from e
-                    return self._complete(d, rec, pending, resumed=True)
-            return self._commit(d, None, rec, identity)
+            try:
+                os.mkdir(tmp, 0o700)
+                self._check_dir(tmp)
+            except OSError as e:
+                raise Refused(f"cannot create the {slot} record directory: {e}") from e
+            self._commit(tmp, None, rec, identity)
+            try:
+                self.fault("before_publish")
+                os.rename(tmp, d)
+                self._fsync_dir(d.parent)
+            except OSError as e:
+                raise Refused(f"{slot} recovery storage failed: {e}") from e
+            return rec
 
     def request(self, slot, *, op_id, authorization, record):
         """ACTIVE -> RECOVERY_REQUESTED, on an authorization of the same class
@@ -822,8 +830,8 @@ class RecoveryStore:
         return self._step(slot, op_id, REQUESTED, authorization, check, record)
 
     def cancel(self, slot, *, op_id, authorization, record):
-        """RECOVERY_REQUESTED -> CANCELLED, terminal. Never writes the slot
-        record and is impossible after quarantine. A cancelled operation
+        """ACTIVE or RECOVERY_REQUESTED -> CANCELLED, terminal. Never writes
+        the slot record and is impossible after quarantine. A cancelled operation
         cannot resume; a new recovery needs a new op_id and a fresh adoption."""
         def check(rec, repeat):
             self._authorized(authorization, rec, "cancel", repeat)
@@ -959,5 +967,5 @@ class RecoveryStore:
         except Refused:
             return False
         return (rec["state"] == ACTIVE and pending is None and rec["identity"] == identity
-                and rec["slot_generation"] == slot_generation and isinstance(token, str)
+                and type(slot_generation) is int and rec["slot_generation"] == slot_generation and isinstance(token, str)
                 and bool(HEX32.match(token)) and hmac.compare_digest(_verifier(rec["salt"], token), rec["verifier"]))

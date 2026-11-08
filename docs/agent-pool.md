@@ -167,9 +167,9 @@ time:
 
 | From | To | Requires |
 |---|---|---|
-| (none) | `ACTIVE` | adoption of the live lease; every earlier operation of the slot must be terminal |
+| (none) | `ACTIVE` | adoption of the live lease under a new operation ID; every earlier operation of the slot must be terminal |
 | `ACTIVE` | `RECOVERY_REQUESTED` | an authorization; the live record is still the adopted lease |
-| `RECOVERY_REQUESTED` | `CANCELLED` | an authorization; the live record is the adopted lease unchanged, or proves it released; never after quarantine |
+| `ACTIVE` or `RECOVERY_REQUESTED` | `CANCELLED` | an authorization; the live record is the adopted lease unchanged, or proves it released; never after quarantine |
 | `RECOVERY_REQUESTED` | `QUARANTINED` | the owner's authorization, the live record still the adopted lease, and a caller hook that replaces it with a quarantined record; the slot generation moves on |
 | `QUARANTINED` | `QUIESCENCE_VERIFIED` | the owner's quiescence evidence, by the method the authorization named (containment teardown, owner-controlled quiescence or the reboot runbook), accounting for old coordinators, wrappers, escaped descendants, remote writers and automatic restarts |
 | `QUIESCENCE_VERIFIED` | `PRESERVED` | a complete inventory of dirty, untracked and ignored files and unpublished commits, each with a verified copy |
@@ -190,8 +190,10 @@ Slot records it reads:
   `token=` line is refused. Free and quarantined records are never adopted.
 - Leases written before versioning, only when the owner explicitly asks for a
   legacy adoption. Their identity is the SHA-256 of the record without its
-  `token=` line. It proves the bytes did not change, not that the holder is
-  gone, quiescent or consents.
+  `token=` line. It proves only that the bytes other than the token did not
+  change, not that the holder is gone, quiescent or consents. Before
+  quarantine the live token is also checked against the stored verifier, so a
+  re-acquired lease with the same other bytes is not taken for the adopted one.
 
 Unknown versions, states or fields, repeated fields, control characters and
 missing required fields are refused. Error messages never quote a value from
@@ -223,18 +225,22 @@ Bindings:
 Storage and ordering:
 
 - Records live in `<root>/<slot>/<operation>/` under a root the caller names,
-  whose parent must exist. Directories are 0700 and files 0600 whatever the
-  umask. A symlink, a non-regular file, another owner or group or other
+  whose parent must exist. Directories are created 0700 and files 0600; a
+  umask can only narrow that. A symlink, a non-regular file, another owner or group or other
   permission bits make the record corrupt.
 - Every state and marker write goes to a private temporary file, is flushed
   (`F_FULLFSYNC` on macOS, `fsync` elsewhere), renamed over the destination,
   and the directory is flushed. Journal appends are flushed. A directory's
   parent is flushed every time it is ensured, not only when it was created.
+- Adoption builds the operation in a private `.adopt-*` directory and
+  renames it into place, so an interrupted adoption leaves no operation; an
+  unpublished `.adopt-*` directory is ignored and never removed.
 - A transition appends an intent, replaces the state, appends a completion,
   and for a terminal state then writes the `TERMINAL` marker. The quarantine
   intent also names the token-free digests of the live record before and
   after; between the intent and the state the caller's hook must replace the
-  live record with the expected one only if it still equals the old one.
+  live record with the expected one only if it still equals the old one, and
+  return the text it wrote. Anything else leaves the quarantine unfinished.
 - A trailing intent without a completion leaves the operation unfinished,
   whether or not the state was replaced. While it exists, cancel, new
   adoptions and every other transition are refused; only the exact retry of
