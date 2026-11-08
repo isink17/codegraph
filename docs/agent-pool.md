@@ -360,10 +360,14 @@ permanent record file itself is present.
 lines, and the status detail lines for a strictly parsed record.
 
 **Fencing.** `acquire`, `release`, `reclaim`, `prepare` and `review-checkout`
-refuse with exit 1 and change nothing when any of these holds:
+refuse and change nothing when any of these holds. They exit 1, except that
+`acquire --slot auto` exits 3 (`BLOCKED_POOL_BUSY`) when every worker is
+refused for its record or recovery state, as for any other occupied lease
+path:
 
 - the pool carries the schema marker, valid or not. `acquire --slot auto`
-  and `prepare --all` refuse before touching any slot;
+  and `prepare --all` refuse before touching any slot, and the marker is
+  checked again under each slot lock;
 - the slot has recovery state;
 - the slot holds a strictly parsed record, including a v2 `free` record.
 

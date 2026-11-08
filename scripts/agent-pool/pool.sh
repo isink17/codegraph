@@ -13,7 +13,7 @@
 # only after it has linked a lease; any other exit it chooses means it linked
 # none. The coordinator relies on this to settle an interrupted acquire.
 set -euo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd -P)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
@@ -384,6 +384,7 @@ try_acquire_locked() {
 	# directory is an occupied lease path, and the slot is not fetched into.
 	[[ $(lease_seen "$f") == absent ]] || { echo "$slot lease path is not absent" >&2; return 1; }
 	! recovery_seen "$slot" || { echo "$slot has recovery state under $RECOVERY" >&2; return 1; }
+	[[ $(marker_state) == absent ]] || { echo "the pool carries the record schema marker $MARKER" >&2; return 1; }
 	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" 2>/dev/null || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
@@ -441,6 +442,9 @@ cmd_acquire() {
 		((review == 1)) || die "$REVIEW is the review slot; it is never leased for implementation"
 	else
 		((review == 0)) || die "$slot is an implementation slot"
+	fi
+	if [[ -e $(lease_file "$slot") ]] && needs_strict "$(lease_file "$slot")"; then
+		die "$slot holds a version 2 or ambiguous slot record; this pool.sh does not change it"
 	fi
 	try_acquire "$slot" || die "$slot not leased: $(slot_state "$slot" | sed -n 1p)"
 }
@@ -644,6 +648,7 @@ prepare_locked() {
 	[[ $seen != present ]] || { echo "$slot is leased; not prepared" >&2; return 1; }
 	[[ $seen == absent ]] || { echo "$slot lease cannot be observed; not prepared" >&2; return 1; }
 	! recovery_seen "$slot" || { echo "$slot has recovery state under $RECOVERY; not prepared" >&2; return 1; }
+	[[ $(marker_state) == absent ]] || { echo "the pool carries the record schema marker $MARKER; $slot not prepared" >&2; return 1; }
 	problems=$(slot_shape_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not prepared: ${problems//$'\n'/; }" >&2; return 1; }
 	git -C "$p" fetch -q "$REMOTE" || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }

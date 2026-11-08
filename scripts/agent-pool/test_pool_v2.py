@@ -288,6 +288,21 @@ class Fencing(Pool):
                     self.assertNotIn(TOKEN, p.stdout + p.stderr)
                 self.assertEqual(self.snapshot(), before)
 
+    def test_auto_acquire_and_prepare_all_pass_over_v2_records(self):
+        for text in (record("free"), record(), record("quarantined")):
+            with self.subTest(record=text.splitlines()[3]):
+                self.setUp()
+                for s in (A, B, R):
+                    self.put(s, text.replace(f"slot={A}", f"slot={s}"))
+                before = self.snapshot()
+                p = self.pool("acquire", "--slot", "auto", "--task", "x", "--agent", "y")
+                self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+                self.assertEqual(self.pool("prepare", "--all").returncode, 1)
+                p = self.pool("acquire", "--slot", A, "--task", "x", "--agent", "y")
+                self.assertEqual(p.returncode, 1)
+                self.assertIn("version 2 or ambiguous slot record", p.stderr)
+                self.assertEqual(self.snapshot(), before)
+
     def test_a_marked_pool_refuses_every_mutator(self):
         self.put(A, v1_lease())
         (self.leases / ".schema").write_text("2\n")
@@ -301,12 +316,15 @@ class Fencing(Pool):
     def test_recovery_state_refuses_the_slot_only(self):
         self.put(A, v1_lease())
         (self.leases / "recovery" / A).mkdir(parents=True)
+        (self.leases / "recovery" / R).mkdir()
+        self.put(R, v1_lease(slot=R))
         before = self.snapshot()
-        for args in self.mutators()[:4]:
+        for args in self.mutators():
             p = self.pool(*args)
             self.assertEqual(p.returncode, 1, f"{args}: {p.stdout}{p.stderr}")
         self.assertEqual(self.snapshot(), before)
         (self.leases / f"{A}.lease").unlink()
+        (self.leases / f"{R}.lease").unlink()
         p = self.pool("acquire", "--slot", A, "--task", "x", "--agent", "y")
         self.assertEqual(p.returncode, 1)
         p = self.pool("acquire", "--slot", "auto", "--task", "x", "--agent", "y")
