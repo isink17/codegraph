@@ -13,6 +13,7 @@
 # only after it has linked a lease; any other exit it chooses means it linked
 # none. The coordinator relies on this to settle an interrupted acquire.
 set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd -P)
 cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
@@ -27,6 +28,12 @@ REVIEW=codegraph-review
 # and stays recognizable and busy; a version this script does not know is
 # refused rather than reinterpreted.
 LEASE_VERSION=1
+# Version 2 records are read only by the strict parser in pool_record.py, never
+# in bash, and this pool.sh changes none of them. A pool carrying the schema
+# marker, or recovery state for a slot, is likewise read but never changed.
+PYTHON=${CG_POOL_PYTHON:-python3}
+MARKER=$LEASES/.schema
+RECOVERY=$LEASES/recovery
 
 die() { echo "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 ]] || die "$1 needs a value" 2; }
@@ -139,6 +146,125 @@ public_lease() {
 # reported, so nothing past the bound was readable anyway.
 lease_text() { head -n 200 "$1" 2>/dev/null || true; }
 
+# True when the record at $1 may be version 2 or is ambiguous about its
+# version: it then goes to the strict parser. Legacy, version 1 and unknown
+# versions keep the bash path below.
+needs_strict() {
+	local n
+	grep -q -E '^(lease_token|state|generation|recovery_op|legacy_digest)=' "$1" 2>/dev/null && return 0
+	n=$(grep -c '^version=' "$1" 2>/dev/null) || true
+	((${n:-0} > 1)) && return 0
+	grep -q '^version=2' "$1" 2>/dev/null
+}
+
+# The strict parser's key=value classification of the record at $2 for slot
+# $1. Fails when the interpreter is missing, fails, or prints anything else;
+# callers then treat the record as unknown, never as legacy.
+strict_inspect() {
+	local out
+	out=$("$PYTHON" -I -B "$HERE/pool_record.py" inspect "$1" "$2" 2>/dev/null) || return 1
+	[[ $out == record=* ]] || return 1
+	printf '%s\n' "$out"
+}
+kv() { printf '%s\n' "$1" | sed -n "/^$2=/{s/^$2=//p;q;}"; }
+# Public fields of a record the strict parser did not accept, minus any line
+# that is not printable ASCII: such a record may not even be text.
+raw_public() { printf '%s\n' "$1" | { LC_ALL=C grep -a -v '[^ -~]' || true; } | public_lease; }
+
+# absent | 2 | unknown for the pool's record schema marker.
+marker_state() {
+	if [[ ! -e $MARKER && ! -L $MARKER ]]; then echo absent; return; fi
+	if [[ -f $MARKER && ! -L $MARKER && $(cat "$MARKER" 2>/dev/null) == 2 ]]; then echo 2; else echo unknown; fi
+}
+
+# True when slot $1 may have recovery state this pool.sh cannot evaluate.
+recovery_seen() {
+	[[ -e $RECOVERY || -L $RECOVERY ]] || return 1
+	[[ -d $RECOVERY && -x $RECOVERY ]] || return 0
+	[[ -e $RECOVERY/$1 || -L $RECOVERY/$1 ]]
+}
+
+# Refuses, before anything changes, a slot this pool.sh must not touch.
+fence() {
+	local f
+	[[ $(marker_state) == absent ]] ||
+		die "the pool carries the record schema marker $MARKER; this pool.sh does not change a migrated pool"
+	! recovery_seen "$1" || die "$1 has recovery state under $RECOVERY; this pool.sh does not change it"
+	f=$(lease_file "$1")
+	if [[ -e $f ]] && needs_strict "$f"; then
+		die "$1 holds a version 2 or ambiguous slot record; this pool.sh does not change it"
+	fi
+	return 0
+}
+
+# Status of a record that needs the strict parser: <slot> <file> <lease text>
+# <slot problems> <recovery flag>.
+strict_state() {
+	local slot=$1 out rec pid host id
+	if ! out=$(strict_inspect "$slot" "$2"); then
+		echo inconsistent
+		echo "slot record could not be classified by the strict parser ($PYTHON); owner must inspect"
+		echo "  lease=present"
+		echo "  record_state=unknown"
+		raw_public "$3"
+		[[ -z $5 ]] || echo "  recovery=unknown"
+		return
+	fi
+	rec=$(kv "$out" record)/$(kv "$out" state)
+	id=$(printf '%s\n' "$out" | sed -n -e 's/^\(lease_id=.*\)/  \1/p' -e 's/^\(legacy_digest=.*\)/  \1/p')
+	case $rec in
+	v2/free)
+		if [[ -z $4 && -z $5 ]]; then
+			echo free
+		else
+			echo inconsistent
+			[[ -z $4 ]] || echo "unleased: $4"
+			[[ -z $5 ]] || echo "recovery state present; this pool.sh cannot evaluate it"
+		fi
+		# No active lease; the permanent record file itself is present.
+		echo "  lease=absent"
+		echo "  record_state=free"
+		;;
+	v2/leased)
+		pid=$(kv "$out" public.pid)
+		host=$(kv "$out" public.host)
+		if [[ -n $pid && $host == "$(hostname)" ]] && ! pid_alive "$pid" && ! slot_in_use "$slot"; then
+			echo stale-suspected
+		else
+			echo busy
+		fi
+		echo "  lease=present"
+		echo "  record_state=leased"
+		echo "  version=2"
+		echo "  slot=$slot"
+		echo "$id"
+		printf '%s\n' "$out" | sed -n 's/^public\./  /p'
+		;;
+	v2/quarantined)
+		echo inconsistent
+		echo "quarantined by recovery operation $(kv "$out" recovery_op); owner must inspect"
+		echo "  lease=present"
+		echo "  record_state=quarantined"
+		echo "  recovery_op=$(kv "$out" recovery_op)"
+		echo "  version=2"
+		echo "  slot=$slot"
+		echo "$id"
+		printf '%s\n' "$out" | sed -n 's/^public\./  /p'
+		;;
+	*)
+		echo inconsistent
+		echo "unsupported or malformed slot record: $(kv "$out" reason)"
+		echo "  lease=present"
+		echo "  record_state=invalid"
+		raw_public "$3"
+		[[ -z $5 ]] || echo "  recovery=unknown"
+		return
+		;;
+	esac
+	echo "  generation=$(kv "$out" generation)"
+	[[ -z $5 ]] || echo "  recovery=unknown"
+}
+
 # A lease file can be called absent only when the directory that would hold
 # it can be searched. A missing directory whose nearest existing ancestor can
 # be searched is a pool that has never leased anything.
@@ -161,7 +287,7 @@ lease_seen() {
 
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
-	local slot=$1 f problems pid version lease seen
+	local slot=$1 f problems pid version lease seen recovery marker
 	f=$(lease_file "$slot")
 	seen=$(lease_seen "$f")
 	if [[ $seen == unknown ]]; then
@@ -171,12 +297,32 @@ slot_state() {
 		return
 	fi
 	problems=$(slot_problems "$slot")
+	recovery=""
+	recovery_seen "$slot" && recovery=1
 	if [[ $seen == absent ]]; then
-		if [[ -z $problems ]]; then echo free; else echo inconsistent; echo "unleased: $problems"; fi
-		echo "  lease=absent"
+		marker=$(marker_state)
+		if [[ $marker != absent ]]; then
+			echo inconsistent
+			echo "slot record missing in a pool carrying the record schema marker ($marker)"
+			echo "  lease=absent"
+			echo "  record_state=missing"
+		elif [[ -z $problems && -z $recovery ]]; then
+			echo free
+			echo "  lease=absent"
+		else
+			echo inconsistent
+			[[ -z $problems ]] || echo "unleased: $problems"
+			[[ -z $recovery ]] || echo "recovery state present; this pool.sh cannot evaluate it"
+			echo "  lease=absent"
+		fi
+		[[ -z $recovery ]] || echo "  recovery=unknown"
 		return
 	fi
 	lease=$(lease_text "$f")
+	if needs_strict "$f"; then
+		strict_state "$slot" "$f" "$lease" "$problems" "$recovery"
+		return
+	fi
 	if ! lease_valid "$f" "$slot"; then
 		echo inconsistent
 		version=$(field "$f" version) || version=""
@@ -189,6 +335,7 @@ slot_state() {
 		# concludes the slot is unheld and discards the token that still guards it.
 		echo "  lease=present"
 		printf '%s\n' "$lease" | public_lease
+		[[ -z $recovery ]] || echo "  recovery=unknown"
 		return
 	fi
 	pid=$(field "$f" pid)
@@ -199,6 +346,7 @@ slot_state() {
 	fi
 	echo "  lease=present"
 	printf '%s\n' "$lease" | public_lease
+	[[ -z $recovery ]] || echo "  recovery=unknown"
 }
 
 cmd_status() {
@@ -235,6 +383,7 @@ try_acquire_locked() {
 	# Checked again under the lock: a dangling link or an unobservable lease
 	# directory is an occupied lease path, and the slot is not fetched into.
 	[[ $(lease_seen "$f") == absent ]] || { echo "$slot lease path is not absent" >&2; return 1; }
+	! recovery_seen "$slot" || { echo "$slot has recovery state under $RECOVERY" >&2; return 1; }
 	git -C "$(slot_path "$slot")" fetch -q "$REMOTE" 2>/dev/null || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
 	problems=$(slot_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not idle: $problems" >&2; return 1; }
@@ -279,6 +428,8 @@ cmd_acquire() {
 	done
 	[[ -n $slot && -n $TASK && -n $AGENT ]] || die "acquire needs --slot, --task and --agent" 2
 	[[ $TASK$AGENT$PR$OWNER$LEASE_PID != *$'\n'* ]] || die "metadata must be one line" 2
+	[[ $(marker_state) == absent ]] ||
+		die "the pool carries the record schema marker $MARKER; this pool.sh does not change a migrated pool"
 	mkdir -p "$LEASES"
 	if [[ $slot == auto ]]; then
 		((review == 0)) || die "--review needs --slot $REVIEW" 2
@@ -299,6 +450,7 @@ own_lease() {
 	local slot=$1 token=$2 f
 	f=$(lease_file "$slot")
 	lock_slot "$slot" || die "$slot lock held: $LEASES/.$slot.lock"
+	fence "$slot"
 	[[ -e $f ]] || die "$slot has no lease"
 	lease_valid "$f" "$slot" || die "the $slot lease is malformed or of an unsupported schema; owner must inspect"
 	[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
@@ -406,15 +558,18 @@ cmd_reclaim() {
 # and it mutates nothing (no fetch, no lock, no lease change). It grants no
 # recovery authorization: recovering a lease still needs the owner.
 cmd_assess() {
-	local slot=${1:-} f p head branch changes ignored base refs lease seen
+	local slot=${1:-} f p head branch changes ignored base refs lease seen full
 	[[ $# -eq 1 ]] || die "assess needs one slot" 2
 	known_slot "$slot" || die "unknown slot $slot" 2
 	f=$(lease_file "$slot")
 	p=$(slot_path "$slot")
 	echo "slot: $slot"
 	echo "path: $p"
-	echo "state: $(slot_state "$slot" | sed -n 1p)"
+	full=$(slot_state "$slot")
+	echo "state: ${full%%$'\n'*}"
 	echo "host: $(hostname)"
+	echo "pool-schema-marker: $(marker_state)"
+	if recovery_seen "$slot"; then echo "recovery: unknown; state present that this pool.sh cannot evaluate"; else echo "recovery: none"; fi
 	# One snapshot: a lease released mid-report must read as gone, not abort.
 	lease=$(lease_text "$f")
 	seen=$(lease_seen "$f")
@@ -422,6 +577,10 @@ cmd_assess() {
 		echo "lease: unknown; lease directory cannot be observed"
 	elif [[ $seen == absent ]]; then
 		echo "lease: absent"
+	elif [[ -e $f ]] && needs_strict "$f"; then
+		echo "lease: present"
+		echo "lease-schema: strict (version 2 or ambiguous; read by pool_record.py)"
+		printf '%s\n' "$full" | sed -n 's/^  /  /p'
 	elif [[ -z $lease ]]; then
 		# The file is there and nothing came back from it: it is empty, or it
 		# could not be read. Both are unknown, neither is absent.
@@ -478,8 +637,13 @@ prepare_locked() {
 	local slot=$1 p problems head base seen
 	p=$(slot_path "$slot")
 	seen=$(lease_seen "$(lease_file "$slot")")
+	if [[ $seen == present ]] && needs_strict "$(lease_file "$slot")"; then
+		echo "$slot holds a version 2 or ambiguous slot record; not prepared" >&2
+		return 1
+	fi
 	[[ $seen != present ]] || { echo "$slot is leased; not prepared" >&2; return 1; }
 	[[ $seen == absent ]] || { echo "$slot lease cannot be observed; not prepared" >&2; return 1; }
+	! recovery_seen "$slot" || { echo "$slot has recovery state under $RECOVERY; not prepared" >&2; return 1; }
 	problems=$(slot_shape_problems "$slot")
 	[[ -z $problems ]] || { echo "$slot not prepared: ${problems//$'\n'/; }" >&2; return 1; }
 	git -C "$p" fetch -q "$REMOTE" || { echo "$slot: fetch of $REMOTE failed" >&2; return 1; }
@@ -514,6 +678,8 @@ cmd_prepare() {
 	*) die "prepare needs --slot <slot> or --all" 2 ;;
 	esac
 	for s in "${slots[@]}"; do known_slot "$s" || die "unknown slot $s" 2; done
+	[[ $(marker_state) == absent ]] ||
+		die "the pool carries the record schema marker $MARKER; this pool.sh does not change a migrated pool"
 	mkdir -p "$LEASES"
 	for s in "${slots[@]}"; do prepare_slot "$s" || rc=1; done
 	return $rc
