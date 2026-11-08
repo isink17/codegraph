@@ -820,14 +820,26 @@ class Coordinator:
         p = self.pool("status")
         if p.returncode != 0:
             raise Refused(f"pool.sh status failed: {p.stderr.strip()}")
-        slots, cur = {}, None
+        # A slot whose block cannot be read unambiguously (unknown state word,
+        # repeated header, repeated field) is reported as a bare inconsistent
+        # slot, and the lines after it are attributed to no slot.
+        slots, cur, seen = {}, None, set()
         for line in p.stdout.splitlines():
-            m = re.match(r"^(codegraph-[\w.-]+): (free|busy|stale-suspected|inconsistent)$", line)
+            m = re.match(r"^(codegraph-[\w.-]+): (.*)$", line)
             if m:
-                cur = slots[m.group(1)] = {"state": m.group(2)}
+                name, state = m.groups()
+                known = state in ("free", "busy", "stale-suspected", "inconsistent") and name not in seen
+                seen.add(name)
+                slots[name] = {"state": state if known else "inconsistent"}
+                cur = slots[name] if known else None
             elif cur is not None and line.startswith("  ") and "=" in line:
                 k, v = line.strip().split("=", 1)
-                cur.setdefault(k, v)
+                if k in cur:
+                    cur.clear()
+                    cur["state"] = "inconsistent"
+                    cur = None
+                else:
+                    cur[k] = v
         return slots
 
     def lease_matches(self, t, lease):
