@@ -157,9 +157,10 @@ no `pool.sh` process is running.
 
 `scripts/agent-pool/recovery_state.py` models orphan lease recovery
 (CG-150, phases 2a and 2b-1). It is a library with tests and nothing else.
-`pool.sh`, the coordinator and the campaign do not call it, and it has no
-command-line entry point. It cannot quarantine, reclaim or reassign a real
-slot, and it never reads or writes the pool: the caller passes the live slot
+`pool.sh`, the coordinator and the campaign do not run its state machine
+(`pool.sh` only borrows its record parser, see "Version 2 slot records"), and
+it has no command-line entry point. It cannot quarantine, reclaim or reassign
+a real slot, and it never reads or writes the pool: the caller passes the live slot
 record as text and does any replacement itself. `reclaim` above is unchanged.
 
 One recovery operation, named by an operation ID, moves one transition at a
@@ -295,7 +296,93 @@ The coordinator keeps the Plane ticket of every PR in step with GitHub.
   ticket keeps its state.
 - Plane credentials never appear in logs, commits, comments or reports.
 
+## Version 2 slot records
+
+Phase 2b-2a teaches `pool.sh` to read version 2 slot records. Nothing writes
+them yet: no command creates, replaces or deletes a version 2 record, no
+command writes the schema marker, and there is no migration.
+
+**Strict parsing.** A lease file that may be version 2, or is ambiguous
+about its version, is never read in bash. It is handed to
+`scripts/agent-pool/pool_record.py`, which applies the rules of
+`recovery_state.parse_record`. That covers any line starting `lease_token=`,
+`state=`, `generation=`, `recovery_op=` or `legacy_digest=`, more than one
+`version=` line, and any `version=2...` line. Legacy, version 1 and other
+unknown-version leases keep the bash path unchanged.
+
+The helper interface is:
+
+    "$PYTHON" -I -B pool_record.py inspect <slot> <path>
+
+- `PYTHON` is `CG_POOL_PYTHON`, or `python3` on `PATH`. Python 3.9 or later
+  is required; it has been tested with 3.9.6 (macOS system) and 3.14.5. The
+  canonical tool bundle of the cutover will pin the interpreter path the same
+  way.
+- `-I` ignores the environment and user site; `-B` writes no bytecode.
+- Output is `key=value` lines, the first one `record=`:
+  - `record`: `absent`, `legacy`, `v1`, `v2` or `invalid`;
+  - `state`: `free`, `leased` or `quarantined`;
+  - `generation`;
+  - `lease_id` or `legacy_digest`;
+  - `recovery_op`;
+  - `public.<field>` for the holder fields;
+  - `reason` for an invalid record, never quoting a record value.
+- Exit 0 means classified; 2 is usage; 3 means Python is too old.
+- The file is opened without following symlinks, and must be a regular,
+  UTF-8 file of at most 64 KiB.
+- `pool.sh` discards the helper's stderr. A missing interpreter, any non-zero
+  exit, or output that does not start with `record=` makes the record
+  `unknown`. It is never parsed in bash instead.
+
+`pool_record.durable_replace` is the durable writer the enforcement phase will
+use: a private temporary file, flushed (`F_FULLFSYNC` on macOS), renamed over
+the record, then the directory flushed. It writes only valid version 2 records
+ending in a newline, refuses a symlinked or non-regular target, and refuses
+Windows. No command calls it in this phase.
+
+**Status rendering.** Every detail key is printed at most once per slot, no
+token or `lease_token` is ever printed, and the status exit code is unchanged.
+
+| Record | Header | Detail lines |
+|---|---|---|
+| v2 `free` | `free` only when the slot is otherwise idle and has no recovery state; otherwise `inconsistent` with the reasons | `lease=absent`, `record_state=free`, `generation=` |
+| v2 `leased` | `busy` or `stale-suspected`, on the same evidence as version 1 | `lease=present`, `record_state=leased`, `version=2`, `slot=`, `lease_id=`, the holder fields, `generation=` |
+| v2 `quarantined` | `inconsistent`, never a new header word | `lease=present`, `record_state=quarantined`, `recovery_op=`, `version=2`, `slot=`, `lease_id=` or `legacy_digest=`, the holder fields, `generation=` |
+| refused by the parser | `inconsistent` | `lease=present`, `record_state=invalid`, and the allowlisted public fields of its printable lines |
+| helper unavailable or failing | `inconsistent` | `lease=present`, `record_state=unknown`, the same allowlisted fields |
+| no record, schema marker `$LEASES/.schema` present (valid `2` or not) | `inconsistent` | `lease=absent`, `record_state=missing` |
+| recovery state: `$LEASES/recovery` exists and holds an entry for the slot, or cannot be searched | never `free` | `recovery=unknown` |
+
+For a v2 `free` record, `lease=absent` means there is no active lease. The
+permanent record file itself is present.
+
+`assess` prints the same state, plus `pool-schema-marker:` and `recovery:`
+lines, and the status detail lines for a strictly parsed record.
+
+**Fencing.** `acquire`, `release`, `reclaim`, `prepare` and `review-checkout`
+refuse and change nothing when any of these holds. They exit 1, except that
+`acquire --slot auto` exits 3 (`BLOCKED_POOL_BUSY`) when every worker is
+refused for its record or recovery state, as for any other occupied lease
+path:
+
+- the pool carries the schema marker, valid or not. `acquire --slot auto`
+  and `prepare --all` refuse before touching any slot, and the marker is
+  checked again under each slot lock;
+- the slot has recovery state;
+- the slot holds a strictly parsed record, including a v2 `free` record.
+
+With no marker, no recovery state and no strictly parsed record, they behave
+as before.
+
+Every `pool.sh` that ever shipped refuses every mutator on version 2 records
+and leaves them unchanged: `test_pool_v2.History` extracts each one from git.
+The pre-version-1 copies accept any record that carries a `token=` line, so a
+version 2 record must never contain one.
+
 ## Tests
 
 `scripts/agent-pool/pool_test.sh` runs against a throwaway pool and never
-touches the live one.
+touches the live one. `test_pool_v2` covers version 2 records against the
+current and every historical `pool.sh`, the strict reader, the dormant writer
+and the coordinator and campaign consumers, all in throwaway pools:
+`python3 -m unittest test_pool_v2` from `scripts/agent-pool`.
