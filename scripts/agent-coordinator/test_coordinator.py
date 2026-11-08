@@ -1621,6 +1621,32 @@ class Units(unittest.TestCase):
         import coordinator
         self.c = coordinator
 
+    def test_pool_status_never_attributes_an_unreadable_block(self):
+        """Lines after an unknown header belong to no slot, and a repeated
+        header or field makes the slot a bare inconsistent one."""
+        def parse(text):
+            c = object.__new__(self.c.Coordinator)
+            c.pool = lambda *a: types.SimpleNamespace(returncode=0, stdout=text, stderr="")
+            return c.pool_status()
+        a, b, r = "codegraph-worker-a", "codegraph-worker-b", "codegraph-review"
+        good = (f"{a}: busy\nmalformed detail\n  lease=present\n  slot={a}\n  owner=o\n"
+                f"{b}: free\n  lease=absent\n")
+        self.assertEqual(parse(good), {a: {"state": "busy", "lease": "present", "slot": a, "owner": "o"},
+                                       b: {"state": "free", "lease": "absent"}})
+        bare = {"state": "inconsistent"}
+        cases = {
+            f"{a}: busy\n  lease=present\n  slot={a}\n{b}: quarantined\n  owner=x\n  slot={b}\n{r}: free\n":
+                {a: {"state": "busy", "lease": "present", "slot": a}, b: bare, r: {"state": "free"}},
+            f"{a}: busy\n  owner=o\n{a}: free\n  lease=absent\n": {a: bare},
+            f"{a}: free\n{b}: busy\n{a}: free\n": {a: bare, b: {"state": "busy"}},
+            f"{a}: busy\n  owner=o\n  owner=p\n  slot={a}\n": {a: bare},
+            f"{a}: busy\n  slot={a}\n  slot={a}\n": {a: bare},
+            f"{a}: free\n  lease=absent\n  lease=present\n{b}: free\n": {a: bare, b: {"state": "free"}},
+        }
+        for text, want in cases.items():
+            with self.subTest(text):
+                self.assertEqual(parse(text), want)
+
     def test_release_discards_the_token_only_when_the_slot_is_free(self):
         """A refused release whose outcome is uncertain keeps the token: a
         state without a matching lease may be an unreadable record, not an

@@ -806,7 +806,6 @@ class Units(unittest.TestCase):
         self.assertEqual(r("plain"), "plain")
 
 
-
 # Stand-in for pool.sh: status prints $FAKE_POOL/status (exit status from
 # status.rc), release logs its argv and exits with release.rc; after a
 # successful release, status prints after-release when present.
@@ -923,6 +922,34 @@ class CiLeaseSettlement(unittest.TestCase):
             with self.subTest(name):
                 self.reset()
                 self.status(text)
+                self.assert_kept(self.settle())
+                self.assertEqual(self.releases(), [])
+
+    def test_another_owner_proves_absence_only_through_a_validated_lease_of_that_slot(self):
+        other = ["slot=" + A, "task=other", "owner=coordinator:x"]
+        cases = {
+            "lease=unknown": slot(A, "busy", "lease=unknown", *other),
+            "no lease line": slot(A, "busy", *other),
+            "slot mismatch": slot(A, "busy", *lease("coordinator:x", B)),
+            "repeated header": slot(A, "busy", *lease(OURS)) + FREE_A,
+            "contradictory owner": slot(A, "busy", *lease("coordinator:x"), f"owner={OURS}"),
+            "contradictory slot": slot(A, "busy", *lease("coordinator:x"), f"slot={B}"),
+            "contradictory lease": slot(A, "free", "lease=absent", "lease=present"),
+            "ownerless lease before an unknown header": slot(A, "busy", "lease=present", f"slot={A}", "task=legacy")
+                                                        + slot(B, "quarantined", *lease("coordinator:x", B)),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.reset()
+                self.status(text + FREE_B + FREE_R)
+                self.assert_kept(self.settle())
+                self.assertEqual(self.releases(), [])
+
+    def test_our_record_under_an_unknown_header_is_not_released_elsewhere(self):
+        for before in (FREE_A, slot(A, "busy", *lease("coordinator:x"))):
+            with self.subTest(before):
+                self.reset({"task": "a", "txn": TXN, "slot": B})
+                self.status(before + slot(B, "quarantined", *lease(OURS, B)) + FREE_R)
                 self.assert_kept(self.settle())
                 self.assertEqual(self.releases(), [])
 

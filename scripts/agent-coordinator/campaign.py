@@ -646,13 +646,14 @@ def copy_evidence(src, dst):
     return problems, errors
 
 
-def ci_lease_absent(v, owner):
-    """True when slot status v proves the slot holds no lease of owner:
+def ci_lease_absent(slot, v, owner):
+    """True when the status v of slot proves it holds no lease of owner:
     pool.sh observed the slot free with no lease file, or validated a lease
-    that names another owner."""
+    of that slot that names another owner."""
     if v.get("state") == "free":
         return v.get("lease") == "absent"
-    return v.get("state") in ("busy", "stale-suspected") and v.get("owner", "") not in ("", owner)
+    return (v.get("state") in ("busy", "stale-suspected") and v.get("lease") == "present"
+            and v.get("slot") == slot and v.get("owner", "") not in ("", owner))
 
 
 def settle_ci_lease(c):
@@ -681,7 +682,7 @@ def settle_ci_lease(c):
         # Before acquire recorded its slot, the lease may be on any worker.
         slots = [m["slot"]] if m.get("slot") else co.WORKERS
         unproven = [f"{s} {status.get(s, {}).get('state', 'unreported')}" for s in slots
-                    if not ci_lease_absent(status.get(s, {}), owner)]
+                    if not ci_lease_absent(s, status.get(s, {}), owner)]
         if unproven:
             return (f"the ci-local lease of {owner} cannot be ruled out on {', '.join(unproven)}; "
                     f"record and token kept, owner must inspect")
