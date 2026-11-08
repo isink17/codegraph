@@ -2,8 +2,8 @@
 
 Nothing in pool.sh, the coordinator or the campaign runs this state machine
 and it has no command-line entry point, so it cannot quarantine, reclaim or
-reassign a real slot. pool.sh reads version 2 slot records through
-parse_record (via pool_record.py) and nothing else here. It records recovery decisions per slot and operation in a store
+reassign a real slot. pool_record.py, which pool.sh runs, uses parse_record
+and the durable-write helpers, never the state machine. It records recovery decisions per slot and operation in a store
 directory the caller names, and reads the live slot record only as text the
 caller passes in. Policy and limits: docs/agent-pool.md, "Recovery state
 machine".
@@ -79,7 +79,9 @@ SECRET_KEY = re.compile(r"token|secret|password|verifier|salt", re.I)
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 KEY = re.compile(r"^[a-z][a-z_]{0,31}\Z")
 GENERATION = re.compile(r"^(0|[1-9][0-9]{0,17})\Z")
-CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
+# Record values are printed by pool.sh status, and line-splitting readers
+# treat U+2028, U+0085 and the like as line breaks.
+NOT_PRINTABLE_ASCII = re.compile(r"[^\x20-\x7e\n]")
 HEX32 = re.compile(r"^[0-9a-f]{32}\Z")
 HEX40 = re.compile(r"^[0-9a-f]{40}\Z")
 HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
@@ -156,8 +158,8 @@ def parse_record(text, slot, *, legacy=False):
     the message never quotes a value from the record."""
     if not isinstance(text, str) or not text:
         raise Refused("slot record text is missing")
-    if CONTROL.search(text):
-        raise Refused("slot record contains a control character")
+    if NOT_PRINTABLE_ASCII.search(text):
+        raise Refused("slot record contains a character that is not printable ASCII")
     lines = text.split("\n")
     if lines[-1] == "":
         lines.pop()

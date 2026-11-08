@@ -31,6 +31,8 @@ scripts/agent-pool/pool.sh acquire --slot auto --task <branch> --agent <name> [-
 scripts/agent-pool/pool.sh release --slot <slot> --token <token>
 scripts/agent-pool/pool.sh review-checkout --slot codegraph-review --token <token> --branch <branch> --head <sha>
 scripts/agent-pool/pool.sh prepare --slot <slot> | --all
+scripts/agent-pool/pool.sh migrate [--dry-run]     # owner only; see "Version 2 slot records"
+scripts/agent-pool/pool.sh unmigrate               # owner only
 ```
 
 - A lease record carries `version=1`, a non-secret `lease_id`, the slot,
@@ -98,8 +100,9 @@ scripts/agent-pool/pool.sh prepare --slot <slot> | --all
     release keeps. A detached commit that no local branch holds is never
     released on content alone.
 
-  It then detaches the slot at `origin/v2.0` and removes the lease. Any
-  failure keeps the lease and the work. The task branch is kept.
+  It then detaches the slot at `origin/v2.0` and removes the lease (in a
+  migrated pool: replaces it with a free record). Any failure keeps the
+  lease and the work. The task branch is kept.
 - `prepare` moves idle, unleased slots forward to a freshly fetched
   `origin/v2.0` after merges, so they can be leased again. Under the slot
   lock it requires: a valid worktree of the repository, no lease, no process
@@ -131,17 +134,16 @@ created with `mkdir`). The lock is advisory: it serialises `pool.sh` runs
 and nothing else, so it does not fence a process that writes to the slot or
 the lease directory without taking it. A lock left behind by a crashed run
 blocks the slot and is reported; remove it by hand only after checking that
-no `pool.sh` process is running.
+no `pool.sh` process is running. `migrate` and `unmigrate` take every slot
+lock, so one held lock refuses them.
 
 ## Recovery
 
-- A stale-suspected lease is cleared only by an explicit
-  `pool.sh reclaim --slot <slot> --token <token> --reason <text>`, with the
-  token read from `token=` in `pool/<slot>.lease` (`status` hides it). The
-  token guards against reclaiming a lease that changed, not against a
-  deliberate reclaim. The lease
-  is moved to `pool/archive/` and the action appended to `pool/archive/audit.log`;
-  the slot's files are not touched.
+- `reclaim` is disabled: it exits 1 and changes nothing, in every pool. It
+  freed a slot on PID death alone and wrote the token into the archive file
+  name and `audit.log`. A stale-suspected lease stays until its holder
+  releases it; an orphaned one needs the owner (CG-150 recovery protocol).
+  Copies of `pool.sh` older than this change still offer it; do not run them.
 - Unfinished work in a slot is archived before the slot is recycled, to
   `~/Projekti/codegraph-evidence/<slot>-recovery-<date>/`: HEAD,
   `status --porcelain=v2`, `diff --binary HEAD`, raw changed and untracked
@@ -161,7 +163,7 @@ no `pool.sh` process is running.
 (`pool.sh` only borrows its record parser, see "Version 2 slot records"), and
 it has no command-line entry point. It cannot quarantine, reclaim or reassign
 a real slot, and it never reads or writes the pool: the caller passes the live slot
-record as text and does any replacement itself. `reclaim` above is unchanged.
+record as text and does any replacement itself.
 
 One recovery operation, named by an operation ID, moves one transition at a
 time:
@@ -196,8 +198,8 @@ Slot records it reads:
   quarantine the live token is also checked against the stored verifier, so a
   re-acquired lease with the same other bytes is not taken for the adopted one.
 
-Unknown versions, states or fields, repeated fields, control characters and
-missing required fields are refused. Error messages never quote a value from
+Unknown versions, states or fields, repeated fields, any character that is
+not printable ASCII and missing required fields are refused. Error messages never quote a value from
 the record.
 
 Bindings:
@@ -298,9 +300,9 @@ The coordinator keeps the Plane ticket of every PR in step with GitHub.
 
 ## Version 2 slot records
 
-Phase 2b-2a teaches `pool.sh` to read version 2 slot records. Nothing writes
-them yet: no command creates, replaces or deletes a version 2 record, no
-command writes the schema marker, and there is no migration.
+Phase 2b-2a taught `pool.sh` to read version 2 slot records; phase 2b-2b adds
+the writes behind the migration marker. No live pool has been migrated: that
+is a separate, owner-run cutover.
 
 **Strict parsing.** A lease file that may be version 2, or is ambiguous
 about its version, is never read in bash. It is handed to
@@ -334,11 +336,81 @@ The helper interface is:
   exit, or output that does not start with `record=` makes the record
   `unknown`. It is never parsed in bash instead.
 
-`pool_record.durable_replace` is the durable writer the enforcement phase will
-use: a private temporary file, flushed (`F_FULLFSYNC` on macOS), renamed over
-the record, then the directory flushed. It writes only valid version 2 records
-ending in a newline, refuses a symlinked or non-regular target, and refuses
-Windows. No command calls it in this phase.
+**Pool modes.** The schema marker `$LEASES/.schema` decides, and every
+mutator reads it again after taking the slot lock; that reading is the one it
+acts on. `migrate` and `unmigrate` change the marker only while holding every
+slot lock.
+
+| Marker | Mode | Mutators |
+|---|---|---|
+| absent | version 1 (unmigrated) | as before; a version 2 or ambiguous record or recovery state is refused unchanged |
+| `2` (trailing newlines ignored) | migrated | write version 2 records through `pool_record.py`; refuse every version 1 or legacy lease, missing record and recovery state |
+| anything else, a symlink or not a regular file (including `unmigrating`) | unknown | every mutator refuses |
+
+`reclaim` is disabled in every mode. Acquire metadata (`--task`, `--agent`,
+`--pr`, `--owner`, `--pid`) must be one line of printable ASCII in every mode,
+because `status` prints it and readers split lines on more than `\n`.
+
+**Python is required in a migrated pool.** Every read and write of a version 2
+record runs `pool_record.py` under Python 3.9 or later. A missing, failing,
+too old or misbehaving interpreter refuses the operation; nothing falls back
+to bash. The interpreter is trusted: it is part of the tool bundle.
+
+**Writes.** Under the slot lock `pool.sh` holds, `pool_record.py` checks that
+the lock exists, the marker is `2`, the slot has no recovery state and the
+record is a regular version 2 file, then the compare-and-swap preconditions:
+
+| Command | Precondition | Result |
+|---|---|---|
+| acquire | free record at the generation read under the lock; the slot idle after a fresh fetch | leased record at the next generation with a new `lease_id` and `lease_token`; prints `leased <slot> token=<hex32>` |
+| release | leased record whose token matches (constant-time), at the `lease_id` and generation read under the lock; the usual release checks | free record at the same generation |
+| review-checkout | leased record whose token matches | no record change |
+| prepare | free record | no record change |
+
+A write is a private `O_EXCL|O_NOFOLLOW` 0600 temporary file, flushed
+(`F_FULLFSYNC` on macOS, `fsync` elsewhere), renamed over the record (or
+linked, for a record that must not exist yet), then the directory flushed.
+A failure before the rename leaves the record unchanged. A directory flush that
+fails after the rename is reported (helper exit 4): the new record is in place
+but may not survive a power loss. For acquire that can leave a lease no caller
+holds a token for; the slot stays busy, `--slot auto` stops instead of trying
+the next worker, and the owner inspects. acquire prints the token only after
+the flush, so one generation is never issued to two token holders.
+
+The caller's token reaches the helper on stdin, never in its arguments. No
+token appears in status, assess, messages, file names or logs.
+
+**Migration.** Owner-run, never by an agent or the coordinator.
+
+- `migrate --dry-run` takes no lock, does not fetch and writes nothing; it
+  reports, per slot, what `migrate` would do and exits 1 if it would refuse.
+- `migrate` holds every slot lock, fetches, and requires every slot to be idle
+  with no recovery state and either no record or the free record of
+  generation 0 (left by an interrupted run). Anything else, including a version
+  1 or legacy lease, refuses the whole migration and writes nothing: a leased
+  slot is never rewritten, so its holder must release it first. It then
+  creates each free record, verifies them, and writes the marker last.
+- An interrupted migration leaves free records without a marker. They fence
+  their slots in the unmigrated pool; running `migrate` again completes it,
+  `unmigrate` rolls it back.
+- After migration an absent record never means free: `status` prints
+  `record_state=missing` and every mutator refuses. No command restores a
+  missing record, because nothing records its last generation; the owner
+  decides.
+
+**Rollback.** `unmigrate` holds every slot lock and accepts only the free
+record of generation 0 (no lease was ever issued on that slot since
+migration), plus, when the marker is not `2`, an absent record or a version 1
+or legacy lease. Anything else refuses and changes nothing: a leased,
+quarantined or released (generation 1 or later) record, other content, a
+missing record under marker `2`, recovery state or an unknown marker. It then
+rewrites the marker to `unmigrating`, which makes every mutator refuse,
+removes the records, and removes the marker last. A run that fails part way
+leaves the pool refusing every change until `unmigrate` is run again.
+
+Old `pool.sh` copies are fenced by the record's presence (see below), not by
+the marker: copies older than phase 2b-2a still acquire an absent path, so
+none of them may run against a migrated pool.
 
 **Status rendering.** Every detail key is printed at most once per slot, no
 token or `lease_token` is ever printed, and the status exit code is unchanged.
@@ -359,30 +431,37 @@ permanent record file itself is present.
 `assess` prints the same state, plus `pool-schema-marker:` and `recovery:`
 lines, and the status detail lines for a strictly parsed record.
 
-**Fencing.** `acquire`, `release`, `reclaim`, `prepare` and `review-checkout`
-refuse and change nothing when any of these holds. They exit 1, except that
+**Fencing.** `acquire`, `release`, `prepare` and `review-checkout` refuse and
+change nothing when any of these holds. They exit 1, except that
 `acquire --slot auto` exits 3 (`BLOCKED_POOL_BUSY`) when every worker is
 refused for its record or recovery state, as for any other occupied lease
 path:
 
-- the pool carries the schema marker, valid or not. `acquire --slot auto`
-  and `prepare --all` refuse before touching any slot, and the marker is
-  checked again under each slot lock;
+- the marker is unknown. `acquire` and `prepare` refuse before touching any
+  slot, and the marker is read again under each slot lock;
 - the slot has recovery state;
-- the slot holds a strictly parsed record, including a v2 `free` record.
-
-With no marker, no recovery state and no strictly parsed record, they behave
-as before.
+- without the marker: the slot holds a strictly parsed record, including a v2
+  `free` record;
+- with marker `2`: the record is missing, unreadable, invalid, quarantined, a
+  version 1 or legacy lease, or not in the state the command needs.
 
 Every `pool.sh` that ever shipped refuses every mutator on version 2 records
-and leaves them unchanged: `test_pool_v2.History` extracts each one from git.
+and leaves them unchanged: `test_pool_v2.History` extracts each one from git,
+and `test_pool_v2_writes.History` runs each against the records this
+`pool.sh` writes.
 The pre-version-1 copies accept any record that carries a `token=` line, so a
 version 2 record must never contain one.
 
 ## Tests
 
 `scripts/agent-pool/pool_test.sh` runs against a throwaway pool and never
-touches the live one. `test_pool_v2` covers version 2 records against the
-current and every historical `pool.sh`, the strict reader, the dormant writer
-and the coordinator and campaign consumers, all in throwaway pools:
-`python3 -m unittest test_pool_v2` from `scripts/agent-pool`.
+touches the live one. `test_pool_v2` covers reading version 2 records against
+the current and every historical `pool.sh`, the strict reader and the
+coordinator and campaign consumers. `test_pool_v2_writes` covers migration,
+rollback, every version 2 write, races, fault injection at each persistence
+point, interpreter failures, every historical `pool.sh` against the records
+the writer produces, and the consumers. All run in throwaway pools:
+`python3 -m unittest test_pool_v2 test_pool_v2_writes` from `scripts/agent-pool`.
+Hosted CI runs `test_recovery_state`, `test_pool_v2`, `test_pool_v2_writes`
+and `pool_test.sh` on Linux (job `pool-safety`); the coordinator and campaign
+suites run only locally on macOS. Windows is not run.

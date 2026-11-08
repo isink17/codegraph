@@ -35,7 +35,8 @@ TXN = "f" * 32
 OWNER = f"coordinator:{TXN}"
 # Every pool.sh that ever shipped: (commit, blob).
 HISTORY = [("7c581a0d", "49556991ad"), ("3f9cebb4", "b07f261e2e"), ("3042dfd2", "abb16fb08a"),
-           ("c324a362", "8f1e829a11"), ("fff20693", "b7ffd7056a"), ("0962d226", "081b10cd4b")]
+           ("c324a362", "8f1e829a11"), ("fff20693", "b7ffd7056a"), ("0962d226", "081b10cd4b"),
+           ("0c9e6c0b", "3a89fe5d8e")]
 PRE_V1 = HISTORY[:4]
 
 
@@ -259,8 +260,10 @@ class Status(Pool):
 
 
 class Fencing(Pool):
-    """Every mutator of this pool.sh refuses every version 2 record, a marked
-    pool and recovery state, and changes nothing."""
+    """In a pool without the schema marker every mutator refuses every
+    version 2 record and recovery state; with a marker it never writes a
+    version 1 lease. Refusals change nothing. Writes in a migrated pool:
+    test_pool_v2_writes."""
 
     def snapshot(self):
         files = {p.relative_to(self.leases).as_posix(): (p.read_bytes() if p.is_file() and not p.is_symlink()
@@ -303,15 +306,20 @@ class Fencing(Pool):
                 self.assertIn("version 2 or ambiguous slot record", p.stderr)
                 self.assertEqual(self.snapshot(), before)
 
-    def test_a_marked_pool_refuses_every_mutator(self):
-        self.put(A, v1_lease())
-        (self.leases / ".schema").write_text("2\n")
-        before = self.snapshot()
-        for args in self.mutators() + [("acquire", "--slot", "auto", "--task", "x", "--agent", "y"),
-                                       ("prepare", "--all")]:
-            p = self.pool(*args)
-            self.assertEqual(p.returncode, 1, f"{args}: {p.stdout}{p.stderr}")
-        self.assertEqual(self.snapshot(), before)
+    def test_a_marked_pool_never_takes_a_version_1_lease_or_an_absent_path(self):
+        for marker in ("2\n", "garbage\n"):
+            with self.subTest(marker=marker):
+                self.setUp()
+                self.put(A, v1_lease())
+                (self.leases / ".schema").write_text(marker)
+                before = self.snapshot()
+                for args in self.mutators() + [("acquire", "--slot", "auto", "--task", "x", "--agent", "y"),
+                                               ("prepare", "--all")]:
+                    p = self.pool(*args)
+                    # auto finds no free version 2 record in a migrated pool: BLOCKED_POOL_BUSY.
+                    want = 3 if marker == "2\n" and args[:3] == ("acquire", "--slot", "auto") else 1
+                    self.assertEqual(p.returncode, want, f"{args}: {p.stdout}{p.stderr}")
+                self.assertEqual(self.snapshot(), before)
 
     def test_recovery_state_refuses_the_slot_only(self):
         self.put(A, v1_lease())
@@ -456,39 +464,7 @@ class Consumers(Pool):
         self.assertNotIn("owner", status[B])
 
 
-class DormantWriter(Pool):
-    def test_pool_sh_only_ever_asks_the_helper_to_inspect(self):
-        log = self.t / "py.log"
-        wrapper = self.t / "py-wrapper"
-        wrapper.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{sys.executable}" "$@"\n')
-        wrapper.chmod(0o755)
-        for text in (record("free"), record(), record("quarantined"), record(token=TOKEN)):
-            self.setUp()
-            self.put(A, text)
-            for args in (("status",), ("assess", A), ("acquire", "--slot", A, "--task", "x", "--agent", "y"),
-                         ("release", "--slot", A, "--token", TOKEN), ("prepare", "--all")):
-                self.pool(*args, CG_POOL_PYTHON=str(wrapper))
-        calls = log.read_text().splitlines()
-        self.assertTrue(calls)
-        for call in calls:
-            argv = call.split()
-            self.assertEqual(argv[:2], ["-I", "-B"], call)
-            self.assertTrue(argv[2].endswith("/pool_record.py"), call)
-            self.assertEqual(argv[3], "inspect", call)
-        src = POOL.read_text()
-        self.assertEqual([ln.strip() for ln in src.splitlines() if '"$PYTHON"' in ln],
-                         ['out=$("$PYTHON" -I -B "$HERE/pool_record.py" inspect "$1" "$2" 2>/dev/null) || return 1'],
-                         "pool.sh runs the helper from somewhere new")
-        self.assertNotIn("durable_replace", src)
-
-    def test_the_helper_has_no_write_command(self):
-        for args in ([], ["write", A, "x"], ["replace", A, "x"], ["durable_replace", A, "x"], ["inspect", A]):
-            p = subprocess.run([sys.executable, "-I", "-B", str(HERE / "pool_record.py"), *args],
-                               capture_output=True, text=True)
-            self.assertEqual(p.returncode, 2, args)
-        src = (HERE / "pool_record.py").read_text()
-        self.assertNotIn("RecoveryStore(", src)
-
+class Helper(Pool):
     def test_the_helper_runs_on_the_oldest_supported_python(self):
         old = Path("/usr/bin/python3")
         if not old.exists():
