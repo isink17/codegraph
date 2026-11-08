@@ -806,5 +806,212 @@ class Units(unittest.TestCase):
         self.assertEqual(r("plain"), "plain")
 
 
+
+# Stand-in for pool.sh: status prints $FAKE_POOL/status (exit status from
+# status.rc), release logs its argv and exits with release.rc; after a
+# successful release, status prints after-release when present.
+FAKE_POOL = textwrap.dedent("""\
+    #!/bin/bash
+    d=$FAKE_POOL
+    case $1 in
+    status) cat "$d/status"; exit "$(cat "$d/status.rc" 2>/dev/null || echo 0)" ;;
+    release) echo "$*" >>"$d/release-calls"; rc=$(cat "$d/release.rc" 2>/dev/null || echo 0)
+        [ "$rc" = 0 ] && [ -e "$d/after-release" ] && mv "$d/after-release" "$d/status"
+        [ "$rc" = 0 ] || echo "release refused" >&2; exit "$rc" ;;
+    *) exit 2 ;;
+    esac
+""")
+
+TXN = "f" * 32
+OURS = f"campaign:{TXN}"
+
+
+def slot(name, state, *lines):
+    return f"{name}: {state}\n" + "".join(f"  {l}\n" for l in lines)
+
+
+def lease(owner, name=A, task="ci/a"):
+    return ["lease=present", f"slot={name}", f"task={task}", "agent=campaign/ci-local", f"owner={owner}"]
+
+
+FREE_A, FREE_B, FREE_R = (slot(s, "free", "lease=absent") for s in (A, B, R))
+
+
+class CiLeaseSettlement(unittest.TestCase):
+    """settle_ci_lease keeps the record and token unless the release went
+    through or the pool positively shows the lease is not there."""
+
+    def setUp(self):
+        import tempfile
+        import campaign
+        import coordinator
+        self.cp, self.co = campaign, coordinator
+        self.addCleanup(setattr, campaign, "co", campaign.co)
+        self.addCleanup(setattr, coordinator, "POOL", coordinator.POOL)
+        campaign.co = coordinator
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.fake = self.d / "pool"
+        self.fake.mkdir()
+        pool = self.d / "pool.sh"
+        pool.write_text(FAKE_POOL)
+        pool.chmod(0o755)
+        coordinator.POOL = pool
+        old = os.environ.get("FAKE_POOL")
+        os.environ["FAKE_POOL"] = str(self.fake)
+        self.addCleanup(lambda: os.environ.pop("FAKE_POOL") if old is None else
+                        os.environ.__setitem__("FAKE_POOL", old))
+        self.c = campaign.Campaign(self.d / "camp")
+        (self.d / "camp/coordinator/tokens").mkdir(parents=True)
+        self.tok = self.d / "camp/coordinator/tokens" / f"ci-{TXN}.token"
+        self.reset()
+
+    def reset(self, m=None):
+        self.tok.write_text("a" * 32 + "\n")
+        (self.fake / "release-calls").unlink(missing_ok=True)
+        self.record(m or {"task": "a", "txn": TXN, "slot": A})
+
+    def record(self, m):
+        self.c.state = {"ci_lease": m}
+        self.c.save()
+
+    def status(self, text, rc=0):
+        (self.fake / "status").write_text(text)
+        (self.fake / "status.rc").write_text(str(rc))
+
+    def releases(self):
+        f = self.fake / "release-calls"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def assert_kept(self, why):
+        self.assertTrue(why)
+        self.assertIn("kept", why)
+        self.assertEqual(self.c.state["ci_lease"]["txn"], TXN)
+        self.assertEqual(self.tok.read_text(), "a" * 32 + "\n")
+        self.assertEqual(json.loads((self.d / "camp/campaign.json").read_text())["ci_lease"]["txn"], TXN)
+
+    def assert_forgotten(self, why):
+        self.assertIsNone(why)
+        self.assertIsNone(self.c.state["ci_lease"])
+        self.assertFalse(self.tok.exists())
+        self.assertIsNone(json.loads((self.d / "camp/campaign.json").read_text())["ci_lease"])
+
+    def settle(self):
+        why = self.cp.settle_ci_lease(self.c)
+        if why:  # what a caller does with an unsettled record
+            self.c.save()
+        return why
+
+    def test_ambiguous_status_keeps_record_and_token(self):
+        cases = {
+            "legacy pool.sh, no fields": slot(A, "busy") + slot(B, "free") + slot(R, "free"),
+            "legacy pool.sh free without lease line": slot(A, "free") + FREE_B + FREE_R,
+            "legacy lease without owner": slot(A, "busy", "slot=" + A, "task=ci/a") + FREE_B + FREE_R,
+            "unsupported v2 record": f"{A}: inconsistent\nlease schema version 2 unsupported; this pool.sh writes 1\n"
+                                     + "  lease=present\n  version=2\n" + FREE_B + FREE_R,
+            "unsupported v2 record naming another holder": slot(A, "inconsistent", "lease=present", "version=2",
+                                                                *lease("coordinator:x")[1:]) + FREE_B + FREE_R,
+            "inconsistent without owner": slot(A, "inconsistent", "lease=present") + FREE_B + FREE_R,
+            "lease directory unobservable": slot(A, "inconsistent", "lease=unknown") + FREE_B + FREE_R,
+            "unknown header drops the slot": slot(A, "quarantined", *lease(OURS)[1:]) + FREE_B + FREE_R,
+            "unknown header after another slot": FREE_B + slot(A, "quarantined", "lease=present") + FREE_R,
+            "malformed output": "garbage\n" + A + " free\n",
+            "empty output": "",
+            "busy with an empty owner": slot(A, "busy", "lease=present", "owner=", "task=ci/a") + FREE_B + FREE_R,
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.reset()
+                self.status(text)
+                self.assert_kept(self.settle())
+                self.assertEqual(self.releases(), [])
+
+    def test_quarantined_record_with_our_holder_fields_is_refused_and_kept(self):
+        self.status(slot(A, "inconsistent", *lease(OURS), "record_state=quarantined") + FREE_B + FREE_R)
+        (self.fake / "release.rc").write_text("1")
+        self.assert_kept(self.settle())
+        self.assertEqual(self.releases(), [f"release --slot {A} --token {'a' * 32}"])
+        self.assertTrue(any(e["event"] == "ci_release_refused" for e in map(
+            json.loads, (self.d / "camp/events.jsonl").read_text().splitlines())))
+
+    def test_quarantined_record_of_another_holder_is_kept(self):
+        self.status(slot(A, "inconsistent", *lease("coordinator:x"), "record_state=quarantined") + FREE_B + FREE_R)
+        self.assert_kept(self.settle())
+        self.assertEqual(self.releases(), [])
+
+    def test_unreadable_status_raises_and_keeps(self):
+        self.status("lease directory cannot be observed\n", rc=1)
+        with self.assertRaises(self.co.Refused):
+            self.settle()
+        self.assert_kept("kept")
+
+    def test_free_slot_with_absent_lease_is_forgotten(self):
+        self.status(FREE_A + FREE_B + FREE_R)
+        self.assert_forgotten(self.settle())
+        self.assertEqual(self.releases(), [])
+
+    def test_readable_lease_of_another_owner_is_forgotten(self):
+        for state in ("busy", "stale-suspected"):
+            with self.subTest(state):
+                self.reset()
+                self.status(slot(A, state, *lease("coordinator:x", task="other")) + FREE_B + FREE_R)
+                self.assert_forgotten(self.settle())
+                self.assertEqual(self.releases(), [])
+
+    def test_failed_then_completed_release(self):
+        self.status(slot(A, "busy", *lease(OURS)) + FREE_B + FREE_R)
+        (self.fake / "release.rc").write_text("1")
+        self.assert_kept(self.settle())
+        self.assert_kept(self.settle())
+        (self.fake / "release.rc").write_text("0")
+        (self.fake / "after-release").write_text(FREE_A + FREE_B + FREE_R)
+        self.assert_forgotten(self.settle())
+        self.assertEqual(len(self.releases()), 3)
+        self.assertIsNone(self.settle())
+        self.assertEqual(len(self.releases()), 3)
+
+    def test_release_interrupted_after_the_lease_was_removed(self):
+        self.status(slot(A, "busy", *lease(OURS)) + FREE_B + FREE_R)
+        (self.fake / "release.rc").write_text("143")
+        self.assert_kept(self.settle())
+        self.status(FREE_A + FREE_B + FREE_R)
+        self.assert_forgotten(self.settle())
+
+    def test_repeated_ambiguous_settlement_changes_nothing(self):
+        self.status(slot(A, "inconsistent", "lease=present") + FREE_B + FREE_R)
+        first = self.settle()
+        state = (self.d / "camp/campaign.json").read_bytes()
+        for _ in range(3):
+            self.assertEqual(self.settle(), first)
+            self.assertEqual((self.d / "camp/campaign.json").read_bytes(), state)
+        self.assert_kept(first)
+
+    def test_acquire_interrupted_before_the_slot_was_recorded(self):
+        cases = {
+            FREE_A + FREE_B + FREE_R: None,
+            FREE_A + slot(B, "busy", *lease("coordinator:x", B)) + FREE_R: None,
+            FREE_A + slot(B, "inconsistent", "unleased: dirty", "lease=absent") + FREE_R: B,
+            FREE_A + FREE_R: B,
+            slot(A, "inconsistent", "lease=present") + FREE_B + FREE_R: A,
+            slot(A, "busy") + FREE_B + FREE_R: A,
+        }
+        for text, held in cases.items():
+            with self.subTest(text):
+                self.reset({"task": "a", "txn": TXN})
+                self.status(text)
+                why = self.settle()
+                if held:
+                    self.assert_kept(why)
+                    self.assertIn(held, why)
+                else:
+                    self.assert_forgotten(why)
+                self.assertEqual(self.releases(), [])
+
+    def test_lease_found_on_another_slot_is_released_there(self):
+        self.status(FREE_A + slot(B, "busy", *lease(OURS, B)) + FREE_R)
+        self.assert_forgotten(self.settle())
+        self.assertEqual(self.releases(), [f"release --slot {B} --token {'a' * 32}"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

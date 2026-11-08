@@ -646,17 +646,28 @@ def copy_evidence(src, dst):
     return problems, errors
 
 
+def ci_lease_absent(v, owner):
+    """True when slot status v proves the slot holds no lease of owner:
+    pool.sh observed the slot free with no lease file, or validated a lease
+    that names another owner."""
+    if v.get("state") == "free":
+        return v.get("lease") == "absent"
+    return v.get("state") in ("busy", "stale-suspected") and v.get("owner", "") not in ("", owner)
+
+
 def settle_ci_lease(c):
     """Releases the ci-local lease recorded in the campaign state, also after
-    a crash: no lease with its owner id means none was taken; a lease with
-    its token on file is released through pool.sh (which refuses to lose
-    work); anything else is left for the owner. Returns why it is unsettled."""
+    a crash: a lease with its owner id and its token on file is released
+    through pool.sh (which refuses to lose work). The record and token are
+    dropped only after that release, or when every slot that could hold the
+    lease proves it does not; anything else is left for the owner. Returns
+    why it is unsettled."""
     m = c.state.get("ci_lease")
     if not m:
         return None
     owner = f"campaign:{m['txn']}"
-    lease = next(((s, v) for s, v in co.Coordinator(c.coord_dir).pool_status().items()
-                  if v.get("owner") == owner), None)
+    status = co.Coordinator(c.coord_dir).pool_status()
+    lease = next(((s, v) for s, v in status.items() if v.get("owner") == owner), None)
     tok = c.coord_dir / "tokens" / f"ci-{m['txn']}.token"
     if lease:
         if not tok.exists():
@@ -666,6 +677,14 @@ def settle_ci_lease(c):
             c.event("ci_release_refused", slot=lease[0], detail=r.stderr.strip())
             return f"release of ci-local slot {lease[0]} refused ({r.stderr.strip()}); lease and token kept"
         c.event("ci_released", slot=lease[0], task=m["task"])
+    else:
+        # Before acquire recorded its slot, the lease may be on any worker.
+        slots = [m["slot"]] if m.get("slot") else co.WORKERS
+        unproven = [f"{s} {status.get(s, {}).get('state', 'unreported')}" for s in slots
+                    if not ci_lease_absent(status.get(s, {}), owner)]
+        if unproven:
+            return (f"the ci-local lease of {owner} cannot be ruled out on {', '.join(unproven)}; "
+                    f"record and token kept, owner must inspect")
     tok.unlink(missing_ok=True)
     c.state["ci_lease"] = None
     c.save()
