@@ -164,6 +164,8 @@ def durable_replace(path, text, *, create=False):
         raise rs.Refused("slot record path must end in .lease")
     if not isinstance(text, str) or not text.endswith("\n"):
         raise rs.Refused("slot record must end with a newline")
+    if len(text.encode()) > MAX_BYTES:
+        raise rs.Refused("slot record would be larger than any valid record; nothing written")
     if rs.parse_record(text, path.name[:-len(".lease")]).kind != "v2":
         raise rs.Refused("only version 2 records are written")
     try:
@@ -410,8 +412,8 @@ def _holder(args):
     holder = {}
     for a in args:
         k, sep, v = a.partition("=")
-        if not sep or k in holder:
-            raise rs.Refused("holder fields must be distinct field=value arguments")
+        if not sep or k in holder or "\n" in v:
+            raise rs.Refused("holder fields must be distinct single-line field=value arguments")
         holder[k] = v
     return holder
 
@@ -459,10 +461,14 @@ def main(argv):
               "step, whose record is unchanged; check status", file=sys.stderr)
         return 1
     except Exception as e:  # noqa: BLE001 - fail closed without a traceback
-        print(f"pool_record {cmd}: internal error ({type(e).__name__}); nothing confirmed", file=sys.stderr)
-        return 1
-    if out:
-        print("\n".join(out))
+        # The failing step is unknown, so a write may have been published.
+        print(f"pool_record {cmd}: internal error ({type(e).__name__}); state unconfirmed", file=sys.stderr)
+        return 4
+    try:
+        if out:
+            print("\n".join(out), flush=True)
+    except OSError:
+        return 4
     return 0
 
 

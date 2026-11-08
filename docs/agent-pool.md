@@ -370,11 +370,14 @@ record is a regular version 2 file, then the compare-and-swap preconditions:
 A write is a private `O_EXCL|O_NOFOLLOW` 0600 temporary file, flushed
 (`F_FULLFSYNC` on macOS, `fsync` elsewhere), renamed over the record (or
 linked, for a record that must not exist yet), then the directory flushed.
-A failure before the rename leaves the record unchanged. A directory flush that
-fails after the rename is reported (helper exit 4): the new record is in place
-but may not survive a power loss. For acquire that can leave a lease no caller
-holds a token for; the slot stays busy, `--slot auto` stops instead of trying
-the next worker, and the owner inspects. acquire prints the token only after
+A record larger than 64 KiB is refused before anything is written. A failure
+before the rename leaves the record unchanged. A directory flush that fails
+after the rename is reported (helper exit 4): the new record is in place but
+may not survive a power loss. Any helper exit other than a refusal (1, 2, 3)
+or a failure to start (126, 127), such as a signal, counts as possibly written.
+For acquire that can leave a lease no caller holds a token for; the slot stays
+busy, `--slot auto` stops instead of trying the next worker, and the owner
+inspects. acquire prints the token only after
 the flush, so one generation is never issued to two token holders.
 
 The caller's token reaches the helper on stdin, never in its arguments. No
@@ -417,7 +420,7 @@ token or `lease_token` is ever printed, and the status exit code is unchanged.
 
 | Record | Header | Detail lines |
 |---|---|---|
-| v2 `free` | `free` only when the slot is otherwise idle and has no recovery state; otherwise `inconsistent` with the reasons | `lease=absent`, `record_state=free`, `generation=` |
+| v2 `free` | `free` only when the marker is `2` and the slot is otherwise idle and has no recovery state; otherwise `inconsistent` with the reasons | `lease=absent`, `record_state=free`, `generation=` |
 | v2 `leased` | `busy` or `stale-suspected`, on the same evidence as version 1 | `lease=present`, `record_state=leased`, `version=2`, `slot=`, `lease_id=`, the holder fields, `generation=` |
 | v2 `quarantined` | `inconsistent`, never a new header word | `lease=present`, `record_state=quarantined`, `recovery_op=`, `version=2`, `slot=`, `lease_id=` or `legacy_digest=`, the holder fields, `generation=` |
 | refused by the parser | `inconsistent` | `lease=present`, `record_state=invalid`, and the allowlisted public fields of its printable lines |

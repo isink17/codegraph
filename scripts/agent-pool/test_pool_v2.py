@@ -129,8 +129,15 @@ class Pool(unittest.TestCase):
 
 
 class Status(Pool):
-    def test_v2_free_renders_free_with_no_active_lease(self):
+    def test_v2_free_renders_free_only_in_a_migrated_pool(self):
         self.put(A, record("free"))
+        lines = self.status(A)
+        self.assertEqual(lines[0], f"{A}: inconsistent", "no marker: nothing can lease this record")
+        self.assertEqual(lines[2:], ["  lease=absent", "  record_state=free", "  generation=3"])
+        for marker in ("garbage\n", "unmigrating\n"):
+            (self.leases / ".schema").write_text(marker)
+            self.assertEqual(self.status(A)[0], f"{A}: inconsistent")
+        (self.leases / ".schema").write_text("2\n")
         self.assertEqual(self.status(A), [f"{A}: free", "  lease=absent", "  record_state=free", "  generation=3"])
 
     def test_v2_free_on_a_slot_that_is_not_idle_is_inconsistent(self):
@@ -255,7 +262,8 @@ class Status(Pool):
         p = self.pool("status")
         self.assertEqual(p.returncode, 0)
         b = blocks(p.stdout)
-        self.assertEqual(b[B], [f"{B}: free", "  lease=absent", "  record_state=free", "  generation=3"])
+        self.assertEqual(b[B][0], f"{B}: inconsistent")
+        self.assertEqual(b[B][2:], ["  lease=absent", "  record_state=free", "  generation=3"])
         self.assertEqual(b[R], [f"{R}: free", "  lease=absent"])
 
 
@@ -435,7 +443,7 @@ class Consumers(Pool):
 
     def test_consumers_keep_tokens_unless_the_record_proves_absence(self):
         cases = {
-            "free": (record("free"), True, False),
+            "free, unmigrated pool": (record("free"), False, False),
             "leased by another owner": (record(owner="coordinator:" + "0" * 32), True, False),
             "quarantined": (record("quarantined"), False, False),
             "invalid": (record(token=TOKEN), False, False),
@@ -452,6 +460,7 @@ class Consumers(Pool):
 
     def test_free_v2_record_parses_exactly(self):
         self.put(A, record("free"))
+        (self.leases / ".schema").write_text("2\n")
         _, _, status = self.parsed()
         self.assertEqual(status[A], {"state": "free", "lease": "absent", "record_state": "free", "generation": "3"})
 

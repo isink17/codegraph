@@ -422,6 +422,29 @@ class MarkerRaces(Migrated):
         (d / "mkdir").chmod(0o755)
         return {"PATH": f"{d}:{os.environ['PATH']}", "MARK_AT": str(self.leases / ".schema")}
 
+    def test_release_and_prepare_also_act_on_the_marker_under_the_lock(self):
+        env = self.shim()
+        self.put(A, v1_lease())
+        before = (self.leases / f"{A}.lease").read_bytes()
+        p = self.pool("release", "--slot", A, "--token", TOKEN, **env)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual((self.leases / f"{A}.lease").read_bytes(), before, "a migrated pool released a v1 lease")
+        (self.leases / ".schema").unlink()
+        heads = [self.head(s) for s in SLOTS]
+        git("-C", str(self.t / "seed"), "commit", "-q", "--allow-empty", "-m", "next")
+        git("-C", str(self.t / "seed"), "push", "-q", "origin", "HEAD:v2.0")
+        try:
+            p = self.pool("prepare", "--slot", B, **env)
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("missing", p.stderr)
+            self.assertEqual([self.head(s) for s in SLOTS], heads, "prepare moved a slot of a migrated pool")
+        finally:
+            git("-C", str(self.t / "seed"), "push", "-q", "-f", "origin", f"{heads[0]}:v2.0")
+            for s in SLOTS:
+                git("-C", str(self.t / "slots" / s), "fetch", "-q", "--prune", "origin")
+        (self.leases / ".schema").unlink()
+        (self.leases / f"{A}.lease").unlink()
+
     def test_a_marker_written_before_the_lock_is_taken_wins(self):
         env = self.shim()
         before = self.snapshot()
@@ -686,6 +709,35 @@ class Interpreter(Migrated):
             (self.leases / f".{A}.lock").rmdir()
         self.assertEqual(f.read_text(), initial(A))
 
+    def test_oversized_metadata_is_refused_before_any_token(self):
+        self.migrate()
+        before = self.snapshot()
+        for flag in ("--task", "--owner"):
+            p = self.pool("acquire", "--slot", "auto", "--task", "t", "--agent", "ag", flag, "x" * 70000)
+            self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertNotIn("token=", p.stdout)
+        self.assertEqual(self.snapshot(), before)
+        long_value = "x" * 70000 + "\u00e9"
+        p = self.pool("acquire", "--slot", "auto", "--task", long_value, "--agent", "ag")
+        self.assertEqual(p.returncode, 2, "the ASCII check must hold for long values too")
+
+    def test_a_helper_killed_after_writing_stops_auto(self):
+        self.migrate()
+        wrapper = self.t / "py-killed"
+        wrapper.write_text(f'#!/bin/sh\n"{sys.executable}" "$@" >/dev/null || exit $?\n'
+                           'case $4 in acquire) kill -9 $$ ;; esac\n'
+                           f'exec "{sys.executable}" "$@"\n')
+        wrapper.chmod(0o755)
+        p = self.pool("acquire", "--slot", "auto", "--task", "t", "--agent", "ag", CG_POOL_PYTHON=str(wrapper))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual(self.rec(A).state, "leased")
+        self.assertEqual((self.leases / f"{B}.lease").read_text(), initial(B), "auto moved on to the next worker")
+        self.setUp()
+        self.migrate()
+        p = self.pool("acquire", "--slot", A, "--task", "t", "--agent", "ag", CG_POOL_PYTHON=str(wrapper))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not confirmed", p.stderr)
+
     def test_an_unconfirmed_acquire_stops_auto_and_keeps_the_slot_busy(self):
         self.migrate()
         wrapper = self.t / "py-unconfirmed"
@@ -845,6 +897,26 @@ class Durability(unittest.TestCase):
                 self.assertEqual(pool_record.marker_state(self.d), "unmigrating")
                 pool_record.unmigrate(self.d, SLOTS)
                 self.assertEqual(sorted(p.name for p in self.d.iterdir()), sorted(f".{s}.lock" for s in SLOTS))
+
+    def test_migrate_verifies_records_before_writing_the_marker(self):
+        for s in SLOTS:
+            (self.d / f"{s}.lease").unlink()
+        (self.d / ".schema").unlink()
+        with mock.patch("pool_record.durable_replace"), self.assertRaises(rs.Refused):
+            pool_record.migrate(self.d, SLOTS)
+        self.assertEqual(pool_record.marker_state(self.d), "absent")
+
+    def test_unmigrate_rechecks_each_record_before_removing_it(self):
+        real = pool_record._durable_write
+
+        def and_change_b(path, data, *, create=False):
+            real(path, data, create=create)
+            (self.d / f"{B}.lease").write_text(pool_record.free_record(B, 1))
+
+        with mock.patch("pool_record._durable_write", side_effect=and_change_b), self.assertRaises(rs.Refused):
+            pool_record.unmigrate(self.d, SLOTS)
+        self.assertEqual((self.d / f"{B}.lease").read_text(), pool_record.free_record(B, 1), "a changed record was removed")
+        self.assertEqual(pool_record.marker_state(self.d), "unmigrating", "the pool must stay unavailable")
 
     def test_an_unconfirmed_marker_flush_is_reported(self):
         for s in SLOTS:

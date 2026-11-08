@@ -207,7 +207,7 @@ fence() {
 # Status of a record that needs the strict parser: <slot> <file> <lease text>
 # <slot problems> <recovery flag>.
 strict_state() {
-	local slot=$1 out rec pid host id
+	local slot=$1 out rec pid host id marker
 	if ! out=$(strict_inspect "$slot" "$2"); then
 		echo inconsistent
 		echo "slot record could not be classified by the strict parser ($PYTHON); owner must inspect"
@@ -221,10 +221,12 @@ strict_state() {
 	id=$(printf '%s\n' "$out" | sed -n -e 's/^\(lease_id=.*\)/  \1/p' -e 's/^\(legacy_digest=.*\)/  \1/p')
 	case $rec in
 	v2/free)
-		if [[ -z $4 && -z $5 ]]; then
+		marker=$(marker_state)
+		if [[ -z $4 && -z $5 && $marker == 2 ]]; then
 			echo free
 		else
 			echo inconsistent
+			[[ $marker == 2 ]] || echo "free version 2 record in a pool whose record schema marker is $marker; not leasable"
 			[[ -z $4 ]] || echo "unleased: $4"
 			[[ -z $5 ]] || echo "recovery state present; this pool.sh cannot evaluate it"
 		fi
@@ -370,6 +372,12 @@ cmd_status() {
 
 random_token() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
 
+# True when $1 is printable ASCII only (no newline, tab or other control).
+printable_ascii() {
+	local LC_ALL=C
+	[[ $1 != *[![:print:]]* ]]
+}
+
 try_acquire() {
 	local slot=$1 rc=0
 	lock_slot "$slot" || { echo "$slot lock held: $LEASES/.$slot.lock" >&2; return 1; }
@@ -453,7 +461,11 @@ try_acquire_v2() {
 	gen=$(v2_free_generation "$slot") || return 1
 	acquire_idle "$slot" || return 1
 	out=$("$PYTHON" -I -B "$HERE/pool_record.py" acquire "$slot" "$f" "$gen" "task=$TASK" "agent=$AGENT" \
-		"pr=$PR" "owner=$OWNER" "host=$(hostname)" "pid=$LEASE_PID") || return $?
+		"pr=$PR" "owner=$OWNER" "host=$(hostname)" "pid=$LEASE_PID") || {
+		# Only these exits mean nothing was written; a signal or a crash after
+		# the rename may have left a lease that no caller holds.
+		case $? in 1 | 2 | 3 | 126 | 127) return 1 ;; *) return 4 ;; esac
+	}
 	token=$(kv "$out" token)
 	[[ $token =~ ^[0-9a-f]{32}$ ]] ||
 		{ echo "$slot: the lease may have been written but no token came back; owner must inspect" >&2; return 4; }
@@ -477,9 +489,7 @@ cmd_acquire() {
 	done
 	[[ -n $slot && -n $TASK && -n $AGENT ]] || die "acquire needs --slot, --task and --agent" 2
 	# Status prints these values; readers split lines on more than newlines.
-	[[ $TASK$AGENT$PR$OWNER$LEASE_PID != *$'\n'* ]] &&
-		! printf '%s' "$TASK$AGENT$PR$OWNER$LEASE_PID" | LC_ALL=C grep -q '[^ -~]' ||
-		die "metadata must be one line of printable ASCII" 2
+	printable_ascii "$TASK$AGENT$PR$OWNER$LEASE_PID" || die "metadata must be one line of printable ASCII" 2
 	[[ $slot == auto ]] || known_slot "$slot" || die "unknown slot $slot" 2
 	case $(marker_state) in
 	absent | 2) ;;
@@ -506,7 +516,11 @@ cmd_acquire() {
 	if [[ $(marker_state) == absent && -e $(lease_file "$slot") ]] && needs_strict "$(lease_file "$slot")"; then
 		die "$slot holds a version 2 or ambiguous slot record in a pool without the schema marker; not changed"
 	fi
-	try_acquire "$slot" || die "$slot not leased: $(slot_state "$slot" | sed -n 1p)"
+	try_acquire "$slot" || {
+		rc=$?
+		((rc != 4)) || die "$slot: a lease may have been written but was not confirmed; owner must inspect"
+		die "$slot not leased: $(slot_state "$slot" | sed -n 1p)"
+	}
 }
 
 # Takes the slot lock and checks the caller owns the lease. Sets MODE to the
