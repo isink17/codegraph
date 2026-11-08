@@ -156,58 +156,118 @@ no `pool.sh` process is running.
 ## Recovery state machine
 
 `scripts/agent-pool/recovery_state.py` models orphan lease recovery
-(CG-150, phase 2a). It is a library with tests and nothing else.
+(CG-150, phases 2a and 2b-1). It is a library with tests and nothing else.
 `pool.sh`, the coordinator and the campaign do not call it, and it has no
 command-line entry point. It cannot quarantine, reclaim or reassign a real
-slot. `reclaim` above is unchanged.
+slot, and it never reads or writes the pool: the caller passes the live slot
+record as text and does any replacement itself. `reclaim` above is unchanged.
 
-The only path to reassignment, one transition at a time:
+One recovery operation, named by an operation ID, moves one transition at a
+time:
 
 | From | To | Requires |
 |---|---|---|
-| `ACTIVE` | `RECOVERY_REQUESTED` | the current lease ID and generation; authorizes nothing, but the lease can no longer act and there is no way back in this phase |
-| `RECOVERY_REQUESTED` | `QUARANTINED` | the owner's authorization for this exact slot, lease ID, generation and operation; the generation moves on, so the old lease's token can no longer act |
+| (none) | `ACTIVE` | adoption of the live lease under a new operation ID; every earlier operation of the slot must be terminal |
+| `ACTIVE` | `RECOVERY_REQUESTED` | an authorization; the live record is still the adopted lease |
+| `ACTIVE` or `RECOVERY_REQUESTED` | `CANCELLED` | an authorization; the live record is the adopted lease unchanged, or proves it released; never after quarantine |
+| `RECOVERY_REQUESTED` | `QUARANTINED` | the owner's authorization, the live record still the adopted lease, and a caller hook that replaces it with a quarantined record; the slot generation moves on |
 | `QUARANTINED` | `QUIESCENCE_VERIFIED` | the owner's quiescence evidence, by the method the authorization named (containment teardown, owner-controlled quiescence or the reboot runbook), accounting for old coordinators, wrappers, escaped descendants, remote writers and automatic restarts |
 | `QUIESCENCE_VERIFIED` | `PRESERVED` | a complete inventory of dirty, untracked and ignored files and unpublished commits, each with a verified copy |
 | `PRESERVED` | `READY_FOR_REASSIGNMENT` | a final check showing the slot clean, unleased and at the preserved HEAD |
 
-- Every step after the request needs the operation ID, the current generation
-  and the recovery token the caller chose at quarantine. That token must not
-  be the lease token.
+`CANCELLED` and `READY_FOR_REASSIGNMENT` are terminal for the operation.
+`READY_FOR_REASSIGNMENT` leaves the slot record quarantined; nothing in this
+phase reassigns it. A cancelled operation cannot resume: a new recovery needs
+a new operation ID and a fresh adoption.
+
+Slot records it reads:
+
+- Version 1 leases (`version=1`, `token=`).
+- Version 2 records (`version=2`, `slot`, `generation`, `state=free|leased|quarantined`).
+  A leased record carries `lease_id`, the holder fields and `lease_token=`; a
+  quarantined record carries `recovery_op`, the holder fields and exactly one
+  of `lease_id` or `legacy_digest`, never a token. A version 2 record with a
+  `token=` line is refused. Free and quarantined records are never adopted.
+- Leases written before versioning, only when the owner explicitly asks for a
+  legacy adoption. Their identity is the SHA-256 of the record without its
+  `token=` line. It proves only that the bytes other than the token did not
+  change, not that the holder is gone, quiescent or consents. Before
+  quarantine the live token is also checked against the stored verifier, so a
+  re-acquired lease with the same other bytes is not taken for the adopted one.
+
+Unknown versions, states or fields, repeated fields, control characters and
+missing required fields are refused. Error messages never quote a value from
+the record.
+
+Bindings:
+
+- Every authorization and every piece of evidence names the slot, the
+  operation, the transition, the adopted identity (`identity_kind` and
+  `identity`), the slot generation, and the store sequence number of the state
+  it leaves. A copy from another slot, operation, transition, generation or
+  step is refused.
+- Request and cancel need the same authorization class: once pool.sh gates on
+  recovery, a request blocks the holder's own release.
+- The only trust level accepted is `same-uid-attestation`. It records that a
+  process running as the owner's user attested the decision. A 0600 file, a
+  TTY or a same-user file is not proof of owner approval. No signed level
+  exists until a verifier and a trust anchor the agents cannot write exist.
+- Before quarantine the live record must be the adopted lease at the adopted
+  generation. After quarantine it must be this operation's quarantined record
+  at the new generation; the original lease bytes are never compared again.
+- Every step after quarantine also needs the recovery token the caller chose
+  at quarantine. It must not be the lease token. Tokens are stored only as
+  salted HMAC verifiers.
 - A missing PID, a stale heartbeat, no process cwd or a rotated token is
   never quiescence evidence. The module records the owner's evidence and
   checks that it is complete. It does not observe processes itself.
-- Each record lives in a store directory the caller names, with no default.
-- A transition takes a per-slot `mkdir` lock, appends a secret-free intent to
-  a journal, atomically replaces the state, and appends a completion. Each
-  write is flushed with `fsync`, or with `F_FULLFSYNC` on macOS, and so is
-  its directory. Finishing an interrupted transition syncs the directory
-  again before writing the completion.
-- A record whose last transition has no completion is not ready. Only the
-  same operation, with the same evidence, can finish it.
-- A record that is unreadable, inconsistent with its journal, or missing an
-  evidence gate is refused, never read as available.
-- The journal is replayed on every read. It must show every transition from
-  adoption, one legal step at a time, with the right generation and
-  operation. Every completion must repeat its latest intent: the same
-  operation, states, generation and evidence. Adoption records the lease
-  identity. `READY_FOR_REASSIGNMENT` is terminal: nothing may follow it in
-  the journal.
-- Intents that never completed, left by a crash or a refused write, are
-  allowed. The state must equal the last completion, or the intent after it
-  when that transition was interrupted. Anything else is corrupt.
-- A lock left by a crash is never broken automatically.
-- A journal that records transitions whose state file is gone is never
-  re-adopted.
-- The read-only queries do not take the lock. A read during a transition can
-  report a record as not ready or corrupt, never as ready. Phase 2b runs them
-  under the pool's slot lock.
-- Tokens are stored only as salted HMAC verifiers. Evidence carrying
-  secret-looking fields is refused.
-- Windows cannot open a directory to sync it, so every transition is refused
-  there. Tests simulate this; it has not been run on Windows.
 
-Tests use disposable stores only:
+Storage and ordering:
+
+- Records live in `<root>/<slot>/<operation>/` under a root the caller names,
+  whose parent must exist. Directories are created 0700 and files 0600; a
+  umask can only narrow that. A symlink, a non-regular file, another owner or group or other
+  permission bits make the record corrupt.
+- Every state and marker write goes to a private temporary file, is flushed
+  (`F_FULLFSYNC` on macOS, `fsync` elsewhere), renamed over the destination,
+  and the directory is flushed. Journal appends are flushed. A directory's
+  parent is flushed every time it is ensured, not only when it was created.
+- Adoption builds the operation in a private `.adopt-*` directory and
+  renames it into place, so an interrupted adoption leaves no operation; an
+  unpublished `.adopt-*` directory is ignored and never removed.
+- A transition appends an intent, replaces the state, appends a completion,
+  and for a terminal state then writes the `TERMINAL` marker. The quarantine
+  intent also names the token-free digests of the live record before and
+  after; between the intent and the state the caller's hook must replace the
+  live record with the expected one only if it still equals the old one, and
+  return the text it wrote. Anything else leaves the quarantine unfinished.
+- A trailing intent without a completion leaves the operation unfinished,
+  whether or not the state was replaced. While it exists, cancel, new
+  adoptions and every other transition are refused; only the exact retry of
+  the same transition proceeds, reusing the intent. For the quarantine,
+  `reconcile` compares the live record with the intent: the old record means
+  the replacement did not happen and the retry may run it; the new record
+  means it did and the retry may only finish; anything else is corrupt and
+  needs the owner.
+- A storage failure, a hook failure or a crash never leaves a free, ready or
+  terminal record and never reuses a generation.
+- The journal is replayed on every read. It must alternate intents and
+  completions from adoption, one legal step at a time, with the right slot
+  generation and operation, and each completion must repeat the intent before
+  it. Nothing may follow a terminal state.
+- `terminal` accepts the marker only when the state and journal agree with
+  it; a marker never overrides an inconsistent record. A terminal state whose
+  marker is missing is not terminal until the same transition is repeated.
+- Without a held lock the store takes its own `mkdir` lock per slot. A caller
+  that already holds the pool's slot lock passes it as `held_lock`; the store
+  then checks it exists and never takes or removes it. A lock left by a crash
+  is never broken automatically.
+- The read-only queries do not take the lock. A read during a transition can
+  report an operation as unfinished or corrupt, never as ready.
+- Windows is refused outright: the durability guarantees above cannot be met
+  there. It has not been run on Windows.
+
+Tests use disposable stores and synthetic slot records only:
 `python3 -m unittest test_recovery_state` from `scripts/agent-pool`.
 
 ## Plane tracking
