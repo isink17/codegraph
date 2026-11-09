@@ -366,6 +366,7 @@ class Interlock(Cli):
             "directory": lambda: ((self.leases / cli.SYNTHETIC).unlink(), (self.leases / cli.SYNTHETIC).mkdir()),
             "not ascii": lambda: self.mark(MARK + "é"),
             "hard link": lambda: os.link(self.leases / cli.SYNTHETIC, self.t / "marker-link"),
+            "slot record with a hard link": lambda: os.link(self.leases / f"{B}.lease", self.t / "record-link"),
         }
         for name, arrange in cases.items():
             with self.subTest(case=name):
@@ -376,6 +377,7 @@ class Interlock(Cli):
                     self.assertIn("nothing changed", p.stderr)
                 self.assertEqual(self.tree(), before)
                 (self.t / "marker-link").unlink(missing_ok=True)
+                (self.t / "record-link").unlink(missing_ok=True)
                 m = self.leases / cli.SYNTHETIC
                 if m.is_dir() and not m.is_symlink():
                     m.rmdir()
