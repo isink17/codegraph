@@ -384,7 +384,8 @@ coordinator version.
   that call (needs a pool.sh change to pass it on stdin).
 - An open acquire transaction whose lease exists but whose token was lost
   (pool.sh killed after writing the lease) blocks all acquisition until the
-  owner releases or reclaims that lease with the token from the lease file;
+  owner releases that lease with the token from the lease file (`reclaim`
+  is disabled);
   the coordinator then clears the marker by itself on the next pass.
 - A process adopted without a start time (its wrapper died before the
   coordinator recorded it, or `ps` failed at launch) is tracked by its

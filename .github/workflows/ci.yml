@@ -152,11 +152,32 @@ jobs:
       - name: Run Go JVM inspector integration tests
         run: go test ./internal/jvmbinary ./internal/cli -count=1
 
+  # The agent pool lease manager and its recovery library (Python and bash),
+  # on throwaway pools only. The coordinator and campaign suites are not run
+  # here: parts of them exercise macOS sandbox-exec and they are unvalidated
+  # on Linux.
+  pool-safety:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # test_pool_v2 extracts every historical pool.sh from git.
+          fetch-depth: 0
+      - name: Pool and recovery suites
+        working-directory: scripts/agent-pool
+        run: |
+          python3 --version
+          python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes
+          bash pool_test.sh
+
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.
   # Fails on any failed or cancelled job, and when classification failed.
   ci:
-    needs: [changes, test-native, quality, race, no-cgo, jvm-binary-inspector]
+    needs: [changes, test-native, quality, race, no-cgo, jvm-binary-inspector, pool-safety]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

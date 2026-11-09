@@ -154,7 +154,7 @@ expect 1 "$POOL" release --slot $B --token "$(token $B)"
 [[ -e $CG_POOL_LEASES/$B.lease && -e $CG_POOL_ROOT/$B/wip.txt ]] || fail "dirty release lost state"
 
 # Abandoned lease with a dead process: stale-suspected, never auto-freed;
-# reclaim archives the lease and leaves the dirty slot untouched.
+# reclaim is disabled and changes nothing.
 TB=$(token $B)
 sh -c 'exit 0' &
 dead=$!
@@ -162,15 +162,17 @@ wait $dead || true
 sed -i.bak "s/^pid=.*/pid=$dead/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$B.lease" && rm "$CG_POOL_LEASES/$B.lease.bak"
 [[ $(state $B) == stale-suspected ]] || fail "dead-pid state $(state $B)"
 expect 1 "$POOL" acquire --slot $B --task steal --agent x
+cp "$CG_POOL_LEASES/$B.lease" "$T/stale.lease"
 expect 1 "$POOL" reclaim --slot $B --token wrong --reason test
-expect 2 "$POOL" reclaim --slot $B --token "$TB"
-expect 0 "$POOL" reclaim --slot $B --token "$TB" --reason "agent gone"
-ls "$CG_POOL_LEASES/archive/$B".*."$TB".lease >/dev/null 2>&1 || fail "reclaimed lease not archived"
-grep -q "reclaim $B token=$TB" "$CG_POOL_LEASES/archive/audit.log" || fail "reclaim not audited"
+expect 1 "$POOL" reclaim --slot $B --token "$TB"
+expect 1 "$POOL" reclaim --slot $B --token "$TB" --reason "agent gone"
+grep -q "reclaim is disabled" "$T/out" || fail "reclaim refusal does not say it is disabled: $(cat "$T/out")"
+grep -q "$TB" "$T/out" && fail "reclaim refusal printed the token"
+cmp -s "$T/stale.lease" "$CG_POOL_LEASES/$B.lease" || fail "disabled reclaim changed the lease"
+[[ ! -e $CG_POOL_LEASES/archive ]] || fail "disabled reclaim created an archive"
 [[ $(cat "$CG_POOL_ROOT/$B/wip.txt") == wip ]] || fail "reclaim touched the slot"
-[[ $(state $B) == inconsistent ]] || fail "dirty unleased state $(state $B)"
-expect 1 "$POOL" acquire --slot $B --task t --agent x
 rm "$CG_POOL_ROOT/$B/wip.txt"
+expect 0 "$POOL" release --slot $B --token "$TB"
 
 # Live lease cannot be reclaimed.
 "$POOL" acquire --slot $B --task live --agent x --pid $$ >/dev/null
@@ -404,7 +406,7 @@ expect 1 "$POOL" prepare --all
 { grep -q "prepared $R" "$T/out" && grep -q "$B is leased" "$T/out"; } || fail "--all output: $(cat "$T/out")"
 expect 0 "$POOL" release --slot $B --token "$(token $B)"
 
-# Concurrency: prepare against acquire, release, reclaim and other prepares.
+# Concurrency: prepare against acquire, release and other prepares.
 # Whatever interleaving wins, no lease appears or vanishes unexpectedly and a
 # leased slot is never moved by prepare.
 advance_base race
@@ -426,14 +428,14 @@ if lease_exists $A; then "$POOL" release --slot $A --token "$(token $A)" >/dev/n
 "$POOL" acquire --slot $B --task stale --agent x >/dev/null
 TB=$(token $B)
 sed -i.bak "s/^pid=.*/pid=$dead/; s/^host=.*/host=$(hostname)/" "$CG_POOL_LEASES/$B.lease" && rm "$CG_POOL_LEASES/$B.lease.bak"
-advance_base reclaim
+advance_base stale-release
 bh=$(head_of $B)
-("$POOL" reclaim --slot $B --token "$TB" --reason race >/dev/null 2>&1 || :) &
+("$POOL" release --slot $B --token "$TB" >/dev/null 2>&1 || :) &
 ("$POOL" prepare --slot $B >/dev/null 2>&1 || :) &
 wait
 if lease_exists $B; then
 	[[ $(head_of $B) == "$bh" ]] || fail "prepare moved a leased slot"
-	expect 0 "$POOL" reclaim --slot $B --token "$TB" --reason race
+	expect 0 "$POOL" release --slot $B --token "$TB"
 fi
 expect 0 "$POOL" prepare --all
 for s in $A $B $R; do
