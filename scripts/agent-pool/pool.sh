@@ -200,7 +200,8 @@ GATE_CLASS="" GATE_OP="" GATE_STATE="" GATE_REASON=""
 read_gate() {
 	local out re nl=$'\n'
 	GATE_CLASS=none GATE_OP="" GATE_STATE="" GATE_REASON=""
-	[[ -e $RECOVERY || -L $RECOVERY ]] || return 0
+	# -e is false for anything under a directory that cannot be searched.
+	[[ -e $RECOVERY || -L $RECOVERY ]] || ! leases_observable || return 0
 	GATE_CLASS=unknown GATE_REASON="the recovery gate could not be evaluated by $PYTHON"
 	out=$("$PYTHON" -I -B "$HERE/pool_record.py" gate "$LEASES" "$1" 2>/dev/null) || return 0
 	local LC_ALL=C
@@ -222,7 +223,10 @@ gate_refusal() { echo "${1:+$1 }recovery state is $GATE_CLASS${GATE_STATE:+ ($GA
 RECOVERY_LINES=""
 recovery_status() {
 	RECOVERY_LINES=""
-	if [[ $(marker_state) == 2 ]]; then
+	if ! leases_observable; then
+		GATE_CLASS=unknown GATE_OP="" GATE_STATE="" GATE_REASON="lease directory $LEASES cannot be observed"
+		RECOVERY_LINES="  recovery=unknown"
+	elif [[ $(marker_state) == 2 ]]; then
 		read_gate "$1"
 		[[ $GATE_CLASS != none ]] || return 0
 		RECOVERY_LINES="  recovery=$GATE_CLASS"

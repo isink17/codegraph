@@ -252,6 +252,23 @@ class GateClasses(Recovery):
                         root.unlink()
                     shutil.rmtree(self.t / "elsewhere", True)
 
+    def test_an_unsearchable_lease_directory_is_never_no_recovery(self):
+        for mode in (0o600, 0o000):
+            with self.subTest(mode=oct(mode)):
+                self.leases.chmod(mode)
+                try:
+                    p = subprocess.run(["python3", "-I", "-B", str(HERE / "pool_record.py"), "gate", str(self.leases), A],
+                                       capture_output=True, text=True)
+                    a = self.pool("assess", A)
+                    st = self.pool("status", A)
+                finally:
+                    self.leases.chmod(0o755)
+                self.assertEqual(p.returncode, 0)
+                self.assertIn("recovery=unknown\ngate=blocked\n", p.stdout)
+                self.assertIn("recovery: unknown;", a.stdout)
+                self.assertNotEqual(st.returncode, 0)
+                self.assertNotIn(f"{A}: free", st.stdout)
+
     def test_the_gate_reads_only(self):
         _, token = self.acquire(A)
         self.drive(A, "op-1", "adopt", "request")

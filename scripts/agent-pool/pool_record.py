@@ -277,7 +277,9 @@ def recovery_gate(leases, slot):
     leases = Path(leases)
     root = leases / "recovery"
     try:
-        if not os.path.lexists(root):
+        try:
+            os.lstat(root)
+        except FileNotFoundError:
             return "none", "", "", ""
         if not rs.SUPPORTED:
             return "unknown", "", "", "recovery state cannot be evaluated on this platform"
