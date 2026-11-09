@@ -266,6 +266,41 @@ def _gate_operation(store, slot, op, record):
     return "blocked", op, state, "recovery in progress"
 
 
+def gate_entries(leases, slot):
+    """(verdict, entries) for the recovery state of `slot`: verdict is the
+    (class, op_id, state, reason) of the whole slot when the recovery
+    directory itself decides it, else None; entries pairs each entry of
+    recovery/<slot>/ with its (class, op_id, state, reason). Read-only."""
+    leases = Path(leases)
+    root = leases / "recovery"
+    try:
+        try:
+            os.lstat(root)
+        except FileNotFoundError:
+            return ("none", "", "", ""), []
+        if not rs.SUPPORTED:
+            return ("unknown", "", "", "recovery state cannot be evaluated on this platform"), []
+        store = rs.RecoveryStore(root)
+        names = _listing(store, root)
+        for name in names:
+            s = name[1:-len(".lock")] if name.startswith(".") and name.endswith(".lock") else name
+            if not rs.NAME.match(s) or not os.path.lexists(leases / f"{s}.lease"):
+                return ("corrupt", "", "", "the recovery directory holds an unexpected entry"), []
+        # Presence comes from the listing: a lookup in a directory that cannot
+        # be searched reports absence.
+        if f".{slot}.lock" in names:
+            return ("incomplete", "", "", "a recovery transition holds or left its own lock; owner must inspect"), []
+        if slot not in names:
+            return ("none", "", "", ""), []
+        ops = _listing(store, root / slot)
+        record = read_record(leases / f"{slot}.lease")
+        return None, [(op, _gate_operation(store, slot, op, record)) for op in sorted(ops)]
+    except rs.Corrupt as e:
+        return ("corrupt", "", "", re.sub(r"[^\x20-\x7e]", " ", str(e))), []
+    except Exception:  # noqa: BLE001 - an unreadable state is never no recovery
+        return ("unknown", "", "", "recovery state could not be read; owner must inspect"), []
+
+
 def recovery_gate(leases, slot):
     """(class, op_id, state, reason) of the recovery state of `slot` in a
     migrated pool, from GATE_CLASSES. It only reads: nothing under recovery/
@@ -274,34 +309,10 @@ def recovery_gate(leases, slot):
     is never read as no recovery. A same-uid process can still forge a
     consistent operation or delete one: this proves consistency, not owner
     approval."""
-    leases = Path(leases)
-    root = leases / "recovery"
-    try:
-        try:
-            os.lstat(root)
-        except FileNotFoundError:
-            return "none", "", "", ""
-        if not rs.SUPPORTED:
-            return "unknown", "", "", "recovery state cannot be evaluated on this platform"
-        store = rs.RecoveryStore(root)
-        names = _listing(store, root)
-        for name in names:
-            s = name[1:-len(".lock")] if name.startswith(".") and name.endswith(".lock") else name
-            if not rs.NAME.match(s) or not os.path.lexists(leases / f"{s}.lease"):
-                return "corrupt", "", "", "the recovery directory holds an unexpected entry"
-        # Presence comes from the listing: a lookup in a directory that cannot
-        # be searched reports absence.
-        if f".{slot}.lock" in names:
-            return "incomplete", "", "", "a recovery transition holds or left its own lock; owner must inspect"
-        if slot not in names:
-            return "none", "", "", ""
-        ops = _listing(store, root / slot)
-        record = read_record(leases / f"{slot}.lease")
-        seen = [_gate_operation(store, slot, op, record) for op in sorted(ops)]
-    except rs.Corrupt as e:
-        return "corrupt", "", "", re.sub(r"[^\x20-\x7e]", " ", str(e))
-    except Exception:  # noqa: BLE001 - an unreadable state is never no recovery
-        return "unknown", "", "", "recovery state could not be read; owner must inspect"
+    verdict, entries = gate_entries(leases, slot)
+    if verdict is not None:
+        return verdict
+    seen = [v for _, v in entries]
     if not seen:
         return "none", "", "", ""
     if sum(1 for v in seen if v[2] and v[2] not in rs.TERMINAL_STATES) > 1:

@@ -170,7 +170,7 @@ jobs:
         working-directory: scripts/agent-pool
         run: |
           python3 --version
-          python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes test_recovery_gate
+          python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes test_recovery_gate test_recovery_cli
           bash pool_test.sh
 
   # One stable result for branch rules: a skipped matrix job does not report
