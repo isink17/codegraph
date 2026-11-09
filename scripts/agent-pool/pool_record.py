@@ -7,11 +7,16 @@ slot records".
     python3 -I -B pool_record.py owns <slot> <path>                     (token on stdin)
     python3 -I -B pool_record.py acquire <slot> <path> <generation> <field>=<value>...
     python3 -I -B pool_record.py release <slot> <path> <generation> <lease_id>  (token on stdin)
+    python3 -I -B pool_record.py gate <leases> <slot>
     python3 -I -B pool_record.py migrate [--dry-run] <leases> <slot>...
     python3 -I -B pool_record.py unmigrate <leases> <slot>...
 
 `inspect` prints key=value lines whose first line is `record=` and exits 0
-once the record is classified (an invalid record is a classification). Every
+once the record is classified (an invalid record is a classification). `gate`
+prints the six lines slot=, recovery=, gate=, recovery_operation=,
+recovery_state= and reason= and exits 0 once the recovery state of a slot is
+classified; it never changes anything and has no way to create or advance a
+recovery operation. Every
 other command changes records only under the slot locks pool.sh holds, and
 only in a pool whose schema marker allows it. Exit 0 is success, 1 a refusal
 or failure (reason on stderr), 2 a usage error, 3 an interpreter older than
@@ -205,6 +210,107 @@ def recovery_seen(leases, slot):
     return os.path.lexists(r / slot)
 
 
+# Recovery gate classes, mildest first; a slot takes the worst class of its
+# operations. Only the first three let an ordinary pool command proceed.
+GATE_CLASSES = ("none", "cancelled", "active", "blocked", "incomplete", "corrupt", "unknown")
+GATE_OPEN = GATE_CLASSES[:3]
+OP_FILES = {"journal.jsonl", "state.json", "TERMINAL"}
+# What an interrupted durable replace inside an operation directory leaves.
+OP_LEFTOVER = re.compile(r"^\.(state\.json|TERMINAL)\.[0-9a-f]{16}\.tmp\Z")
+
+
+def _listing(store, path):
+    """The entry names of a private recovery directory. One that cannot be
+    both listed and searched is unreadable, never empty."""
+    store._check_dir(path)
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise OSError(f"{path.name} cannot be listed and searched")
+    return set(os.listdir(path))
+
+
+def _gate_operation(store, slot, op, record):
+    """(class, op_id, state, reason) of one entry of recovery/<slot>/."""
+    if op.startswith(".adopt-"):
+        return "incomplete", "", "", "an interrupted adoption left an unpublished operation; owner must inspect"
+    if not rs.NAME.match(op):
+        return "corrupt", "", "", "the slot recovery directory holds an unexpected entry"
+    entries = _listing(store, store.root / slot / op)
+    if any(not OP_LEFTOVER.match(n) for n in entries - OP_FILES):
+        return "corrupt", op, "", "an operation directory holds an unexpected entry"
+    if entries - OP_FILES:
+        return "incomplete", op, "", "an interrupted write left a temporary file; owner must inspect"
+    if "state.json" not in entries:
+        return "corrupt", op, "", "an operation has no state record"
+    rec, pending = store._read(slot, op)
+    done = store.terminal(slot, op)
+    state = rec["state"]
+    if pending is not None:
+        return "incomplete", op, state, "an unfinished transition remains; only its exact retry may finish it"
+    if rec["identity_kind"] != "v2":
+        return "corrupt", op, state, "the operation adopted a lease that is not version 2"
+    if state in rs.TERMINAL_STATES and done != state:
+        return "incomplete", op, state, "the terminal marker was not written"
+    try:
+        if state == rs.ACTIVE:
+            store._lease_matches(rec, record)
+            return "active", op, state, "the adopted lease is unchanged; only its holder may act"
+        if state == rs.CANCELLED:
+            store._released_or_unchanged(rec, record)
+            return "cancelled", op, state, "cancelled; the slot record decides"
+    except rs.Corrupt:
+        raise
+    except rs.Refused:
+        return "blocked", op, state, "the slot record does not fit the operation; owner must inspect"
+    if state == rs.READY:
+        return "blocked", op, state, "ready for reassignment, which needs a separate authorization"
+    return "blocked", op, state, "recovery in progress"
+
+
+def recovery_gate(leases, slot):
+    """(class, op_id, state, reason) of the recovery state of `slot` in a
+    migrated pool, from GATE_CLASSES. It only reads: nothing under recovery/
+    is created, repaired or removed. Every operation must be valid and its
+    journal, state and marker must agree; anything unreadable or unexpected
+    is never read as no recovery. A same-uid process can still forge a
+    consistent operation or delete one: this proves consistency, not owner
+    approval."""
+    leases = Path(leases)
+    root = leases / "recovery"
+    try:
+        try:
+            os.lstat(root)
+        except FileNotFoundError:
+            return "none", "", "", ""
+        if not rs.SUPPORTED:
+            return "unknown", "", "", "recovery state cannot be evaluated on this platform"
+        store = rs.RecoveryStore(root)
+        names = _listing(store, root)
+        for name in names:
+            s = name[1:-len(".lock")] if name.startswith(".") and name.endswith(".lock") else name
+            if not rs.NAME.match(s) or not os.path.lexists(leases / f"{s}.lease"):
+                return "corrupt", "", "", "the recovery directory holds an unexpected entry"
+        # Presence comes from the listing: a lookup in a directory that cannot
+        # be searched reports absence.
+        if f".{slot}.lock" in names:
+            return "incomplete", "", "", "a recovery transition holds or left its own lock; owner must inspect"
+        if slot not in names:
+            return "none", "", "", ""
+        ops = _listing(store, root / slot)
+        record = read_record(leases / f"{slot}.lease")
+        seen = [_gate_operation(store, slot, op, record) for op in sorted(ops)]
+    except rs.Corrupt as e:
+        return "corrupt", "", "", re.sub(r"[^\x20-\x7e]", " ", str(e))
+    except Exception:  # noqa: BLE001 - an unreadable state is never no recovery
+        return "unknown", "", "", "recovery state could not be read; owner must inspect"
+    if not seen:
+        return "none", "", "", ""
+    if sum(1 for v in seen if v[2] and v[2] not in rs.TERMINAL_STATES) > 1:
+        return "corrupt", "", "", "more than one operation is unfinished"
+    # Ties go to the operation furthest along, never to a cancelled one.
+    rank = {"": 0, rs.CANCELLED: 1, **{st: 2 + i for i, st in enumerate(rs.ORDER)}}
+    return max(seen, key=lambda v: (GATE_CLASSES.index(v[0]), rank[v[2]]))
+
+
 def _slot_path(slot, path):
     if not isinstance(slot, str) or not rs.NAME.match(slot):
         raise rs.Refused("invalid slot name")
@@ -232,8 +338,9 @@ def _v2_pool(slot, path):
     _held(leases, slot)
     if marker_state(leases) != MIGRATED:
         raise rs.Refused("the pool is not migrated to version 2 records; nothing written")
-    if recovery_seen(leases, slot):
-        raise rs.Refused(f"{slot} has recovery state; nothing written")
+    gate = recovery_gate(leases, slot)
+    if gate[0] not in GATE_OPEN:
+        raise rs.Refused(f"{slot} recovery state is {gate[0]}; nothing written")
     text = read_record(path)
     if text is None:
         raise rs.Refused(f"{slot} slot record is missing in a migrated pool; owner must intervene")
@@ -418,7 +525,7 @@ def _holder(args):
     return holder
 
 
-USAGE = "usage: pool_record.py inspect|owns|acquire|release|migrate|unmigrate ... (see the module doc)"
+USAGE = "usage: pool_record.py inspect|gate|owns|acquire|release|migrate|unmigrate ... (see the module doc)"
 
 
 def main(argv):
@@ -426,15 +533,21 @@ def main(argv):
     dry = cmd == "migrate" and args[:1] == ["--dry-run"]
     if dry:
         args = args[1:]
-    arity = {"inspect": 2, "owns": 2, "release": 4}
+    arity = {"inspect": 2, "gate": 2, "owns": 2, "release": 4}
     if (cmd in arity and len(args) != arity[cmd]) or (cmd == "acquire" and len(args) < 4) or \
             (cmd in ("migrate", "unmigrate") and len(args) < 2) or \
-            cmd not in ("inspect", "owns", "acquire", "release", "migrate", "unmigrate"):
+            cmd not in ("inspect", "gate", "owns", "acquire", "release", "migrate", "unmigrate"):
         print(USAGE, file=sys.stderr)
         return 2
     try:
         if cmd == "inspect":
             out = inspect(*args)
+        elif cmd == "gate":
+            if not rs.NAME.match(args[1]):
+                raise rs.Refused("invalid slot name")
+            cls, op, state, reason = recovery_gate(args[0], args[1])
+            out = [f"slot={args[1]}", f"recovery={cls}", f"gate={'open' if cls in GATE_OPEN else 'blocked'}",
+                   f"recovery_operation={op}", f"recovery_state={state}", f"reason={reason}"]
         elif cmd == "owns":
             r = owns(args[0], args[1], _stdin_token())
             out = [f"generation={r.generation}", f"lease_id={r.identity}"]

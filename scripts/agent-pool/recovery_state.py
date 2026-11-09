@@ -1,9 +1,10 @@
 """Orphan lease recovery state machine, isolated (CG-150 phases 2a and 2b-1).
 
-Nothing in pool.sh, the coordinator or the campaign runs this state machine
-and it has no command-line entry point, so it cannot quarantine, reclaim or
-reassign a real slot. pool_record.py, which pool.sh runs, uses parse_record
-and the durable-write helpers, never the state machine. It records recovery decisions per slot and operation in a store
+Nothing in pool.sh, the coordinator or the campaign creates or advances an
+operation and it has no command-line entry point, so it cannot quarantine,
+reclaim or reassign a real slot. pool_record.py, which pool.sh runs, uses
+parse_record, the durable-write helpers and, for the recovery gate, only the
+read-only queries of RecoveryStore. It records recovery decisions per slot and operation in a store
 directory the caller names, and reads the live slot record only as text the
 caller passes in. Policy and limits: docs/agent-pool.md, "Recovery state
 machine".

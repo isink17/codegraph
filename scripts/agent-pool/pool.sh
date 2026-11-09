@@ -192,6 +192,58 @@ recovery_seen() {
 	[[ -e $RECOVERY/$1 || -L $RECOVERY/$1 ]]
 }
 
+# The recovery gate of slot $1 in a migrated pool, from pool_record.py: sets
+# GATE_CLASS (none, cancelled, active: open; blocked, incomplete, corrupt,
+# unknown: blocked), GATE_OP, GATE_STATE and GATE_REASON. Anything but exit 0
+# with exactly the six expected lines for this slot is unknown, never none.
+GATE_CLASS="" GATE_OP="" GATE_STATE="" GATE_REASON=""
+read_gate() {
+	local out re nl=$'\n'
+	GATE_CLASS=none GATE_OP="" GATE_STATE="" GATE_REASON=""
+	# -e is false for anything under a directory that cannot be searched.
+	[[ -e $RECOVERY || -L $RECOVERY ]] || ! leases_observable || return 0
+	GATE_CLASS=unknown GATE_REASON="the recovery gate could not be evaluated by $PYTHON"
+	out=$("$PYTHON" -I -B "$HERE/pool_record.py" gate "$LEASES" "$1" 2>/dev/null) || return 0
+	local LC_ALL=C
+	re="^slot=([^$nl]*)${nl}recovery=(none|cancelled|active|blocked|incomplete|corrupt|unknown)${nl}gate=(open|blocked)"
+	re+="${nl}recovery_operation=([A-Za-z0-9._-]*)${nl}recovery_state=([A-Z_]*)${nl}reason=([ -~]*)\$"
+	[[ $out =~ $re && ${BASH_REMATCH[1]} == "$1" ]] || return 0
+	case ${BASH_REMATCH[2]}/${BASH_REMATCH[3]} in
+	none/open | cancelled/open | active/open | blocked/blocked | incomplete/blocked | corrupt/blocked | unknown/blocked) ;;
+	*) return 0 ;;
+	esac
+	GATE_CLASS=${BASH_REMATCH[2]} GATE_OP=${BASH_REMATCH[4]} GATE_STATE=${BASH_REMATCH[5]} GATE_REASON=${BASH_REMATCH[6]}
+}
+gate_open() { [[ $GATE_CLASS == none || $GATE_CLASS == cancelled || $GATE_CLASS == active ]]; }
+gate_refusal() { echo "${1:+$1 }recovery state is $GATE_CLASS${GATE_STATE:+ ($GATE_STATE)}: $GATE_REASON"; }
+
+# Status detail lines for the recovery state of slot $1, in RECOVERY_LINES,
+# with GATE_* set. Only a migrated pool evaluates recovery state; in any
+# other pool, state that is present reads as unknown.
+RECOVERY_LINES=""
+recovery_status() {
+	RECOVERY_LINES=""
+	if ! leases_observable; then
+		GATE_CLASS=unknown GATE_OP="" GATE_STATE="" GATE_REASON="lease directory $LEASES cannot be observed"
+		RECOVERY_LINES="  recovery=unknown"
+	elif [[ $(marker_state) == 2 ]]; then
+		read_gate "$1"
+		[[ $GATE_CLASS != none ]] || return 0
+		RECOVERY_LINES="  recovery=$GATE_CLASS"
+		[[ -z $GATE_OP ]] || RECOVERY_LINES+=$'\n'"  recovery_operation=$GATE_OP"
+		[[ -z $GATE_STATE ]] || RECOVERY_LINES+=$'\n'"  recovery_state=$GATE_STATE"
+	elif recovery_seen "$1"; then
+		GATE_CLASS=unknown GATE_OP="" GATE_STATE="" GATE_REASON="state present that this pool.sh evaluates only in a migrated pool"
+		RECOVERY_LINES="  recovery=unknown"
+	else
+		GATE_CLASS=none GATE_OP="" GATE_STATE="" GATE_REASON=""
+	fi
+}
+recovery_detail() { [[ -z $RECOVERY_LINES ]] || printf '%s\n' "$RECOVERY_LINES"; }
+recovery_note() {
+	if [[ $(marker_state) == 2 ]]; then gate_refusal ""; else echo "recovery state present; this pool.sh cannot evaluate it"; fi
+}
+
 # Refuses, before anything changes, a slot of a version 1 pool this pool.sh
 # must not touch.
 fence() {
@@ -205,7 +257,7 @@ fence() {
 }
 
 # Status of a record that needs the strict parser: <slot> <file> <lease text>
-# <slot problems> <recovery flag>.
+# <slot problems> <recovery blocks the slot>. recovery_status has run.
 strict_state() {
 	local slot=$1 out rec pid host id marker
 	if ! out=$(strict_inspect "$slot" "$2"); then
@@ -214,7 +266,7 @@ strict_state() {
 		echo "  lease=present"
 		echo "  record_state=unknown"
 		raw_public "$3"
-		[[ -z $5 ]] || echo "  recovery=unknown"
+		recovery_detail
 		return
 	fi
 	rec=$(kv "$out" record)/$(kv "$out" state)
@@ -228,7 +280,7 @@ strict_state() {
 			echo inconsistent
 			[[ $marker == 2 ]] || echo "free version 2 record in a pool whose record schema marker is $marker; not leasable"
 			[[ -z $4 ]] || echo "unleased: $4"
-			[[ -z $5 ]] || echo "recovery state present; this pool.sh cannot evaluate it"
+			[[ -z $5 ]] || recovery_note
 		fi
 		# No active lease; the permanent record file itself is present.
 		echo "  lease=absent"
@@ -266,12 +318,12 @@ strict_state() {
 		echo "  lease=present"
 		echo "  record_state=invalid"
 		raw_public "$3"
-		[[ -z $5 ]] || echo "  recovery=unknown"
+		recovery_detail
 		return
 		;;
 	esac
 	echo "  generation=$(kv "$out" generation)"
-	[[ -z $5 ]] || echo "  recovery=unknown"
+	recovery_detail
 }
 
 # A lease file can be called absent only when the directory that would hold
@@ -296,7 +348,7 @@ lease_seen() {
 
 # free | busy | stale-suspected | inconsistent, plus detail lines.
 slot_state() {
-	local slot=$1 f problems pid version lease seen recovery marker
+	local slot=$1 f problems pid version lease seen recovery="" marker
 	f=$(lease_file "$slot")
 	seen=$(lease_seen "$f")
 	if [[ $seen == unknown ]]; then
@@ -306,8 +358,8 @@ slot_state() {
 		return
 	fi
 	problems=$(slot_problems "$slot")
-	recovery=""
-	recovery_seen "$slot" && recovery=1
+	recovery_status "$slot"
+	gate_open || recovery=1
 	if [[ $seen == absent ]]; then
 		marker=$(marker_state)
 		if [[ $marker != absent ]]; then
@@ -321,10 +373,10 @@ slot_state() {
 		else
 			echo inconsistent
 			[[ -z $problems ]] || echo "unleased: $problems"
-			[[ -z $recovery ]] || echo "recovery state present; this pool.sh cannot evaluate it"
+			[[ -z $recovery ]] || recovery_note
 			echo "  lease=absent"
 		fi
-		[[ -z $recovery ]] || echo "  recovery=unknown"
+		recovery_detail
 		return
 	fi
 	lease=$(lease_text "$f")
@@ -344,7 +396,7 @@ slot_state() {
 		# concludes the slot is unheld and discards the token that still guards it.
 		echo "  lease=present"
 		printf '%s\n' "$lease" | public_lease
-		[[ -z $recovery ]] || echo "  recovery=unknown"
+		recovery_detail
 		return
 	fi
 	pid=$(field "$f" pid)
@@ -355,7 +407,7 @@ slot_state() {
 	fi
 	echo "  lease=present"
 	printf '%s\n' "$lease" | public_lease
-	[[ -z $recovery ]] || echo "  recovery=unknown"
+	recovery_detail
 }
 
 cmd_status() {
@@ -438,7 +490,8 @@ try_acquire_v1() {
 v2_free_generation() {
 	local slot=$1 f out
 	f=$(lease_file "$slot")
-	! recovery_seen "$slot" || { echo "$slot has recovery state under $RECOVERY" >&2; return 1; }
+	read_gate "$slot"
+	gate_open || { gate_refusal "$slot" >&2; return 1; }
 	case $(lease_seen "$f") in
 	present) ;;
 	absent) echo "$slot slot record missing in a migrated pool; owner must intervene" >&2; return 1 ;;
@@ -539,7 +592,8 @@ own_lease() {
 		[[ $(field "$f" token) == "$token" ]] || die "token does not match the $slot lease"
 		;;
 	2)
-		! recovery_seen "$slot" || die "$slot has recovery state under $RECOVERY; nothing changed"
+		read_gate "$slot"
+		gate_open || die "$(gate_refusal "$slot"); nothing changed"
 		[[ $(lease_seen "$f") == present ]] || die "$slot slot record missing in a migrated pool; owner must intervene"
 		# The token goes to the helper on stdin, never in its arguments.
 		out=$(printf '%s\n' "$token" | "$PYTHON" -I -B "$HERE/pool_record.py" owns "$slot" "$f") ||
@@ -652,7 +706,12 @@ cmd_assess() {
 	echo "state: ${full%%$'\n'*}"
 	echo "host: $(hostname)"
 	echo "pool-schema-marker: $(marker_state)"
-	if recovery_seen "$slot"; then echo "recovery: unknown; state present that this pool.sh cannot evaluate"; else echo "recovery: none"; fi
+	recovery_status "$slot"
+	if [[ $GATE_CLASS == none ]]; then
+		echo "recovery: none"
+	else
+		echo "recovery: $GATE_CLASS; ${GATE_OP:+operation $GATE_OP; }${GATE_STATE:+state $GATE_STATE; }$GATE_REASON"
+	fi
 	# One snapshot: a lease released mid-report must read as gone, not abort.
 	lease=$(lease_text "$f")
 	seen=$(lease_seen "$f")
