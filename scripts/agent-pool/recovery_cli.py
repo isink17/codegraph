@@ -15,9 +15,11 @@ interactive confirmation every mutating action asks for on /dev/tty, prevent
 accidents; they authenticate nobody. Any process of the owner's uid can forge
 the marker, drive a pseudo-terminal or call recovery_state.py directly.
 
-The mutating actions run only under the slot lock pool.sh holds. Exit 0 is
+Run it only through `pool.sh recover`, which takes the slot lock: run
+directly, it accepts any existing lock directory as held. The mutating
+actions run only under the slot lock pool.sh holds. Exit 0 is
 done, 1 refused with nothing written, 2 usage, 3 an interpreter older than
-MIN_PYTHON, 4 an unfinished transition or an unconfirmed outcome.
+MIN_PYTHON, 4 a write whose step did not finish, or an unconfirmed outcome.
 """
 
 import json
@@ -118,7 +120,7 @@ def _private_file(path, limit, what):
         raise rs.Refused(f"{what} is not a readable regular file") from None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_nlink != 1:
             raise rs.Refused(f"{what} is not a private regular file of this user")
         data = os.read(fd, limit + 1)
         if len(data) > limit:
@@ -160,10 +162,11 @@ def synthetic_pool(pool, slot):
         raise rs.Refused("the synthetic pool is not migrated; recovery runs only on version 2 slot records")
     for s in slots:
         try:
-            if not stat.S_ISREG(os.lstat(os.path.join(pool, f"{s}.lease")).st_mode):
+            st = os.lstat(os.path.join(pool, f"{s}.lease"))
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 raise OSError
         except OSError:
-            raise rs.Refused(f"the synthetic pool lacks a regular slot record for {s}") from None
+            raise rs.Refused(f"the synthetic pool lacks a regular, singly linked slot record for {s}") from None
 
 
 # ---------------------------------------------------------------- terminal
@@ -246,6 +249,31 @@ def _sound_history(pool, slot, op):
         if left:
             raise rs.Refused(f"{slot} operation {op} holds a temporary file left by an interrupted write; "
                              "owner must inspect; nothing changed")
+
+
+def _fingerprint(pool, slot):
+    """Everything a step may write: the slot's recovery tree and its slot
+    record. A tree that cannot be read compares unequal to anything."""
+    root = Path(pool) / "recovery"
+    out = [os.path.lexists(root), os.path.lexists(root / slot)]
+    try:
+        for d, dirs, files in os.walk(root / slot):
+            dirs.sort()
+            for n in sorted(dirs + files):
+                path = os.path.join(d, n)
+                st = os.lstat(path)
+                body = None
+                if stat.S_ISREG(st.st_mode):
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        body = os.read(fd, st.st_size + 1)
+                    finally:
+                        os.close(fd)
+                out.append((path, st.st_mode, body))
+        out.append(_live(pool, slot))
+    except (OSError, rs.Refused):
+        return object()
+    return out
 
 
 def _actor():
@@ -351,7 +379,8 @@ def authorize(term, store, pool, slot, op, action):
         token = term.ask("Recovery token you retained (not echoed): ", secret=True)
     else:
         if expected is not None:
-            term.write("The interrupted quarantine never recorded a token; a new one replaces any shown before.\n")
+            term.write("The interrupted quarantine never recorded a token. Any token shown before is void; "
+                       "a new one replaces it.\n")
         token = secrets.token_hex(16)
         term.write("\nRECOVERY TOKEN, shown once. Keep it privately; it is never stored, logged or shown again,\n"
                    "and every later step needs it. A lost token leaves the operation quarantined for good.\n"
@@ -593,38 +622,26 @@ def run(action, pool, slot, op=None, evidence=None, term=None, fault=None):
     pr._held(pool, slot)
     term = term or Terminal()
     store = _store(pool, fault)
-    if action == "adopt":
-        def leftovers():
-            d = Path(pool) / "recovery" / slot
-            return {p.name for p in d.glob(".adopt-*")} if d.is_dir() else set()
-        before = leftovers()
-        try:
+    before = _fingerprint(pool, slot)
+    try:
+        if action == "adopt":
             rec = adopt(term, pool, slot, store)
-        except rs.Refused as e:
-            if leftovers() - before:
-                raise Unfinished(f"{e}; an interrupted adoption left an unpublished operation; owner must inspect") \
-                    from e
-            raise
-        op = rec["op_id"]
-    else:
-        _sound_history(pool, slot, op)
-        try:
+            op = rec["op_id"]
+        else:
+            _sound_history(pool, slot, op)
             if action in ("request", "cancel", "quarantine"):
                 rec = authorize(term, store, pool, slot, op, action)
             else:
                 rec = evidence_step(term, store, pool, slot, op, action, evidence)
-        except rs.Refused as e:
-            try:
-                pending = store._read(slot, op)[1]
-            except rs.Refused:
-                pending = None
-            if pending is not None:
-                raise Unfinished(f"{e}; an unfinished {rs.TRANSITION[pending['to']]} remains: run recover inspect, "
-                                 "then retry it exactly") from e
+    except rs.Refused as e:
+        # Exit 1 promises nothing was written; a failure after any write is unfinished.
+        if isinstance(e, Unfinished) or _fingerprint(pool, slot) == before:
             raise
-        if rec is None:
-            st = store._read(slot, op)[0]
-            return [f"recover {action}: slot={slot} operation={op} already {st['state']}; nothing changed"]
+        raise Unfinished(f"{e}; recovery state or the slot record changed before the failure: run recover inspect, "
+                         "then finish or retry the step exactly") from e
+    if rec is None:
+        st = store._read(slot, op)[0]
+        return [f"recover {action}: slot={slot} operation={op} already {st['state']}; nothing changed"]
     return [f"recover {action}: slot={slot} operation={op} state={rec['state']} seq={rec['seq']} "
             f"slot_generation={rec['slot_generation']} trust={rs.TRUST}"]
 

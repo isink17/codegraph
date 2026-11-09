@@ -376,13 +376,14 @@ again under the slot lock:
   directory of this user.
 - It is not the live pool, `~/Projekti/codegraph-evidence/pool`, a path
   inside it or one of its parents. The home directory comes from the user
-  database, not `$HOME`, and `CG_POOL_LEASES` plays no part. Inode
+  database, not `$HOME`, and `CG_POOL_LEASES` plays no part: a live pool
+  configured elsewhere is kept out only by its lack of a synthetic marker. Inode
   comparison also refuses aliases that keep their own path, such as the
   macOS `/System/Volumes/Data` firmlinks.
-- `<pool>/.synthetic-pool` is a private regular file of this user (not a
-  symlink, at most 4 KiB) containing exactly
+- `<pool>/.synthetic-pool` is a private, singly linked regular file of this
+  user (not a symlink, at most 4 KiB) containing exactly
   `codegraph-synthetic-recovery-pool=1` and a `slots=` line that lists the
-  slot. Every listed slot has a regular slot record.
+  slot. Every listed slot has a regular, singly linked slot record.
 - The pool is migrated (marker `2`), Python is 3.9 or later, and the
   platform is supported (not Windows).
 - Every mutating action needs an interactive controlling terminal
@@ -393,7 +394,11 @@ variable, flag or file that confirms anything for the owner. **The interlock
 prevents accidents. It authenticates nobody**: any process of the owner's
 user can write the marker, drive a pseudo-terminal, take the lock directory
 or call `recovery_state.py` directly. A recovery started that way is exactly
-as untrusted as the library already documents.
+as untrusted as the library already documents. Between the first check and
+the lock there is a window: a pool path swapped for another directory in it
+could briefly get a lock directory, but nothing else, because the helper
+checks again under the lock and refuses. Run the helper only through
+`pool.sh recover`; run directly it takes any existing lock directory as held.
 
 **Locking.** The mutating actions take the slot lock `<pool>/.<slot>.lock`
 in `pool.sh` with the same `mkdir` protocol every other command uses, then
@@ -479,7 +484,9 @@ live record: `pre` (the replace did not happen), `post` (it did) or `corrupt`
   `QUARANTINED` on. `CANCELLED` does not free a leased slot, and
   `READY_FOR_REASSIGNMENT` stays blocked: there is no reassignment command.
 
-**inspect and reconcile** change nothing. They report:
+**inspect and reconcile** change nothing. They take no lock, so while a
+transition is running they can briefly report it `incomplete` or `corrupt`;
+read them again once no recovery command runs. They report:
 
 - the slot and operation;
 - state, sequence and slot generation;
@@ -497,10 +504,11 @@ live record: `pre` (the replace did not happen), `post` (it did) or `corrupt`
 | Exit | Meaning |
 |---|---|
 | 0 | done, or already in the requested state |
-| 1 | refused; nothing was written |
+| 1 | refused; nothing was written (the slot's recovery tree and record are compared before and after) |
 | 2 | usage |
 | 3 | Python too old |
-| 4 | an unfinished transition remains, or the outcome is unconfirmed; run `inspect` |
+| 4 | something was written and the step did not finish, or the outcome is unconfirmed; run `inspect` |
+| 128+N | the helper was killed by signal N; treat as 4 |
 
 **Not in this phase.**
 

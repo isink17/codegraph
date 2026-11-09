@@ -13,6 +13,7 @@ before and after; no file in it is read.
 import ast
 import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -251,6 +252,17 @@ def live_tree():
     return out
 
 
+def unexplained(before, after):
+    """Changes to the live pool that concurrent ordinary pool use cannot
+    explain: anything but its own directory times, lease files and archive.
+    A recovery command could only ever add a lock, a marker or recovery/."""
+    if before is None or after is None:
+        return [] if before == after else ["the live pool appeared or vanished"]
+    names = set(before) | set(after)
+    ordinary = lambda n: n == "." or n.endswith(".lease") or n == "archive" or n.startswith("archive/")
+    return sorted(n for n in names if before.get(n) != after.get(n) and not ordinary(n))
+
+
 class Interlock(Cli):
     def every_action(self, pool, **env):
         for action in cli.ACTIONS:
@@ -287,7 +299,7 @@ class Interlock(Cli):
                             self.assertIn("live pool", p.stderr)
                         else:
                             self.assertIn("canonical", p.stderr)
-        self.assertEqual(live_tree(), before, "the live pool changed")
+        self.assertEqual(unexplained(before, live_tree()), [], "the live pool changed")
 
     def test_a_perfect_synthetic_pool_at_the_live_path_is_refused(self):
         """The live pool, played by a marked and migrated synthetic pool."""
@@ -353,6 +365,7 @@ class Interlock(Cli):
                                 (self.leases / cli.SYNTHETIC).unlink(), (self.leases / cli.SYNTHETIC).symlink_to(self.t / "m")),
             "directory": lambda: ((self.leases / cli.SYNTHETIC).unlink(), (self.leases / cli.SYNTHETIC).mkdir()),
             "not ascii": lambda: self.mark(MARK + "é"),
+            "hard link": lambda: os.link(self.leases / cli.SYNTHETIC, self.t / "marker-link"),
         }
         for name, arrange in cases.items():
             with self.subTest(case=name):
@@ -362,6 +375,7 @@ class Interlock(Cli):
                     self.assertEqual(p.returncode, 1, f"{action}: {p.stdout}{p.stderr}")
                     self.assertIn("nothing changed", p.stderr)
                 self.assertEqual(self.tree(), before)
+                (self.t / "marker-link").unlink(missing_ok=True)
                 m = self.leases / cli.SYNTHETIC
                 if m.is_dir() and not m.is_symlink():
                     m.rmdir()
@@ -709,7 +723,7 @@ class Crash(Cli):
                 else:
                     self.assertFalse((self.leases / f"{A}.lease").exists())
                     # A synthetic pool missing a slot record fails its own fixture check.
-                    self.assertIn("lacks a regular slot record", self.recover("inspect", A, op).stderr)
+                    self.assertIn("lacks a regular, singly linked slot record", self.recover("inspect", A, op).stderr)
                 self.put(A, pool_record.free_record(A, 9))   # leaves no missing record for tearDown's status
 
     def test_a_mismatched_identity_or_generation_is_refused(self):
@@ -835,6 +849,65 @@ class Hook(Cli):
             err, _ = self.inproc(step, A, "op-1")
             self.assertIn("version 2 leases", str(err), step)
             self.assertEqual(self.tree(), before)
+
+
+class ExitCodes(Cli):
+    """Exit 1 promises nothing was written; any failure after a write is 4."""
+
+    def test_failures_after_a_write_are_unfinished(self):
+        def complete_then_fail():
+            real = rs.RecoveryStore._append
+
+            def append(store, d, entry):
+                real(store, d, entry)
+                if entry.get("kind") == "complete":
+                    raise OSError(5, "injected after the completion was written")
+            return mock.patch.object(rs.RecoveryStore, "_append", append)
+
+        def publish_then_fail():
+            real = rs.RecoveryStore._fsync_dir
+
+            def fsync_dir(store, path):
+                if Path(path) == self.leases / "recovery" / A and \
+                        any(not n.startswith(".") for n in os.listdir(path)):
+                    raise OSError(5, "injected after the operation was published")
+                return real(store, path)
+            return mock.patch.object(rs.RecoveryStore, "_fsync_dir", fsync_dir)
+
+        cases = {"cancel before its marker": ("cancel", "adopt", None, "before_marker_rename"),
+                 "ready before its marker": ("ready", "preservation", None, "before_marker_rename"),
+                 "request after its completion": ("request", "adopt", complete_then_fail, None),
+                 "adopt after publishing": ("adopt", None, publish_then_fail, None)}
+        for name, (step, upto, patch, point) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                self.acquire(A)
+                op, token = self.path_to(A, upto) if upto else (None, None)
+                with patch() if patch else contextlib.nullcontext():
+                    err, _ = self.inproc(step, A, op, ctx={"token": token}, fault=fault_at(point) if point else None)
+                self.assertIsInstance(err, cli.Unfinished, f"{name}: {err!r}")
+                self.assertIn("run recover inspect", str(err))
+                if step == "adopt":
+                    self.assertEqual(self.gate(A)["recovery"], "active")
+                    self.assertIn("next=request or cancel", self.recover("inspect", A).stdout)
+
+    def test_a_refusal_before_any_write_stays_exit_1(self):
+        self.acquire(A)
+        op, _ = self.path_to(A, "adopt")
+        before = self.tree()
+        err, _ = self.inproc("request", A, op, ctx={"wrong": "slot"})
+        self.assertIs(type(err), rs.Refused)
+        self.assertEqual(self.tree(), before)
+
+    def test_main_maps_outcomes_to_exit_codes(self):
+        argv = ["recovery_cli.py", "cancel", str(self.leases), A, "--op", "op-1"]
+        for exc, code in ((cli.Unfinished("x"), 4), (pool_record.Unconfirmed("x"), 4), (rs.Refused("x"), 1),
+                          (rs.Corrupt("x"), 1), (OSError(5, "x"), 4), (KeyboardInterrupt(), 4), (ValueError(), 4)):
+            with self.subTest(exc=type(exc).__name__), mock.patch.object(cli, "run", side_effect=exc), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(argv), code)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["recovery_cli.py", "cancel", str(self.leases), A]), 2)
 
 
 class Locks(Cli):
