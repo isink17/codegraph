@@ -159,11 +159,13 @@ lock, so one held lock refuses them.
 
 `scripts/agent-pool/recovery_state.py` models orphan lease recovery
 (CG-150, phases 2a and 2b-1). It is a library with tests and nothing else.
-`pool.sh`, the coordinator and the campaign do not run its state machine
-(`pool.sh` only borrows its record parser, see "Version 2 slot records"), and
-it has no command-line entry point. It cannot quarantine, reclaim or reassign
-a real slot, and it never reads or writes the pool: the caller passes the live slot
-record as text and does any replacement itself.
+`pool.sh`, the coordinator and the campaign never create or advance an
+operation, and it has no command-line entry point. `pool.sh` borrows its
+record parser (see "Version 2 slot records") and, in a migrated pool, its
+read-only queries for the recovery gate (see "Recovery gate"). It cannot
+quarantine, reclaim or reassign a real slot, and it never reads or writes the
+pool: the caller passes the live slot record as text and does any replacement
+itself.
 
 One recovery operation, named by an operation ID, moves one transition at a
 time:
@@ -236,8 +238,9 @@ Storage and ordering:
   and the directory is flushed. Journal appends are flushed. A directory's
   parent is flushed every time it is ensured, not only when it was created.
 - Adoption builds the operation in a private `.adopt-*` directory and
-  renames it into place, so an interrupted adoption leaves no operation; an
-  unpublished `.adopt-*` directory is ignored and never removed.
+  renames it into place, so an interrupted adoption leaves no operation. The
+  library ignores an unpublished `.adopt-*` directory and never removes it;
+  the pool's recovery gate treats it as an incomplete operation.
 - A transition appends an intent, replaces the state, appends a completion,
   and for a terminal state then writes the `TERMINAL` marker. The quarantine
   intent also names the token-free digests of the live record before and
@@ -272,6 +275,68 @@ Storage and ordering:
 
 Tests use disposable stores and synthetic slot records only:
 `python3 -m unittest test_recovery_state` from `scripts/agent-pool`.
+
+## Recovery gate
+
+In a migrated pool every `pool.sh` mutator, and every `pool_record.py` write
+command, asks one read-only function, `pool_record.recovery_gate`, whether the
+slot's recovery state lets an ordinary pool command proceed. `pool.sh` runs
+it as `"$PYTHON" -I -B pool_record.py gate <leases> <slot>` after taking the
+slot lock and reading the marker under it; the helper's write commands run it
+again under the same lock. The command prints exactly six lines (`slot=`,
+`recovery=`, `gate=`, `recovery_operation=`, `recovery_state=`, `reason=`) and
+exits 0. Anything else, including a non-zero exit, missing or extra lines,
+another slot's name, or a `gate=` that disagrees with the class, makes the
+slot `unknown` in `pool.sh`, which blocks. The gate never creates, repairs or
+removes anything under `recovery/`, and nothing in `pool.sh` or
+`pool_record.py` creates or advances an operation: that needs the recovery
+command line of a later phase.
+
+Every operation under `recovery/<slot>/` is read with the library: directory
+and file types, ownership and modes (no symlinks, 0700 directories, 0600
+files), the full journal replay, the state record and the `TERMINAL` marker,
+which must agree with both. Then:
+
+| Recovery state of the slot | Class | Ordinary commands |
+|---|---|---|
+| no `recovery/`, or no entry for the slot, or an empty private slot directory | `none` | as without recovery |
+| `ACTIVE`, no unfinished transition, and the live record is exactly the adopted lease (identity, generation, token verifier) | `active` | open: the holder may release or check out with its token; the record refuses everyone else |
+| `ACTIVE` with any other record (released, replaced, another generation or token) | `blocked` | refused |
+| `CANCELLED`, marker written and consistent, and the record is the adopted lease unchanged or proves it released (free at the adopted generation or later, or another lease at a later generation) | `cancelled` | open: the record decides; cancellation never frees a lease |
+| `CANCELLED` with any other record | `blocked` | refused |
+| `RECOVERY_REQUESTED`, `QUARANTINED`, `QUIESCENCE_VERIFIED`, `PRESERVED` | `blocked` | refused, the holder included |
+| `READY_FOR_REASSIGNMENT` | `blocked` | refused until a separately authorized reassignment exists; READY is not a free lease |
+| a trailing intent, a terminal state without its marker, an interrupted adoption (`.adopt-*`), a temporary file left by an interrupted write, the store's own lock `recovery/.<slot>.lock` | `incomplete` | refused |
+| a malformed, contradictory or forged journal, state or marker; a marker on an unfinished operation; an operation adopted from a lease that is not version 2; more than one unfinished operation; an unexpected entry, symlink, mode or owner; an entry in `recovery/` for no slot of the pool | `corrupt` | refused |
+| anything unreadable, an unsupported platform (Windows), or a helper that fails or misbehaves | `unknown` | refused |
+
+A slot takes the worst class over all its operations, so one corrupt earlier
+operation blocks a valid later one, and every cancelled operation must still
+fit the live record. The record check stays separate: a quarantined, missing,
+invalid, version 1 or legacy record refuses every mutator whatever the gate
+says. A read failure is never read as no recovery, and nothing falls back to
+the presence check of the unmigrated pool, which stays unchanged there (any
+entry refuses).
+
+`status` and `assess` run the gate without the lock. A read that races a
+transition can report it `incomplete` or `corrupt`, never open; `status`
+still exits 0.
+
+**What the gate does not prove.** The only trust level is
+`same-uid-attestation`, and the gate checks consistency only:
+
+- Journal validation proves internal consistency, not owner approval. Any
+  process running as the owner's user can build a consistent `CANCELLED`
+  operation with the library, which opens the gate, or delete `recovery/`,
+  which removes it.
+- Lock directories prove that a lock exists, not which process holds it. The
+  held-lock checks of the library and the helper test existence only; this is
+  accepted because only `pool.sh`, which took the lock itself, calls them.
+- Modes 0600 and 0700 and the presence of a TTY do not authenticate the owner.
+- This phase does not make live recovery secure. No live cutover or live
+  recovery may happen without a separate, OS-enforced authorization boundary,
+  such as a dedicated user that owns the pool with a narrow privileged entry
+  point. That remains a future design decision.
 
 ## Plane tracking
 
@@ -344,7 +409,7 @@ slot lock.
 | Marker | Mode | Mutators |
 |---|---|---|
 | absent | version 1 (unmigrated) | as before; a version 2 or ambiguous record or recovery state is refused unchanged |
-| `2` (trailing newlines ignored) | migrated | write version 2 records through `pool_record.py`; refuse every version 1 or legacy lease, missing record and recovery state |
+| `2` (trailing newlines ignored) | migrated | write version 2 records through `pool_record.py`; refuse every version 1 or legacy lease and missing record, and every slot whose recovery gate is not open |
 | anything else, a symlink or not a regular file (including `unmigrating`) | unknown | every mutator refuses |
 
 `reclaim` is disabled in every mode. Acquire metadata (`--task`, `--agent`,
@@ -357,7 +422,7 @@ too old or misbehaving interpreter refuses the operation; nothing falls back
 to bash. The interpreter is trusted: it is part of the tool bundle.
 
 **Writes.** Under the slot lock `pool.sh` holds, `pool_record.py` checks that
-the lock exists, the marker is `2`, the slot has no recovery state and the
+the lock exists, the marker is `2`, the slot's recovery gate is open and the
 record is a regular version 2 file, then the compare-and-swap preconditions:
 
 | Command | Precondition | Result |
@@ -388,7 +453,7 @@ token appears in status, assess, messages, file names or logs.
 - `migrate --dry-run` takes no lock, does not fetch and writes nothing; it
   reports, per slot, what `migrate` would do and exits 1 if it would refuse.
 - `migrate` holds every slot lock, fetches, and requires every slot to be idle
-  with no recovery state and either no record or the free record of
+  with no recovery entry and either no record or the free record of
   generation 0 (left by an interrupted run). Anything else, including a version
   1 or legacy lease, refuses the whole migration and writes nothing: a leased
   slot is never rewritten, so its holder must release it first. It then
@@ -406,7 +471,9 @@ record of generation 0 (no lease was ever issued on that slot since
 migration), plus, when the marker is not `2`, an absent record or a version 1
 or legacy lease. Anything else refuses and changes nothing: a leased,
 quarantined or released (generation 1 or later) record, other content, a
-missing record under marker `2`, recovery state or an unknown marker. It then
+missing record under marker `2`, any recovery entry (even a cancelled
+operation: rollback is one-way once recovery state exists) or an unknown
+marker. It then
 rewrites the marker to `unmigrating`, which makes every mutator refuse,
 removes the records, and removes the marker last. A run that fails part way
 leaves the pool refusing every change until `unmigrate` is run again.
@@ -420,19 +487,21 @@ token or `lease_token` is ever printed, and the status exit code is unchanged.
 
 | Record | Header | Detail lines |
 |---|---|---|
-| v2 `free` | `free` only when the marker is `2` and the slot is otherwise idle and has no recovery state; otherwise `inconsistent` with the reasons | `lease=absent`, `record_state=free`, `generation=` |
+| v2 `free` | `free` only when the marker is `2`, the slot is otherwise idle and its recovery gate is open; otherwise `inconsistent` with the reasons | `lease=absent`, `record_state=free`, `generation=` |
 | v2 `leased` | `busy` or `stale-suspected`, on the same evidence as version 1 | `lease=present`, `record_state=leased`, `version=2`, `slot=`, `lease_id=`, the holder fields, `generation=` |
 | v2 `quarantined` | `inconsistent`, never a new header word | `lease=present`, `record_state=quarantined`, `recovery_op=`, `version=2`, `slot=`, `lease_id=` or `legacy_digest=`, the holder fields, `generation=` |
 | refused by the parser | `inconsistent` | `lease=present`, `record_state=invalid`, and the allowlisted public fields of its printable lines |
 | helper unavailable or failing | `inconsistent` | `lease=present`, `record_state=unknown`, the same allowlisted fields |
 | no record, schema marker `$LEASES/.schema` present (valid `2` or not) | `inconsistent` | `lease=absent`, `record_state=missing` |
-| recovery state: `$LEASES/recovery` exists and holds an entry for the slot, or cannot be searched | never `free` | `recovery=unknown` |
+| migrated pool, `$LEASES/recovery` exists and the gate class is not `none` | as above; never `free` unless the gate is open | `recovery=<class>`, and `recovery_operation=` and `recovery_state=` when an operation decided it |
+| unmigrated pool or unknown marker, `$LEASES/recovery` holds an entry for the slot or cannot be searched | never `free` | `recovery=unknown` |
 
 For a v2 `free` record, `lease=absent` means there is no active lease. The
 permanent record file itself is present.
 
 `assess` prints the same state, plus `pool-schema-marker:` and `recovery:`
-lines, and the status detail lines for a strictly parsed record.
+lines (in a migrated pool: the gate class, operation, state and reason), and
+the status detail lines for a strictly parsed record.
 
 **Fencing.** `acquire`, `release`, `prepare` and `review-checkout` refuse and
 change nothing when any of these holds. They exit 1, except that
@@ -442,7 +511,8 @@ path:
 
 - the marker is unknown. `acquire` and `prepare` refuse before touching any
   slot, and the marker is read again under each slot lock;
-- the slot has recovery state;
+- without the marker: the slot has any recovery entry;
+- with marker `2`: the slot's recovery gate is not open;
 - without the marker: the slot holds a strictly parsed record, including a v2
   `free` record;
 - with marker `2`: the record is missing, unreadable, invalid, quarantined, a
@@ -465,6 +535,11 @@ rollback, every version 2 write, races, fault injection at each persistence
 point, interpreter failures, every historical `pool.sh` against the records
 the writer produces, and the consumers. All run in throwaway pools:
 `python3 -m unittest test_pool_v2 test_pool_v2_writes` from `scripts/agent-pool`.
-Hosted CI runs `test_recovery_state`, `test_pool_v2`, `test_pool_v2_writes`
-and `pool_test.sh` on Linux (job `pool-safety`); the coordinator and campaign
-suites run only locally on macOS. Windows is not run.
+`test_recovery_gate` covers the recovery gate against operations built with
+the library in every state, faults at each persistence point, forged,
+missing and contradictory markers, symlinks and modes, failing interpreters,
+lock races, old `pool.sh` copies (including the presence-fence copy of PR
+#539 with its helpers), and the current and an older coordinator reader.
+Hosted CI runs `test_recovery_state`, `test_pool_v2`, `test_pool_v2_writes`,
+`test_recovery_gate` and `pool_test.sh` on Linux (job `pool-safety`); the
+coordinator and campaign suites run only locally on macOS. Windows is not run.

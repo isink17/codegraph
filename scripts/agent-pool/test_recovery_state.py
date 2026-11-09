@@ -1268,8 +1268,9 @@ class NotWired(unittest.TestCase):
         src = (HERE / "recovery_state.py").read_text()
         self.assertNotIn("__main__", src)
         self.assertNotIn("codegraph-evidence", src)
-        for caller in (HERE / "pool.sh", HERE.parent / "agent-coordinator/coordinator.py",
-                       HERE.parent / "agent-coordinator/campaign.py"):
+        # pool.sh prints a recovery_state= status key; it reaches the library only through pool_record.py.
+        self.assertNotIn("recovery_state.py", (HERE / "pool.sh").read_text())
+        for caller in (HERE.parent / "agent-coordinator/coordinator.py", HERE.parent / "agent-coordinator/campaign.py"):
             self.assertNotIn("recovery_state", caller.read_text(), f"{caller.name} calls the recovery state machine")
 
 
