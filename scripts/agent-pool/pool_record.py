@@ -219,14 +219,22 @@ OP_FILES = {"journal.jsonl", "state.json", "TERMINAL"}
 OP_LEFTOVER = re.compile(r"^\.(state\.json|TERMINAL)\.[0-9a-f]{16}\.tmp\Z")
 
 
+def _listing(store, path):
+    """The entry names of a private recovery directory. One that cannot be
+    both listed and searched is unreadable, never empty."""
+    store._check_dir(path)
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise OSError(f"{path.name} cannot be listed and searched")
+    return set(os.listdir(path))
+
+
 def _gate_operation(store, slot, op, record):
     """(class, op_id, state, reason) of one entry of recovery/<slot>/."""
     if op.startswith(".adopt-"):
         return "incomplete", "", "", "an interrupted adoption left an unpublished operation; owner must inspect"
     if not rs.NAME.match(op):
         return "corrupt", "", "", "the slot recovery directory holds an unexpected entry"
-    store._check_dir(store.root / slot / op)
-    entries = set(os.listdir(store.root / slot / op))
+    entries = _listing(store, store.root / slot / op)
     if any(not OP_LEFTOVER.match(n) for n in entries - OP_FILES):
         return "corrupt", op, "", "an operation directory holds an unexpected entry"
     if entries - OP_FILES:
@@ -274,18 +282,20 @@ def recovery_gate(leases, slot):
         if not rs.SUPPORTED:
             return "unknown", "", "", "recovery state cannot be evaluated on this platform"
         store = rs.RecoveryStore(root)
-        store._check_dir(root)
-        for name in os.listdir(root):
+        names = _listing(store, root)
+        for name in names:
             s = name[1:-len(".lock")] if name.startswith(".") and name.endswith(".lock") else name
             if not rs.NAME.match(s) or not os.path.lexists(leases / f"{s}.lease"):
                 return "corrupt", "", "", "the recovery directory holds an unexpected entry"
-        if os.path.lexists(root / f".{slot}.lock"):
+        # Presence comes from the listing: a lookup in a directory that cannot
+        # be searched reports absence.
+        if f".{slot}.lock" in names:
             return "incomplete", "", "", "a recovery transition holds or left its own lock; owner must inspect"
-        if not os.path.lexists(root / slot):
+        if slot not in names:
             return "none", "", "", ""
-        store._check_dir(root / slot)
+        ops = _listing(store, root / slot)
         record = read_record(leases / f"{slot}.lease")
-        seen = [_gate_operation(store, slot, op, record) for op in sorted(os.listdir(root / slot))]
+        seen = [_gate_operation(store, slot, op, record) for op in sorted(ops)]
     except rs.Corrupt as e:
         return "corrupt", "", "", re.sub(r"[^\x20-\x7e]", " ", str(e))
     except Exception:  # noqa: BLE001 - an unreadable state is never no recovery

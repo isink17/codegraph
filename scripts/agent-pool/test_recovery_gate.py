@@ -17,7 +17,6 @@ import shutil
 import stat
 import subprocess
 import threading
-import time
 import unittest
 from contextlib import contextmanager
 from unittest import mock
@@ -212,6 +211,16 @@ class GateClasses(Recovery):
             "unreadable slot directory": (lambda: (private(A), (root / A / "op-1").mkdir(mode=0o700),
                                                    (root / A).chmod(0o000)), "unknown", "none"),
             "unreadable recovery directory": (lambda: (private(), root.chmod(0o000)), "unknown", "unknown"),
+            "recovery directory listable, not searchable": (lambda: (private(A, "op-1"), root.chmod(0o600)),
+                                                            "unknown", "unknown"),
+            "recovery directory searchable, not listable": (lambda: (private(A, "op-1"), root.chmod(0o300)),
+                                                            "unknown", "unknown"),
+            "slot directory listable, not searchable": (lambda: (private(A, "op-1"), (root / A).chmod(0o600)),
+                                                        "unknown", "none"),
+            "empty slot directory, not searchable": (lambda: (private(A), (root / A).chmod(0o600)), "unknown", "none"),
+            "operation directory listable, not searchable": (lambda: (private(A, "op-1"),
+                                                                      (root / A / "op-1").chmod(0o600)),
+                                                             "unknown", "none"),
             "operation directory without state": (lambda: private(A, "op-1"), "corrupt", "none"),
         }
         for name, (arrange, cls_a, cls_b) in cases.items():
@@ -219,7 +228,7 @@ class GateClasses(Recovery):
                 self.setUp()
                 arrange()
                 try:
-                    before = self.tree() if cls_a != "unknown" else None
+                    before = self.tree() if cls_a != "unknown" and cls_b != "unknown" else None
                     self.assertEqual(self.gate(A)["recovery"], cls_a)
                     self.assertEqual(self.gate(B)["recovery"], cls_b)
                     if before is not None:
@@ -236,7 +245,7 @@ class GateClasses(Recovery):
                         for args in self.mutators(A, "d" * 32):
                             self.assertEqual(self.pool(*args).returncode, 1, args)
                 finally:
-                    for p in (root, root / A):
+                    for p in (root, root / A, root / A / "op-1"):
                         if p.is_dir() and not p.is_symlink():
                             p.chmod(0o700)
                     if root.is_symlink():
@@ -678,42 +687,41 @@ class Locks(Recovery):
             self.assertEqual(p.returncode, 1)
             self.assertNotIn(token, p.stdout + p.stderr)
 
-    def test_a_concurrent_request_and_release_never_both_take_effect(self):
-        for i in range(4):
-            with self.subTest(round=i):
-                self.setUp()
-                _, token = self.acquire(A)
-                result = {}
+    def test_a_request_and_a_release_are_serialised_by_the_slot_lock(self):
+        """pool.sh never waits for a lock: while a recovery transition holds
+        the slot lock the release refuses, and once the request is in place
+        the release is refused by the gate. In the other order the released
+        record is no adoption source."""
+        _, token = self.acquire(A)
+        holding, done = threading.Event(), threading.Event()
 
-                def request():
-                    lock = self.leases / f".{A}.lock"
-                    while True:
-                        try:
-                            lock.mkdir()
-                            break
-                        except FileExistsError:
-                            time.sleep(0.005)
-                    try:
-                        st = self.store()
-                        rec = st.adopt(A, "op-1", self.live(A))
-                        st.request(A, op_id="op-1", authorization=self.auth(rec, "request"), record=self.live(A))
-                        result["request"] = True
-                    except rs.Refused:
-                        result["request"] = False
-                    finally:
-                        lock.rmdir()
+        def request():
+            with self.locked(A):
+                holding.set()
+                st = self.store()
+                rec = st.adopt(A, "op-1", self.live(A))
+                done.wait(60)
+                st.request(A, op_id="op-1", authorization=self.auth(rec, "request"), record=self.live(A))
 
-                t = threading.Thread(target=request)
-                if i % 2:
-                    t.start()
-                rel = self.pool("release", "--slot", A, "--token", token)
-                if not i % 2:
-                    t.start()
-                t.join()
-                released = rel.returncode == 0
-                self.assertNotEqual(released, result["request"], rel.stdout + rel.stderr)
-                state = rs.parse_record(self.live(A), A).state
-                self.assertEqual(state, "free" if released else "leased")
+        t = threading.Thread(target=request)
+        t.start()
+        self.assertTrue(holding.wait(60))
+        p = self.pool("release", "--slot", A, "--token", token)
+        done.set()
+        t.join()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("lock held", p.stderr)
+        p = self.pool("release", "--slot", A, "--token", token)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("recovery state is blocked (RECOVERY_REQUESTED)", p.stderr)
+        self.assertEqual(rs.parse_record(self.live(A), A).state, "leased")
+
+        self.setUp()
+        _, token = self.acquire(A)
+        self.assertEqual(self.pool("release", "--slot", A, "--token", token).returncode, 0)
+        with self.locked(A), self.assertRaisesRegex(rs.Refused, "never an adoption source"):
+            self.store().adopt(A, "op-1", self.live(A))
+        self.assertEqual(self.gate(A)["recovery"], "none")
 
 
 class Rollback(Recovery):

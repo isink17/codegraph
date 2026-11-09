@@ -307,8 +307,8 @@ which must agree with both. Then:
 | `RECOVERY_REQUESTED`, `QUARANTINED`, `QUIESCENCE_VERIFIED`, `PRESERVED` | `blocked` | refused, the holder included |
 | `READY_FOR_REASSIGNMENT` | `blocked` | refused until a separately authorized reassignment exists; READY is not a free lease |
 | a trailing intent, a terminal state without its marker, an interrupted adoption (`.adopt-*`), a temporary file left by an interrupted write, the store's own lock `recovery/.<slot>.lock` | `incomplete` | refused |
-| a malformed, contradictory or forged journal, state or marker; a marker on an unfinished operation; an operation adopted from a lease that is not version 2; more than one unfinished operation; an unexpected entry, symlink, mode or owner; an entry in `recovery/` for no slot of the pool | `corrupt` | refused |
-| anything unreadable, an unsupported platform (Windows), or a helper that fails or misbehaves | `unknown` | refused |
+| a malformed, contradictory or forged journal, state or marker; a marker on an unfinished operation; an operation adopted from a lease that is not version 2; more than one unfinished operation; an unexpected entry, symlink, mode or owner; an entry in `recovery/` that names no slot record of the pool | `corrupt` | refused |
+| anything unreadable, including a recovery directory that cannot be both listed and searched; an unsupported platform (Windows); a helper that fails or misbehaves | `unknown` | refused |
 
 A slot takes the worst class over all its operations, so one corrupt earlier
 operation blocks a valid later one, and every cancelled operation must still
