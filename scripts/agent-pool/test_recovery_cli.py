@@ -17,6 +17,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -270,6 +271,9 @@ class Interlock(Cli):
         aliases["symlink"] = str(self.t / "alias")
         if Path("/System/Volumes/Data" + live).parent.exists():
             aliases["firmlink"] = "/System/Volumes/Data" + live
+        for name, sub in (("firmlink-inside", live + "/archive"), ("firmlink-parent", os.path.dirname(live))):
+            if os.path.isdir(sub) and os.path.isdir("/System/Volumes/Data" + sub):
+                aliases[name] = "/System/Volumes/Data" + sub
         before = live_tree()
         for name, path in aliases.items():
             for env in ({}, {"CG_POOL_LEASES": live}, {"HOME": str(self.t / "home"), "CG_POOL_LEASES": path}):
@@ -295,19 +299,24 @@ class Interlock(Cli):
         # The same pool is accepted once it is not the live one.
         cli.synthetic_pool(str(self.leases), A)
 
-    def test_an_inode_alias_of_the_live_pool_is_refused(self):
-        live = self.t / "elsewhere-live"
-        live.mkdir(exist_ok=True)
-        st = os.stat(self.leases)
+    def test_inode_aliases_of_the_live_pool_are_refused(self):
+        """Paths that name the live pool's inodes under other names, as a
+        firmlink or bind mount would, played by a stat that resolves them."""
+        (self.t / "elsewhere-live").mkdir(exist_ok=True)
         real_stat = os.stat
-
-        def fake_stat(p, *a, **k):
-            # The live path resolves to the pool's inode, as a firmlink or bind mount would.
-            return real_stat(self.leases) if str(p) == str(live) else real_stat(p, *a, **k)
-        with mock.patch.object(cli, "live_pool", lambda: str(live)), mock.patch.object(cli.os, "stat", fake_stat):
-            self.assertEqual((os.stat(str(live)).st_ino), st.st_ino)
-            with self.assertRaisesRegex(rs.Refused, "aliases the live pool"):
-                cli.synthetic_pool(str(self.leases), A)
+        cases = {
+            # The live pool is the pool's parent under another name: the pool lies inside it.
+            "inside": (self.t / "elsewhere-live", {str(self.t / "elsewhere-live"): self.t}, "a path inside it"),
+            # A parent of the live pool is the pool under another name: the pool lies above it.
+            "above": (self.t / "elsewhere" / "pool", {str(self.t / "elsewhere"): self.leases}, "one of its parents"),
+        }
+        for name, (live, alias, msg) in cases.items():
+            def fake_stat(p, *a, alias=alias, **k):
+                return real_stat(alias[str(p)]) if str(p) in alias else real_stat(p, *a, **k)
+            with self.subTest(case=name), mock.patch.object(cli, "live_pool", lambda live=live: str(live)), \
+                    mock.patch.object(cli.os, "stat", fake_stat):
+                with self.assertRaisesRegex(rs.Refused, msg):
+                    cli.synthetic_pool(str(self.leases), A)
 
     def test_the_pool_path_must_be_absolute_and_canonical(self):
         (self.t / "pool-link").unlink(missing_ok=True)
@@ -321,6 +330,11 @@ class Interlock(Cli):
                     self.assertIn(p.returncode, (1, 2), f"{action}: {p.stderr}")
                     self.assertNotEqual(p.returncode, 0)
         self.assertEqual(self.tree(), before)
+        (self.t / "afile").write_text("x")
+        for path, why in (("relative/pool", "explicit absolute pool path"),
+                          (str(self.t / "afile"), "not a directory of this user")):
+            for action, p in self.every_action(path):
+                self.assertIn(why, p.stderr, action)
 
     def test_the_synthetic_marker_must_be_present_well_formed_and_private(self):
         _, token = self.acquire(A)
@@ -746,6 +760,81 @@ class Crash(Cli):
         self.assertIn(f"state={rs.REQUESTED}", lines[0])
         self.assertEqual([m for m in made if m.endswith(".lock")], [])
         self.assertFalse((self.leases / "recovery" / f".{A}.lock").exists())
+
+
+class Hook(Cli):
+    def prepared(self):
+        self.acquire(A)
+        op, _ = self.path_to(A, "request")
+        pre = self.live(A)
+        r = rs.parse_record(pre, A)
+        return op, pre, r, rs.quarantined_record(A, op, r.generation + 1, r)
+
+    def test_the_hook_checks_its_lock_and_the_post_image(self):
+        op, pre, r, good = self.prepared()
+        hook = cli._replace_hook(str(self.leases), A, op)
+        with self.assertRaisesRegex(rs.Refused, "does not hold the slot lock"):
+            hook(pre, good)
+        bad = {"another operation": rs.quarantined_record(A, "op-other", r.generation + 1, r),
+               "the same generation": rs.quarantined_record(A, op, r.generation, r),
+               "another identity": good.replace(r.identity, "2" * 32),
+               "a lease": pre}
+        with self.locked(A):
+            for name, post in bad.items():
+                with self.subTest(post=name):
+                    with self.assertRaisesRegex(rs.Refused, "does not follow from the adopted lease"):
+                        hook(pre, post)
+                    self.assertEqual(self.live(A), pre)
+            self.assertEqual(hook(pre, good), good)
+        self.put(A, pre)
+
+    def test_the_hook_returns_what_it_reads_back(self):
+        op, pre, r, good = self.prepared()
+        hook = cli._replace_hook(str(self.leases), A, op)
+        with self.locked(A), mock.patch.object(pool_record, "durable_replace",
+                                               lambda path, text: Path(path).write_text(text.replace("task=t", "task=x"))):
+            got = hook(pre, good)
+        self.assertNotEqual(got, good)
+        self.assertEqual(got, self.live(A))
+        self.put(A, pre)
+
+    def test_a_lying_hook_never_counts_as_the_replace(self):
+        op, pre, r, good = self.prepared()
+        with mock.patch.object(cli, "_replace_hook", lambda pool, slot, op_: (lambda p, post: post)):
+            err, _ = self.inproc("quarantine", A, op)
+        self.assertIsInstance(err, cli.Unfinished)
+        self.assertIn("does not show it", str(err))
+        self.assertEqual(self.live(A), pre)
+
+    def test_adopt_refuses_an_unsound_recovery_directory(self):
+        self.acquire(A)
+        root = self.leases / "recovery"
+        root.mkdir(mode=0o700)
+        cases = (("an unexpected entry", lambda: (root / "notes").write_text("x"), lambda: (root / "notes").unlink()),
+                 ("the store lock", lambda: (root / f".{A}.lock").mkdir(mode=0o700),
+                  lambda: (root / f".{A}.lock").rmdir()))
+        for name, arrange, cleanup in cases:
+            with self.subTest(case=name):
+                arrange()
+                before = self.tree()
+                err, _ = self.inproc("adopt", A)
+                self.assertIsInstance(err, rs.Refused)
+                self.assertIn("recovery state is", str(err))
+                self.assertEqual(self.tree(), before)
+                cleanup()
+
+    def test_an_operation_on_a_lease_that_is_not_version_2_is_refused(self):
+        self.acquire(A)
+        other = self.t / "other-v1"
+        shutil.rmtree(other, True)
+        rs.RecoveryStore(other).adopt(A, "op-1", v1_lease())
+        (self.leases / "recovery").mkdir(mode=0o700)
+        shutil.copytree(other / A, self.leases / "recovery" / A)
+        before = self.tree()
+        for step in ("cancel", "request"):
+            err, _ = self.inproc(step, A, "op-1")
+            self.assertIn("version 2 leases", str(err), step)
+            self.assertEqual(self.tree(), before)
 
 
 class Locks(Cli):
