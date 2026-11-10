@@ -118,8 +118,7 @@ class Session:
         def ctty():
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         self.p = subprocess.Popen(["/bin/bash", str(POOL), "recover", *args], stdin=slave, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=env, cwd=test.t, start_new_session=True,
-                                  preexec_fn=ctty)
+                                  stderr=subprocess.PIPE, env=env, start_new_session=True, preexec_fn=ctty)
         os.close(slave)
 
     def _read(self, timeout):
@@ -183,10 +182,10 @@ class Cli(Recovery):
     def confined(self, pool, slot):
         """Refuses to start pool.sh unless the lock it could create for `pool`
         lies inside this test's directory, compared by inode so a firmlink
-        alias counts as inside. Relative paths resolve against the run's
-        working directory, which is that directory."""
-        target = os.path.realpath(os.path.join(self.t, pool + f"/.{slot}.lock"))
-        if not pool or not any(os.path.exists(p) and os.path.samefile(p, self.t)
+        alias counts as inside. pool.sh starts with `cd /`, so a relative path
+        resolves against the root, as here."""
+        target = os.path.realpath(os.path.join("/", pool + f"/.{slot}.lock"))
+        if not any(os.path.exists(p) and os.path.samefile(p, self.t)
                                for p in (target, *map(str, Path(target).parents))):
             raise AssertionError(f"pool.sh would run on {pool!r}, outside the test's directory {self.t}")
 
@@ -202,14 +201,14 @@ class Cli(Recovery):
         """pool.sh recover without a pool: it must stop while parsing its
         arguments, before naming any directory."""
         p = subprocess.run(["/bin/bash", str(POOL), "recover", *args], stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, env=self.env, cwd=self.t, start_new_session=True, timeout=120)
+                           text=True, env=self.env, start_new_session=True, timeout=120)
         self.assertEqual((p.returncode, p.stdout), (2, ""), p.stderr)
         self.assertRegex(p.stderr, r"usage: pool.sh recover|recover needs --pool and --slot")
 
     def recover(self, action, slot=A, op=None, *extra, pool=None, stdin=subprocess.DEVNULL, **env):
         """pool.sh recover in a new session with no controlling terminal."""
         p = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args(action, slot, op, pool, *extra)],
-                           stdin=stdin, capture_output=True, text=True, env={**self.env, **env}, cwd=self.t,
+                           stdin=stdin, capture_output=True, text=True, env={**self.env, **env},
                            start_new_session=True, timeout=120)
         self.outputs.append(p.stdout + p.stderr)
         return p
@@ -264,11 +263,14 @@ class Cli(Recovery):
         """Every file and directory of the test's tree is as it was. With
         under_lock, the refusals came after pool.sh took the slot lock: the lock
         directory was created and removed in the pool, so the pool directory's
-        own modification and change times are the one difference allowed."""
+        own modification and change times must differ, and nothing else may.
+        Any other entry created and removed in the pool directory itself would
+        leave the same trace; entries anywhere else still count."""
         after = snapshot(self.t)
         diff = changes(before, after)
         pool = os.path.relpath(self.leases, self.t)
-        if under_lock and diff == [pool]:
+        if under_lock:
+            self.assertEqual(diff, [pool], "under_lock, but pool.sh did not take and release the slot lock")
             # (type, mode, links, inode, size, mtime, ctime, body): all but the two times must match.
             self.assertEqual(before[pool][:5] + before[pool][7:], after[pool][:5] + after[pool][7:])
             diff = []
@@ -310,7 +312,7 @@ class Interlock(Cli):
             extra = ("--evidence", self.ev) if action == "preservation" else ()
             p = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args(action, A, op, pool, *extra)],
                                stdin=subprocess.DEVNULL, capture_output=True, text=True, env={**self.env, **env},
-                               cwd=self.t, start_new_session=True, timeout=120)
+                               start_new_session=True, timeout=120)
             yield action, p
 
     def userdb_python(self, home):
@@ -367,7 +369,7 @@ class Interlock(Cli):
         before = snapshot(self.t)
         # Control: the same replica is an acceptable synthetic pool while the user database names another home.
         ok = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args("inspect", A, None, live)],
-                            stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=self.t, timeout=120,
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
                             env={**self.env, **elsewhere})
         self.assertEqual(ok.returncode, 0, ok.stderr)
         for name, path in aliases.items():
@@ -430,7 +432,11 @@ class Interlock(Cli):
         (self.t / "pool-link").unlink(missing_ok=True)
         (self.t / "pool-link").symlink_to(self.leases)
         before = snapshot(self.t)
-        for path in ("relative/pool", str(self.leases) + "/", f"{self.leases}/.", f"{self.t}/x/..",
+        relative = str(self.leases).lstrip("/")   # pool.sh resolves it from / to the test's own pool
+        for outside in (str(self.t.parent).lstrip("/"), "/", str(self.t.parent), str(self.t) + "/.."):
+            with self.assertRaisesRegex(AssertionError, "outside the test's directory"):
+                self.confined(outside, A)
+        for path in (relative, str(self.leases) + "/", f"{self.leases}/.", f"{self.t}/x/..",
                      f"{self.leases.parent}/./{self.leases.name}", f"{self.leases}/../{self.leases.name}", str(self.t / "pool-link"),
                      str(self.t / "missing")):
             with self.subTest(path=path):
@@ -440,7 +446,7 @@ class Interlock(Cli):
         self.usage_error("adopt", "--pool", "", "--slot", A)
         self.assert_untouched(before)
         (self.t / "afile").write_text("x")
-        for path, why in (("relative/pool", "explicit absolute pool path"),
+        for path, why in ((relative, "explicit absolute pool path"),
                           (str(self.t / "afile"), "not a directory of this user")):
             for action, p in self.every_action(path):
                 self.assertIn(why, p.stderr, action)
@@ -529,7 +535,7 @@ class Interlock(Cli):
         p = self.recover("adopt", stdin=open(os.devnull, "rb"), CG_RECOVERY_CONFIRM="yes")
         piped = subprocess.run(["/bin/bash", str(POOL), "recover", "adopt", "--pool", str(self.leases), "--slot", A],
                                input="\n".join([A, "x", "adopt"] * 5), capture_output=True, text=True, env=self.env,
-                               cwd=self.t, start_new_session=True, timeout=60)
+                               start_new_session=True, timeout=60)
         for q in (p, piped):
             self.assertEqual(q.returncode, 1)
             self.assertIn("needs an interactive terminal", q.stderr)
@@ -1052,7 +1058,7 @@ class Locks(Cli):
         for args in self.mutators(A, token):
             self.assertIn("lock held", self.pool(*args).stderr)
         self.assertIn("lock held", self.recover("request", A, op).stderr)
-        self.assert_untouched(before, under_lock=True)
+        self.assert_untouched(before)
         # The documented procedure: inspect read-only, see nothing unfinished, then remove the lock by hand.
         ins = self.recover("inspect", A, op)
         self.assertIn("pending=none", ins.stdout)
@@ -1072,7 +1078,7 @@ class ReadOnly(Cli):
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertNotIn(rtok, p.stdout + p.stderr)
                 self.assertNotIn(token, p.stdout + p.stderr)
-            self.assert_untouched(before, under_lock=True)
+            self.assert_untouched(before)
         out = self.recover("inspect", A, op).stdout
         for key in ("slot=", f"operation={op}", f"state={rs.QUARANTINED}", "seq=2", "pending=none",
                     "terminal_marker=none", "expected_record=v2 quarantined", "observed_record=v2 quarantined",
