@@ -9,6 +9,8 @@
 #   pool.sh prepare --slot <slot> | --all
 #   pool.sh migrate [--dry-run]
 #   pool.sh unmigrate
+#   pool.sh recover <action> --pool <absolute path> --slot <slot> [--op <op_id>] [--evidence <file>]
+#     (synthetic pools only; docs/agent-pool.md, "Recovery command line")
 #
 # Exit codes: 0 ok, 1 refused, 2 usage, 3 BLOCKED_POOL_BUSY. acquire exits 0
 # only after it has written a lease; any other exit it chooses means it wrote
@@ -889,6 +891,45 @@ cmd_unmigrate() {
 	[[ $(marker_state) == absent ]] || die "unmigrate reported success but the marker remains; owner must inspect"
 }
 
+# Recovery of a synthetic pool only. The interlock runs before anything
+# touches the pool: no default path, no lock, no directory is created first.
+# The mutating actions then take the slot lock here and recovery_cli.py runs
+# under it, reading the owner's confirmation from /dev/tty, never stdin.
+cmd_recover() {
+	local action=${1:-} pool="" slot="" op="" evidence="" out args
+	case $action in
+	adopt | request | cancel | quarantine | quiescence | preservation | ready | reconcile | inspect) shift ;;
+	*) die "usage: pool.sh recover adopt|request|cancel|quarantine|quiescence|preservation|ready|reconcile|inspect --pool <absolute path> --slot <slot> [--op <op_id>] [--evidence <file>]" 2 ;;
+	esac
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--pool) need "$@"; pool=$2; shift 2 ;;
+		--slot) need "$@"; slot=$2; shift 2 ;;
+		--op) need "$@"; op=$2; shift 2 ;;
+		--evidence) need "$@"; evidence=$2; shift 2 ;;
+		*) die "unknown argument $1" 2 ;;
+		esac
+	done
+	[[ -n $pool && -n $slot ]] || die "recover needs --pool and --slot" 2
+	known_slot "$slot" || die "unknown slot $slot" 2
+	out=$("$PYTHON" -I -B "$HERE/recovery_cli.py" check "$pool" "$slot" </dev/null) ||
+		die "recover refused before touching the pool; nothing changed"
+	[[ $out == "synthetic-pool=$pool" ]] || die "recover: the synthetic pool interlock was not confirmed; nothing changed"
+	args=("$action" "$pool" "$slot")
+	[[ -z $op ]] || args+=(--op "$op")
+	[[ -z $evidence ]] || args+=(--evidence "$evidence")
+	LEASES=$pool MARKER=$pool/.schema RECOVERY=$pool/recovery
+	case $action in
+	inspect | reconcile)
+		"$PYTHON" -I -B "$HERE/recovery_cli.py" "${args[@]}" </dev/null
+		return
+		;;
+	esac
+	lock_slot "$slot" || die "$slot lock held: $LEASES/.$slot.lock; nothing changed"
+	[[ $(marker_state) == 2 ]] || die "the synthetic pool is not migrated; nothing changed"
+	"$PYTHON" -I -B "$HERE/recovery_cli.py" "${args[@]}" </dev/null
+}
+
 case ${1:-} in
 status) shift; cmd_status "$@" ;;
 assess) shift; cmd_assess "$@" ;;
@@ -899,5 +940,6 @@ reclaim) shift; cmd_reclaim "$@" ;;
 prepare) shift; cmd_prepare "$@" ;;
 migrate) shift; cmd_migrate "$@" ;;
 unmigrate) shift; cmd_unmigrate "$@" ;;
-*) die "usage: pool.sh status|assess|acquire|review-checkout|release|reclaim|prepare|migrate|unmigrate (see header)" 2 ;;
+recover) shift; cmd_recover "$@" ;;
+*) die "usage: pool.sh status|assess|acquire|review-checkout|release|reclaim|prepare|migrate|unmigrate|recover (see header)" 2 ;;
 esac

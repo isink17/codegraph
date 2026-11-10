@@ -33,6 +33,7 @@ scripts/agent-pool/pool.sh review-checkout --slot codegraph-review --token <toke
 scripts/agent-pool/pool.sh prepare --slot <slot> | --all
 scripts/agent-pool/pool.sh migrate [--dry-run]     # owner only; see "Version 2 slot records"
 scripts/agent-pool/pool.sh unmigrate               # owner only
+scripts/agent-pool/pool.sh recover <action> --pool <path> --slot <slot> ...   # synthetic pools only; see "Recovery command line"
 ```
 
 - A lease record carries `version=1`, a non-secret `lease_id`, the slot,
@@ -133,9 +134,19 @@ Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
 created with `mkdir`). The lock is advisory: it serialises `pool.sh` runs
 and nothing else, so it does not fence a process that writes to the slot or
 the lease directory without taking it. A lock left behind by a crashed run
-blocks the slot and is reported; remove it by hand only after checking that
-no `pool.sh` process is running. `migrate` and `unmigrate` take every slot
-lock, so one held lock refuses them.
+blocks the slot and is reported; nothing removes it automatically. The owner
+removes it by hand only after all of these, recorded in evidence:
+
+1. No `pool.sh`, `recovery_cli.py`, coordinator or campaign process is
+   running (`pgrep -fl 'pool.sh|recovery_cli.py|coordinator.py|campaign.py'`),
+   and none has its cwd in the slot.
+2. In a synthetic pool, `pool.sh recover inspect --pool <pool> --slot <slot>`
+   shows `pending=none` for every operation, or the unfinished transition is
+   noted for its exact retry. Inspect takes no lock and changes nothing.
+3. Only then `rmdir <pool>/.<slot>.lock`, never `rm -r`.
+
+`migrate` and `unmigrate` take every slot lock, so one held lock refuses
+them.
 
 ## Recovery
 
@@ -158,14 +169,14 @@ lock, so one held lock refuses them.
 ## Recovery state machine
 
 `scripts/agent-pool/recovery_state.py` models orphan lease recovery
-(CG-150, phases 2a and 2b-1). It is a library with tests and nothing else.
-`pool.sh`, the coordinator and the campaign never create or advance an
-operation, and it has no command-line entry point. `pool.sh` borrows its
-record parser (see "Version 2 slot records") and, in a migrated pool, its
-read-only queries for the recovery gate (see "Recovery gate"). It cannot
-quarantine, reclaim or reassign a real slot, and it never reads or writes the
-pool: the caller passes the live slot record as text and does any replacement
-itself.
+(CG-150, phases 2a and 2b-1). It is a library with no command-line entry
+point. Only `recovery_cli.py`, run as `pool.sh recover` against marked
+synthetic pools (see "Recovery command line"), creates or advances an
+operation; the coordinator and the campaign never do. `pool.sh` also borrows
+its record parser (see "Version 2 slot records") and, in a migrated pool, its
+read-only queries for the recovery gate (see "Recovery gate"). Nothing
+reassigns a slot, and the library never reads or writes the pool: the caller
+passes the live slot record as text and does any replacement itself.
 
 One recovery operation, named by an operation ID, moves one transition at a
 time:
@@ -288,9 +299,9 @@ again under the same lock. The command prints exactly six lines (`slot=`,
 exits 0. Anything else, including a non-zero exit, missing or extra lines,
 another slot's name, or a `gate=` that disagrees with the class, makes the
 slot `unknown` in `pool.sh`, which blocks. The gate never creates, repairs or
-removes anything under `recovery/`, and nothing in `pool.sh` or
-`pool_record.py` creates or advances an operation: that needs the recovery
-command line of a later phase.
+removes anything under `recovery/`. `pool_record.py` never creates or
+advances an operation; only `pool.sh recover` does, and only in a marked
+synthetic pool.
 
 Every operation under `recovery/<slot>/` is read with the library: directory
 and file types, ownership and modes (no symlinks, 0700 directories, 0600
@@ -337,6 +348,195 @@ still exits 0.
   recovery may happen without a separate, OS-enforced authorization boundary,
   such as a dedicated user that owns the pool with a narrow privileged entry
   point. That remains a future design decision.
+
+## Recovery command line
+
+`pool.sh recover` drives the recovery state machine (CG-150, phase 2b-2c-2),
+**in disposable synthetic pools only**. It exists to implement and test the
+protocol. Nothing in it is authorized for, or able through its supported
+use to reach, the live pool, and passing its tests says nothing about the
+security of a live recovery.
+
+    pool.sh recover adopt        --pool <pool> --slot <slot>
+    pool.sh recover request      --pool <pool> --slot <slot> --op <op_id>
+    pool.sh recover cancel       --pool <pool> --slot <slot> --op <op_id>
+    pool.sh recover quarantine   --pool <pool> --slot <slot> --op <op_id>
+    pool.sh recover quiescence   --pool <pool> --slot <slot> --op <op_id>
+    pool.sh recover preservation --pool <pool> --slot <slot> --op <op_id> --evidence <file>
+    pool.sh recover ready        --pool <pool> --slot <slot> --op <op_id>
+    pool.sh recover inspect      --pool <pool> --slot <slot> [--op <op_id>]
+    pool.sh recover reconcile    --pool <pool> --slot <slot> --op <op_id>
+
+**Synthetic-only interlock.** Before anything touches the pool (no lock, no
+directory), `recovery_cli.py check` must confirm all of these, and it runs
+again under the slot lock:
+
+- `--pool` is given explicitly; there is no default. It must be absolute and
+  canonical (no symlink, no `.` or `..` part, no trailing slash), and a
+  directory of this user.
+- It is not the live pool, `~/Projekti/codegraph-evidence/pool`, a path
+  inside it or one of its parents. The home directory comes from the user
+  database, not `$HOME`, and `CG_POOL_LEASES` plays no part: a live pool
+  configured elsewhere is kept out only by its lack of a synthetic marker. Inode
+  comparison also refuses aliases that keep their own path, such as the
+  macOS `/System/Volumes/Data` firmlinks.
+- `<pool>/.synthetic-pool` is a private, singly linked regular file of this
+  user (not a symlink, at most 4 KiB) containing exactly
+  `codegraph-synthetic-recovery-pool=1` and a `slots=` line that lists the
+  slot. Every listed slot has a regular, singly linked slot record.
+- The pool is migrated (marker `2`), Python is 3.9 or later, and the
+  platform is supported (not Windows).
+- Every mutating action needs an interactive controlling terminal
+  (`/dev/tty`). stdin is never read: `pool.sh` gives the helper `/dev/null`.
+
+There is no force, unsafe or skip option, no live mode, and no environment
+variable, flag or file that confirms anything for the owner. **The interlock
+prevents accidents. It authenticates nobody**: any process of the owner's
+user can write the marker, drive a pseudo-terminal, take the lock directory
+or call `recovery_state.py` directly. A recovery started that way is exactly
+as untrusted as the library already documents. Between the first check and
+the lock there is a window: a pool path swapped for another directory in it
+could briefly get a lock directory, but nothing else, because the helper
+checks again under the lock and refuses. Run the helper only through
+`pool.sh recover`; run directly it takes any existing lock directory as held.
+
+**Locking.** The mutating actions take the slot lock `<pool>/.<slot>.lock`
+in `pool.sh` with the same `mkdir` protocol every other command uses, then
+read the marker under it. The helper checks that the lock exists and passes
+it to the library as `held_lock`, so no second lock (such as
+`recovery/.<slot>.lock`) is ever taken. The lock is held while the owner
+confirms, so the values shown are the values acted on, and every other
+command on that slot meanwhile refuses with "lock held". `inspect` and
+`reconcile` take no lock.
+
+**Confirmation (trust level `same-uid-attestation`).** Before any change the
+terminal shows the pool, slot, operation, transition, adopted identity, slot
+generation and journal sequence, and, for every step after adoption, the
+complete canonical JSON of the authorization or evidence with its digest.
+The owner then retypes the slot, operation, transition, the first 12
+characters of the identity, the generation, the sequence and the first 12
+characters of the digest. Any mismatch refuses and changes nothing.
+
+- `actor` is the user database name of the user, and `utc` is the time of
+  confirmation.
+- `request`, `cancel` and `quarantine` ask for a reason. `quarantine` also
+  asks for the quiescence method, the preservation disposition and an
+  assessment digest.
+- `quiescence` asks for evidence references and for each writer class to be
+  confirmed accounted for.
+- `preservation` reads its head, inventory and preserved copies from
+  `--evidence`, a private JSON file with exactly those keys. The file is
+  evidence the owner sees in full before confirming, not an approval.
+- `ready` asks for the observed HEAD and cleanliness. It sets `lease_absent`
+  only after checking that the live record is this operation's quarantined
+  record.
+
+The process and evidence facts are the owner's attestations. Nothing here
+observes processes or runs Git.
+
+**Interrupted steps.** A step interrupted after its intent can finish only
+with its exact original record, timestamp included. The command asks for the
+original `utc` and `reason` (and for quarantine its other fields), compares
+the digest with the journal before showing anything, and refuses a changed or
+regenerated record. Keep the record the terminal showed: the journal holds
+only its digest. The same applies to a cancelled or ready operation whose
+terminal marker was not written; repeating the step writes it.
+
+**Recovery token.** `quarantine` generates a fresh token, shows it once on
+the terminal after the owner confirmed the authorization and before the
+quarantine intent is written, and starts only after the owner retypes it
+(not echoed). A retry whose state was already written asks for the retained
+token instead. A retry whose state was never written issues a new one and
+says so. Every later step reads the token from the terminal without echo, and
+the library checks it against its salted verifier.
+
+- The token is never in argv, the environment, stdout, stderr, a file, a log,
+  the journal or a file name. Never run `recover` through an agent session
+  (for example a `!` command in Claude Code): its terminal output would
+  reach the agent's context.
+- There is no rotation. **A lost token leaves the operation quarantined for
+  good**: the slot stays out of service and nothing in the normal protocol
+  advances it.
+
+**Quarantine record replacement.** The hook runs under the held slot lock. It
+reads the live record without following symlinks and requires it to be
+exactly the pre-image the intent named and the adopted version 2 lease. The
+post-image must be this operation's quarantined record at the next
+generation, with the same identity and no `token=` line. The hook then
+replaces the record with `durable_replace`, reads it back, and returns what
+it read. After the library completes, the command reads the record again and
+requires the quarantined record. A failure anywhere after the intent leaves
+an unfinished quarantine (exit 4), which `reconcile` classifies against the
+live record: `pre` (the replace did not happen), `post` (it did) or `corrupt`
+(neither; the owner inspects).
+
+**Other recovery state fails closed.**
+
+- `adopt` takes only a version 2 leased record, and only when every earlier
+  operation of the slot is cancelled and still fits the record. An `.adopt-*`
+  leftover, a store lock, an unexpected entry or an unfinished operation
+  refuses it.
+- The other steps refuse when another operation of the slot is not such a
+  cancelled one, when the operation directory holds a temporary file left by
+  an interrupted write, or when the operation adopted anything but a version
+  2 lease.
+- Cancellation is terminal, never writes the slot record, and is refused from
+  `QUARANTINED` on. `CANCELLED` does not free a leased slot, and
+  `READY_FOR_REASSIGNMENT` stays blocked: there is no reassignment command.
+
+**inspect and reconcile** change nothing. They take no lock, so while a
+transition is running they can briefly report it `incomplete` or `corrupt`;
+read them again once no recovery command runs. They report:
+
+- the slot and operation;
+- state, sequence and slot generation;
+- the identity;
+- any unfinished transition;
+- the terminal marker (`consistent`, `missing`, `none` or `inconsistent`);
+- the expected and observed slot record;
+- whether the record is `unchanged`, `released`, `replaced`, `incompatible`
+  or `absent`;
+- the gate class;
+- the exact next permitted action, or why there is none.
+
+**Exit codes.**
+
+| Exit | Meaning |
+|---|---|
+| 0 | done, or already in the requested state |
+| 1 | refused; nothing was written (the slot's recovery tree and record are compared before and after) |
+| 2 | usage |
+| 3 | Python too old |
+| 4 | something was written and the step did not finish, or the outcome is unconfirmed; run `inspect` |
+| 128+N | the helper was killed by signal N; treat as 4 |
+
+**Tests never aim pool.sh at the live pool.** `test_recovery_cli` runs
+`pool.sh recover` only on paths inside its temporary directory, and checks
+that by inode before each run. The live pool and its aliases are played by a
+replica there: pool.sh gets an interpreter (`CG_POOL_PYTHON`) whose user
+database names a home directory in the test's tree. The real live pool is
+checked only in process, by `stat`. Refused runs must leave every file and
+directory of the test's tree unchanged, directory times included, so even a
+lock created and removed again fails the test. Mutation testing must run
+each mutant under an outer OS sandbox applied from outside the code under
+test. Its only writable area is a fresh run directory that is not the live
+pool, inside it or one of its parents. If that containment cannot be
+verified first, the run stops.
+
+**Not in this phase.**
+
+- Live recovery or migration.
+- An OS-enforced boundary (a dedicated account owning the pool, with a
+  narrow, separately authenticated entry point).
+- Protected token custody.
+- Phase 3 reassignment.
+
+That future privileged component must not run Git in an agent-writable
+worktree, run agent-controlled code or interpreters, trust a caller's
+assertion of cleanliness, HEAD, quiescence or process absence, follow
+unvalidated paths, take a lock directory as proof of ownership, or take a
+cached `sudo` session as fresh owner approval. It needs a supported,
+patched, root-owned interpreter.
 
 ## Plane tracking
 
@@ -540,6 +740,12 @@ the library in every state, faults at each persistence point, forged,
 missing and contradictory markers, symlinks and modes, failing interpreters,
 lock races, old `pool.sh` copies (including the presence-fence copy of PR
 #539 with its helpers), and the current and an older coordinator reader.
-Hosted CI runs `test_recovery_state`, `test_pool_v2`, `test_pool_v2_writes`,
-`test_recovery_gate` and `pool_test.sh` on Linux (job `pool-safety`); the
+`test_recovery_cli` drives `pool.sh recover` through a pseudo-terminal made
+the controlling terminal of a new session, and runs crash points in process
+with a scripted terminal. It covers the interlock, including the real live
+path and its aliases (compared by `stat` before and after; no file there is
+read), confirmation, retries, token custody, quarantine reconciliation and
+locking. Hosted CI runs `test_recovery_state`, `test_pool_v2`,
+`test_pool_v2_writes`, `test_recovery_gate`, `test_recovery_cli` and
+`pool_test.sh` on Linux (job `pool-safety`); the
 coordinator and campaign suites run only locally on macOS. Windows is not run.

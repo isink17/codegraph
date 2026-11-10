@@ -755,7 +755,10 @@ class Rollback(Recovery):
 
 
 class NoRecoveryCommand(Recovery):
-    def test_no_command_creates_or_advances_an_operation(self):
+    def test_only_the_synthetic_recover_command_creates_or_advances_an_operation(self):
+        """pool_record.py has no writer of recovery state, and pool.sh reaches
+        one only through `recover`, which needs a marked synthetic pool
+        (test_recovery_cli). This pool carries no such marker."""
         for cmd in ("adopt", "request", "cancel", "quarantine", "quiescence", "preservation", "ready", "recover",
                     "reconcile"):
             p = subprocess.run(["python3", "-I", "-B", str(HERE / "pool_record.py"), cmd, str(self.leases), A],
@@ -763,6 +766,11 @@ class NoRecoveryCommand(Recovery):
             self.assertEqual(p.returncode, 2, cmd)
             self.assertEqual(self.pool(cmd, "--slot", A).returncode, 2, cmd)
             self.assertEqual(self.pool("recover", cmd, "--slot", A).returncode, 2, cmd)
+            if cmd not in ("recover", "adopt", "inspect"):
+                p = subprocess.run(["/bin/bash", str(POOL), "recover", cmd, "--pool", str(self.leases), "--slot", A,
+                                    "--op", "op-1"], capture_output=True, text=True, env=self.env,
+                                   start_new_session=True, stdin=subprocess.DEVNULL)
+                self.assertEqual(p.returncode, 1, cmd)
         self.assertFalse((self.leases / "recovery").exists())
         writers = {"adopt", "request", "cancel", "quarantine", "verify_quiescence", "record_preservation",
                    "mark_ready", "reconcile", "_step", "_commit", "_complete", "_append", "_replace", "_ensure_dir",
