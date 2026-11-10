@@ -39,6 +39,8 @@ MARK = cli.SYNTHETIC_HEAD + "\nslots=" + " ".join(SLOTS) + "\n"
 RETYPES = ["slot", "operation", "transition", "first 12 characters of the adopted identity", "slot generation",
            "journal sequence", "first 12 characters of the digest"]
 HEAD = "a" * 40
+# Runs aimed at the real live pool happen under a no-write sandbox where one exists (macOS).
+SANDBOX = "/usr/bin/sandbox-exec"
 TOKEN_SHOWN = re.compile(r"quarantined for good\.\r?\n([0-9a-f]{32})\r?\n")
 
 
@@ -264,17 +266,26 @@ def unexplained(before, after):
 
 
 class Interlock(Cli):
-    def every_action(self, pool, **env):
+    def every_action(self, pool, write_nothing=False, **env):
+        """Every recover action against `pool`. With write_nothing, on macOS the
+        run happens under a sandbox that denies every file write outside /dev,
+        so even a broken pool.sh cannot touch what `pool` names."""
+        jail = []
+        if write_nothing and os.path.exists(SANDBOX):
+            jail = [SANDBOX, "-p", '(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "/dev"))']
         for action in cli.ACTIONS:
             op = None if action in ("adopt", "inspect") else "op-1"
             extra = ("--evidence", self.evidence()) if action == "preservation" else ()
-            p = subprocess.run(["/bin/bash", str(POOL), "recover", action, "--pool", pool, "--slot", A,
+            p = subprocess.run([*jail, "/bin/bash", str(POOL), "recover", action, "--pool", pool, "--slot", A,
                                 *(["--op", op] if op else []), *extra], stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, env={**self.env, **env}, start_new_session=True,
                                timeout=120)
             yield action, p
 
     def test_the_live_pool_and_its_aliases_are_refused_before_anything_happens(self):
+        """Runs aimed at the real live pool and its aliases: refused before the
+        lock. On macOS a no-write sandbox also keeps a broken pool.sh from
+        creating even a transient lock there."""
         live = cli.live_pool()
         aliases = {"live": live, "inside": live + "/recovery", "parent": os.path.dirname(live),
                    "home": os.path.dirname(os.path.dirname(os.path.dirname(live))), "root": "/"}
@@ -289,7 +300,7 @@ class Interlock(Cli):
         before = live_tree()
         for name, path in aliases.items():
             for env in ({}, {"CG_POOL_LEASES": live}, {"HOME": str(self.t / "home"), "CG_POOL_LEASES": path}):
-                for action, p in self.every_action(path, **env):
+                for action, p in self.every_action(path, write_nothing=True, **env):
                     with self.subTest(alias=name, action=action, env=sorted(env)):
                         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                         self.assertIn("nothing changed", p.stderr)
