@@ -510,6 +510,19 @@ read them again once no recovery command runs. They report:
 | 4 | something was written and the step did not finish, or the outcome is unconfirmed; run `inspect` |
 | 128+N | the helper was killed by signal N; treat as 4 |
 
+**Tests never aim pool.sh at the live pool.** `test_recovery_cli` runs
+`pool.sh recover` only on paths inside its temporary directory, and checks
+that by inode before each run. The live pool and its aliases are played by a
+replica there: pool.sh gets an interpreter (`CG_POOL_PYTHON`) whose user
+database names a home directory in the test's tree. The real live pool is
+checked only in process, by `stat`. Refused runs must leave every file and
+directory of the test's tree unchanged, directory times included, so even a
+lock created and removed again fails the test. Mutation testing must run
+each mutant under an outer OS sandbox applied from outside the code under
+test. Its only writable area is a fresh run directory that is not the live
+pool, inside it or one of its parents. If that containment cannot be
+verified first, the run stops.
+
 **Not in this phase.**
 
 - Live recovery or migration.

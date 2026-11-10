@@ -3,9 +3,11 @@
 End-to-end runs drive pool.sh through a pseudo-terminal made the controlling
 terminal of a new session; crash points run the same code in process with a
 scripted terminal and the library's fault hook. Every pool is a throwaway:
-HOME and every CG_POOL_* point into a temporary directory. The live pool is
-only ever named, to prove it is refused, and its tree is compared by stat
-before and after; no file in it is read.
+HOME and every CG_POOL_* point into a temporary directory, and every pool.sh
+run names a pool inside it. The live pool and its aliases are played by a
+replica there: pool.sh gets an interpreter whose user database gives a home
+directory in the test's tree. The real live pool is only checked in process,
+by stat; no test runs pool.sh against it and no file in it is read.
 
     python3 -m unittest test_recovery_cli      (from scripts/agent-pool)
 """
@@ -13,15 +15,19 @@ before and after; no file in it is read.
 import ast
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
+import pwd
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import termios
 import time
 import unittest
@@ -39,8 +45,6 @@ MARK = cli.SYNTHETIC_HEAD + "\nslots=" + " ".join(SLOTS) + "\n"
 RETYPES = ["slot", "operation", "transition", "first 12 characters of the adopted identity", "slot generation",
            "journal sequence", "first 12 characters of the digest"]
 HEAD = "a" * 40
-# Runs aimed at the real live pool happen under a no-write sandbox where one exists (macOS).
-SANDBOX = "/usr/bin/sandbox-exec"
 TOKEN_SHOWN = re.compile(r"quarantined for good\.\r?\n([0-9a-f]{32})\r?\n")
 
 
@@ -114,7 +118,8 @@ class Session:
         def ctty():
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         self.p = subprocess.Popen(["/bin/bash", str(POOL), "recover", *args], stdin=slave, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=env, start_new_session=True, preexec_fn=ctty)
+                                  stderr=subprocess.PIPE, env=env, cwd=test.t, start_new_session=True,
+                                  preexec_fn=ctty)
         os.close(slave)
 
     def _read(self, timeout):
@@ -175,16 +180,36 @@ class Cli(Recovery):
         p.write_text(text)
         p.chmod(mode)
 
+    def confined(self, pool, slot):
+        """Refuses to start pool.sh unless the lock it could create for `pool`
+        lies inside this test's directory, compared by inode so a firmlink
+        alias counts as inside. Relative paths resolve against the run's
+        working directory, which is that directory."""
+        target = os.path.realpath(os.path.join(self.t, pool + f"/.{slot}.lock"))
+        if not pool or not any(os.path.exists(p) and os.path.samefile(p, self.t)
+                               for p in (target, *map(str, Path(target).parents))):
+            raise AssertionError(f"pool.sh would run on {pool!r}, outside the test's directory {self.t}")
+
     def args(self, action, slot, op, pool, *extra):
-        a = [action, "--pool", str(pool or self.leases), "--slot", slot]
+        pool = str(pool or self.leases)
+        self.confined(pool, slot)
+        a = [action, "--pool", pool, "--slot", slot]
         if op:
             a += ["--op", op]
         return a + list(extra)
 
+    def usage_error(self, *args):
+        """pool.sh recover without a pool: it must stop while parsing its
+        arguments, before naming any directory."""
+        p = subprocess.run(["/bin/bash", str(POOL), "recover", *args], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, env=self.env, cwd=self.t, start_new_session=True, timeout=120)
+        self.assertEqual((p.returncode, p.stdout), (2, ""), p.stderr)
+        self.assertRegex(p.stderr, r"usage: pool.sh recover|recover needs --pool and --slot")
+
     def recover(self, action, slot=A, op=None, *extra, pool=None, stdin=subprocess.DEVNULL, **env):
         """pool.sh recover in a new session with no controlling terminal."""
         p = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args(action, slot, op, pool, *extra)],
-                           stdin=stdin, capture_output=True, text=True, env={**self.env, **env},
+                           stdin=stdin, capture_output=True, text=True, env={**self.env, **env}, cwd=self.t,
                            start_new_session=True, timeout=120)
         self.outputs.append(p.stdout + p.stderr)
         return p
@@ -235,82 +260,142 @@ class Cli(Recovery):
             except rs.Refused as e:
                 return e, term
 
+    def assert_untouched(self, before, under_lock=False):
+        """Every file and directory of the test's tree is as it was. With
+        under_lock, the refusals came after pool.sh took the slot lock: the lock
+        directory was created and removed in the pool, so the pool directory's
+        own modification and change times are the one difference allowed."""
+        after = snapshot(self.t)
+        diff = changes(before, after)
+        pool = os.path.relpath(self.leases, self.t)
+        if under_lock and diff == [pool]:
+            # (type, mode, links, inode, size, mtime, ctime, body): all but the two times must match.
+            self.assertEqual(before[pool][:5] + before[pool][7:], after[pool][:5] + after[pool][7:])
+            diff = []
+        self.assertEqual(diff, [], "a refused run changed the fixture")
+
     def store_state(self, slot, op):
         return rs.RecoveryStore(self.leases / "recovery").state(slot, op)
 
 
-def live_tree():
-    """stat of every path in the live pool, without reading a file."""
-    live = Path(cli.live_pool())
-    if not os.path.lexists(live):
-        return None
+def snapshot(root):
+    """Every path under `root`, `root` included, without following links:
+    type, mode, link count, inode, size, modification and change times, and
+    the contents of files and links. A lock created and removed again still
+    shows in its directory's times."""
     out = {}
-    for root, dirs, files in os.walk(live):
-        for n in sorted(dirs + files):
-            st = os.lstat(os.path.join(root, n))
-            out[os.path.relpath(os.path.join(root, n), live)] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino)
-    st = os.lstat(live)
-    out["."] = (st.st_mode, st.st_mtime_ns, st.st_ino)
+    for d, dirs, files in os.walk(root):
+        for p in (d, *(os.path.join(d, n) for n in dirs + files)):
+            st = os.lstat(p)
+            body = (os.readlink(p) if stat.S_ISLNK(st.st_mode) else
+                    hashlib.sha256(Path(p).read_bytes()).hexdigest() if stat.S_ISREG(st.st_mode) else None)
+            out[os.path.relpath(p, root)] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_nlink,
+                                             st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, body)
     return out
 
 
-def unexplained(before, after):
-    """Changes to the live pool that concurrent ordinary pool use cannot
-    explain: anything but its own directory times, lease files and archive.
-    A recovery command could only ever add a lock, a marker or recovery/."""
-    if before is None or after is None:
-        return [] if before == after else ["the live pool appeared or vanished"]
-    names = set(before) | set(after)
-    ordinary = lambda n: n == "." or n.endswith(".lease") or n == "archive" or n.startswith("archive/")
-    return sorted(n for n in names if before.get(n) != after.get(n) and not ordinary(n))
+def changes(before, after):
+    return sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
 
 
 class Interlock(Cli):
-    def every_action(self, pool, write_nothing=False, **env):
-        """Every recover action against `pool`. With write_nothing, on macOS the
-        run happens under a sandbox that denies every file write outside /dev,
-        so even a broken pool.sh cannot touch what `pool` names."""
-        jail = []
-        if write_nothing and os.path.exists(SANDBOX):
-            jail = [SANDBOX, "-p", '(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "/dev"))']
+    def setUp(self):
+        super().setUp()
+        self.ev = self.evidence()
+
+    def every_action(self, pool, **env):
+        """Every recover action against `pool`, which must lie inside the test's directory."""
         for action in cli.ACTIONS:
             op = None if action in ("adopt", "inspect") else "op-1"
-            extra = ("--evidence", self.evidence()) if action == "preservation" else ()
-            p = subprocess.run([*jail, "/bin/bash", str(POOL), "recover", action, "--pool", pool, "--slot", A,
-                                *(["--op", op] if op else []), *extra], stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, env={**self.env, **env}, start_new_session=True,
-                               timeout=120)
+            extra = ("--evidence", self.ev) if action == "preservation" else ()
+            p = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args(action, A, op, pool, *extra)],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, env={**self.env, **env},
+                               cwd=self.t, start_new_session=True, timeout=120)
             yield action, p
 
+    def userdb_python(self, home):
+        """An interpreter for pool.sh (CG_POOL_PYTHON) whose user database
+        names `home` as this user's home directory, so the live pool that
+        recovery_cli.py derives from it is a replica in the test's tree. No
+        production setting moves the live pool; this replaces the interpreter,
+        as CG_POOL_PYTHON already allows."""
+        prelude = ("import os, pwd, runpy, sys\n"
+                   "real = pwd.getpwuid\n"
+                   f"pwd.getpwuid = lambda uid: pwd.struct_passwd(tuple(real(uid))[:5] + ({str(home)!r},)"
+                   " + tuple(real(uid))[6:])\n"
+                   "sys.argv = sys.argv[1:]\n"
+                   "sys.path.insert(0, os.path.dirname(sys.argv[0]))\n"
+                   "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        py = self.t / "bin" / f"python-home-{Path(home).name}"
+        py.parent.mkdir(exist_ok=True)
+        py.write_text('#!/bin/sh\n[ "$1" = -I ] && [ "$2" = -B ] || exit 97\nshift 2\n'
+                      f'exec {shlex.quote(sys.executable)} -I -B -c {shlex.quote(prelude)} "$@"\n')
+        py.chmod(0o700)
+        return str(py)
+
+    def live_replica(self):
+        """A home directory in the test's tree holding a perfect synthetic pool
+        where the live pool would be, with an archive and a parent beside it;
+        (home, live pool)."""
+        home = self.t / "userdb-home"
+        shutil.rmtree(home, True)
+        live = home / "Projekti" / "codegraph-evidence" / "pool"
+        live.parent.mkdir(parents=True)
+        shutil.copytree(self.leases, live, symlinks=True)
+        (live / "archive").mkdir()
+        (live / "archive" / "old.lease").write_text("archived\n")
+        (live.parent / "notes.txt").write_text("evidence\n")
+        return home, live
+
     def test_the_live_pool_and_its_aliases_are_refused_before_anything_happens(self):
-        """Runs aimed at the real live pool and its aliases: refused before the
-        lock. On macOS a no-write sandbox also keeps a broken pool.sh from
-        creating even a transient lock there."""
-        live = cli.live_pool()
-        aliases = {"live": live, "inside": live + "/recovery", "parent": os.path.dirname(live),
-                   "home": os.path.dirname(os.path.dirname(os.path.dirname(live))), "root": "/"}
+        """The live pool, its inside, its parents, the home directory and
+        symlink and firmlink aliases, played by a replica: refused before the
+        lock, every file and directory unchanged, even a directory's times."""
+        home, live = self.live_replica()
+        as_live = {"CG_POOL_PYTHON": self.userdb_python(home)}
+        aliases = {"live": live, "inside": live / "recovery", "inside archive": live / "archive",
+                   "parent": live.parent, "grandparent": live.parent.parent, "home": home}
         (self.t / "alias").unlink(missing_ok=True)
         (self.t / "alias").symlink_to(live)
-        aliases["symlink"] = str(self.t / "alias")
-        if Path("/System/Volumes/Data" + live).parent.exists():
-            aliases["firmlink"] = "/System/Volumes/Data" + live
-        for name, sub in (("firmlink-inside", live + "/archive"), ("firmlink-parent", os.path.dirname(live))):
-            if os.path.isdir(sub) and os.path.isdir("/System/Volumes/Data" + sub):
-                aliases[name] = "/System/Volumes/Data" + sub
-        before = live_tree()
+        aliases["symlink"] = self.t / "alias"
+        for name in ("live", "inside archive", "parent", "home"):
+            firm = "/System/Volumes/Data" + str(aliases[name])
+            if os.path.isdir(firm):
+                aliases["firmlink to " + name] = firm
+        (self.t / "other-home").mkdir(exist_ok=True)
+        elsewhere = {"CG_POOL_PYTHON": self.userdb_python(self.t / "other-home")}
+        before = snapshot(self.t)
+        # Control: the same replica is an acceptable synthetic pool while the user database names another home.
+        ok = subprocess.run(["/bin/bash", str(POOL), "recover", *self.args("inspect", A, None, live)],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=self.t, timeout=120,
+                            env={**self.env, **elsewhere})
+        self.assertEqual(ok.returncode, 0, ok.stderr)
         for name, path in aliases.items():
-            for env in ({}, {"CG_POOL_LEASES": live}, {"HOME": str(self.t / "home"), "CG_POOL_LEASES": path}):
-                for action, p in self.every_action(path, write_nothing=True, **env):
+            path = str(path)
+            for env in ({}, {"CG_POOL_LEASES": str(live)}, {"HOME": str(self.t / "home"), "CG_POOL_LEASES": path}):
+                for action, p in self.every_action(path, **as_live, **env):
                     with self.subTest(alias=name, action=action, env=sorted(env)):
                         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                         self.assertIn("nothing changed", p.stderr)
                         self.assertNotIn("lock held", p.stderr)
                         self.assertEqual(p.stdout, "")
-                        if name != "symlink":
-                            self.assertIn("live pool", p.stderr)
-                        else:
-                            self.assertIn("canonical", p.stderr)
-        self.assertEqual(unexplained(before, live_tree()), [], "the live pool changed")
+                        self.assertIn("canonical" if name == "symlink" else "live pool", p.stderr)
+        self.assertEqual(changes(before, snapshot(self.t)), [], "a refused run changed the fixture")
+
+    def test_the_real_live_pool_is_refused_in_process_by_stat_alone(self):
+        """The real live pool is never handed to pool.sh. In process, its path,
+        inside, parents and firmlink alias are refused; the check only stats."""
+        live = cli.live_pool()
+        self.assertEqual(live, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-evidence",
+                                            "pool"))
+        with mock.patch.dict(os.environ, {"HOME": str(self.t / "home")}):
+            self.assertEqual(cli.live_pool(), live)
+        paths = [live, live + "/recovery", os.path.dirname(live), os.path.dirname(os.path.dirname(live)), "/"]
+        if os.path.isdir("/System/Volumes/Data" + live):
+            paths.append("/System/Volumes/Data" + live)
+        for path in paths:
+            with self.subTest(path=path), self.assertRaisesRegex(rs.Refused, "live pool"):
+                cli._not_live(path)
 
     def test_a_perfect_synthetic_pool_at_the_live_path_is_refused(self):
         """The live pool, played by a marked and migrated synthetic pool."""
@@ -344,15 +429,16 @@ class Interlock(Cli):
     def test_the_pool_path_must_be_absolute_and_canonical(self):
         (self.t / "pool-link").unlink(missing_ok=True)
         (self.t / "pool-link").symlink_to(self.leases)
-        before = self.tree()
+        before = snapshot(self.t)
         for path in ("relative/pool", str(self.leases) + "/", f"{self.leases}/.", f"{self.t}/x/..",
-                     f"{self.leases.parent}/./{self.leases.name}", f"{self.leases}/../{self.leases.name}", str(self.t / "pool-link"), "",
+                     f"{self.leases.parent}/./{self.leases.name}", f"{self.leases}/../{self.leases.name}", str(self.t / "pool-link"),
                      str(self.t / "missing")):
             with self.subTest(path=path):
                 for action, p in self.every_action(path):
                     self.assertIn(p.returncode, (1, 2), f"{action}: {p.stderr}")
                     self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(self.tree(), before)
+        self.usage_error("adopt", "--pool", "", "--slot", A)
+        self.assert_untouched(before)
         (self.t / "afile").write_text("x")
         for path, why in (("relative/pool", "explicit absolute pool path"),
                           (str(self.t / "afile"), "not a directory of this user")):
@@ -382,11 +468,11 @@ class Interlock(Cli):
         for name, arrange in cases.items():
             with self.subTest(case=name):
                 arrange()
-                before = self.tree()
+                before = snapshot(self.t)
                 for action, p in self.every_action(str(self.leases)):
                     self.assertEqual(p.returncode, 1, f"{action}: {p.stdout}{p.stderr}")
                     self.assertIn("nothing changed", p.stderr)
-                self.assertEqual(self.tree(), before)
+                self.assert_untouched(before)
                 (self.t / "marker-link").unlink(missing_ok=True)
                 (self.t / "record-link").unlink(missing_ok=True)
                 m = self.leases / cli.SYNTHETIC
@@ -404,11 +490,11 @@ class Interlock(Cli):
         self.mark()
         for s in SLOTS:
             self.put(s, pool_record.free_record(s, 0))
-        before = self.tree()
+        before = snapshot(self.t)
         for action, p in self.every_action(str(self.leases)):
             self.assertEqual(p.returncode, 1, action)
             self.assertIn("not migrated", p.stderr)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before)
 
     def test_unsupported_platforms_old_interpreters_and_bad_helper_output(self):
         with mock.patch.object(rs, "SUPPORTED", False):
@@ -420,20 +506,22 @@ class Interlock(Cli):
                  "extra line": "printf 'synthetic-pool=%s\\nmore\\n' \"$5\"; exit 0"}
         d = self.t / "fakecli"
         d.mkdir(exist_ok=True)
-        before = self.tree()
         for name, body in fakes.items():
+            py = d / name.replace(" ", "-")
+            py.write_text(f"#!/bin/sh\n{body}\n")
+            py.chmod(0o755)
+        before = snapshot(self.t)
+        for name in fakes:
             with self.subTest(fake=name):
                 py = d / name.replace(" ", "-")
-                py.write_text(f"#!/bin/sh\n{body}\n")
-                py.chmod(0o755)
                 for action, p in self.every_action(str(self.leases), CG_POOL_PYTHON=str(py)):
                     self.assertEqual(p.returncode, 1, f"{action}: {p.stdout}{p.stderr}")
                     self.assertIn("nothing changed", p.stderr)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before)
 
     def test_mutating_actions_need_a_terminal_and_never_read_stdin(self):
         _, token = self.acquire(A)
-        before = self.tree()
+        before = snapshot(self.t)
         for action, p in self.every_action(str(self.leases)):
             if action in ("inspect", "reconcile"):
                 continue
@@ -441,33 +529,33 @@ class Interlock(Cli):
         p = self.recover("adopt", stdin=open(os.devnull, "rb"), CG_RECOVERY_CONFIRM="yes")
         piped = subprocess.run(["/bin/bash", str(POOL), "recover", "adopt", "--pool", str(self.leases), "--slot", A],
                                input="\n".join([A, "x", "adopt"] * 5), capture_output=True, text=True, env=self.env,
-                               start_new_session=True, timeout=60)
+                               cwd=self.t, start_new_session=True, timeout=60)
         for q in (p, piped):
             self.assertEqual(q.returncode, 1)
             self.assertIn("needs an interactive terminal", q.stderr)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
         self.assertEqual(self.recover("inspect").returncode, 0)
 
     def test_no_bypass_option_and_no_approval_from_flags(self):
-        before = self.tree()
+        before = snapshot(self.t)
         for extra in (["--force-live"], ["--unsafe"], ["--skip-interlock"], ["--yes"], ["--authorization", "x"],
                       ["--token", "a" * 32], ["--utc", "x"], ["--live"]):
             p = self.recover("adopt", A, None, *extra)
             self.assertEqual(p.returncode, 2, extra)
         for action in ("reassign", "rotate", "rotate-token", "eval", "hook", "free"):
             self.assertEqual(self.recover(action).returncode, 2, action)
-        self.assertEqual(self.pool("recover").returncode, 2)
-        self.assertEqual(self.pool("recover", "adopt", "--slot", A).returncode, 2)   # no default pool
-        self.assertEqual(self.tree(), before)
+        self.usage_error()
+        self.usage_error("adopt", "--slot", A)   # no default pool
+        self.assert_untouched(before)
 
     def test_the_helper_alone_refuses_without_the_slot_lock(self):
         _, token = self.acquire(A)
-        before = self.tree()
+        before = snapshot(self.t)
         p = subprocess.run(["python3", "-I", "-B", str(HERE / "recovery_cli.py"), "adopt", str(self.leases), A],
                            capture_output=True, text=True, start_new_session=True, stdin=subprocess.DEVNULL)
         self.assertEqual(p.returncode, 1)
         self.assertIn("does not hold the slot lock", p.stderr)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before)
 
 
 class Lifecycle(Cli):
@@ -555,45 +643,45 @@ class Lifecycle(Cli):
         self.setUp()
         self.acquire(A)
         op, _ = self.path_to(A, "quarantine")
-        before = self.tree()
+        before = snapshot(self.t)
         code, _, err, _ = self.tty("cancel", A, op)
         self.assertEqual(code, 1)
         self.assertIn("not a legal step", err)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
 
     def test_a_wrong_retyped_value_changes_nothing(self):
         _, token = self.acquire(A)
         for label in RETYPES[:6]:
             with self.subTest(adopt=label):
-                before = self.tree()
+                before = snapshot(self.t)
                 code, out, err, _ = self.tty("adopt", ctx={"wrong": label})
                 self.assertEqual(code, 1, out + err)
                 self.assertIn("does not match; nothing changed", err)
-                self.assertEqual(self.tree(), before)
+                self.assert_untouched(before, under_lock=True)
         op, _ = self.path_to(A, "adopt")
         for step in ("request", "cancel"):
             for label in RETYPES:
                 with self.subTest(step=step, retype=label):
-                    before = self.tree()
+                    before = snapshot(self.t)
                     code, _, err, _ = self.tty(step, A, op, ctx={"wrong": label})
                     self.assertEqual(code, 1, err)
-                    self.assertEqual(self.tree(), before)
+                    self.assert_untouched(before, under_lock=True)
         self.ok("request", A, op)
-        before = self.tree()
+        before = snapshot(self.t)
         code, _, err, text = self.tty("quarantine", A, op, ctx={"confirm_token": "b" * 32})
         self.assertEqual(code, 1)
         self.assertIn("recovery token was not confirmed; quarantine not started", err)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
 
     def test_a_lost_or_wrong_token_strands_the_operation(self):
         self.acquire(A)
         op, token = self.path_to(A, "quarantine")
-        before = self.tree()
+        before = snapshot(self.t)
         for wrong in ("0" * 32, token.upper(), "", token[:-1]):
             code, _, err, _ = self.tty("quiescence", A, op, ctx={"token": wrong})
             self.assertEqual(code, 1, err)
             self.assertIn("recovery token does not match", err)
-            self.assertEqual(self.tree(), before)
+            self.assert_untouched(before, under_lock=True)
         self.assertEqual(self.store_state(A, op)[0], rs.QUARANTINED)
         self.assertEqual(self.recover("rotate", A, op).returncode, 2)
 
@@ -602,10 +690,10 @@ class Lifecycle(Cli):
             with self.subTest(record=name):
                 if text:
                     self.put(A, text)
-                before = self.tree()
+                before = snapshot(self.t)
                 code, _, err, _ = self.tty("adopt")
                 self.assertEqual(code, 1, err)
-                self.assertEqual(self.tree(), before)
+                self.assert_untouched(before, under_lock=True)
         self.put(A, pool_record.free_record(A, 0))
         _, token = self.acquire(A)
         op, _ = self.path_to(A, "adopt")
@@ -633,12 +721,12 @@ class Crash(Cli):
         self.assertEqual(self.store_state(A, op), (rs.ACTIVE, self.rec(A).generation, True))
         self.assertIn("next=exact retry of request", self.recover("inspect", A, op).stdout)
         for original in ({"utc": "2026-01-01T00:00:00Z", "reason": "first"}, {"utc": utc, "reason": "second"}):
-            before = self.tree()
+            before = snapshot(self.t)
             err, term = self.inproc("request", A, op, ctx={"original": original})
             self.assertIsInstance(err, rs.Refused)
             self.assertIn("differs from the interrupted step", str(err))
             self.assertNotIn("pool: ", term.text, "a changed authorization was displayed for confirmation")
-            self.assertEqual(self.tree(), before)
+            self.assert_untouched(before, under_lock=True)
         lines, _ = self.inproc("request", A, op, ctx={"original": {"utc": utc, "reason": "first"}})
         self.assertIn(f"state={rs.REQUESTED}", lines[0])
 
@@ -690,10 +778,10 @@ class Crash(Cli):
 
     def test_a_quarantine_interrupted_after_the_state_needs_the_retained_token(self):
         op, pre, lease_token, token, original = self.quarantine_interrupted("after_state")
-        before = self.tree()
+        before = snapshot(self.t)
         err, _ = self.inproc("quarantine", A, op, ctx={"original": original, "token": "c" * 32})
         self.assertIn("recovery token does not match", str(err))
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
         term = self.finish(op, original, token)
         self.assertEqual(TOKEN_SHOWN.findall(term.text), [], "a retry after the state showed a new token")
 
@@ -750,11 +838,11 @@ class Crash(Cli):
                            "token": adopted.replace(token, "e" * 32)}.items():
             with self.subTest(changed=name):
                 self.put(A, text)
-                before = self.tree()
+                before = snapshot(self.t)
                 for step in ("quarantine", "cancel"):
                     err, _ = self.inproc(step, A, op)
                     self.assertIsInstance(err, rs.Refused)
-                    self.assertEqual(self.tree(), before, step)
+                    self.assert_untouched(before, under_lock=True)
         self.put(A, adopted)
 
     def test_a_missing_terminal_marker_is_written_by_the_exact_repeat(self):
@@ -843,11 +931,11 @@ class Hook(Cli):
         for name, arrange, cleanup in cases:
             with self.subTest(case=name):
                 arrange()
-                before = self.tree()
+                before = snapshot(self.t)
                 err, _ = self.inproc("adopt", A)
                 self.assertIsInstance(err, rs.Refused)
                 self.assertIn("recovery state is", str(err))
-                self.assertEqual(self.tree(), before)
+                self.assert_untouched(before, under_lock=True)
                 cleanup()
 
     def test_an_operation_on_a_lease_that_is_not_version_2_is_refused(self):
@@ -857,11 +945,11 @@ class Hook(Cli):
         rs.RecoveryStore(other).adopt(A, "op-1", v1_lease())
         (self.leases / "recovery").mkdir(mode=0o700)
         shutil.copytree(other / A, self.leases / "recovery" / A)
-        before = self.tree()
+        before = snapshot(self.t)
         for step in ("cancel", "request"):
             err, _ = self.inproc(step, A, "op-1")
             self.assertIn("version 2 leases", str(err), step)
-            self.assertEqual(self.tree(), before)
+            self.assert_untouched(before, under_lock=True)
 
 
 class ExitCodes(Cli):
@@ -907,10 +995,10 @@ class ExitCodes(Cli):
     def test_a_refusal_before_any_write_stays_exit_1(self):
         self.acquire(A)
         op, _ = self.path_to(A, "adopt")
-        before = self.tree()
+        before = snapshot(self.t)
         err, _ = self.inproc("request", A, op, ctx={"wrong": "slot"})
         self.assertIs(type(err), rs.Refused)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
 
     def test_main_maps_outcomes_to_exit_codes(self):
         argv = ["recovery_cli.py", "cancel", str(self.leases), A, "--op", "op-1"]
@@ -960,11 +1048,11 @@ class Locks(Cli):
         s.finish()
         lock = self.leases / f".{A}.lock"
         self.assertTrue(lock.is_dir(), "a killed run left no lock")
-        before = self.tree()
+        before = snapshot(self.t)
         for args in self.mutators(A, token):
             self.assertIn("lock held", self.pool(*args).stderr)
         self.assertIn("lock held", self.recover("request", A, op).stderr)
-        self.assertEqual(self.tree(), before)
+        self.assert_untouched(before, under_lock=True)
         # The documented procedure: inspect read-only, see nothing unfinished, then remove the lock by hand.
         ins = self.recover("inspect", A, op)
         self.assertIn("pending=none", ins.stdout)
@@ -978,13 +1066,13 @@ class ReadOnly(Cli):
         self.assertEqual(self.recover("inspect").stdout.splitlines()[2], "gate=none")
         op, rtok = self.path_to(A, "quarantine")
         for _ in range(2):
-            before = self.tree()
+            before = snapshot(self.t)
             for args in (("inspect", A, None), ("inspect", A, op), ("reconcile", A, op), ("inspect", B, None)):
                 p = self.recover(*args)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertNotIn(rtok, p.stdout + p.stderr)
                 self.assertNotIn(token, p.stdout + p.stderr)
-            self.assertEqual(self.tree(), before)
+            self.assert_untouched(before, under_lock=True)
         out = self.recover("inspect", A, op).stdout
         for key in ("slot=", f"operation={op}", f"state={rs.QUARANTINED}", "seq=2", "pending=none",
                     "terminal_marker=none", "expected_record=v2 quarantined", "observed_record=v2 quarantined",
