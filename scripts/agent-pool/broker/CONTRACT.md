@@ -61,13 +61,13 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
    including pre mode).
 6. **`binding_digest`** = `digest({verb, slot, op_id, slot_generation})` of the
    document; I-NOREMINT looks up `verb = quarantine` at `g_pre`.
-8. **RS-1 refusal before display.** Until RS-1, an `owner-authenticated`
-   `request`, `cancel` or `quarantine` refuses `TRUST_INSUFFICIENT` in phase V
-   (the r4 §8.2 replica of the library's trust check), so nothing is burned.
 7. **Replacement documents (A1 §A3.2).** Besides the fields A3.2 lists and
    `repair_plan` (N5-14), `tierp_state_digest` and `anchor_digest` may differ: they
    bind the phase V snapshot, which every extra burn changes. A `ready`
    document's `preservation` field follows the run's own preservation gate.
+8. **RS-1 refusal before display.** Until RS-1, an `owner-authenticated`
+   `request`, `cancel` or `quarantine` refuses `TRUST_INSUFFICIENT` in phase V
+   (the r4 §8.2 replica of the library's trust check), so nothing is burned.
 
 ## Review N5 dispositions
 
