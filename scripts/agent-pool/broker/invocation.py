@@ -245,10 +245,10 @@ def _validate_slot(world, plan):
     c = lifecycle.Components(plan.g, facts.l, facts.a, facts.f, facts.r, facts.k, facts.op)
     if op.verb == "custody-destroy":
         return _validate_destroy(world, plan, facts)
+    _precheck(c)
     if op.verb in LIBRARY_STEP and facts.view is not None:
         if fields["op_id"] != facts.op_id:
             raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "not the slot's current operation")
-        _precheck(c)
         mode = lifecycle.completion_mode(facts.view.rec, facts.view.pending, facts.view.marker, op.verb,
                                          _is_burned_doc(world, entries))
         if mode == lifecycle.ALREADY_COMPLETE:
@@ -287,10 +287,11 @@ def _nothing_to_resume(c):
 
 
 def _precheck(c):
-    """A1 §A2.6 steps 3–5 for a slot verb before completion_mode."""
+    """A1 §A2.6 steps 4–5, before any completion_mode or ALREADY_COMPLETE shortcut."""
     if c.r.mode == "busy":
         raise Refused(Code.BUSY)
-    if c.r.mode == "corrupt" or c.a.kind in (anchor.ABSENT, anchor.CORRUPT) or c.l.kind == libview.UNKNOWN:
+    if c.r.mode == "corrupt" or c.a.kind in (anchor.ABSENT, anchor.CORRUPT) or c.l.kind == libview.UNKNOWN \
+            or c.f == "UNKNOWN":
         raise Refused(Code.STATE_UNKNOWN)
     if (c.a.kind == anchor.STABLE and c.l.digest != c.a.digest) or (
             c.a.kind == anchor.PENDING and c.l.digest not in (c.a.pre, c.a.post)):
@@ -385,6 +386,8 @@ def _validate_destroy(world, plan, facts):
         raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE)
     if facts.r.mode in ("corrupt", "busy"):
         raise Refused(Code.STATE_UNKNOWN if facts.r.mode == "corrupt" else Code.BUSY)
+    if facts.a.kind in (anchor.ABSENT, anchor.CORRUPT):
+        raise Refused(Code.STATE_UNKNOWN, "anchor")
     terminal = world.library.terminal(facts.slot, facts.op_id)
     action = lifecycle.custody_row(facts.r, facts.k, facts.op, terminal)
     if action == "done":
@@ -395,24 +398,26 @@ def _validate_destroy(world, plan, facts):
     rec = facts.view.rec
     key = custody.recovery_key(facts.slot, facts.op_id, facts.op.gen)
     st = facts.k_state
+    marker = facts.view.marker
+    terminal_ref = {"state": facts.r.state, "marker_digest": canonical.sha256(marker),
+                    "journal_digest": canonical.sha256(facts.view.journal)}
     if action == "full":
         world.custody.retrieve(key, world.ctx.principal)
         if facts.r.state == rs.READY:
             q = [e for e in _journal_entries(facts.view) if e["to"] == rs.QUARANTINED and e["kind"] == "complete"]
             intent = canonical.digest({k: q[-1][k] for k in rs.ENTRY_KEYS if k in q[-1]})
-            if st.k == custody.BOUND and st.record["bound"] != [intent, rec["gates"]["quarantine"]]:
+            if st.record["bound"] != [intent, rec["gates"]["quarantine"]]:
                 raise Refused(Code.CUSTODY_CONFLICT)
         elif st.record["bound"] != []:
             raise Refused(Code.CUSTODY_CONFLICT)
-    marker = facts.view.marker
+        if st.k == custody.TERMINAL and st.record["terminal_ref"] != terminal_ref:
+            raise Refused(Code.CUSTODY_CONFLICT, "terminal reference differs")
     backup = world.backups(canonical.sha256(marker))
     if not backup:
         raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "no backup newer than the marker")
     plan.row, plan.mode = "CD-R" if facts.r.state == rs.READY else "CD-C", action
     receipt_digest = canonical.digest(st.record["receipt"]) if st.record else st.tombstone["receipt_digest"]
-    plan.extra.update(key=key, backup=backup, receipt_digest=receipt_digest,
-                      terminal_ref={"state": facts.r.state, "marker_digest": canonical.sha256(marker),
-                                    "journal_digest": canonical.sha256(facts.view.journal)})
+    plan.extra.update(key=key, backup=backup, receipt_digest=receipt_digest, terminal_ref=terminal_ref)
 
 
 # ------------------------------------------------------------------ phase P
@@ -532,8 +537,7 @@ def invoke(world, raw, confirmer, entry=opclass.POOLCTL_OWNER):
     """Runs one owner invocation and returns a Result. Crash (a simulated
     process stop) propagates."""
     try:
-        op, fields = protocol.parse_request(raw, entry)
-        opclass.authorize(entry, op.verb, owner=authz.is_owner(world.ctx))
+        op, fields = protocol.parse_request(raw, entry, owner=authz.is_owner(world.ctx))
         if op.cls == opclass.READ_ONLY:
             return Result(Outcome.COMMITTED, detail=_report(world, op, fields))
         authz.trust_of(world.ctx)

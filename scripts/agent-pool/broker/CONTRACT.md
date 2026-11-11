@@ -53,13 +53,17 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 4. **Resume with nothing to resume.** `resume-step` on a readable slot with no
    library pending entry, no marker-less terminal state, no anchor `pending` and
    no F intent is `ALREADY_COMPLETE` with no write (A1 §A3.3, "a second resume
-   after completion").
+   after completion"). Like every `ALREADY_COMPLETE` shortcut, it is decided only
+   after the A1 §A2.6 step 4–5 checks (reads, §6.1 and K consistency) pass.
 5. **Resume of a quarantine checks the receipt.** Besides `check_digest` and
    the verifier, RESUME requires the original document's
    `custody_receipt_digest` to equal custody's receipt (A1 §A3.3 wrong token,
    including pre mode).
 6. **`binding_digest`** = `digest({verb, slot, op_id, slot_generation})` of the
    document; I-NOREMINT looks up `verb = quarantine` at `g_pre`.
+8. **RS-1 refusal before display.** Until RS-1, an `owner-authenticated`
+   `request`, `cancel` or `quarantine` refuses `TRUST_INSUFFICIENT` in phase V
+   (the r4 §8.2 replica of the library's trust check), so nothing is burned.
 7. **Replacement documents (A1 §A3.2).** Besides the fields A3.2 lists and
    `repair_plan` (N5-14), `tierp_state_digest` and `anchor_digest` may differ: they
    bind the phase V snapshot, which every extra burn changes. A `ready`

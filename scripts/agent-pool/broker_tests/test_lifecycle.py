@@ -126,9 +126,6 @@ class Rows(unittest.TestCase):
         self.assertEqual(seen - {None}, set(lifecycle.ROW_VERBS))
 
 
-K_TABLE = {  # A1 §A1.2, transcribed: (state, mode, request_gate) -> legal K
-    ("none",): {"ABSENT"},
-}
 
 
 def k_expected(r, request_gate):

@@ -411,6 +411,12 @@ class Restore(unittest.TestCase):
             "auth_digest": "1" * 64, "auth_kind": "initiate", "binding_digest": "2" * 64, "confirmed_at": 1,
             "issued_at": 1, "nonce_digest": "3" * 64})) + b"\n"
         self.assertIsNone(ledger.restore_acceptable(B, other, ledger.LEDGER))
+        log = ledger.MemLog(ledger.LEDGER, "ledger")
+        log.data = B + E2[:30]
+        log.append(txn(), log.plan(), {"auth_digest": "6" * 64, "auth_kind": "initiate", "binding_digest": "6" * 64,
+                                       "confirmed_at": 1, "issued_at": 1, "nonce_digest": "7" * 64})
+        self.assertIsNone(ledger.restore_acceptable(B, log.data, ledger.LEDGER))
+        self.assertEqual(ledger.restore_acceptable(B, log.data, ledger.LEDGER, log.evidence), [2])
 
 
 if __name__ == "__main__":

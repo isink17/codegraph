@@ -347,10 +347,11 @@ def plan_item(log_name, res):
     return dict(base, action="record", offset=res["body_len"], len=0, sha256=canonical.sha256(b""))
 
 
-def restore_acceptable(current, backup, spec):
-    """A1 §A4.7 conditions for an out-of-band restore from backup B. Returns the
-    list of extra backup line indexes the owner must confirm (review N-10)."""
-    b = classify(backup, spec)
+def restore_acceptable(current, backup, spec, backup_evidence=None):
+    """A1 §A4.7 conditions for an out-of-band restore from backup B (with its
+    own repair evidence). Returns the list of extra backup line indexes the
+    owner must confirm (review N-10), or None."""
+    b = classify(backup, spec, backup_evidence)
     if b["cls"] != CLEAN:
         return None
     blines = backup.split(b"\n")[:-1]

@@ -124,8 +124,9 @@ def _decode(text):
         raise Refused(Code.ENCODING, "not one JSON value") from None
 
 
-def parse_request(raw, entry):
-    """Returns (op, fields) for one request. `raw` is bytes."""
+def parse_request(raw, entry, owner=None):
+    """Returns (op, fields) for one request. `raw` is bytes. With `owner`
+    given, the class check runs before the field checks (A1 §A2.6 steps 1–2)."""
     if type(raw) is not bytes:
         raise Refused(Code.ENCODING)
     if len(raw) > MAX_REQUEST:
@@ -146,7 +147,7 @@ def parse_request(raw, entry):
     verb = obj.get("verb")
     if type(verb) is not str:
         raise Refused(Code.FIELD_INVALID, "verb")
-    op = opclass.lookup(entry, verb)
+    op = opclass.lookup(entry, verb) if owner is None else opclass.authorize(entry, verb, owner=owner)
     required, optional = FIELDS[op.verb]
     fields = {k: v for k, v in obj.items() if k not in ("v", "verb")}
     if any(k in NOT_ALLOWED for k in fields):

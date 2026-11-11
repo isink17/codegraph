@@ -200,6 +200,74 @@ class Refusals(Base):
         self.refused("request", Code.ANCHOR_MISMATCH, op_id="op1")
 
 
+class ShortcutPrecedence(Base):
+    """Review B1: no ALREADY_COMPLETE shortcut may skip the A1 §A2.6 step 4-5 checks."""
+
+    def tamper_tierc(self):
+        w = self.env.world
+        w.tierc.records[SLOT] = w.tierc.records[SLOT].replace("task=t1", "task=tX")
+
+    def f_unknown(self):
+        self.env.world.fwal.entries.setdefault(SLOT, []).append(
+            {"op_id": "op1", "kind": "complete", "value": "BOGUS",
+             "auth_digest": self.env.world.ledger.entries()[-1]["auth_digest"]})
+
+    def test_shortcuts_refuse_contradictory_state(self):
+        self.run_ok("adopt", op_id="op1")
+        self.run_ok("request", op_id="op1")
+        self.tamper_tierc()
+        self.refused("resume-step", Code.ANCHOR_MISMATCH, op_id="op1")
+        self.refused("adopt", Code.ANCHOR_MISMATCH, op_id="op1")
+        self.refused("request", Code.ANCHOR_MISMATCH, op_id="op1")
+
+    def test_shortcuts_refuse_unknown_f(self):
+        self.run_ok("adopt", op_id="op1")
+        self.run_ok("request", op_id="op1")
+        self.f_unknown()
+        for verb in ("resume-step", "request", "adopt"):
+            self.refused(verb, Code.STATE_UNKNOWN, op_id="op1")
+
+    def test_shortcuts_refuse_custody_states(self):
+        harness.to_quarantine(self.env)
+        self.run_ok("quarantine", op_id="op1", **QUARANTINE)
+        w = self.env.world
+        kd = canonical.digest(self.rkey())
+        good = w.custody.records[kd]
+        w.custody.records[kd] = good[:-3] + b"00}"
+        self.refused("resume-step", Code.CUSTODY_CORRUPT, op_id="op1")
+        del w.custody.records[kd]
+        self.refused("resume-step", Code.CUSTODY_ABSENT, op_id="op1")
+        self.refused("quarantine", Code.CUSTODY_ABSENT, op_id="op1", **QUARANTINE)
+
+    def test_repeat_adopt_with_a_corrupt_anchor_log(self):
+        self.run_ok("adopt", op_id="op1")
+        self.env.world.anchors[SLOT].data += b"*\n"
+        self.refused("adopt", Code.STATE_UNKNOWN, op_id="op1")
+
+    def test_refused_quiescence_on_p11_with_persisted_custody(self):
+        harness.to_quarantine(self.env)
+        self.crash("library:after_complete", "quarantine", op_id="op1", **QUARANTINE)
+        self.run_ok("resume-step", op_id="op1")
+        w = self.env.world
+        st = w.custody.lookup(self.rkey())
+        w.custody._store(self.rkey(), dict(st.record, state=custody.PERSISTED, bound=[]))
+        self.assertEqual((self.row()[0], self.facts().k), ("P11", "PERSISTED"))
+        self.env.declines = True
+        self.refused("quiescence", Code.CONFIRMATION_FAILED, op_id="op1", **QUIESCENCE)
+        self.env.declines = False
+        self.assertEqual(self.facts().k, "PERSISTED")
+        self.run_ok("quiescence", op_id="op1", **QUIESCENCE)
+        self.assertEqual(self.facts().k, "BOUND")
+
+    def test_owner_check_precedes_field_checks(self):
+        env = Env(store_kind=authz.PROTECTED, principal=authz.SyntheticOwner())
+        try:
+            r = env.run("request", slot=SLOT, op_id="op1", reason=reason(), bogus=1)
+            self.assertEqual(r.code, Code.OWNER_REQUIRED)
+        finally:
+            env.close()
+
+
 class Trust(unittest.TestCase):
     def test_protected_context_refuses_until_rs1(self):
         env = Env(store_kind=authz.PROTECTED, principal=capability.owner_capability())
@@ -423,6 +491,22 @@ class CancellationAndCleanup(Base):
         harness.to_ready(self.env)
         self.assertIs(self.env.run("stop", reason=reason()).outcome, Outcome.COMMITTED)
         self.refused("custody-destroy", Code.STOPPED, op_id="op1")
+
+    def test_custody_destroy_refuses_an_unclassifiable_anchor_log(self):
+        harness.to_ready(self.env)
+        self.env.world.anchors[SLOT].data += b"junk"
+        self.refused("custody-destroy", Code.STATE_UNKNOWN, op_id="op1")
+        self.assertEqual(self.facts().k, "BOUND")
+
+    def test_custody_destroy_checks_a_terminal_record(self):
+        harness.to_ready(self.env)
+        w = self.env.world
+        st = w.custody.lookup(self.rkey())
+        w.custody._store(self.rkey(), dict(st.record, state=custody.TERMINAL, terminal_ref={
+            "state": rs.READY, "marker_digest": "0" * 64, "journal_digest": "0" * 64}))
+        self.refused("custody-destroy", Code.CUSTODY_CONFLICT, op_id="op1")
+        w.custody._store(self.rkey(), dict(st.record, bound=["0" * 64, st.record["bound"][1]]))
+        self.refused("custody-destroy", Code.CUSTODY_CONFLICT, op_id="op1")
 
     def test_custody_destroy_needs_a_backup_newer_than_the_marker(self):
         harness.to_ready(self.env)
