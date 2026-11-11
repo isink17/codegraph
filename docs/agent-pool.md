@@ -538,6 +538,19 @@ unvalidated paths, take a lock directory as proof of ownership, or take a
 cached `sudo` session as fresh owner approval. It needs a supported,
 patched, root-owned interpreter.
 
+## Owner-only broker protocol core (O5 PR-1)
+
+`scripts/agent-pool/broker/` is the pure protocol core of the owner-only
+recovery broker (CG-150 O5, design r4 with addenda A1 and R5-1): request and
+document parsing, canonical encoding, the operation table, provenance,
+authorization documents and their confirmation, token custody, the replay
+ledger and anchor logs with strict torn-tail classification, and the combined
+lifecycle. It is stdlib Python with in-memory stores and an adapter over the
+unmodified `recovery_state.py`. Nothing imports it except its tests
+(`broker_tests/`); it installs, enables or deploys nothing, performs no file,
+network or process I/O, and has no path to the live pool. Its contract notes
+are in `scripts/agent-pool/broker/CONTRACT.md`.
+
 ## Plane tracking
 
 The coordinator keeps the Plane ticket of every PR in step with GitHub.
@@ -747,5 +760,7 @@ path and its aliases (compared by `stat` before and after; no file there is
 read), confirmation, retries, token custody, quarantine reconciliation and
 locking. Hosted CI runs `test_recovery_state`, `test_pool_v2`,
 `test_pool_v2_writes`, `test_recovery_gate`, `test_recovery_cli` and
-`pool_test.sh` on Linux (job `pool-safety`); the
+`pool_test.sh`, and the broker suites
+(`python3 -m unittest discover -s broker_tests -t broker_tests`) on Linux
+(job `pool-safety`); the
 coordinator and campaign suites run only locally on macOS. Windows is not run.
