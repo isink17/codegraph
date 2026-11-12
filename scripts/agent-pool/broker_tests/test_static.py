@@ -188,9 +188,23 @@ STR_METHODS = {"startswith", "endswith", "split", "rsplit", "partition", "rparti
                "strip", "find", "index", "format", "removeprefix", "removesuffix"}
 
 
-def modules(include_testsupport=False):
+# The read-only Git observer; every other module is protocol core.
+OBSERVER = {"fdwalk.py", "gitraw.py", "indexverify.py"}
+OBSERVER_IMPORTS = {"collections", "contextlib", "dataclasses", "enum", "errno", "hashlib", "os", "re", "stat", "zlib"}
+OBSERVER_SIBLINGS = {"fdwalk", "gitraw", "indexverify", "sanitize"}
+OS_FORBIDDEN = {"write", "writev", "pwrite", "remove", "unlink", "rename", "renames", "replace", "mkdir", "makedirs",
+                "rmdir", "removedirs", "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chflags", "lchflags",
+                "utime", "symlink", "link", "truncate", "ftruncate", "mkfifo", "mknod", "system", "popen", "fork",
+                "forkpty", "kill", "killpg", "putenv", "unsetenv", "environ", "environb", "getenv", "getenvb",
+                "posix_spawn", "posix_spawnp", "chdir", "fchdir", "chroot", "setxattr", "removexattr", "walk",
+                "scandir", "fwalk", "O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND", "O_EXCL"}
+
+
+def modules(include_testsupport=False, observer=False):
     for p in sorted(BROKER.rglob("*.py")):
         if "_testsupport" in p.parts and not include_testsupport:
+            continue
+        if observer is not None and (p.name in OBSERVER) != observer:
             continue
         yield p, ast.parse(p.read_text(), str(p))
 
@@ -211,7 +225,7 @@ class AstBoundaries(unittest.TestCase):
     def test_private_constructors_are_referenced_only_where_allowed(self):
         allowed = {"_issue": {"authz_txn.py", "authz.py"}, "_new_capability": {"authz.py", "capability.py"},
                    "_SEAL": {"authz.py", "provenance.py", "capability.py"}, "_produce": {"provenance.py", "capability.py"}}
-        for path, tree in modules(include_testsupport=True):
+        for path, tree in modules(include_testsupport=True, observer=None):
             for node in ast.walk(tree):
                 name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else (
                     node.name if isinstance(node, (ast.FunctionDef, ast.alias)) else None)
@@ -221,7 +235,7 @@ class AstBoundaries(unittest.TestCase):
                     self.assertIn(path.name, allowed[name], f"{path.name} references {name}")
 
     def test_no_production_module_imports_testsupport(self):
-        for path, tree in modules():
+        for path, tree in modules(observer=None):
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     self.assertNotIn("_testsupport", (node.module or ""), path.name)
@@ -230,7 +244,7 @@ class AstBoundaries(unittest.TestCase):
                     self.assertFalse(any("_testsupport" in a.name for a in node.names), path.name)
 
     def test_no_string_operations_on_verb_names(self):
-        for path, tree in modules():
+        for path, tree in modules(observer=None):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                         and node.func.attr in STR_METHODS:
@@ -241,7 +255,7 @@ class AstBoundaries(unittest.TestCase):
 
     def test_module_level_has_no_side_effects(self):
         allowed = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign, ast.Expr)
-        for path, tree in modules(include_testsupport=True):
+        for path, tree in modules(include_testsupport=True, observer=None):
             for node in tree.body:
                 self.assertIsInstance(node, allowed, f"{path.name}: {type(node).__name__}")
                 if isinstance(node, ast.Expr):
@@ -264,6 +278,37 @@ class AstBoundaries(unittest.TestCase):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     names = [a.name for a in node.names] + [getattr(node, "module", "") or ""]
                     self.assertFalse(any(n.split(".")[0] == "broker" for n in names), p.name)
+
+    def test_core_does_not_import_the_observer(self):
+        for path, tree in modules(include_testsupport=True):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    names = {node.module or ""} | {a.name for a in node.names}
+                    self.assertFalse(names & {"fdwalk", "gitraw", "indexverify"}, path.name)
+
+    def test_observer_is_read_only_and_runs_nothing(self):
+        found = set()
+        for path, tree in modules(observer=True):
+            found.add(path.name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        self.assertIn(a.name, OBSERVER_IMPORTS, f"{path.name}: import {a.name}")
+                if isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        names = {node.module} if node.module else {a.name for a in node.names}
+                        self.assertLessEqual(names, OBSERVER_SIBLINGS, path.name)
+                    else:
+                        self.assertIn(node.module, OBSERVER_IMPORTS, path.name)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    self.assertNotIn(node.func.id, BANNED_CALLS, f"{path.name}: {node.func.id}()")
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os":
+                    self.assertFalse(node.attr in OS_FORBIDDEN or node.attr.startswith(("exec", "spawn")),
+                                     f"{path.name}: os.{node.attr}")
+                name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+                self.assertNotIn(name, {"_produce", "_SEAL", "_new_capability", "_issue", "provenance", "authz",
+                                        "custody", "invocation", "Provenance"}, path.name)
+        self.assertEqual(found, OBSERVER)
 
     def test_request_parser_never_trusts_owner_path_fields(self):
         for k in ("trust", "actor", "nonce", "session", "repair_plan", "issued_at", "not_after", "class"):

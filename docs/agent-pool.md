@@ -551,6 +551,14 @@ unmodified `recovery_state.py`. Nothing imports it except its tests
 network or process I/O, and has no path to the live pool. Its contract notes
 are in `scripts/agent-pool/broker/CONTRACT.md`.
 
+The same package holds a read-only Git worktree observer (`fdwalk.py`,
+`gitraw.py`, `indexverify.py`, O5 PR-2). Given a worktree and the Git
+administrative and common directories its caller authorizes, it reports
+`CLEAN`, `NOT_CLEAN`, `UNKNOWN` or `IDENTITY_CHANGED` from descriptor-relative,
+no-follow reads. It never runs Git, supports loose objects only, and carries no
+provenance. `CLEAN` is an observation, not authorization, and nothing calls the
+observer outside its tests.
+
 ## Plane tracking
 
 The coordinator keeps the Plane ticket of every PR in step with GitHub.

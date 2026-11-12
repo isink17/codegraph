@@ -36,6 +36,9 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 | `library.py` (added) | adapter over the unmodified library; reads use the library's own readers |
 | `invocation.py` (added) | phases V, P, C, R, W of one owner invocation |
 | `_testsupport/` | test-only capability and evidence producers (LB5) |
+| `fdwalk.py` (PR-2) | descriptor-relative, no-follow, bounded reads |
+| `gitraw.py` (PR-2) | strict-subset config, HEAD, refs, loose commit and tree objects |
+| `indexverify.py` (PR-2) | index parser, worktree comparison, `observe`, result model |
 
 ## Clarifications made in PR-1
 
@@ -130,6 +133,80 @@ can be loaded by, the privileged broker:
 
 The proof must cover the installed file set, the import path, environment
 variables and writable directories.
+
+## Read-only Git observer (PR-2)
+
+`indexverify.observe(Context)` reports one worktree's state from reads only. It
+is not called by anything outside its tests.
+
+**Roots.** The caller names three directories: the worktree (A), the Git
+administrative directory (B) and the common directory (C). For an ordinary
+repository B is `A/.git` and C is B. Each root must be an absolute, normalized
+path and is opened one component at a time from `/` with `O_NOFOLLOW`. A
+symbolic link anywhere in it gives UNKNOWN. Repository pointers select nothing:
+they are compared, never followed.
+- Ordinary: `A/.git` must be a directory with B's device and inode, and B has
+  no `commondir`.
+- Linked: `A/.git` must be the regular file `gitdir: <B>\n` with B written
+  exactly; `B/commondir` must name C (absolute, or relative to B); `B/gitdir`
+  must be exactly `<A>/.git\n`. Anything else, including a relative `.git`
+  link, is IDENTITY_CHANGED, and the named location is never opened.
+
+**Reads.** Every open is relative to an open directory descriptor, with
+`O_NOFOLLOW`, `O_NONBLOCK` for files, and no write flag. FIFOs, sockets and
+devices anywhere in the worktree give UNKNOWN without being opened. A regular
+file is read only if it has one link and lies on its root's device; its
+metadata (kind, mode, device, inode, links, size, mtime, ctime) must be equal
+before the open, after the open and after the last byte. All sizes, counts,
+depths and the zlib output are bounded (`fdwalk.Limits`); exceeding one is
+UNKNOWN. The worktree is walked twice and every repository input is read
+twice; any difference, or a root path that now opens another directory, fails
+closed.
+
+**Supported subset.** Index versions 2 and 3 with stage-0 entries and no flags,
+optional extensions `TREE`, `REUC`, `EOIE`, `IEOT`. Config: only
+`core.{repositoryformatversion 0|1, filemode, bare = false, logallrefupdates,
+ignorecase, precomposeunicode, symlinks}` with literal `true`/`false`,
+`extensions.objectformat = sha1`, and the `remote`, `branch` and `user`
+sections without partial-clone keys. HEAD on `refs/heads/*` or detached; loose
+or packed refs; loose commit and tree objects, SHA-1 only. Everything else is
+UNKNOWN, including: packed-only objects (no pack reader), SHA-256, alternates,
+grafts, replace refs, shallow, partial clone, includes, quoting, `core.worktree`,
+attributes files anywhere (`.gitattributes`, `info/attributes`),
+`config.worktree`, sparse checkout, `index.lock`, assume-unchanged,
+skip-worktree, intent-to-add, split index, untracked cache, fsmonitor, sparse
+index, index version 4, conflicts and submodules.
+
+**Results.** CLEAN means only: HEAD's tree equals the index, every index entry
+exists with the same type, executable bit and content hash (computed from the
+bytes, never from stat data), and nothing else exists in the worktree except
+the root `.git`. Untracked and ignored files and empty directories are
+NOT_CLEAN. One observation stops at its first IDENTITY_CHANGED or UNKNOWN
+finding; NOT_CLEAN collects every difference. Reasons are at most 16 fixed codes with escaped, truncated paths; results
+carry digests, never file contents. An `Observation` has no truth value.
+`combine` gives the worst status of an attempt and turns disagreeing CLEAN
+results into UNKNOWN, so a retry cannot upgrade an earlier result.
+
+**Identity.** The binding holds each root's device, inode and birth time, and
+the digest of the pointer bytes. macOS reports `st_birthtime`; Linux does not,
+and none is invented. With `require_birthtime` (the default) a missing birth
+time is UNKNOWN. With it off, the binding detects a replaced root only while
+the inode number is not reused (P7).
+
+**Provenance and limits.** The observer produces no provenance and is absent
+from the `_produce` allowlist; a static test keeps it from importing the
+protocol core's authority modules. Its digests are supporting observations,
+unprivileged in PR-2. CLEAN is not proof of quiescence or immutability:
+someone who can write the tree can change a file and restore its mtime, and
+only the ctime check detects that. SHA-1 ids are checked for integrity only,
+not for collision resistance. Most real repositories have packed objects or
+config outside the subset and so observe as UNKNOWN; Git can call clean what
+this observer calls NOT_CLEAN (empty directories, case or Unicode
+normalization, `filemode = false`). The result is defined over
+repository-local state only: environment variables and global or system Git
+config are never read, so a consumer must not equate CLEAN with what a Git
+process under some other configuration would print. Object stores hard-linked
+by a local clone observe as UNKNOWN.
 
 ## Not in PR-1
 
