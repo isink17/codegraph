@@ -160,9 +160,9 @@ metadata (kind, mode, device, inode, links, size, mtime, ctime) must be equal
 before the open, after the open and after the last byte. All sizes, counts,
 depths and the zlib output are bounded (`fdwalk.Limits`); exceeding one is
 UNKNOWN. In particular, a name component is at most 255 bytes, so a long
-non-ASCII name that APFS accepts can observe as UNKNOWN. A path in the index,
-in a tree or in the worktree is at most `max_path` bytes and `max_depth`
-directories deep. Every parsed tree entry, directories included, and every
+non-ASCII name that APFS accepts can observe as UNKNOWN. A path in the index
+or in a tree is at most `max_path` bytes, and every path, worktree paths
+included, is at most `max_depth` directories deep. Every parsed tree entry, directories included, and every
 listed directory name counts against `max_entries`. Work and memory stay
 linear in the input; the largest permitted index takes seconds, not minutes. The worktree is walked twice and every repository input is read
 twice; any difference, or a root path that now opens another directory, fails
