@@ -69,6 +69,27 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
    `request`, `cancel` or `quarantine` refuses `TRUST_INSUFFICIENT` in phase V
    (the r4 §8.2 replica of the library's trust check), so nothing is burned.
 
+9. **Restore needs an LF-terminated current file (A1 §A4.7).** Condition 3
+   counts only LF-terminated lines, so a committed `TAIL_UNTERMINATED_VALID`
+   entry would escape condition 2. `restore_acceptable` therefore refuses
+   whenever the current file has any byte after its last LF. A valid
+   unterminated entry is first terminated in band (plan `terminate`) and the
+   predicate is then re-run, so the entry is compared like any other line. Every
+   other tail (prefix, NULs, corrupt or divergent bytes) stays unrestorable until
+   a separately authorized protocol handles it.
+10. **I-ORPHAN fails closed on unreadable sources (A1 §A4.9).** Every reference
+    source is read for every slot. Any of the following refuses every owner verb,
+    `stop` included:
+    - an anchor log that is `UNCLASSIFIABLE` or has no entries: `STATE_UNKNOWN`;
+    - a listed library operation that cannot be read: `STATE_UNKNOWN` or `BUSY`;
+    - a custody record or tombstone that fails lookup's checks: `CUSTODY_CORRUPT`.
+
+    The slot set includes every slot that has an F WAL. A skipped source could pin
+    a burn that a phase W trim would then remove, or hide a deleted burn. No
+    narrower exception is claimed. PR-4 must enumerate slots from protected
+    configuration, so that a slot cannot leave the set by losing its Tier C
+    record and its anchor log.
+
 ## Review N5 dispositions
 
 | Item | Disposition |
@@ -81,6 +102,21 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 | N5-6 | Evidence is written only inside the CommitTxn-gated log append; snapshots include evidence |
 | N5-7 | No `trim` plan when 16 evidence items are pending: `LEDGER_UNAVAILABLE` in V |
 | N5-14 | The comparator names `repair_plan` as replaceable (item 7 above) |
+
+## Packaging gate for PR-4 (not implemented here)
+
+Underscore names and the AST tests in `test_static.py` are development checks.
+They are not an OS security boundary. Before any privileged install, PR-4 must
+prove on the installed artifact that none of the following is present in, or
+can be loaded by, the privileged broker:
+
+- `_testsupport`;
+- `SyntheticOwner` and the synthetic store kind;
+- any development-only constructor for `OwnerCapability`, decisive provenance
+  or `CommitTxn`.
+
+The proof must cover the installed file set, the import path, environment
+variables and writable directories.
 
 ## Not in PR-1
 

@@ -350,12 +350,18 @@ def plan_item(log_name, res):
 def restore_acceptable(current, backup, spec, backup_evidence=None):
     """A1 §A4.7 conditions for an out-of-band restore from backup B (with its
     own repair evidence). Returns the list of extra backup line indexes the
-    owner must confirm (review N-10), or None."""
+    owner must confirm (review N-10), or None.
+
+    Bytes after the current file's last LF refuse: they may be a committed
+    TAIL_UNTERMINATED_VALID entry that condition 2 would not see. A valid one
+    is terminated in band first; any other tail needs its own protocol."""
     b = classify(backup, spec, backup_evidence)
     if b["cls"] != CLEAN:
         return None
     blines = backup.split(b"\n")[:-1]
     clines = current.split(b"\n")
+    if clines[-1]:
+        return None
     lf_terminated = len(clines) - 1
     if len(blines) < lf_terminated:
         return None

@@ -418,6 +418,38 @@ class Restore(unittest.TestCase):
         self.assertIsNone(ledger.restore_acceptable(B, log.data, ledger.LEDGER))
         self.assertEqual(ledger.restore_acceptable(B, log.data, ledger.LEDGER, log.evidence), [2])
 
+    def test_restore_refuses_bytes_after_the_last_lf(self):
+        prev = ledger.classify(B, ledger.LEDGER)["entries"][-1]["line_digest"]
+        divergent = canonical.canon(ledger.make_entry(ledger.LEDGER, 2, prev, {
+            "auth_digest": "4" * 64, "auth_kind": "initiate", "binding_digest": "4" * 64, "confirmed_at": 1,
+            "issued_at": 1, "nonce_digest": "5" * 64}))
+        flipped = E2[:120] + (b"1" if E2[120:121] == b"0" else b"0") + E2[121:]
+        corrupt_interior = L0 + b"\n" + L1[:-3] + b"xx}\n"
+        cases = {
+            "valid unterminated": (B + E2, ledger.TAIL_UNTERMINATED_VALID),
+            "valid unterminated, lost LF write": (B + E2 + b"\x00", ledger.TAIL_UNTERMINATED_VALID),
+            "divergent unterminated": (B + divergent, ledger.TAIL_UNTERMINATED_VALID),
+            "truncated": (B + E2[:200], ledger.TAIL_PREFIX),
+            "corrupted": (B + flipped, ledger.UNCLASSIFIABLE),
+            "interior corruption and a valid unterminated record": (corrupt_interior + E2, ledger.UNCLASSIFIABLE),
+        }
+        for name, (current, cls) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(ledger.classify(current, ledger.LEDGER)["cls"], cls)
+                for backup in (B, B + E2 + b"\n", B + divergent + b"\n"):
+                    self.assertIsNone(ledger.restore_acceptable(current, backup, ledger.LEDGER))
+
+    def test_restore_after_in_band_terminate_compares_the_entry(self):
+        terminated = B + E2 + b"\n"
+        self.assertEqual(ledger.classify(terminated, ledger.LEDGER)["cls"], ledger.CLEAN)
+        self.assertIsNone(ledger.restore_acceptable(terminated, B, ledger.LEDGER))
+        prev = ledger.classify(B, ledger.LEDGER)["entries"][-1]["line_digest"]
+        divergent = canonical.canon(ledger.make_entry(ledger.LEDGER, 2, prev, {
+            "auth_digest": "4" * 64, "auth_kind": "initiate", "binding_digest": "4" * 64, "confirmed_at": 1,
+            "issued_at": 1, "nonce_digest": "5" * 64}))
+        self.assertIsNone(ledger.restore_acceptable(terminated, B + divergent + b"\n", ledger.LEDGER))
+        self.assertEqual(ledger.restore_acceptable(terminated, terminated, ledger.LEDGER), [])
+
 
 if __name__ == "__main__":
     unittest.main()

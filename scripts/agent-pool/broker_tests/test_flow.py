@@ -792,6 +792,123 @@ class LedgerRepairInBand(Base):
         self.refused("request", Code.LEDGER_UNAVAILABLE, op_id="op1")
 
 
+OTHER = "codegraph-worker-y"
+
+
+class IOrphanSources(unittest.TestCase):
+    """I-ORPHAN reads every source on every slot; one it cannot read refuses
+    every owner verb, and restoring the source restores service."""
+
+    def setUp(self):
+        self.env = Env()
+        self.env.seed_leased()
+        self.env.seed_leased(slot=OTHER)
+
+    def tearDown(self):
+        self.env.close()
+
+    def ok(self, slot, verb, **extra):
+        r = self.env.run(verb, slot=slot, reason=reason(), **extra)
+        self.assertIs(r.outcome, Outcome.COMMITTED, (slot, verb, r))
+
+    def refused(self, code, slot=SLOT, verb="mark-suspect"):
+        before, writes = self.env.snapshot(), len(self.env.world.writes())
+        fields = {"reason": reason()} if verb == "stop" else {"slot": slot, "reason": reason()}
+        r = self.env.run(verb, **fields)
+        self.assertEqual((r.outcome, r.code), (Outcome.REFUSED, code), r)
+        self.assertEqual(self.env.snapshot(), before)
+        self.assertEqual(len(self.env.world.writes()), writes)
+
+    def other_op(self):
+        self.ok(OTHER, "adopt", op_id="op2")
+        self.ok(OTHER, "request", op_id="op2")
+        return self.env.world.library.store._op_dir(OTHER, "op2")
+
+    def test_control_two_slots_commit(self):
+        self.ok(OTHER, "mark-suspect")
+        self.other_op()
+        self.ok(SLOT, "mark-suspect")
+
+    def test_target_slot_anchor_unreadable(self):
+        self.env.world.anchors[SLOT].data += b"*\n"
+        self.refused(Code.STATE_UNKNOWN)
+
+    def test_other_slot_anchor_unreadable(self):
+        self.ok(OTHER, "mark-suspect")
+        log = self.env.world.anchors[OTHER]
+        good = log.data
+        log.data += b"*\n"
+        self.refused(Code.STATE_UNKNOWN)
+        self.refused(Code.STATE_UNKNOWN, verb="stop")
+        log.data = good
+        self.ok(SLOT, "mark-suspect")
+
+    def test_unreadable_anchor_cannot_hide_a_cut_burn(self):
+        self.ok(OTHER, "mark-suspect")
+        w = self.env.world
+        lines = w.ledger.data.split(b"\n")
+        w.ledger.data = b"\n".join(lines[:-2]) + b"\n" + lines[-2][:200]
+        w.anchors[OTHER].data += b"*\n"
+        self.refused(Code.STATE_UNKNOWN)
+        w.anchors[OTHER].data = w.anchors[OTHER].data[:-2]
+        self.refused(Code.LEDGER_UNAVAILABLE)
+
+    def test_absent_anchor_log(self):
+        self.ok(OTHER, "mark-suspect")
+        log = self.env.world.anchors.pop(OTHER)
+        self.refused(Code.STATE_UNKNOWN)
+        self.env.world.anchors[OTHER] = log
+        self.ok(SLOT, "mark-suspect")
+
+    def test_other_slot_library_operation_unreadable(self):
+        state = self.other_op() / "state.json"
+        good = state.read_bytes()
+        state.write_bytes(b"{")
+        self.refused(Code.STATE_UNKNOWN)
+        state.write_bytes(good)
+        read = self.env.world.library.read
+        self.env.world.library.read = lambda slot, op_id: None if slot == OTHER else read(slot, op_id)
+        self.refused(Code.STATE_UNKNOWN)
+        self.env.world.library.read = read
+        self.ok(SLOT, "mark-suspect")
+
+    def test_unreadable_operation_cannot_hide_a_deleted_burn(self):
+        journal = self.other_op() / "journal.jsonl"
+        w = self.env.world
+        lines = w.ledger.data.split(b"\n")
+        w.ledger.data = b"\n".join(lines[:-2]) + b"\n"
+        good = journal.read_bytes()
+        journal.write_bytes(good[:-1])
+        self.refused(Code.STATE_UNKNOWN)
+        journal.write_bytes(good)
+        self.refused(Code.LEDGER_UNAVAILABLE)
+
+    def test_custody_entry_unreadable(self):
+        harness.to_quarantine(self.env, "op2", OTHER)
+        self.ok(OTHER, "quarantine", op_id="op2", **QUARANTINE)
+        w = self.env.world
+        kd = canonical.digest(custody.recovery_key(OTHER, "op2", 1))
+        good = w.custody.records[kd]
+        self.assertEqual(len(custody.parse_doc(good)["bound"]), 2)
+        unbound = dict(custody.parse_doc(good), state=custody.PERSISTED, bound=[])
+        for bad in (good[:-1], canonical.canon(unbound)):
+            w.custody.records[kd] = bad
+            self.refused(Code.CUSTODY_CORRUPT)
+        w.custody.records[kd] = good
+        w.custody.tombstones["0" * 64] = b"{}"
+        self.refused(Code.CUSTODY_CORRUPT)
+        del w.custody.tombstones["0" * 64]
+        self.ok(SLOT, "mark-suspect")
+
+    def test_f_wal_of_an_unlisted_slot(self):
+        w = self.env.world
+        w.fwal.entries["codegraph-worker-z"] = [{"op_id": "op9", "kind": "intent", "f_from": "NONE",
+                                                 "f_to": "MOVED", "value": "MOVE_INTENT", "auth_digest": "9" * 64}]
+        self.refused(Code.STATE_UNKNOWN)
+        del w.fwal.entries["codegraph-worker-z"]
+        self.ok(SLOT, "mark-suspect")
+
+
 class TokenScope(unittest.TestCase):
     def test_tokens_never_leave_custody(self):
         env = Env()

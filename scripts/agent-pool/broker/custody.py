@@ -273,14 +273,24 @@ class InMemoryCustody(Gated, CustodyStore):
                                 "tombstones": {k: v.decode() for k, v in sorted(self.tombstones.items())}})
 
     def references(self):
-        """auth_digests that custody binds (I-ORPHAN): bound pairs and tombstones."""
+        """auth_digests that custody binds (I-ORPHAN): bound pairs and tombstones.
+        Any record or tombstone that fails lookup's checks refuses CUSTODY_CORRUPT."""
         out = set()
-        for kd in self.records:
-            rec = self._parse(self.records[kd])
-            if type(rec) is dict and type(rec.get("bound")) is list and len(rec["bound"]) == 2:
-                out.add(rec["bound"][1])
-        for kd in self.tombstones:
-            tomb = self._parse(self.tombstones[kd])
-            if type(tomb) is dict and "auth_digest" in tomb:
-                out.add(tomb["auth_digest"])
+        for kd in sorted(set(self.records) | set(self.tombstones)):
+            st = self.lookup(self._key_of(kd))
+            if st.k in (CORRUPT, ABSENT):
+                raise Refused(Code.CUSTODY_CORRUPT, "I-ORPHAN: custody entry unreadable")
+            if st.record is not None and len(st.record["bound"]) == 2:
+                out.add(st.record["bound"][1])
+            if st.tombstone is not None:
+                out.add(st.tombstone["auth_digest"])
         return out
+
+    def _key_of(self, kd):
+        for raw, path in ((self.tombstones.get(kd), ("key",)), (self.records.get(kd), ("receipt", "key"))):
+            v = self._parse(raw) if raw is not None else None
+            for p in path:
+                v = v.get(p) if type(v) is dict else None
+            if v is not None and canonical.digest(v) == kd:
+                return v
+        raise Refused(Code.CUSTODY_CORRUPT, "I-ORPHAN: custody entry unreadable")

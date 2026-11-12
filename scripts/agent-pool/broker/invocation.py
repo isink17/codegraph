@@ -54,7 +54,7 @@ class World:
         return log
 
     def slots(self):
-        return sorted(set(self.tierc.records) | set(self.anchors))
+        return sorted(set(self.tierc.records) | set(self.anchors) | set(self.fwal.entries))
 
     def snapshot(self):
         snap = {"ledger": self.ledger.snapshot(), "authz": self.authz.snapshot(), "custody": self.custody.snapshot(),
@@ -96,23 +96,24 @@ def _latest_op(world, slot, entries):
 
 def i_orphan(world, entries):
     """A1 §A4.9: every auth_digest a durable effect binds is a committed burn,
-    and every library operation has a committed adopt burn."""
+    and every library operation has a committed adopt burn. A source that
+    cannot be read refuses, on every slot: a reference it holds cannot be
+    checked, and a repair in W could then erase a burn it pins."""
     burned = {e["auth_digest"] for e in entries}
     adopt_docs = [d for d in (_doc(world, e["auth_digest"]) for e in entries) if d and d.get("verb") == "adopt"]
     refs = set()
     for slot in world.slots():
-        log = world.anchor_log(slot)
-        res = log.classify()
-        if res["cls"] != ledger.UNCLASSIFIABLE:
-            refs |= {e["auth_digest"] for e in res["entries"]}
+        res = world.anchor_log(slot).classify()
+        if res["cls"] == ledger.UNCLASSIFIABLE or not res["entries"]:
+            raise Refused(Code.STATE_UNKNOWN, "I-ORPHAN: anchor log unreadable")
+        refs |= {e["auth_digest"] for e in res["entries"]}
         adopts = {d["op_id"] for d in adopt_docs if d.get("slot") == slot}
         for op_id in world.library.operations(slot):
             if op_id not in adopts:
                 raise Refused(Code.LEDGER_UNAVAILABLE, "I-ORPHAN")
-            try:
-                view = world.library.read(slot, op_id)
-            except Refused:
-                continue
+            view = world.library.read(slot, op_id)
+            if view is None:
+                raise Refused(Code.STATE_UNKNOWN, "I-ORPHAN: library operation unreadable")
             refs |= set(view.rec["gates"].values())
             refs |= {e["evidence"] for e in _journal_entries(view) if e.get("from") is not None}
         refs |= {e["auth_digest"] for e in world.fwal.log(slot)}
