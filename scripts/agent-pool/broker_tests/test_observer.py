@@ -332,6 +332,14 @@ class Hostile(Base):
         self.see(iv.Context(r, self.lab.path("admin"), r + "/.git", require_birthtime=HAS_BIRTHTIME),
                  Status.IDENTITY_CHANGED, "git-link-mismatch")
 
+    def test_admin_root_that_is_not_the_worktree_git_directory(self):
+        r, ctx = self.make()
+        copy = self.lab.path("git-copy")
+        shutil.copytree(Path(r, ".git"), copy, symlinks=True)
+        real = fdwalk.open_root
+        with mock.patch.object(fdwalk, "open_root", lambda p: real(copy if p == ctx.admin else p)):
+            self.see(ctx, Status.IDENTITY_CHANGED, "git-link-mismatch")
+
     def test_replaced_roots_change_the_binding(self):
         r, ctx = self.make()
         first = self.see(ctx, Status.CLEAN)
@@ -702,6 +710,7 @@ class FdwalkUnit(Base):
         self.assertEqual(len(fdwalk.walk(self.fd, self.dev, Limits())), 9)
         self.assertEqual(self.code(fdwalk.walk, self.fd, self.dev, Limits(max_depth=2)), "limit-exceeded")
         self.assertEqual(self.code(fdwalk.walk, self.fd, self.dev, Limits(max_entries=4)), "limit-exceeded")
+        self.assertEqual(self.code(fdwalk.walk, self.fd, self.dev, Limits(max_entries=7)), "limit-exceeded")
         self.assertEqual(self.code(fdwalk.walk, self.fd, self.dev + 1, Limits()), "cross-device")
         os.mkfifo(Path(self.d, "a/b/pipe"))
         self.assertEqual(self.code(fdwalk.walk, self.fd, self.dev, Limits()), "special-file")
@@ -951,7 +960,8 @@ class Results(Base):
                   iv.Context(r, r + "/.git", self.lab.path("x")), iv.Context(r, r + "/admin", r + "/admin"),
                   iv.Context(r, r + "/inner", self.lab.path("c")), iv.Context(r, r + "/.git", r + "/.git", expected=(1,)),
                   iv.Context("/", "/.git", "/.git")):
-            self.assertIs(iv.observe(c).status, Status.UNKNOWN, c)
+            obs = iv.observe(c)
+            self.assertEqual((obs.status, obs.reasons[0][0]), (Status.UNKNOWN, "invalid-context"), c)
 
 
 if __name__ == "__main__":
