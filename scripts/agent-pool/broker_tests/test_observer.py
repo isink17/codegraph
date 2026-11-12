@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import socket
+import time
 import unittest
 import zlib
 from pathlib import Path
@@ -401,6 +402,21 @@ class Hostile(Base):
             obs = self.lab.observe(wctx)
         self.assertIn(obs.status, (Status.UNKNOWN, Status.IDENTITY_CHANGED), obs)
 
+    def test_tree_budget_counts_directories(self):
+        r, ctx = self.make()
+        tree = self.lab.git(r, "rev-parse", "HEAD^{tree}").stdout.strip()
+        fd, st = fdwalk.open_root(ctx.admin)
+        self.addCleanup(os.close, fd)
+        for limits, ok in ((Limits(max_entries=10), True), (Limits(max_entries=9), False),
+                           (Limits(max_path=6), False), (Limits(max_path=12), True)):
+            repo = gitraw.Repo(fd, st.st_dev, fd, st.st_dev, limits)
+            if ok:
+                self.assertEqual(len(repo.flatten(tree)), 6)
+            else:
+                with self.assertRaises(Unknown) as cm:
+                    repo.flatten(tree)
+                self.assertEqual(cm.exception.code, "limit-exceeded")
+
     def test_hardlinked_tracked_file_is_not_read(self):
         r, ctx = self.make()
         os.link(Path(r, "README"), self.lab.path("outside-link"))
@@ -672,6 +688,19 @@ class FdwalkUnit(Base):
         m = fdwalk.lstat_at(self.fd, b"f", b"f")
         self.assertEqual(fdwalk.read_at(self.fd, b"f", m, 100, b"f", self.dev), b"ABCDEF")
 
+    def test_hard_link_swapped_in_before_the_open_is_never_read(self):
+        Path(self.d, "f").write_bytes(b"public")
+        Path(self.lab.root, "secret").write_bytes(b"SECRET")
+        m = fdwalk.lstat_at(self.fd, b"f", b"f")
+        os.unlink(Path(self.d, "f"))
+        os.link(Path(self.lab.root, "secret"), Path(self.d, "f"))
+        reads = []
+        real = os.read
+        with mock.patch.object(os, "read", lambda fd, n: reads.append(fd) or real(fd, n)):
+            self.assertEqual(self.code(fdwalk.read_at, self.fd, b"f", m, 100, b"f", self.dev),
+                             "changed-during-observation")
+        self.assertEqual(reads, [])
+
     def test_read_at_refusals(self):
         Path(self.d, "f").write_bytes(b"abcdef")
         os.mkfifo(Path(self.d, "p"))
@@ -765,6 +794,27 @@ class IndexParser(unittest.TestCase):
         pad[-1] = 1
         self.refused(bytes(pad) + hashlib.sha1(bytes(pad)).digest(), "malformed-index")
 
+    def test_deep_and_long_paths_are_bounded(self):
+        limits = Limits()
+        self.refused(index_bytes([(b"/".join([b"d"] * (limits.max_depth + 2)), self.F, 0, None)]), "limit-exceeded")
+        self.refused(index_bytes([(b"x" * (limits.max_path + 1), self.F, 0, None)]), "limit-exceeded")
+        self.refused(index_bytes([(b"x" * 256, self.F, 0, None)]), "malformed-index")
+        start = time.monotonic()
+        self.refused(index_bytes([(b"/".join([b"d"] * 40000), self.F, 0, None)]), "limit-exceeded")
+        comp = b"c" * 60
+        deep = [(b"/".join([comp] * 60 + [b"%03d" % i]), self.F, 0, None) for i in range(300)]
+        index = self.parse(index_bytes(deep))
+        iv._compare(index, index, {}, {})
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_file_and_directory_at_one_path_with_interleaved_names(self):
+        self.refused(index_bytes([(b"a", self.F, 0, None), (b"a-b", self.F, 0, None), (b"a/c", self.F, 0, None)]),
+                     "malformed-index")
+        names = [b"a", b"a-b", b"a.c/x", b"a/c", b"b"]
+        self.assertEqual([n for n in names if iv.has_children(names, n)], [b"a"])
+        self.assertTrue(iv.has_children(names, b"a.c"))
+        self.assertFalse(iv.has_children(names, b"a-"))
+
     def test_unsupported(self):
         self.refused(index_bytes([(b"a", self.F, 0, None)], version=4), "unsupported-index-feature")
         self.refused(index_bytes([(b"a", self.F, 0x8000, None)]), "unsupported-index-feature")
@@ -806,14 +856,16 @@ class GitParsers(unittest.TestCase):
 
     def test_trees(self):
         ok = self.tree((b"100644", b"a"), (b"40000", b"a.d"), (b"100755", b"b.x"), (b"40000", b"b"))
-        self.assertEqual([n for n, _, _ in gitraw.parse_tree(b"t", b"tree", ok)], [b"a", b"a.d", b"b.x", b"b"])
+        self.assertEqual([n for n, _, _ in gitraw.parse_tree(b"t", b"tree", ok, 100)], [b"a", b"a.d", b"b.x", b"b"])
         for bad in (self.tree((b"100644", b"b"), (b"100644", b"a")), self.tree((b"100644", b"a"), (b"100644", b"a")),
                     self.tree((b"100664", b"a")), self.tree((b"100644", b"..")), self.tree((b"100644", b".git")),
                     self.tree((b"100644", b"")), self.tree((b"100644", b"a"), (b"40000", b"a")),
                     self.tree((b"40000", b"a"), (b"100644", b"a.b"))[:-1], b"100644 a"):
-            self.refused(gitraw.parse_tree, b"t", b"tree", bad, code="malformed-object")
-        self.refused(gitraw.parse_tree, b"t", b"blob", ok, code="malformed-object")
-        self.refused(gitraw.parse_tree, b"t", b"tree", self.tree((b"160000", b"s")), code="submodule")
+            self.refused(gitraw.parse_tree, b"t", b"tree", bad, 100, code="malformed-object")
+        self.refused(gitraw.parse_tree, b"t", b"blob", ok, 100, code="malformed-object")
+        self.refused(gitraw.parse_tree, b"t", b"tree", self.tree((b"160000", b"s")), 100, code="submodule")
+        self.refused(gitraw.parse_tree, b"t", b"tree", ok, 3, code="limit-exceeded")
+        self.assertEqual(len(gitraw.parse_tree(b"t", b"tree", ok, 4)), 4)
 
     def test_commit(self):
         self.assertEqual(gitraw.parse_commit_tree(b"c", b"commit", b"tree " + b"a" * 40 + b"\nparent x\n"), b"a" * 40)
@@ -904,7 +956,7 @@ class Fuzz(unittest.TestCase):
                 gitraw.parse_object(b"0" * 40, data, 1 << 16)
 
         self.run_fuzz(6, [raw], safe_obj)
-        self.run_fuzz(7, [tree], lambda d: gitraw.parse_tree(b"t", b"tree", d))
+        self.run_fuzz(7, [tree], lambda d: gitraw.parse_tree(b"t", b"tree", d, 100))
         self.run_fuzz(8, [b"tree " + b"a" * 40 + b"\nauthor x\n"], lambda d: gitraw.parse_commit_tree(b"c", b"commit", d))
 
 

@@ -40,6 +40,7 @@ class Limits:
     max_index: int = 64 << 20
     max_object: int = 16 << 20
     max_trees: int = 50_000
+    max_path: int = 4096
 
 
 Meta = collections.namedtuple("Meta", "kind perm dev ino nlink size mtime_ns ctime_ns")
@@ -54,7 +55,8 @@ def meta(st):
 
 
 def valid_name(name):
-    return type(name) is bytes and name not in (b"", b".", b"..") and b"/" not in name and b"\0" not in name
+    return (type(name) is bytes and 0 < len(name) <= 255 and name not in (b".", b"..") and b"/" not in name
+            and b"\0" not in name)
 
 
 def _os_error(e, path):
@@ -252,12 +254,16 @@ def walk(root, dev, limits, skip_top=(), visit=None):
     path. Directories are entered only through open_dir_at; special files and
     other devices raise Unknown. visit(dirfd, name, rel, meta) runs on each
     non-directory entry while its directory is open."""
-    entries = {}
+    entries, listed = {}, [0]
 
     def rec(dfd, prefix, depth):
         if depth > limits.max_depth:
             raise Unknown("limit-exceeded", prefix)
-        for name in list_dir(dfd, prefix, limits.max_entries):
+        names = list_dir(dfd, prefix, limits.max_entries)
+        listed[0] += len(names)
+        if listed[0] > limits.max_entries + len(skip_top):
+            raise Unknown("limit-exceeded", prefix)
+        for name in names:
             if not prefix and name in skip_top:
                 continue
             rel = prefix + name

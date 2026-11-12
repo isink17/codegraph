@@ -8,6 +8,7 @@ absence of concurrent writers, and it carries no provenance: nothing privileged
 may treat it as authorization. Untracked and ignored entries, including empty
 directories, are NOT_CLEAN. Unsupported or inconsistent state is UNKNOWN."""
 
+import bisect
 import collections
 import contextlib
 import dataclasses
@@ -102,6 +103,13 @@ def combine(observations):
     return obs[0]
 
 
+def has_children(names, path):
+    """Whether any of the sorted paths lies below path; O(log n) per call."""
+    under = path + b"/"
+    i = bisect.bisect_left(names, under)
+    return i < len(names) and names[i].startswith(under)
+
+
 def blob_oid(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
 
@@ -144,6 +152,8 @@ def parse_index(data, limits):
         name, length = data[name_at:nul], flags & 0xFFF
         if not name:
             raise Unknown("unsupported-index-feature", b"split index")
+        if len(name) > limits.max_path or name.count(b"/") > limits.max_depth:
+            raise Unknown("limit-exceeded", b"index path")
         entry_end = pos + ((name_at - pos + len(name) + 8) & ~7)
         if (length != min(len(name), 0xFFF) or entry_end > end or data[nul:entry_end].strip(b"\0")
                 or not gitraw.valid_path(name)):
@@ -164,9 +174,9 @@ def parse_index(data, limits):
         if sig not in (b"TREE", b"REUC", b"EOIE", b"IEOT"):
             raise Unknown("unsupported-index-feature", sig)
         pos += 8 + size
-    for name in out:
-        parts = name.split(b"/")
-        if any(b"/".join(parts[:i]) in out for i in range(1, len(parts))):
+    names = list(out)
+    for name in names:
+        if has_children(names, name):
             raise Unknown("malformed-index", name)
     return out
 
@@ -266,9 +276,9 @@ def _compare(index, tree, entries, found):
         if got is True:
             continue
         reasons.append(_reason(got if got else "type-changed" if p in entries else "deleted", p))
-    dirs = {p[:i] for p in index for i in range(len(p)) if p[i:i + 1] == b"/"}
+    names = sorted(index)
     for p, m in entries.items():
-        if p not in index and not (m.kind == "dir" and p in dirs):
+        if p not in index and not (m.kind == "dir" and has_children(names, p)):
             reasons.append(_reason("untracked", p))
     return reasons
 

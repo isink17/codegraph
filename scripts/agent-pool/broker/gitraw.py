@@ -157,8 +157,9 @@ def parse_commit_tree(oid, typ, body):
     return body[5:45]
 
 
-def parse_tree(oid, typ, body):
-    """[(name, mode, oid)] in Git's tree order, with every name checked."""
+def parse_tree(oid, typ, body, limit):
+    """[(name, mode, oid)] in Git's tree order, with every name checked and
+    at most limit entries."""
     if typ != b"tree":
         raise Unknown("malformed-object", oid)
     out, pos, prev, names = [], 0, None, set()
@@ -175,6 +176,8 @@ def parse_tree(oid, typ, body):
         key = name + b"/" if mode == MODE_DIR else name
         if prev is not None and key <= prev:
             raise Unknown("malformed-object", oid)
+        if len(out) >= limit:
+            raise Unknown("limit-exceeded", oid)
         out.append((name, mode, body[nul + 1:nul + 21].hex().encode()))
         names.add(name)
         prev, pos = key, nul + 21
@@ -241,14 +244,20 @@ class Repo:
         return parse_commit_tree(oid, *self.read_object(oid))
 
     def flatten(self, tree_oid):
-        """{path: (mode, oid)} for every non-tree entry reachable from tree_oid."""
-        out, count = {}, [0]
+        """{path: (mode, oid)} for every non-tree entry reachable from tree_oid.
+        Every parsed entry, directories included, counts against max_entries
+        before any recursion, so the lists held along one path stay bounded."""
+        out, count, budget = {}, [0], [self.limits.max_entries]
 
         def rec(oid, prefix, depth):
             count[0] += 1
             if depth > self.limits.max_depth or count[0] > self.limits.max_trees:
                 raise Unknown("limit-exceeded", oid)
-            for name, mode, child in parse_tree(oid, *self.read_object(oid)):
+            entries = parse_tree(oid, *self.read_object(oid), budget[0])
+            budget[0] -= len(entries)
+            for name, mode, child in entries:
+                if len(prefix) + len(name) > self.limits.max_path:
+                    raise Unknown("limit-exceeded", oid)
                 if mode == MODE_DIR:
                     rec(child, prefix + name + b"/", depth + 1)
                 else:

@@ -190,7 +190,7 @@ STR_METHODS = {"startswith", "endswith", "split", "rsplit", "partition", "rparti
 
 # The read-only Git observer; every other module is protocol core.
 OBSERVER = {"fdwalk.py", "gitraw.py", "indexverify.py"}
-OBSERVER_IMPORTS = {"collections", "contextlib", "dataclasses", "enum", "errno", "hashlib", "os", "re", "stat", "zlib"}
+OBSERVER_IMPORTS = {"bisect", "collections", "contextlib", "dataclasses", "enum", "errno", "hashlib", "os", "re", "stat", "zlib"}
 OBSERVER_SIBLINGS = {"fdwalk", "gitraw", "indexverify", "sanitize"}
 OS_FORBIDDEN = {"write", "writev", "pwrite", "remove", "unlink", "rename", "renames", "replace", "mkdir", "makedirs",
                 "rmdir", "removedirs", "chmod", "fchmod", "lchmod", "chown", "fchown", "lchown", "chflags", "lchflags",
