@@ -72,14 +72,16 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 9. **Restore needs an LF-terminated current file (A1 §A4.7).** Condition 3
    counts only LF-terminated lines, so a committed `TAIL_UNTERMINATED_VALID`
    entry would escape condition 2. `restore_acceptable` therefore refuses
-   whenever the current file has any byte after its last LF. A valid
-   unterminated entry is first terminated in band (plan `terminate`) and the
-   predicate is then re-run, so the entry is compared like any other line. Every
-   other tail (prefix, NULs, corrupt or divergent bytes) stays unrestorable until
-   a separately authorized protocol handles it.
+   whenever the current file has any byte after its last LF. In PR-1 this makes
+   every `UNCLASSIFIABLE` file with a non-empty tail unrestorable, including a
+   self-valid unterminated final entry and A4.7's complete-but-invalid final
+   segment. No in-band path terminates such a file, because `plan()` refuses an
+   `UNCLASSIFIABLE` log. An LF repair followed by a re-run of the predicate
+   would belong to a separately authorized PR-4 out-of-band runbook. A file that
+   ends in LF is compared line by line as before.
 10. **I-ORPHAN fails closed on unreadable sources (A1 §A4.9).** Every reference
-    source is read for every slot. Any of the following refuses every owner verb,
-    `stop` included:
+    source is read for every slot. Any of the following refuses every non-read
+    owner verb, `stop` included (`READ_ONLY` verbs skip phase V and still answer):
     - an anchor log that is `UNCLASSIFIABLE` or has no entries: `STATE_UNKNOWN`;
     - a listed library operation that cannot be read: `STATE_UNKNOWN` or `BUSY`;
     - a custody record or tombstone that fails lookup's checks: `CUSTODY_CORRUPT`.
@@ -89,6 +91,12 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
     narrower exception is claimed. PR-4 must enumerate slots from protected
     configuration, so that a slot cannot leave the set by losing its Tier C
     record and its anchor log.
+
+    The refusal is global: an unseeded slot (a Tier C record or F WAL without
+    an anchor entry) or a `BUSY` operation on any slot blocks every non-read
+    verb, where r4 refused only that slot. The PR that adds `migrate` must order
+    the anchor seed before a slot can be enumerated, or define a reviewed
+    exception, or migration itself will be refused.
 
 ## Review N5 dispositions
 
@@ -110,8 +118,13 @@ They are not an OS security boundary. Before any privileged install, PR-4 must
 prove on the installed artifact that none of the following is present in, or
 can be loaded by, the privileged broker:
 
-- `_testsupport`;
-- `SyntheticOwner` and the synthetic store kind;
+- `_testsupport` (PR-1 has no bundle manifest; the exclusion its docstring
+  names is still to be built);
+- `SyntheticOwner` and the synthetic store kind, which PR-1 defines in
+  `authz.py`, so PR-4 must move them out of the installed modules rather than
+  only omit `_testsupport`;
+- `authz._new_capability` and `provenance._produce` reachable from anything
+  but the production entry points;
 - any development-only constructor for `OwnerCapability`, decisive provenance
   or `CommitTxn`.
 

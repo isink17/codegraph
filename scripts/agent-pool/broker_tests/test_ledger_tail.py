@@ -439,7 +439,7 @@ class Restore(unittest.TestCase):
                 for backup in (B, B + E2 + b"\n", B + divergent + b"\n"):
                     self.assertIsNone(ledger.restore_acceptable(current, backup, ledger.LEDGER))
 
-    def test_restore_after_in_band_terminate_compares_the_entry(self):
+    def test_restore_compares_an_lf_terminated_final_entry(self):
         terminated = B + E2 + b"\n"
         self.assertEqual(ledger.classify(terminated, ledger.LEDGER)["cls"], ledger.CLEAN)
         self.assertIsNone(ledger.restore_acceptable(terminated, B, ledger.LEDGER))
