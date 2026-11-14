@@ -7,7 +7,7 @@ import unittest
 
 import harness
 from harness import SLOT, Env, reason
-from broker import authz, evidence, freeze, invocation, o5contract as oc
+from broker import authz, barrier, cutover, evidence, freeze, invocation, o5contract as oc
 from broker._testsupport import capability, o5
 from broker.authz_txn import TxnError
 from broker.refusal import Code, Outcome, Refused
@@ -138,6 +138,92 @@ class Protected(Base):
                                              op_id=None, cycle=None, barrier_id=None, now=self.env.world.clock(),
                                              mode=oc.PROTECTED)
         self.assertEqual((picked, sorted(missing)), ({}, sorted(oc.TMB_KINDS)))
+
+
+class DirectPreconditions(Base):
+    """B1 (R2 §3.2, A18, A32): every B precondition refuses outside synthetic mode
+    as its first act, whoever calls it; only the exact SYNTHETIC constant passes."""
+
+    class Fake(str):
+        def __eq__(self, other):
+            return True
+
+        __hash__ = str.__hash__
+
+    def calls(self, mode):
+        w = self.env.world
+        h = freeze.head_of(w, w.ledger.entries(), freeze.burned_docs(w, w.ledger.entries()))
+        c = o5.chain(self.env, self.env.barrier_id)
+        enum = {s: o5.AGENT_UID for s in harness.O5_SLOTS}
+        o5.release_chain(self.env, self.env.barrier_id)
+        released = {c.id: o5.chain(self.env, self.env.barrier_id)}
+        views = freeze.release_views(w, c, freeze.burned_docs(w, w.ledger.entries()), w.ledger.entries(),
+                                     {s: [] for s in c.slots})
+        return {
+            "cutover_allowed": lambda: cutover.cutover_allowed(mode, "rebaseline", h, [], [], 1),
+            "establish_allowed": lambda: barrier.establish_allowed(mode, released, "POOL_MAINTENANCE", sorted(enum),
+                                                                   [o5.AGENT_UID], enum, []),
+            "handoff_allowed": lambda: barrier.handoff_allowed(mode, None, "ESTABLISHED", "P13", SLOT, None, False,
+                                                               [], [], None),
+            "release_allowed": lambda: barrier.release_allowed(mode, c, "ESTABLISHED", h, views, {}, False, False,
+                                                               False, lambda *a: None),
+        }
+
+    def test_protected_missing_and_forged_modes_refuse(self):
+        self.to()
+        bad = (oc.PROTECTED, None, True, 1, object(), "synthetic", self.Fake("PROTECTED"), b"SYNTHETIC")
+        for mode in bad:
+            for name, call in self.calls(mode).items():
+                snap, writes = self.env.snapshot(), list(self.env.world.writes())
+                with self.assertRaises(Refused, msg=(name, mode)) as e:
+                    call()
+                self.assertEqual(e.exception.detail, "barrier_unavailable(protected_mode_unsupported)")
+                self.assertEqual((self.env.snapshot(), list(self.env.world.writes())), (snap, writes))
+            self.setUp()
+            self.to()
+        for name in self.calls(None):
+            with self.assertRaises(TypeError):
+                getattr({"cutover_allowed": cutover, "establish_allowed": barrier, "handoff_allowed": barrier,
+                         "release_allowed": barrier}[name], name)()
+        self.assertEqual(self.effects, [])
+
+    def test_synthetic_mode_keeps_the_pure_decisions(self):
+        self.env.seed_leased(slot=harness.O5_SLOTS[1])
+        self.to()
+        out = {}
+        for name, call in self.calls(oc.SYNTHETIC).items():
+            try:
+                out[name] = call()
+            except Refused as e:
+                out[name] = e.detail
+        self.assertIsNone(out["cutover_allowed"])
+        self.assertIsNone(out["establish_allowed"])
+        self.assertEqual(out["handoff_allowed"], "barrier_binding")
+        self.assertEqual(out["release_allowed"], [(SLOT, "D1"), (harness.O5_SLOTS[1], "D1")])
+
+    def test_a32_each_precondition_starts_with_the_constant_refusal(self):
+        import ast
+        broker = harness.HERE.parent / "broker"
+        for mod, names in (("cutover.py", ("cutover_allowed",)),
+                           ("barrier.py", ("establish_allowed", "handoff_allowed", "release_allowed"))):
+            tree = ast.parse((broker / mod).read_text())
+            fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+            for name in names:
+                fn = fns[name]
+                self.assertEqual(fn.args.args[0].arg, "mode", name)
+                self.assertEqual(fn.args.defaults, [], name)
+                body = [b for b in fn.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
+                first = body[0]
+                self.assertEqual(ast.unparse(first), "oc.require_synthetic(mode)", name)
+        tree = ast.parse((broker / "o5contract.py").read_text())
+        fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        req = [b for b in fns["require_synthetic"].body if not isinstance(b, ast.Expr)]
+        self.assertEqual(len(req), 1)
+        self.assertEqual(ast.unparse(req[0]), "if type(mode) is not str or mode != SYNTHETIC:\n    refuse_protected()")
+        ref = fns["refuse_protected"].body
+        self.assertEqual(len(ref), 1)
+        self.assertIsInstance(ref[0], ast.Raise)
+        self.assertTrue(all(isinstance(a, (ast.Constant, ast.Attribute)) for a in ref[0].exc.args))
 
 
 class AbsentPreservation(Base):

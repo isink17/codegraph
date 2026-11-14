@@ -126,8 +126,9 @@ def live(chains):
     return [c for c in chains.values() if c.state != RELEASED]
 
 
-def establish_allowed(chains, scope, slots, writer_uids, enum_uids, pending_slots):
+def establish_allowed(mode, chains, scope, slots, writer_uids, enum_uids, pending_slots):
     """R2 §5.2, F5 §3.5: shared uid, overlap (INVALID covers everything), pending Tier C step."""
+    oc.require_synthetic(mode)
     if scope != "POOL_MAINTENANCE" or sorted(slots) != sorted(s for s, u in enum_uids.items() if u in writer_uids):
         raise Refused(Code.FIELD_INVALID, "barrier_scope")
     if any(covers(c, s, writer_uids) for c in live(chains) for s in slots):
@@ -155,9 +156,10 @@ def refuse_state(st):
     raise Refused(Code.QUIESCENCE_NOT_ESTABLISHED, f"barrier_unavailable({st.lower()})")
 
 
-def handoff_allowed(chain, st, row, slot, cycle, stop, verdicts, pre_digests, guard):
+def handoff_allowed(mode, chain, st, row, slot, cycle, stop, verdicts, pre_digests, guard):
     """R2 §5.5 structural part (PR-4 containment-handoff V and R). `verdicts`
     are the V and R establishment verdicts; `guard(v)` is the R4 §4.4 guard."""
+    oc.require_synthetic(mode)
     if stop:
         raise Refused(Code.STOPPED)
     if chain is None or chain.id != cycle.barrier_id:
@@ -227,10 +229,11 @@ def release_case(target, view, chains):
     raise Refused(Code.STATE_UNKNOWN, "row")
 
 
-def release_allowed(target, st, head, views, chains, stop, halt, resume, discharge):
+def release_allowed(mode, target, st, head, views, chains, stop, halt, resume, discharge):
     """R2 §6.1/§6.4 global conditions, then every slot of the enforcement scope
     needs exactly one case. `discharge(view, kind, holder, cycle)` returns an
     accepted Discharge or None (PR-3b; R3 §6.3). Returns [(slot, case)]."""
+    oc.require_synthetic(mode)
     if stop:
         raise Refused(Code.STOPPED)
     if halt:

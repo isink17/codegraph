@@ -185,9 +185,44 @@ def _cell(doc):
     return dec.get("cell") if type(dec) is dict else None
 
 
+def refreshed_records(world):
+    """Every parseable `refreshed` barrier record. An unparseable record makes
+    its chain INVALID in verify_chain; it is never trusted here."""
+    st, out = world.o5.stores["barriers"], []
+    for k in st.keys():
+        try:
+            r = protocol.parse_doc(st.get(k))
+        except Refused:
+            continue
+        if r.get("kind") == "refreshed" and type(r.get("detail")) is dict:
+            out.append(r)
+    return out
+
+
+def _refreshed_consistent(cid, slot, barrier_id, seg, refreshed):
+    """R4 §2.2 last row and §2.4: a `refreshed` naming this cycle must bind
+    exactly one completion of this cycle, written under the record's own
+    authorization, in the cycle's own chain and for the same slot; one
+    completion carries at most one `refreshed`. A completion without its
+    `refreshed` (crash between the two writes) is consistent."""
+    comps = {canonical.digest(e): e for e in seg if e.get("kind") == "complete"}
+    seen = set()
+    for r in refreshed:
+        d = r["detail"]
+        if d.get("cycle_id") != cid:
+            continue
+        done = comps.get(d.get("completion"))
+        if done is None or d["completion"] in seen or d.get("slot") != slot or r.get("barrier_id") != barrier_id \
+                or r.get("owner_auth") != done.get("auth_digest"):
+            return False
+        seen.add(d["completion"])
+    return True
+
+
 def cycles(world, slot, docs):
     """Every cycle of the slot in F WAL order (R2 §5.4 with R4.1 §3.3)."""
     log = world.fwal.log(slot)
+    refreshed = refreshed_records(world)
     out = []
     for op_id in dict.fromkeys(e.get("op_id") for e in log):
         oplog = [e for e in log if e.get("op_id") == op_id]
@@ -206,8 +241,11 @@ def cycles(world, slot, docs):
                     binds.update({k: v for k, v in e["bindings"].items() if k != "early" or e["value"] == "MOVED"})
             last_intent = [e for e in seg if e.get("kind") == "intent"][-1]
             done = seg[-1].get("kind") == "complete"
+            cid = oc.cycle_id(slot, doc.get("slot_generation"), op_id, auth)
             if f == "UNKNOWN":
                 closure = "STATE_UNKNOWN(fwal)"
+            elif not _refreshed_consistent(cid, slot, o5.get("barrier_id"), seg, refreshed):
+                closure = "STATE_UNKNOWN(cycle_inconsistent)"
             elif len(seg) == 2 and done and seg[1]["value"] == "NONE":
                 closure, closed = "none_no_move", seg[1].get("utc")
             elif done and last_intent["value"] == "THAW_INTENT" and seg[-1]["value"] == "NONE":
@@ -220,7 +258,7 @@ def cycles(world, slot, docs):
             else:
                 closure = _ready_closure(world, slot, op_id, docs)
             g_pre = doc.get("slot_generation")
-            out.append(Cycle(oc.cycle_id(slot, g_pre, op_id, auth), slot, op_id, g_pre, auth, doc,
+            out.append(Cycle(cid, slot, op_id, g_pre, auth, doc,
                              o5.get("barrier_id"), o5.get("cutover_head"), o5.get("enumeration"), closure, seg,
                              binds, closed))
     return out
@@ -230,22 +268,47 @@ def is_open(c):
     return c.closure in ("open", "ready_pending")
 
 
+def _burn_bound(world, slot, doc, entry):
+    """R4 §2.3 condition 4: the burn and its document bind exactly this slot's
+    operation at its pre-quarantine generation. The expected binding key is
+    computed from the library record (authoritative), never from the document."""
+    from . import authz, lifecycle
+    op_id = doc.get("op_id")
+    if entry["auth_kind"] != "initiate" or doc.get("verb") != "freeze-start" or doc.get("slot") != slot:
+        return False
+    try:
+        view = world.library.read(slot, op_id)
+    except Refused:
+        return False
+    if view is None:
+        return False
+    g = lifecycle.g_pre(view.rec)
+    o5 = doc.get("o5")
+    return (doc.get("slot_generation") == g and type(o5) is dict and _hex(o5.get("barrier_id"))
+            and _hex(o5.get("cutover_head"))
+            and entry["binding_digest"] == authz.binding_digest({"verb": "freeze-start", "slot": slot,
+                                                                 "op_id": op_id, "slot_generation": g}))
+
+
 def classify_burn(world, slot, docs, entries, auth, cycle_list):
     """R4 §2.2 for one burned freeze-start document (pure)."""
+    mine = [e for e in entries if e["auth_digest"] == auth]
+    if len(mine) != 1:
+        return "STATE_UNKNOWN(fork)"
     doc = docs.get(auth)
     if doc is None:
         return "STATE_UNKNOWN(auth_missing)"
-    if [e["auth_digest"] for e in entries].count(auth) > 1:
-        return "STATE_UNKNOWN(fork)"
+    if not _burn_bound(world, slot, doc, mine[0]):
+        return "STATE_UNKNOWN(barrier_binding)"
     log = world.fwal.log(slot)
     f, _ = fold([e for e in log if e.get("op_id") == doc.get("op_id")], docs.get)
     if f == "UNKNOWN":
         return "STATE_UNKNOWN(fwal)"
-    if doc.get("slot") != slot:
-        return "STATE_UNKNOWN(barrier_binding)"
     intents = [e for e in log if e.get("kind") == "intent" and e.get("auth_digest") == auth]
     if intents:
         cyc = next((c for c in cycle_list if c.freeze_start_auth == auth), None)
+        if cyc is not None and cyc.closure.startswith("STATE_UNKNOWN"):
+            return cyc.closure
         if cyc is None or cyc.entries[-1].get("kind") == "intent" and len(cyc.entries) == 1:
             return "INTENT_PENDING"
         return "COMPLETED"
@@ -519,6 +582,10 @@ def _g4(world, spec, facts, cyc_list, docs, entries):
                 raise Refused(Code.STATE_UNKNOWN, x.closure)
             if is_open(x):
                 raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "cycle_open")
+        known = {x.cycle_id for x in cyc_list}
+        if any(r["detail"].get("slot") == facts.slot and r["detail"].get("cycle_id") not in known
+               for r in refreshed_records(world)):
+            raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
         for auth in freeze_start_burns(world, docs, entries, facts.slot):
             k = classify_burn(world, facts.slot, docs, entries, auth, cyc_list)
             if k.startswith("STATE_UNKNOWN"):
@@ -850,7 +917,8 @@ def release_check(world, barrier_id, resume=False, halt=False):
             return None
         return d
 
-    return barrier.release_allowed(target, st, h, views, chains, world.gates.stopped(), halt, resume, discharge)
+    return barrier.release_allowed(oc.mode(world), target, st, h, views, chains, world.gates.stopped(), halt, resume,
+                                   discharge)
 
 
 def refreshed_record(chain, auth, slot, cid, completion, picked, utc, mode):

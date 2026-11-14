@@ -248,12 +248,12 @@ class CutoverAllowed(unittest.TestCase):
 
     def refuse(self, kind, chains, cycles, seq=1):
         with self.assertRaises(Refused) as e:
-            cutover.cutover_allowed(kind, self.h, chains, cycles, seq)
+            cutover.cutover_allowed(oc.SYNTHETIC, kind, self.h, chains, cycles, seq)
         return e.exception.code, e.exception.detail
 
     def test_closed_cycles_never_block(self):
         for kind in ("rebaseline", "revoked"):
-            cutover.cutover_allowed(kind, self.h, ["RELEASED"], ["none_no_move", "thaw_complete", "ready"], 1)
+            cutover.cutover_allowed(oc.SYNTHETIC, kind, self.h, ["RELEASED"], ["none_no_move", "thaw_complete", "ready"], 1)
 
     def test_open_and_ready_pending_refuse(self):
         for kind in ("rebaseline", "revoked"):
@@ -272,7 +272,7 @@ class CutoverAllowed(unittest.TestCase):
     def test_cutover_over_active_and_sequence_limits(self):
         self.assertEqual(self.refuse("cutover", [], [])[1], "cutover")
         self.assertEqual(self.refuse("rebaseline", [], [], seq=1022)[1], "sequence")
-        cutover.cutover_allowed("revoked", self.h, [], [], oc.REVOKE_SEQ)
+        cutover.cutover_allowed(oc.SYNTHETIC, "revoked", self.h, [], [], oc.REVOKE_SEQ)
 
     def test_pending_or_invalid_head_refuses_everything(self):
         env = Env(o5_fixtures=False)
@@ -282,7 +282,7 @@ class CutoverAllowed(unittest.TestCase):
         h = head(env)
         for kind in ("cutover", "rebaseline", "revoked"):
             with self.assertRaises(Refused) as e:
-                cutover.cutover_allowed(kind, h, [], [], 2)
+                cutover.cutover_allowed(oc.SYNTHETIC, kind, h, [], [], 2)
             self.assertIs(e.exception.code, Code.STATE_UNKNOWN)
 
 

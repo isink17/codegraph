@@ -186,6 +186,219 @@ class BurnClassification(unittest.TestCase):
         self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "cycle_inconsistent"))
 
 
+OTHER = harness.O5_SLOTS[1]
+
+
+class RefreshedIntegrity(unittest.TestCase):
+    """B2 (R4 §2.2 last row, §2.4, A84): every `refreshed` must bind exactly one
+    completion of its own cycle, authorization, slot and chain."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.seed_leased()
+        self.env.seed_leased(slot=OTHER)
+        ok(self, self.env, "adopt")
+        ok(self, self.env, "request")
+        self.effects = []
+        inner = self.env.world.freeze
+
+        def counted(verb, slot, op, ctx):
+            self.effects.append(verb)
+            return inner(verb, slot, op, ctx)
+        self.env.world.freeze = counted
+
+    def cycle(self):
+        return cycles(self.env)[-1]
+
+    def completion(self):
+        return [e for e in self.env.world.fwal.log(SLOT) if e["kind"] == "complete"][-1]
+
+    def add(self, detail, auth=None, bid=None, verb="freeze-start"):
+        return o5.append_record(self.env, bid or self.env.barrier_id, "refreshed", auth=auth, verb=verb,
+                                detail=detail)
+
+    def refused(self, verb, detail="STATE_UNKNOWN(cycle_inconsistent)"):
+        o5.observe(self.env, SLOT)
+        snap, writes, n = self.env.snapshot(), list(self.env.world.writes()), len(self.effects)
+        r = harness.invocation.invoke(self.env.world, harness.json.dumps(
+            {"v": 1, "verb": verb, "slot": SLOT, "op_id": OP, "reason": reason()}).encode(), self.env.confirmer)
+        self.assertEqual((r.outcome, r.code, r.detail), (Outcome.REFUSED, Code.STATE_UNKNOWN, detail))
+        self.assertEqual((self.env.snapshot(), list(self.env.world.writes()), len(self.effects)), (snap, writes, n))
+
+    def test_valid_completion_and_refresh(self):
+        ok(self, self.env, "freeze-start")
+        self.assertEqual((burn_classes(self.env), self.cycle().closure), (["COMPLETED"], "open"))
+        ok(self, self.env, "freeze-continue")
+        self.assertEqual(self.cycle().closure, "open")
+
+    def test_a84_known_cycle_with_refresh_but_no_completion(self):
+        """The review's CE2: the effect must never be re-run."""
+        self.assertTrue(crash(self.env, "fwal:append:after", "freeze-start"))
+        auth = self.env.world.fwal.log(SLOT)[0]["auth_digest"]
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": "d" * 64}, auth=auth)
+        self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(cycle_inconsistent)"])
+        self.refused("resume-step")
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(cycle_inconsistent)"))
+        self.assertEqual(self.effects, [])  # the crash preceded the effect; nothing re-ran it
+
+    def test_unknown_cycle_refresh(self):
+        self.add({"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64})
+        self.refused("freeze-start", "cycle_inconsistent")
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "cycle_inconsistent"))
+
+    def test_completion_digest_mismatch(self):
+        ok(self, self.env, "freeze-start")
+        done = self.completion()
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": "e" * 64},
+                 auth=done["auth_digest"])
+        self.refused("freeze-continue")
+
+    def completed_without_refresh(self):
+        """Completion durable, its own `refreshed` not yet written (crash between
+        the two writes): the only state where a crafted record is not a duplicate."""
+        self.assertTrue(crash(self.env, "barriers:put:before", "freeze-start"))
+        return self.completion()
+
+    def test_refresh_bound_to_another_slot(self):
+        done = self.completed_without_refresh()
+        self.add({"slot": OTHER, "cycle_id": self.cycle().cycle_id, "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"])
+        self.refused("freeze-continue")
+
+    def test_completion_from_another_authorization(self):
+        done = self.completed_without_refresh()
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": freeze.canonical.digest(done)})
+        self.refused("freeze-continue")
+
+    def test_matching_crafted_refresh_is_consistent(self):
+        """Control for the three tests above: the same record with the right
+        slot, chain and authorization is accepted."""
+        done = self.completed_without_refresh()
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"])
+        self.assertEqual(self.cycle().closure, "open")
+        ok(self, self.env, "freeze-continue")
+
+    def test_duplicate_refresh_for_one_completion(self):
+        ok(self, self.env, "freeze-start")
+        done = self.completion()
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"])
+        self.refused("freeze-continue")
+
+    def test_refresh_in_another_chain(self):
+        done = self.completed_without_refresh()
+        b2 = o5.synthetic_barrier(self.env, [OTHER])
+        self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"], bid=b2)
+        self.refused("freeze-continue")
+
+    def test_crash_after_completion_before_refresh_is_consistent(self):
+        self.assertTrue(crash(self.env, "barriers:put:before", "freeze-start"))
+        self.assertEqual((burn_classes(self.env), self.cycle().closure), (["COMPLETED"], "open"))
+        ok(self, self.env, "freeze-continue")
+        self.assertEqual(self.effects, ["freeze-start", "freeze-continue"])
+
+    def test_crash_after_refresh_persistence_is_consistent(self):
+        self.assertTrue(crash(self.env, "barriers:put:after", "freeze-start"))
+        self.assertEqual((burn_classes(self.env), self.cycle().closure), (["COMPLETED"], "open"))
+        self.assertIs(run(self.env, "resume-step").outcome, Outcome.ALREADY_COMPLETE)
+        ok(self, self.env, "freeze-continue")
+        self.assertEqual(self.effects, ["freeze-start", "freeze-continue"])
+
+    def test_malformed_f_wal(self):
+        ok(self, self.env, "freeze-start")
+        self.env.world.fwal.entries[SLOT][-1]["bindings"] = "not-a-map"
+        self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(fwal)"])
+        r = run(self.env, "freeze-continue")
+        self.assertIs(r.code, Code.STATE_UNKNOWN)
+        self.assertEqual(self.effects, ["freeze-start"])
+
+
+class BurnBinding(unittest.TestCase):
+    """B3 (R4 §2.2 `barrier_binding` row, §2.3 condition 4, A81): only an exactly
+    bound burn of this slot's operation can be ABANDONED_PRE_INTENT and D1."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.seed_leased()
+        self.env.seed_leased(slot=OTHER)
+        ok(self, self.env, "adopt")
+        ok(self, self.env, "request")
+
+    def doc(self, **over):
+        h = head(self.env).digest
+        base = {"slot": SLOT, "op_id": OP, "slot_generation": 1, "f_from": "NONE",
+                "o5": {"barrier_id": self.env.barrier_id, "cutover_head": h}}
+        return o5._owner_doc(self.env, over.pop("verb", "freeze-start"), **dict(base, **over))
+
+    def key(self, slot=SLOT, op=OP, gen=1):
+        return freeze.canonical.digest({"verb": "freeze-start", "slot": slot, "op_id": op, "slot_generation": gen})
+
+    def bad(self, doc, **burn_kw):
+        o5.burn(self.env, doc, **burn_kw)
+        self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(barrier_binding)"])
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(barrier_binding)"))
+        snap = self.env.snapshot()
+        r = run(self.env, "freeze-start")
+        self.assertEqual((r.code, r.detail), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(barrier_binding)"))
+        self.assertEqual(self.env.snapshot(), snap)
+
+    def test_valid_abandoned_burn_stays_d1(self):
+        o5.burn(self.env, self.doc())
+        self.assertEqual(burn_classes(self.env), ["ABANDONED_PRE_INTENT"])
+        self.assertEqual(release(self.env), [(SLOT, "D1"), (OTHER, "D1")])
+
+    def test_legitimate_crash_after_the_burn(self):
+        self.assertTrue(crash(self.env, "fwal:append:before", "freeze-start"))
+        self.assertEqual(burn_classes(self.env), ["ABANDONED_PRE_INTENT"])
+        self.assertEqual(release(self.env), [(SLOT, "D1"), (OTHER, "D1")])
+
+    def test_a81_foreign_operation(self):
+        """The review's CE3."""
+        self.bad(self.doc(op_id="ghost"))
+
+    def test_wrong_generation(self):
+        self.bad(self.doc(slot_generation=2))
+
+    def test_wrong_generation_under_the_right_key(self):
+        self.bad(self.doc(slot_generation=2), binding=self.key(gen=1))
+
+    def test_foreign_operation_under_this_slots_key(self):
+        self.bad(self.doc(op_id="ghost"), binding=self.key())
+
+    def test_foreign_slot_under_this_slots_key(self):
+        self.bad(self.doc(slot=OTHER), binding=self.key())
+
+    def test_wrong_verb_under_this_slots_key(self):
+        self.bad(self.doc(verb="freeze-continue"), binding=self.key())
+
+    def test_wrong_binding_digest(self):
+        self.bad(self.doc(), binding=self.key(gen=2))
+
+    def test_wrong_authorization_kind(self):
+        self.bad(self.doc(), auth_kind="resume")
+
+    def test_missing_cycle_identity(self):
+        self.bad(self.doc(o5={"barrier_id": self.env.barrier_id}))
+
+    def test_missing_document(self):
+        doc = self.doc()
+        auth = o5.burn(self.env, doc)
+        del self.env.world.authz.docs[auth]
+        self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(auth_missing)"])
+
+    def test_duplicate_burn(self):
+        w = self.env.world
+        auth = o5.burn(self.env, self.doc())
+        entries = w.ledger.entries()
+        dup = entries + [dict(entries[-1])]
+        d = freeze.burned_docs(w, entries)
+        self.assertEqual(freeze.classify_burn(w, SLOT, d, dup, auth, []), "STATE_UNKNOWN(fork)")
+
+
 class ReadyPending(unittest.TestCase):
     """R4.1 §3.8: T1–T12 and the R4-B1 counterexample."""
 
@@ -249,7 +462,7 @@ class ReadyPending(unittest.TestCase):
         self.assertIsNotNone(view)
         h = head(self.env)
         with self.assertRaises(Refused) as e:
-            cutover.cutover_allowed("rebaseline", h, [], self.closure(), 1)
+            cutover.cutover_allowed(oc.SYNTHETIC, "rebaseline", h, [], self.closure(), 1)
         self.assertEqual(e.exception.detail, "cycle_open")
         self.assertEqual(release(self.env), PD)
         ok(self, self.env, "resume-step")
@@ -274,7 +487,7 @@ class ReadyPending(unittest.TestCase):
         self.assertIs(run(self.env, "resume-step").code, Code.STATE_UNKNOWN)
         self.assertEqual(self.env.snapshot(), snap)
         with self.assertRaises(Refused) as e:
-            cutover.cutover_allowed("rebaseline", head(self.env), [], self.closure(), 1)
+            cutover.cutover_allowed(oc.SYNTHETIC, "rebaseline", head(self.env), [], self.closure(), 1)
         self.assertEqual((e.exception.code, e.exception.detail), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(marker)"))
         self.assertIs(release(self.env)[0], Code.STATE_UNKNOWN)
 
@@ -283,7 +496,7 @@ class ReadyPending(unittest.TestCase):
             self.at(point)
             for kind in ("rebaseline", "revoked"):
                 with self.assertRaises(Refused) as e:
-                    cutover.cutover_allowed(kind, head(self.env), ["RELEASED"], self.closure(), 1)
+                    cutover.cutover_allowed(oc.SYNTHETIC, kind, head(self.env), ["RELEASED"], self.closure(), 1)
                 self.assertEqual(e.exception.detail, "cycle_open")
             self.setUp()
 
@@ -314,7 +527,7 @@ class ReadyPending(unittest.TestCase):
         self.env.world.o5.preservation = o5.DischargeDouble(self.env.world.observer)
         self.assertEqual(release(self.env), [(SLOT, "D4"), (harness.O5_SLOTS[1], "D1")])
         o5.release_chain(self.env, self.env.barrier_id)
-        cutover.cutover_allowed("rebaseline", head(self.env), ["RELEASED"], self.closure(), 1)
+        cutover.cutover_allowed(oc.SYNTHETIC, "rebaseline", head(self.env), ["RELEASED"], self.closure(), 1)
 
     def test_t10_ready_without_d_ready_document(self):
         """N-R4.1-4: the READY gate document must carry exactly D-READY."""

@@ -213,8 +213,9 @@ def require_closed(cycle_classes):
             raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "cycle_open")
 
 
-def cutover_allowed(kind, h, chain_states, cycle_classes, seq):
+def cutover_allowed(mode, kind, h, chain_states, cycle_classes, seq):
     """R2 §4.8 with R3 §4.3/§4.8 and R4.1 §3.4 (pure; the PR-4 V and R)."""
+    oc.require_synthetic(mode)
     if h.state in (PENDING, INVALID):
         raise Refused(Code.STATE_UNKNOWN, f"cutover_invalid({h.state.lower()}_{h.reason})")
     if kind == "cutover":

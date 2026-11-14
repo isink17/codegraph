@@ -209,21 +209,21 @@ class Establishment(unittest.TestCase):
         chains = {env.barrier_id: o5.chain(env, env.barrier_id)}
         enum = {s: o5.AGENT_UID for s in harness.O5_SLOTS}
         with self.assertRaises(Refused) as e:
-            barrier.establish_allowed(chains, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
+            barrier.establish_allowed(oc.SYNTHETIC, chains, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
         self.assertEqual(e.exception.detail, "barrier_in_use")
         for scope, slots in (("SLOT_ISOLATED", [SLOT]), ("POOL_MAINTENANCE", [SLOT])):
             with self.assertRaises(Refused) as e:
-                barrier.establish_allowed({}, scope, slots, [o5.AGENT_UID], enum, [])
+                barrier.establish_allowed(oc.SYNTHETIC, {}, scope, slots, [o5.AGENT_UID], enum, [])
             self.assertEqual(e.exception.detail, "barrier_scope")
         with self.assertRaises(Refused) as e:
-            barrier.establish_allowed({}, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [SLOT])
+            barrier.establish_allowed(oc.SYNTHETIC, {}, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [SLOT])
         self.assertEqual(e.exception.detail, "pending_step")
         invalid = {"x": barrier._invalid("x", "gap")}
         with self.assertRaises(Refused):
-            barrier.establish_allowed(invalid, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
+            barrier.establish_allowed(oc.SYNTHETIC, invalid, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
         o5.release_chain(env, env.barrier_id)
         chains = {env.barrier_id: o5.chain(env, env.barrier_id)}
-        barrier.establish_allowed(chains, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
+        barrier.establish_allowed(oc.SYNTHETIC, chains, "POOL_MAINTENANCE", sorted(enum), [o5.AGENT_UID], enum, [])
 
     def test_activating_chain_and_ambiguous_resolution(self):
         env = Env(o5_fixtures=False)

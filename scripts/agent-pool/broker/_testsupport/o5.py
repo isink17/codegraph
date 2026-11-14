@@ -38,8 +38,9 @@ def _next(env):
     return env.o5_counter
 
 
-def burn(env, doc, ledger_line=True):
-    """Stores the document and appends its initiate burn (raw seeding)."""
+def burn(env, doc, ledger_line=True, binding=None, auth_kind="initiate"):
+    """Stores the document and appends its burn (raw seeding). `binding` and
+    `auth_kind` override the ledger fields for crafted-burn tests."""
     w = env.world
     data = canonical.canon(doc)
     d = canonical.sha256(data)
@@ -49,7 +50,7 @@ def burn(env, doc, ledger_line=True):
         prev = res["entries"][-1]["line_digest"] if res["entries"] else ledger.ZERO64
         n = _next(env)
         e = ledger.make_entry(ledger.LEDGER, len(res["entries"]), prev, {
-            "auth_digest": d, "auth_kind": "initiate", "binding_digest": authz.binding_digest(doc),
+            "auth_digest": d, "auth_kind": auth_kind, "binding_digest": binding or authz.binding_digest(doc),
             "confirmed_at": env.world.clock(), "issued_at": env.world.clock(),
             "nonce_digest": h(f"fixture-nonce-{d}-{n}")})
         w.ledger.data += canonical.canon(e) + b"\n"
@@ -262,7 +263,7 @@ def synthetic_handoff(env, slot):
         verdicts.append(prov.handoff_establish(pre, sel.public(), None) if prov is not None else None)
         last_sel = sel
     c = chain(env, cyc.barrier_id)
-    barrier.handoff_allowed(c, barrier.ESTABLISHED, "P13", slot, cyc, w.gates.stopped(), verdicts, pres,
+    barrier.handoff_allowed(oc.mode(w), c, barrier.ESTABLISHED, "P13", slot, cyc, w.gates.stopped(), verdicts, pres,
                             lambda v: freeze.guard(v, "H-EST", v.pre, last_sel, oc.H_EST_KINDS))
     auth = burn(env, doc)
     return append_record(env, cyc.barrier_id, "superseded", auth=auth, detail={

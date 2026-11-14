@@ -7,6 +7,7 @@ that uses it."""
 from collections import namedtuple
 
 from . import authz, canonical
+from .refusal import Code, Refused
 
 SYNTHETIC = "SYNTHETIC"
 PROTECTED = "PROTECTED"
@@ -77,6 +78,18 @@ def h_val_kinds(f):
 def discharge_kinds(kind, f):
     base = h_val_kinds(f) + ("holder_record",)
     return base + (("ready_doc", "preservation_doc") if kind in ("D4", "D4H") else ())
+
+
+def refuse_protected():
+    raise Refused(Code.QUIESCENCE_NOT_ESTABLISHED, "barrier_unavailable(protected_mode_unsupported)")
+
+
+def require_synthetic(mode):
+    """The first statement of every B precondition (R2 §3.2, A32). Only the
+    exact module constant SYNTHETIC passes; PROTECTED, a missing, forged or
+    non-str value refuses. PR-4 replaces this branch under its own review."""
+    if type(mode) is not str or mode != SYNTHETIC:
+        refuse_protected()
 
 
 def mode(world):

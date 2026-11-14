@@ -110,14 +110,14 @@ class HEst(unittest.TestCase):
             with self.assertRaises(Refused):
                 freeze.guard(oc.HandoffVerdict(oc._PSEAL, **bad), "H-EST", pre.digest, sel, oc.H_EST_KINDS)
         c = o5.chain(self.env, self.env.barrier_id)
-        args = (c, barrier.ESTABLISHED, "P13", SLOT, self.cycle, False)
+        args = (oc.SYNTHETIC, c, barrier.ESTABLISHED, "P13", SLOT, self.cycle, False)
         guard = lambda x: freeze.guard(x, "H-EST", x.pre, sel, oc.H_EST_KINDS)  # noqa: E731
         barrier.handoff_allowed(*args, [v, v], [pre.digest, pre.digest], guard)
         with self.assertRaises(Refused) as e:
             barrier.handoff_allowed(*args, [None, None], [pre.digest, pre.digest], guard)
         self.assertEqual(e.exception.detail, "handoff_unavailable")
         with self.assertRaises(Refused) as e:
-            barrier.handoff_allowed(c, barrier.ESTABLISHED, "P13", SLOT, self.cycle, True, [v, v],
+            barrier.handoff_allowed(oc.SYNTHETIC, c, barrier.ESTABLISHED, "P13", SLOT, self.cycle, True, [v, v],
                                     [pre.digest] * 2, guard)
         self.assertIs(e.exception.code, Code.STOPPED)
         prov.refuse["H-EST"] = (Code.STATE_UNKNOWN, "x")
