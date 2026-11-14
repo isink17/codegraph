@@ -63,13 +63,31 @@ def _verifier_ok(v, run):
         _fail("custody check_digest does not commit to the token")
 
 
+def _o5_projection(o5):
+    """The O5 bindings that must not change across a crash and resume. The
+    selection-bound digests (pre, ctx, selection, decision digest, barrier head)
+    cover time-stamped evidence, and cycle_id binds the freeze-start document
+    digest (nonce, issued_at); both differ by construction (R4 review N-R4-1)."""
+    dec = o5.get("decision") or {}
+    return {k: o5.get(k) for k in ("cutover_head", "barrier_id", "g_pre", "enumeration")} | {
+        "cell": dec.get("cell"), "keys": sorted(o5)}
+
+
+def _evidence_projection(ev):
+    """Quiescence components are the selected time-stamped observations (C9‴):
+    names, provenance and roles must match; their digests differ by time."""
+    return [{k: c[k] for k in c if k != "sha256"} for c in ev.get("components", [])]
+
+
 def _doc_equivalent(ref, act, ref_digest, act_digest):
     if ref_digest == act_digest:
         return
     a, b = ref.docs.get(ref_digest), act.docs.get(act_digest)
     if a is None or b is None:
         _fail("gate or evidence is not a stored document")
-    strip = lambda d: {k: v for k, v in d.items() if k not in REPLACEABLE}  # noqa: E731
+    strip = lambda d: {k: (_o5_projection(v) if k == "o5" else _evidence_projection(v) if k == "evidence"
+                           and d.get("doc") == "quiescence" else v) for k, v in d.items()  # noqa: E731
+                       if k not in REPLACEABLE}
     if a.get("doc") == "ready" and (a.get("preservation"), b.get("preservation")) == (
             ref.state["gates"].get("preservation"), act.state["gates"].get("preservation")):
         a, b = dict(a, preservation=None), dict(b, preservation=None)  # follows the preservation gate (A1 §A3.2)

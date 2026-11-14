@@ -18,10 +18,12 @@ sys.path.insert(0, str(HERE.parent))
 import recovery_state as rs  # noqa: E402
 
 from broker import authz, canonical, custody, invocation, ledger, library, libview  # noqa: E402
-from broker._testsupport import capability  # noqa: E402
+from broker._testsupport import capability, o5  # noqa: E402
 from broker.stores import FaultPlan  # noqa: E402
 
 SLOT = "codegraph-worker-x"
+# Slots the default O5 fixtures enumerate and cover (test_flow's OTHER is the second).
+O5_SLOTS = (SLOT, "codegraph-worker-y")
 HEAD = "a" * 40
 T0 = 1762819200
 _LIVE = (Path.home() / "Projekti" / "codegraph-evidence").resolve()
@@ -55,7 +57,12 @@ class Clock:
 class Observer:
     """Stands in for the PR-2/PR-3 producers."""
 
-    def components(self, verb, slot, op_id):
+    def components(self, verb, slot, op_id, selection=None):
+        """With an O5 selection, quiescence components are exactly the selected
+        objects (C9‴); every other verb keeps its one synthetic component."""
+        if selection is not None and verb == "quiescence":
+            return [capability.observed(k, d, role="supporting") for k, d in sorted(selection.items())
+                    if k in o5.oc.QUIES_KINDS or k == "boot_session"]
         h = hashlib.sha256(f"{verb}|{slot}|{op_id}".encode()).hexdigest()
         role = "supporting" if verb == "quiescence" else "decisive"
         return [capability.observed("root_observation", h, role=role)]
@@ -80,7 +87,8 @@ FREEZE_RESULT = {"freeze-start": "MOVED", "freeze-continue": "REVOKED", "thaw": 
 class Env:
     """One synthetic world plus its temporary library store."""
 
-    def __init__(self, store_kind=authz.SYNTHETIC, principal=None, faults=None, cap=ledger.CAP, one_way=True):
+    def __init__(self, store_kind=authz.SYNTHETIC, principal=None, faults=None, cap=ledger.CAP, one_way=True,
+                 o5_fixtures=True, auto_handoff=True, preservation=True):
         self.tmp = scratch_dir()
         self.faults = faults if faults is not None else FaultPlan()
         root = self.tmp / "store"
@@ -98,10 +106,17 @@ class Env:
         self.ctx = authz.Ctx(principal, store_kind)
         self.world = invocation.World(
             library.Library(store, list_ops), self.ctx, clock=Clock(), observer=Observer(),
-            freeze=lambda verb, slot, op: self.freeze_results[verb], backups=self._backup,
+            freeze=lambda verb, slot, op, ctx: o5.fresult(self.freeze_results[verb], verb, slot, op),
+            backups=self._backup,
             ids=counter_hex("id"), tokens=counter_hex("token"), nonces=counter_hex("nonce"), faults=self.faults,
             cap=cap, one_way=one_way)
         self.declines = False
+        self.o5_fixtures, self.auto_handoff = o5_fixtures, auto_handoff
+        if preservation:
+            self.world.o5.preservation = o5.SyntheticPreservation(self.world.observer)
+        if o5_fixtures:
+            o5.synthetic_model_b(self, list(O5_SLOTS))
+            self.barrier_id = o5.synthetic_barrier(self, list(O5_SLOTS))
 
     def _backup(self, marker_digest):
         return self.backups.get(marker_digest, {"sha256": "b" * 64, "marker_digest": marker_digest})
@@ -153,8 +168,18 @@ class Env:
         return "0" * 32 if self.declines else nonce_line.split(" ", 1)[1]
 
     def run(self, verb, **fields):
+        """With O5 fixtures, fresh synthetic observations are ingested before the
+        invocation; after a COMMITTED quiescence the synthetic handoff is
+        written (A-N1). Neither touches a store in World.snapshot()."""
         raw = json.dumps(dict({"v": 1, "verb": verb}, **fields)).encode()
-        return invocation.invoke(self.world, raw, self.confirmer)
+        if self.o5_fixtures and "slot" in fields:
+            if self.auto_handoff:
+                o5.maybe_handoff(self, fields["slot"])
+            o5.observe(self, fields["slot"])
+        res = invocation.invoke(self.world, raw, self.confirmer)
+        if self.auto_handoff and "slot" in fields and res.outcome.value in ("COMMITTED", "ALREADY_COMPLETE"):
+            o5.maybe_handoff(self, fields["slot"])
+        return res
 
     def snapshot(self):
         return self.world.snapshot()

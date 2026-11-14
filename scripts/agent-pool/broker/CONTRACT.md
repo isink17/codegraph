@@ -213,6 +213,40 @@ config are never read, so a consumer must not equate CLEAN with what a Git
 process under some other configuration would print. Object stores hard-linked
 by a local clone observe as UNKNOWN.
 
+## Containment protocol (PR-3a)
+
+Normative basis: the PR-3a contract R2 as amended by R3, R4 and R4.1 (CG-150
+design evidence). PR-3a is inert: it adds pure modules and a universal gate,
+no producer, no opclass row and no OS effect.
+
+- `o5contract.py`: constants, `cycle_id`, `barrier_id`, the sealed boundary
+  types (`PreBasis`, `ContainmentContext`, `HandoffVerdict`,
+  `PreservationDecision`, `Discharge`), `Wiring` and the cell vocabulary.
+  Seals are an accident guard, never authority.
+- `cutover.py`: the Model B head rule over ledger burns, documents, records,
+  head entries, witnesses and the floor; `cutover_allowed`; the G7a gate.
+- `barrier.py`: chain verification and derived state, overlap,
+  `handoff_allowed`, the release table (D1/D2 here; D3/D4/D3H/D4H only via a
+  PR-3b `Discharge`).
+- `freeze.py`: the F relation and fold, cycles and closure kinds,
+  `classify_burn`, the gate G0–G8, `basis_for`, `quiescence_check` rules 1–6
+  and the release precondition.
+- `evidence.py`: ingestion (an `IngestCapability`, which is not a `CommitTxn`)
+  and selection.
+
+Rules worth repeating:
+
+- Protected mode is a constant refusal (`freeze._protected`).
+- Without a PR-3b provider every F verb, quarantine, quiescence, P/PC cell,
+  handoff and D3/D4 release refuses; only D1 and pure classification work.
+- `ready_pending` (P16/P17) is an open cycle for every rule; only an
+  authenticated, marked READY whose gate document carries `D-READY` closes it.
+- The H-EST input binds `holder_chain = cycle.holder_chain` and
+  `release_target = null`; the proposed handoff document is validated without
+  a burn and never counts as a committed authorization.
+- The in-memory record stores give no rollback resistance; the PR-4 off-host
+  floor is the only rollback anchor.
+
 ## Not in PR-1
 
 PR-2..PR-5, RS-1, RS-4, NL1–NL6, L1–L8, P1–P24, real file I/O, any account,

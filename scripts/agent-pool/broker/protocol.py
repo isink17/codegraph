@@ -43,6 +43,10 @@ def _bool(v):
     return type(v) is bool
 
 
+def _hex64(v):
+    return type(v) is str and bool(canonical.HEX64.match(v))
+
+
 def _attest(v):
     return (type(v) is dict and 0 < len(v) <= 8 and all(k in ATTEST_KEYS for k in v)
             and all(_text(x) for x in v.values()))
@@ -66,7 +70,7 @@ FIELDS = {
     "adopt": (_OP, {}),
     "request": (_OP, {}),
     "cancel": (_OP, {}),
-    "freeze-start": (_OP, {}),
+    "freeze-start": (_OP, {"barrier_id": _hex64}),
     "freeze-continue": (_OP, {}),
     "thaw": (_OP, {}),
     "quarantine": (dict(_OP, quiescence_method=_enum(QUIESCENCE_METHODS),
