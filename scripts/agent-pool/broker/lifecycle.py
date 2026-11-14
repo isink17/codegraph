@@ -42,7 +42,8 @@ ROW_VERBS = {
     "P5": {"request": None, "cancel": None},
     "P5'": {"resume-step": None},
     "P6": {"freeze-start": None, "cancel": None},
-    "P7": {"freeze-continue": ("MOVED", "REVOKE_INTENT", "FREEZE_INCOMPLETE", "FREEZE_BLOCKED"), "thaw": None,
+    "P7": {"freeze-continue": ("MOVED", "FREEZE_INCOMPLETE", "FREEZE_BLOCKED"),
+           "thaw": ("MOVED", "REVOKED", "FREEZE_INCOMPLETE", "FREEZE_BLOCKED"),
            "quarantine": ("REVOKED",), "resume-step": F_INTENTS},
     "P7a": {"resume-step": None},
     "P8": {"resume-step": None}, "P9": {"resume-step": None}, "P10": {"resume-step": None},
@@ -192,7 +193,8 @@ def decide(c, verb):
         raise Refused(Code.GATE_ADMIN)
     if not c.g.ledger_ok:
         raise Refused(Code.LEDGER_UNAVAILABLE)
-    if c.g.stop and verb not in ("resume", "resume-step", "stop"):
+    if c.g.stop and (verb not in ("resume", "resume-step", "stop") or (
+            verb == "resume-step" and c.f == "THAW_INTENT")):
         raise Refused(Code.STOPPED)
     if c.r.mode == "busy":
         raise Refused(Code.BUSY)

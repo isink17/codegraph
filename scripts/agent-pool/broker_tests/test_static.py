@@ -200,6 +200,23 @@ OS_FORBIDDEN = {"write", "writev", "pwrite", "remove", "unlink", "rename", "rena
                 "scandir", "fwalk", "O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND", "O_EXCL"}
 
 
+O5_SEALS = {"_CSEAL": {"freeze.py", "o5contract.py"},
+            "_PSEAL": {"preserve.py", "o5contract.py", "_testsupport/o5.py"},
+            "_ISEAL": {"evidence.py", "_testsupport/o5.py"}, "_new_ingest": {"evidence.py", "_testsupport/o5.py"}}
+O5_CONTAINMENT = {"o5contract.py", "cutover.py", "barrier.py", "freeze.py", "evidence.py"}
+O5_PRESERVATION = {"gitclass", "preserve", "journal"}
+
+
+def o5_seal_violations(rel, tree):
+    out = []
+    for node in ast.walk(tree):
+        name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else (
+            node.name if isinstance(node, (ast.FunctionDef, ast.alias)) else None)
+        if name in O5_SEALS and rel not in O5_SEALS[name]:
+            out.append(name)
+    return out
+
+
 def modules(include_testsupport=False, observer=False):
     for p in sorted(BROKER.rglob("*.py")):
         if "_testsupport" in p.parts and not include_testsupport:
@@ -309,6 +326,41 @@ class AstBoundaries(unittest.TestCase):
                 self.assertNotIn(name, {"_produce", "_SEAL", "_new_capability", "_issue", "provenance", "authz",
                                         "custody", "invocation", "Provenance"}, path.name)
         self.assertEqual(found, OBSERVER)
+
+    def test_o5_seals_are_referenced_only_where_allowed(self):
+        """PR-3a C16′ / R3 A-N-R2-10: keyed by the path relative to broker/."""
+        for path, tree in modules(include_testsupport=True, observer=None):
+            rel = path.relative_to(BROKER).as_posix()
+            self.assertEqual(o5_seal_violations(rel, tree), [], rel)
+
+    def test_o5_seal_allowlist_rejects_a_lookalike_module(self):
+        tree = ast.parse("from broker.o5contract import _PSEAL\nx = _PSEAL\n")
+        self.assertNotEqual(o5_seal_violations("other/o5.py", tree), [])
+        self.assertEqual(o5_seal_violations("_testsupport/o5.py", tree), [])
+
+    def test_containment_modules_import_nothing_from_preservation(self):
+        """A23: PR-3a imports nothing from PR-3b (gitclass, preserve, journal)."""
+        for path, tree in modules(include_testsupport=True, observer=None):
+            if path.name not in O5_CONTAINMENT:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names = {a.name for a in node.names} | {getattr(node, "module", None) or ""}
+                    self.assertFalse({n.split(".")[-1] for n in names} & O5_PRESERVATION, path.name)
+
+    def test_protected_branch_is_a_constant_refusal(self):
+        """A32: the protected-mode branch is one raise with constant arguments,
+        and no module defines a *Backend class."""
+        tree = ast.parse((BROKER / "freeze.py").read_text())
+        fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_protected"][0]
+        self.assertEqual(len(fn.body), 1)
+        self.assertIsInstance(fn.body[0], ast.Raise)
+        call = fn.body[0].exc
+        self.assertTrue(all(isinstance(a, (ast.Constant, ast.Attribute)) for a in call.args))
+        for path, mod in modules(include_testsupport=True, observer=None):
+            for node in ast.walk(mod):
+                if isinstance(node, ast.ClassDef):
+                    self.assertFalse(node.name.endswith("Backend"), f"{path.name}: {node.name}")
 
     def test_request_parser_never_trusts_owner_path_fields(self):
         for k in ("trust", "actor", "nonce", "session", "repair_plan", "issued_at", "not_after", "class"):

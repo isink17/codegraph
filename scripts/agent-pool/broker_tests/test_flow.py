@@ -629,7 +629,7 @@ class Revalidation(unittest.TestCase):
 
 class TierCVerbs(unittest.TestCase):
     def setUp(self):
-        self.env = Env()
+        self.env = Env(o5_fixtures=False)
         self.env.seed_free()
 
     def tearDown(self):
@@ -679,7 +679,7 @@ class TierCVerbs(unittest.TestCase):
         for point, kind in (("tierc:write:before", libview.FREE), ("tierc:write:after", libview.LEASED)):
             with self.subTest(point):
                 self.env.close()
-                self.env = Env()
+                self.env = Env(o5_fixtures=False)
                 self.env.seed_free()
                 self.env.faults.point = point
                 with self.assertRaises(Crash):

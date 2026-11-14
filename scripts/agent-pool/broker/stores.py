@@ -140,3 +140,59 @@ class GateRecords(Gated):
 
     def snapshot(self):
         return canonical.serialize(self.entries)
+
+
+class RecordStore(Gated):
+    """Immutable O5 records (cutover, head, enumeration, barrier, journal and
+    artifact stores; PR-3a contract R2 §8 C20). put is exclusive-create; only a
+    CommitTxn writes. PR-3a tests seed the fakes directly; PR-4 owns the real
+    stores and their writers."""
+
+    def __init__(self, name, faults=None):
+        super().__init__(faults)
+        self.name = name
+        self.items = {}
+
+    def put(self, txn, key, data):
+        self._begin(txn, "put")
+        if key in self.items:
+            raise TxnError(f"{self.name}: {key} exists")
+        self.items[key] = bytes(data)
+        self._end(txn, "put")
+
+    def get(self, key):
+        return self.items.get(key)
+
+    def keys(self):
+        return sorted(self.items)
+
+    def snapshot(self):
+        return canonical.serialize({k: v.decode("ascii", "replace") for k, v in sorted(self.items.items())})
+
+
+class EvidenceStore:
+    """Content-addressed, append-only evidence objects (F4 §5.1). Not Gated: a
+    CommitTxn cannot write it and an IngestCapability cannot write any Gated
+    store. evidence.ingest is the only writer."""
+
+    name = "evidence"
+
+    def __init__(self):
+        self.objects = {}
+        self.by_kind = {}
+
+    def _add(self, digest, data, kind):
+        if self.objects.get(digest, data) != data:
+            raise TxnError("content-addressed evidence differs")
+        if digest not in self.objects:
+            self.by_kind.setdefault(kind, []).append(digest)
+        self.objects[digest] = bytes(data)
+
+    def get(self, digest):
+        data = self.objects.get(digest)
+        if data is None or canonical.sha256(data) != digest:
+            return None
+        return data
+
+    def digests(self):
+        return sorted(self.objects)

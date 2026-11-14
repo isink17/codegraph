@@ -9,7 +9,9 @@ import json
 
 import recovery_state as rs
 
-from . import anchor, authz, canonical, custody, ledger, libview, lifecycle, opclass, protocol, provenance
+from . import (anchor, authz, barrier, canonical, custody, ledger, libview, lifecycle, o5contract, opclass,
+               protocol, provenance)
+from . import freeze as o5freeze
 from .refusal import Code, Outcome, Refused, Result
 from .stores import AuthzStore, Crash, FaultPlan, FWal, GateRecords, TierC
 
@@ -44,6 +46,7 @@ class World:
         self.tierc = TierC(self.faults)
         self.fwal = FWal(self.faults)
         self.gates = GateRecords(self.faults)
+        self.o5 = o5contract.Wiring(o5freeze.new_stores(self.faults))
 
     def anchor_log(self, slot, create=False):
         log = self.anchors.get(slot)
@@ -65,8 +68,9 @@ class World:
         return snap
 
     def writes(self):
+        o5 = [st for n, st in sorted(self.o5.stores.items()) if n != "evidence"]
         return [(s.name, w) for s in [self.ledger, self.authz, self.custody, self.tierc, self.fwal, self.gates,
-                                      self.library, *self.anchors.values()] for w in s.writes]
+                                      self.library, *self.anchors.values(), *o5] for w in s.writes]
 
 
 # ------------------------------------------------------------------ reads shared by V and R
@@ -123,15 +127,13 @@ def i_orphan(world, entries):
         raise Refused(Code.LEDGER_UNAVAILABLE, "I-ORPHAN")
 
 
-def _f_component(world, slot, op_id):
+def _f_component(world, slot, op_id, entries):
+    """C2: the fold over the operation's whole F log (o5freeze.fold)."""
     log = [e for e in world.fwal.log(slot) if e.get("op_id") == op_id]
     if not log:
         return "NONE", None
-    last = log[-1]
-    value = last.get("value")
-    if value not in lifecycle.F_VALUES or (last.get("kind") == "intent") != (value in lifecycle.F_INTENTS):
-        return "UNKNOWN", None
-    return value, last
+    burned = {e["auth_digest"] for e in entries}
+    return o5freeze.fold(log, lambda d: _doc(world, d) if d in burned else None)
 
 
 class Facts:
@@ -166,7 +168,7 @@ def _read_slot(world, slot, entries, op_override=None):
             op = lifecycle.OpInfo(op_id, rec["identity"], lifecycle.g_pre(rec),
                                   "request" in rec["gates"], lifecycle.qi(rec, pending))
             k_state = world.custody.lookup(custody.recovery_key(slot, op_id, op.gen))
-        f, f_entry = _f_component(world, slot, op_id)
+        f, f_entry = _f_component(world, slot, op_id, entries)
     k = k_state.label if k_state is not None else "ABSENT"
     return Facts(slot=slot, text=text, l=l_comp, a=a_comp, alog=alog, op_id=op_id, view=view, r=r, op=op,
                  k=k, k_state=k_state, f=f, f_entry=f_entry)
@@ -226,13 +228,15 @@ def validate(world, op, fields):
         raise Refused(Code.STOPPED)
     i_orphan(world, entries)
     plan = Plan(op=op, fields=fields, g=g, entries=entries, ledger_plan=ledger_plan, anchor_plan=None,
-                facts=None, mode=None, row=None, resume_mode=None, already=False, extra={})
+                facts=None, mode=None, row=None, resume_mode=None, already=False, extra={}, o5=None)
     if op.verb in ("stop", "resume"):
         plan.already = (op.verb == "stop") == world.gates.stopped()
     else:
         _validate_slot(world, plan)
     plan.ctx = {"verb": op.verb, "fields": fields, "g": list(g),
                 "stores": {k: canonical.sha256(v) for k, v in world.snapshot().items()}}
+    if plan.o5 is not None:
+        plan.ctx["o5"] = plan.o5.digest
     plan.ctx_digest = canonical.sha256(canonical.serialize(plan.ctx))
     return plan
 
@@ -247,6 +251,7 @@ def _validate_slot(world, plan):
     if op.verb == "custody-destroy":
         return _validate_destroy(world, plan, facts)
     _precheck(c)
+    plan.o5 = o5freeze.check(world, plan, c, facts, *_o5_shape(world, plan, c, facts, entries))
     if op.verb in LIBRARY_STEP and facts.view is not None:
         if fields["op_id"] != facts.op_id:
             raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "not the slot's current operation")
@@ -279,6 +284,32 @@ def _validate_slot(world, plan):
     if writes_anchor:
         plan.anchor_plan = facts.alog.plan()
     _replica(world, plan, facts)
+
+
+def _o5_shape(world, plan, c, facts, entries):
+    """The cell shape the universal gate needs before the PR-1 shortcuts
+    (PR-3a contract R2 §3.3): (N cell?, row). It applies the PR-1 order, so
+    every PR-1 refusal keeps its code."""
+    verb, fields = plan.op.verb, plan.fields
+    if verb not in o5contract.O5_VERBS and verb != "resume-step":
+        return False, None
+    n = False
+    if verb in LIBRARY_STEP and facts.view is not None:
+        if fields["op_id"] != facts.op_id:
+            raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "not the slot's current operation")
+        mode = lifecycle.completion_mode(facts.view.rec, facts.view.pending, facts.view.marker, verb,
+                                         _is_burned_doc(world, entries))
+        n = mode == lifecycle.ALREADY_COMPLETE
+        if not n and mode != lifecycle.INITIATE:
+            raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "only resume-step finishes it")
+    if verb == "resume-step" and _nothing_to_resume(c):
+        n = True
+    if n:
+        row = lifecycle.row(c)
+        if row is None:
+            raise Refused(Code.STATE_UNKNOWN)
+        return True, row
+    return False, lifecycle.decide(c, verb)[0]
 
 
 def _nothing_to_resume(c):
@@ -376,9 +407,9 @@ def _replica(world, plan, facts):
         if not all(plan.fields[f"accounted_{c}"] for c in protocol.QUIESCENCE_ACCOUNTED):
             raise Refused(Code.QUIESCENCE_NOT_ESTABLISHED)
     if verb == "ready":
-        final = world.observer.final_check(facts.slot, facts.op_id)
-        if final["head"] != rec.get("preserved_head") or final["clean"] is not True \
-                or final["lease_absent"] is not True:
+        final = _decision_fields(plan)
+        if final.get("head") != rec.get("preserved_head") or final.get("clean") is not True \
+                or final.get("lease_absent") is not True:
             raise Refused(Code.NOT_CLEAN)
 
 
@@ -423,10 +454,14 @@ def _validate_destroy(world, plan, facts):
 
 # ------------------------------------------------------------------ phase P
 
-def _components(world, verb, facts):
-    """Evidence components from the injected producers (PR-2/PR-3)."""
+def _components(world, verb, facts, selection=None):
+    """Evidence components from the injected producers (PR-2/PR-3). For an O5
+    cell the producer builds them from exactly the selected objects (C9‴)."""
     getter = getattr(world.observer, "components", None)
-    return getter(verb, facts.slot, facts.op_id) if getter else []
+    if not getter:
+        return []
+    return getter(verb, facts.slot, facts.op_id, selection) if selection is not None else getter(
+        verb, facts.slot, facts.op_id)
 
 
 def prepare(world, plan):
@@ -442,7 +477,8 @@ def prepare(world, plan):
             raise Refused(Code.CUSTODY_CONFLICT)
     if "mint_key" in plan.extra:
         handle = custody.mint(plan.extra["mint_key"], world.tokens)
-    comps = _components(world, op.verb, facts) if facts is not None else []
+    sel = {k: v[0] for k, v in plan.o5.picked.items()} if plan.o5 is not None else None
+    comps = _components(world, op.verb, facts, sel) if facts is not None else []
     repair = [p for p in (plan.ledger_plan, plan.anchor_plan) if p is not None]
     a_digest = canonical.digest({k: v for k, v in facts.a._asdict().items() if v is not None}) \
         if facts is not None else canonical.digest({})
@@ -467,6 +503,8 @@ def _doc_fields(world, plan, doc, facts, handle):
     verb, fields, rec = plan.op.verb, plan.fields, facts.view.rec if facts.view is not None else None
     if verb in LIBRARY_STEP:
         doc.update(_binding(rec, verb))
+    if plan.o5 is not None:
+        doc["o5"] = dict(plan.o5.doc)
     if verb == "quarantine":
         receipt = handle.receipt if handle else world.custody.lookup(plan.extra["reuse_key"]).record["receipt"]
         doc.update(quiescence_method=fields["quiescence_method"],
@@ -480,9 +518,12 @@ def _doc_fields(world, plan, doc, facts, handle):
         doc.update(method=fields["method"], evidence_refs=names,
                    accounted={c: True for c in protocol.QUIESCENCE_ACCOUNTED})
     elif verb == "preservation":
-        doc.update(world.observer.preservation(facts.slot, facts.op_id))
+        extra = _decision_fields(plan)
+        if any(k in doc for k in extra):
+            raise Refused(Code.FIELD_INVALID, "decision field collides with the document")
+        doc.update(extra)
     elif verb == "ready":
-        final = world.observer.final_check(facts.slot, facts.op_id)
+        final = _decision_fields(plan)
         doc.update(clean=final["clean"], lease_absent=final["lease_absent"], head=rec["preserved_head"],
                    preservation=rec["gates"]["preservation"])
     elif verb == "adopt":
@@ -503,6 +544,23 @@ def _doc_fields(world, plan, doc, facts, handle):
                    backup_ref=plan.extra["backup"])
     elif verb == "resume-step":
         _resume_fields(world, plan, doc, facts)
+
+
+def _decision_fields(plan):
+    """C8‴: the PR-3b decision's document fields, never under the reserved keys."""
+    fields = dict(plan.o5.decision.doc_fields or {})
+    if any(k in authz.HEADER_KEYS or k in authz.BINDING_KEYS or k == "o5" for k in fields):
+        raise Refused(Code.FIELD_INVALID, "decision field collides with a reserved key")
+    return fields
+
+
+def _doc_checks(world, plan, doc, now):
+    """C4: the O5 document predicates in P and again in R at confirmed_at."""
+    if plan.o5 is None or plan.op.verb != "quiescence":
+        return
+    o5freeze.quiescence_check(doc["evidence"]["components"], plan.o5.picked, world.o5.stores["evidence"], doc,
+                            o5freeze.revoked_utc(plan.o5.cycle), now,
+                            plan.facts.view.rec.get("quiescence_method"))
 
 
 def _resume_fields(world, plan, doc, facts):
@@ -546,6 +604,7 @@ def invoke(world, raw, confirmer, entry=opclass.POOLCTL_OWNER):
         if plan.already:
             return Result(Outcome.ALREADY_COMPLETE)
         doc, data, nonce, handle = prepare(world, plan)
+        _doc_checks(world, plan, doc, doc["issued_at"])
         digest = authz.confirm(data, nonce, confirmer, world.ctx.principal)
         confirmed_at = world.clock()
         again = validate(world, op, fields)
@@ -553,6 +612,7 @@ def invoke(world, raw, confirmer, entry=opclass.POOLCTL_OWNER):
             raise Refused(Code.CONTEXT_CHANGED)
         if handle is not None and world.custody.lookup(handle.key).k != custody.ABSENT:
             raise Refused(Code.CONTEXT_CHANGED)
+        _doc_checks(world, again, doc, confirmed_at)
         burned = {e["auth_digest"] for e in again.entries} | {e["nonce_digest"] for e in again.entries}
         txn = authz.revalidate(doc, digest, plan.ctx_digest, again.ctx_digest, confirmed_at, burned,
                                world.ctx.principal)
@@ -609,7 +669,7 @@ def _write(world, plan, doc, data, digest, handle, txn, confirmed_at, done):
     elif verb == "adopt":
         world.library.call(txn, "adopt", facts.slot, plan.fields["op_id"], plan.extra["view"])
     elif verb in F_STEP:
-        _f_step(world, facts, txn, verb, digest)
+        _f_step(world, plan, facts, txn, verb, digest)
     elif verb == "custody-destroy":
         _destroy(world, plan, txn, digest, done)
     elif verb == "resume-step":
@@ -637,13 +697,32 @@ def _tierc_verb(world, plan, facts, txn, anchor_append, handle):
     anchor_append("complete", pre, post, verb)
 
 
-def _f_step(world, facts, txn, verb, digest):
+def _f_step(world, plan, facts, txn, verb, digest):
     intent = F_STEP[verb][0]
     world.fwal.append(txn, facts.slot, {"op_id": facts.op_id, "kind": "intent", "value": intent,
                                         "auth_digest": digest})
-    result = world.freeze(verb, facts.slot, facts.op_id)
-    world.fwal.append(txn, facts.slot, {"op_id": facts.op_id, "kind": "complete", "value": result,
-                                        "auth_digest": digest})
+    _f_complete(world, plan, facts, txn, verb, digest, digest)
+
+
+def _f_complete(world, plan, facts, txn, verb, digest, start_auth):
+    """C1′: the effect returns an FResult inside the F relation and accepted by
+    PR-3b check_fresult; then the completion, then (barrier basis only, R4
+    §2.4) the `refreshed` record in the same CommitTxn."""
+    gate = plan.o5
+    res = world.freeze(verb, facts.slot, facts.op_id, gate.ctx)
+    o5freeze.check_result(verb, res)
+    world.o5.preservation.check_fresult(gate.ctx, verb, res)
+    utc = world.clock()
+    done = {"op_id": facts.op_id, "kind": "complete", "value": res.value, "reason": res.reason,
+            "bindings": dict(res.bindings), "auth_digest": digest, "utc": utc}
+    world.fwal.append(txn, facts.slot, done)
+    chain = gate.chain
+    if gate.basis == "barrier" and chain.state == barrier.ESTABLISHED:
+        cid = gate.cycle.cycle_id if gate.cycle is not None else o5contract.cycle_id(
+            facts.slot, facts.op.gen, facts.op_id, start_auth)
+        key, data = o5freeze.refreshed_record(chain, digest, facts.slot, cid, done, gate.picked, utc,
+                                            o5contract.mode(world))
+        world.o5.stores["barriers"].put(txn, key, data)
 
 
 def _quarantine_hook(world, txn, slot, expected_post):
@@ -717,10 +796,7 @@ def _resume(world, plan, facts, txn, anchor_append, digest, done):
         anchor_append("complete" if complete else "abort", a.pre, a.post, a.verb)
         return
     if mode == "f_intent":
-        verb = F_INTENT_VERB[facts.f]
-        result = world.freeze(verb, slot, facts.op_id)
-        world.fwal.append(txn, slot, {"op_id": facts.op_id, "kind": "complete", "value": result,
-                                      "auth_digest": digest})
+        _f_complete(world, plan, facts, txn, F_INTENT_VERB[facts.f], digest, facts.f_entry["auth_digest"])
         return
     t, original = plan.extra["transition"], plan.extra["original"]
     token = None
