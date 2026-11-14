@@ -44,11 +44,33 @@ def _parse(data):
         return None
 
 
-def verify_chain(bid, raw, burned_verb, cycle_ids, mode):
+def _refreshed_ok(r, bid, authorized, cycles, seen):
+    """R4 §2.2 last row and §2.4, enforced at the chain boundary: a `refreshed`
+    binds exactly one known cycle of an authorized slot of this chain, at the
+    slot's authorized generation, and exactly one F WAL completion of that
+    cycle (by canonical digest), written under the record's own authorization
+    for the cycle's operation. One completion carries at most one `refreshed`."""
+    d = r["detail"]
+    if sorted(d) != ["completion", "cycle_id", "slot"] or any(type(v) is not str for v in d.values()):
+        return False
+    slot, cyc = d["slot"], cycles.get(d["cycle_id"])
+    gens = _pairs(authorized["slot_generations"]) or {}
+    if slot not in authorized["slots"] or cyc is None or cyc.slot != slot or cyc.barrier_id != bid \
+            or gens.get(slot) != cyc.g_pre or d["completion"] in seen:
+        return False
+    done = [e for e in cyc.entries if e.get("kind") == "complete" and canonical.digest(e) == d["completion"]]
+    if len(done) != 1 or done[0].get("op_id") != cyc.op_id or r["owner_auth"] != done[0].get("auth_digest"):
+        return False
+    seen.add(d["completion"])
+    return True
+
+
+def verify_chain(bid, raw, burned_verb, cycles, mode):
     """F4 §4.3 INVALID conditions plus R2 §5.1. `burned_verb(d)` is the verb of a
-    burned, stored document or None; `cycle_ids` are the cycles freeze.cycles knows."""
+    burned, stored document or None. `cycles` maps cycle_id to the cycles built
+    from authenticated burns and a classifiable F WAL, never from this chain."""
     recs, prev_d, last = [], oc.ZERO64, None
-    supers, refreshed = {}, []
+    supers, refreshed, seen = {}, [], set()
     for i, data in enumerate(raw):
         r = _parse(data)
         if r is None or sorted(r) != sorted(COMMON) or r["schema"] != oc.S_BARRIER or r["seq"] != i \
@@ -66,10 +88,12 @@ def verify_chain(bid, raw, burned_verb, cycle_ids, mode):
         if named is not None and (not recs or named not in recs[0]["slots"]):
             return _invalid(bid, "slot")
         if r["kind"] == "superseded":
-            if named in supers or r["detail"].get("cycle_id") not in cycle_ids:
+            if named in supers or r["detail"].get("cycle_id") not in cycles:
                 return _invalid(bid, "superseded")
             supers[named] = (r, canonical.sha256(data))
         if r["kind"] == "refreshed":
+            if not _refreshed_ok(r, bid, recs[0], cycles, seen):
+                return _invalid(bid, "refreshed")
             refreshed.append(r)
         recs.append(r)
         prev_d, last = canonical.sha256(data), r["kind"]

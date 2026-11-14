@@ -183,7 +183,7 @@ class BurnClassification(unittest.TestCase):
         """A84 / R3 §6.6."""
         o5.append_record(self.env, self.env.barrier_id, "refreshed", verb="freeze-start",
                          detail={"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64})
-        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "cycle_inconsistent"))
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
 
 
 OTHER = harness.O5_SLOTS[1]
@@ -239,13 +239,13 @@ class RefreshedIntegrity(unittest.TestCase):
         self.add({"slot": SLOT, "cycle_id": self.cycle().cycle_id, "completion": "d" * 64}, auth=auth)
         self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(cycle_inconsistent)"])
         self.refused("resume-step")
-        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(cycle_inconsistent)"))
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
         self.assertEqual(self.effects, [])  # the crash preceded the effect; nothing re-ran it
 
     def test_unknown_cycle_refresh(self):
         self.add({"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64})
         self.refused("freeze-start", "cycle_inconsistent")
-        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "cycle_inconsistent"))
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
 
     def test_completion_digest_mismatch(self):
         ok(self, self.env, "freeze-start")
@@ -314,6 +314,257 @@ class RefreshedIntegrity(unittest.TestCase):
         r = run(self.env, "freeze-continue")
         self.assertIs(r.code, Code.STATE_UNKNOWN)
         self.assertEqual(self.effects, ["freeze-start"])
+
+
+class ChainRefreshIntegrity(unittest.TestCase):
+    """B2-R: every `refreshed` is validated at the chain boundary against cycle
+    facts built from burned freeze-start documents and a classifiable F WAL.
+    A record binding no exact known completion makes the chain INVALID."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.seed_leased()
+        self.env.seed_leased(slot=OTHER)
+        ok(self, self.env, "adopt")
+        ok(self, self.env, "request")
+        self.effects = []
+        inner = self.env.world.freeze
+
+        def counted(verb, slot, op, ctx):
+            self.effects.append(verb)
+            return inner(verb, slot, op, ctx)
+        self.env.world.freeze = counted
+
+    def chain(self, bid=None):
+        return o5.chain(self.env, bid or self.env.barrier_id)
+
+    def cid(self):
+        return cycles(self.env)[-1].cycle_id
+
+    def last_done(self):
+        return [e for e in self.env.world.fwal.log(SLOT) if e["kind"] == "complete"][-1]
+
+    def bad(self, detail, auth=None, bid=None):
+        o5.append_record(self.env, bid or self.env.barrier_id, "refreshed", auth=auth, verb="freeze-start",
+                         detail=detail)
+
+    def assert_invalid(self, bid=None):
+        c = self.chain(bid)
+        self.assertEqual((c.state, c.reason), ("INVALID", "refreshed"))
+
+    def refused(self, verb, **kw):
+        o5.observe(self.env, SLOT)
+        snap, writes, n = self.env.snapshot(), list(self.env.world.writes()), len(self.effects)
+        barriers = dict(self.env.world.o5.stores["barriers"].items)
+        kw = dict({"quarantine": harness.QUARANTINE, "quiescence": harness.QUIESCENCE}.get(verb, {}), **kw)
+        r = harness.invocation.invoke(self.env.world, harness.json.dumps(dict(
+            {"v": 1, "verb": verb, "slot": SLOT, "op_id": OP, "reason": reason()}, **kw)).encode(), self.env.confirmer)
+        self.assertIs(r.outcome, Outcome.REFUSED, (verb, r))
+        self.assertIn(r.code, (Code.STATE_UNKNOWN, Code.FIELD_INVALID), (verb, r))
+        self.assertEqual((self.env.snapshot(), list(self.env.world.writes()), len(self.effects)), (snap, writes, n))
+        self.assertEqual(self.env.world.o5.stores["barriers"].items, barriers)
+        return r
+
+    # -- the review's two variants
+    def test_b2r_unknown_cycle_naming_the_slot(self):
+        ok(self, self.env, "freeze-start")
+        self.bad({"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64})
+        self.assert_invalid()
+        for verb in ("freeze-continue", "thaw"):
+            self.assertEqual(self.refused(verb).detail, "barrier_invalid")
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
+        self.assertEqual(self.effects, ["freeze-start"])
+
+    def test_b2r_slot_less_unknown_cycle(self):
+        ok(self, self.env, "freeze-start")
+        self.bad({"cycle_id": "c" * 64, "completion": "d" * 64})
+        self.assert_invalid()
+        for verb in ("freeze-continue", "thaw"):
+            self.refused(verb)
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
+
+    def test_b2r_slot_less_on_an_idle_pool_never_releases(self):
+        self.bad({"cycle_id": "c" * 64, "completion": "d" * 64})
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
+        r = run(self.env, "freeze-start")
+        self.assertEqual((r.code, r.detail), (Code.FIELD_INVALID, "barrier_ambiguous"))
+
+    # -- positive traces
+    def test_valid_refresh_and_completion_without_refresh(self):
+        ok(self, self.env, "freeze-start")
+        self.assertEqual(self.chain().state, "ESTABLISHED")
+        self.assertEqual(len(self.chain().refreshed), 1)
+        env = self.env
+        self.setUp()
+        self.assertTrue(crash(self.env, "barriers:put:before", "freeze-start"))
+        self.assertEqual((self.chain().state, len(self.chain().refreshed)), ("ESTABLISHED", 0))
+        self.assertIs(run(self.env, "resume-step").outcome, Outcome.ALREADY_COMPLETE)
+        self.assertEqual(self.effects, ["freeze-start"])  # ran once before the crash; never replayed
+        ok(self, self.env, "freeze-continue")
+        self.assertEqual(self.effects, ["freeze-start", "freeze-continue"])
+        self.assertIsNot(env, self.env)
+
+    def test_valid_records_for_two_cycles(self):
+        ok(self, self.env, "freeze-start")
+        ok(self, self.env, "thaw")
+        ok(self, self.env, "freeze-start")
+        self.assertEqual(len(cycles(self.env)), 2)
+        self.assertEqual((self.chain().state, len(self.chain().refreshed)), ("ESTABLISHED", 2))
+        ok(self, self.env, "freeze-continue")
+
+    def test_abandoned_pre_intent_unaffected(self):
+        self.assertTrue(crash(self.env, "fwal:append:before", "freeze-start"))
+        self.assertEqual(self.chain().state, "ESTABLISHED")
+        self.assertEqual(release(self.env), [(SLOT, "D1"), (OTHER, "D1")])
+
+    # -- negative matrix (direct validator)
+    def matrix_case(self, detail_fn, auth_fn=None, bid=None):
+        ok(self, self.env, "freeze-start")
+        done = self.last_done()
+        self.bad(detail_fn(done), auth=auth_fn(done) if auth_fn else done["auth_digest"], bid=bid)
+        self.assert_invalid(bid)
+
+    def test_refresh_without_completion(self):
+        self.assertTrue(crash(self.env, "fwal:append:after", "freeze-start"))
+        self.bad({"slot": SLOT, "cycle_id": self.cid(), "completion": "d" * 64},
+                 auth=self.env.world.fwal.log(SLOT)[0]["auth_digest"])
+        self.assert_invalid()
+        self.refused("resume-step")
+        self.assertEqual(self.effects, [])
+
+    def test_unknown_slot(self):
+        ok(self, self.env, "freeze-start")
+        done = self.last_done()
+        self.bad({"slot": "codegraph-worker-q", "cycle_id": self.cid(), "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"])
+        c = self.chain()
+        self.assertEqual(c.state, "INVALID")
+        self.assertIn(c.reason, ("slot", "refreshed"))
+
+    def test_other_authorized_slot(self):
+        self.matrix_case(lambda d: {"slot": OTHER, "cycle_id": self.cid(), "completion": freeze.canonical.digest(d)})
+
+    def test_wrong_completion_digest(self):
+        self.matrix_case(lambda d: {"slot": SLOT, "cycle_id": self.cid(), "completion": "e" * 64})
+
+    def test_another_operations_authorization(self):
+        self.assertTrue(crash(self.env, "barriers:put:before", "freeze-start"))
+        done = self.last_done()
+        other = o5.burn(self.env, o5._owner_doc(self.env, "freeze-start", slot=OTHER, op_id="op2", slot_generation=1))
+        self.bad({"slot": SLOT, "cycle_id": self.cid(), "completion": freeze.canonical.digest(done)}, auth=other)
+        self.assert_invalid()
+
+    def test_duplicate_and_conflicting_records(self):
+        self.matrix_case(lambda d: {"slot": SLOT, "cycle_id": self.cid(), "completion": freeze.canonical.digest(d)})
+
+    def test_other_chain(self):
+        ok(self, self.env, "freeze-start")
+        done = self.last_done()
+        b2 = o5.synthetic_barrier(self.env, [SLOT, OTHER])
+        self.bad({"slot": SLOT, "cycle_id": self.cid(), "completion": freeze.canonical.digest(done)},
+                 auth=done["auth_digest"], bid=b2)
+        self.assert_invalid(b2)
+
+    def test_malformed_details_fail_closed(self):
+        for detail in ({"slot": SLOT, "cycle_id": ["x"], "completion": "d" * 64},
+                       {"slot": SLOT, "cycle_id": "c" * 64, "completion": {"x": 1}},
+                       {"slot": "", "cycle_id": "c" * 64, "completion": "d" * 64},
+                       {"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64, "extra": "x"}, {}):
+            self.setUp()
+            ok(self, self.env, "freeze-start")
+            self.bad(detail)
+            self.assertEqual(self.chain().state, "INVALID")
+            self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
+            self.refused("freeze-continue")
+
+    def test_closed_historical_cycle(self):
+        self.env.freeze_results["freeze-start"] = "NONE"
+        ok(self, self.env, "freeze-start")
+        self.assertEqual(cycles(self.env)[-1].closure, "none_no_move")
+        self.bad({"slot": SLOT, "cycle_id": self.cid(), "completion": "e" * 64}, auth=self.last_done()["auth_digest"])
+        self.assert_invalid()
+        self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
+
+    def test_invalid_refresh_in_a_released_chain(self):
+        """The release records follow the bad refresh in a structurally valid
+        sequence; the chain is INVALID, never RELEASED."""
+        import json
+        bid = self.env.barrier_id
+        self.bad({"slot": SLOT, "cycle_id": "c" * 64, "completion": "d" * 64})
+        st = self.env.world.o5.stores["barriers"]
+        keys = sorted(k for k in st.keys() if k.split("/")[1] == bid)
+        first = json.loads(st.get(keys[0]))
+        base = {k: first[k] for k in o5.barrier.IMMUTABLE}
+        prev = freeze.canonical.sha256(st.get(keys[-1]))
+        for i, kind in enumerate(("release_requested", "release_authorized", "released")):
+            auth = o5.burn(self.env, o5._owner_doc(self.env, "barrier-release", slot="o5-barrier",
+                                                   slot_generation=900 + i))
+            prev = o5.barrier_record(self.env, bid, len(keys) + i, prev, kind, auth, base)
+        self.assert_invalid()
+        r = self.env.run("clear-suspect", slot=SLOT, reason=reason())
+        self.assertEqual(r.detail, "barrier_in_use")
+
+    def test_corrupt_f_wal_leaves_no_cycle_facts(self):
+        ok(self, self.env, "freeze-start")
+        self.env.world.fwal.entries[SLOT][-1]["bindings"] = "not-a-map"
+        self.assertEqual(self.chain().state, "INVALID")
+        self.assertEqual(self.chain().reason, "refreshed")
+
+    def test_unclassifiable_f_wal_supplies_no_facts_even_with_an_intact_completion(self):
+        """The refreshed completion is untouched; a later entry makes the log
+        unclassifiable, so no cycle facts exist and the chain is INVALID."""
+        ok(self, self.env, "freeze-start")
+        self.assertEqual(self.chain().state, "ESTABLISHED")
+        done = self.last_done()
+        self.env.world.fwal.entries[SLOT].append({"op_id": OP, "kind": "intent", "value": "BOGUS",
+                                                  "auth_digest": done["auth_digest"]})
+        self.assertEqual(burn_classes(self.env), ["STATE_UNKNOWN(fwal)"])
+        self.assertEqual((self.chain().state, self.chain().reason), ("INVALID", "refreshed"))
+
+    def test_cycle_generation_must_match_the_chain(self):
+        """A crafted cycle bound to a chain whose authorized generation differs."""
+        h = head(self.env).digest
+        b2 = o5.synthetic_barrier(self.env, [SLOT, OTHER], gens={SLOT: 5, OTHER: 1})
+        doc = o5._owner_doc(self.env, "freeze-start", slot=SLOT, op_id=OP, slot_generation=1, f_from="NONE",
+                            o5={"barrier_id": b2, "cutover_head": h})
+        auth = o5.burn(self.env, doc)
+        w = self.env.world
+        w.fwal.entries[SLOT] = [{"op_id": OP, "kind": "intent", "value": "MOVE_INTENT", "auth_digest": auth}]
+        done = {"op_id": OP, "kind": "complete", "value": "MOVED", "reason": "", "bindings": {"early": "e" * 64},
+                "auth_digest": auth, "utc": 1}
+        w.fwal.entries[SLOT].append(done)
+        self.assertEqual(self.cid(), harness.o5.oc.cycle_id(SLOT, 1, OP, auth))
+        self.bad({"slot": SLOT, "cycle_id": self.cid(), "completion": freeze.canonical.digest(done)}, auth=auth,
+                 bid=b2)
+        self.assert_invalid(b2)
+
+    def test_every_operation_path_refuses_an_invalid_chain(self):
+        """freeze-continue, thaw, resume-step, quarantine, quiescence, snapshot and
+        verify-preservation each meet the invalid chain at their own row."""
+        steps = [("freeze-start", None), ("freeze-continue", ("freeze-continue", "thaw", "resume-step")),
+                 ("quarantine", ("quarantine",)), ("quiescence", ("quiescence",)),
+                 ("snapshot", ("snapshot",)), ("verify-preservation", ("verify-preservation",))]
+        env_kw = {"auto_handoff": False}
+        for i, (_, probes) in enumerate(steps):
+            if probes is None:
+                continue
+            self.env = Env(**env_kw)
+            self.addCleanup(self.env.close)
+            self.env.seed_leased()
+            self.env.seed_leased(slot=OTHER)
+            self.effects = []
+            for verb in ("adopt", "request") + tuple(v for v, _ in steps[:i]):
+                kw = {"quarantine": harness.QUARANTINE, "quiescence": harness.QUIESCENCE}.get(verb, {})
+                ok(self, self.env, verb, **kw)
+            inner = self.env.world.freeze
+            self.env.world.freeze = lambda verb, slot, op, ctx: (self.effects.append(verb), inner(verb, slot, op,
+                                                                                                  ctx))[1]
+            self.bad({"cycle_id": "c" * 64, "completion": "d" * 64})
+            for verb in probes:
+                self.refused(verb)
+            self.assertEqual(self.effects, [])
+            self.assertEqual(release(self.env), (Code.STATE_UNKNOWN, "barrier_invalid"))
 
 
 class BurnBinding(unittest.TestCase):

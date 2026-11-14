@@ -147,8 +147,7 @@ def synthetic_barrier(env, slots, gens=None, upto="established", head_digest=Non
 def chain(env, bid):
     w = env.world
     docs = freeze.burned_docs(w, w.ledger.entries())
-    known = {c.cycle_id for s in w.slots() for c in freeze.cycles(w, s, docs)}
-    return freeze.chains_of(w, docs, known)[bid]
+    return freeze.chains_of(w, docs, freeze.all_cycles(w, docs))[bid]
 
 
 def append_record(env, bid, kind, auth=None, detail=None, verb=None):

@@ -123,11 +123,13 @@ def head_of(world, entries, docs):
     return cutover.head(entries, docs.get, world.o5.stores, witnesses, world.o5.floor, oc.mode(world))
 
 
-def all_cycle_ids(world, docs):
-    return {c.cycle_id for s in world.slots() for c in cycles(world, s, docs)}
+def all_cycles(world, docs):
+    """Cycle facts for chain verification: built from burned freeze-start
+    documents and a classifiable F WAL only (an unclassifiable log yields none)."""
+    return {c.cycle_id: c for s in world.slots() for c in cycles(world, s, docs) if c.closure != "STATE_UNKNOWN(fwal)"}
 
 
-def chains_of(world, docs, cycle_ids):
+def chains_of(world, docs, cycle_facts):
     st = world.o5.stores["barriers"]
     ids = {}
     for k in st.keys():
@@ -139,7 +141,7 @@ def chains_of(world, docs, cycle_ids):
         if None in raw or not _hex(bid):
             out[bid or "?"] = barrier._invalid(bid, "gap")
             continue
-        out[bid] = barrier.verify_chain(bid, raw, lambda d: (docs.get(d) or {}).get("verb"), cycle_ids,
+        out[bid] = barrier.verify_chain(bid, raw, lambda d: (docs.get(d) or {}).get("verb"), cycle_facts,
                                         oc.mode(world))
     return out
 
@@ -194,7 +196,9 @@ def refreshed_records(world):
             r = protocol.parse_doc(st.get(k))
         except Refused:
             continue
-        if r.get("kind") == "refreshed" and type(r.get("detail")) is dict:
+        d = r.get("detail")
+        if r.get("kind") == "refreshed" and type(d) is dict and type(d.get("cycle_id")) is str \
+                and type(d.get("completion")) is str:
             out.append(r)
     return out
 
@@ -232,7 +236,7 @@ def cycles(world, slot, docs):
             seg = oplog[i:starts[n + 1] if n + 1 < len(starts) else len(oplog)]
             auth = seg[0].get("auth_digest")
             doc = docs.get(auth)
-            if doc is None or doc.get("verb") != "freeze-start":
+            if doc is None or doc.get("verb") != "freeze-start" or doc.get("slot") != slot:
                 continue
             o5 = doc.get("o5") if type(doc.get("o5")) is dict else {}
             binds, closed = {}, None
@@ -435,7 +439,7 @@ def c18(world, plan, facts, docs):
         verb = facts.a.verb
     if verb not in ("acquire", "release", "clear-suspect"):
         return
-    chains = chains_of(world, docs, all_cycle_ids(world, docs))
+    chains = chains_of(world, docs, all_cycles(world, docs))
     if any(barrier.covers(c, facts.slot) for c in barrier.live(chains)):
         raise Refused(Code.VERB_NOT_ALLOWED_IN_STATE, "barrier_in_use")
 
@@ -476,7 +480,7 @@ def check(world, plan, c, facts, n, row):
             raise Refused(Code.STATE_UNKNOWN, "cutover_changed")
         if cycle.closure == "ready" and cycle.cutover_head not in h.history:
             raise Refused(Code.STATE_UNKNOWN, "cutover_invalid(history)")
-    chains = chains_of(world, docs, all_cycle_ids(world, docs))
+    chains = chains_of(world, docs, all_cycles(world, docs))
     if spec.cycle == "none":
         chain = barrier.resolve(chains, slot, plan.fields.get("barrier_id"))
     else:
@@ -760,7 +764,7 @@ def basis_for(world, slot, purpose, doc=None, release_target=None, kind=None):
     cyc_list = cycles(world, slot, docs)
     mine = [x for x in cyc_list if x.op_id == facts.op_id]
     cycle = mine[-1] if mine else None
-    chains = chains_of(world, docs, all_cycle_ids(world, docs))
+    chains = chains_of(world, docs, all_cycles(world, docs))
     now = world.clock()
     if purpose == "handoff":
         if release_target is not None:
@@ -884,8 +888,7 @@ def release_check(world, barrier_id, resume=False, halt=False):
     entries = world.ledger.entries()
     docs = burned_docs(world, entries)
     by_slot = {s: cycles(world, s, docs) for s in world.slots()}
-    known = {x.cycle_id for xs in by_slot.values() for x in xs}
-    chains = chains_of(world, docs, known)
+    chains = chains_of(world, docs, all_cycles(world, docs))
     target = chains.get(barrier_id)
     if target is None:
         raise Refused(Code.QUIESCENCE_NOT_ESTABLISHED, "barrier_unavailable(none)")
