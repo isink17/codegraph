@@ -7,6 +7,7 @@ resistance; the floor (PR-4) is the only rollback anchor."""
 from collections import namedtuple
 
 from . import authz, canonical, o5contract as oc, protocol
+from .canonical import is_hex64
 from .refusal import Code, Refused
 
 Head = namedtuple("Head", "state reason seq record digest enumeration history pending_auth")
@@ -43,19 +44,16 @@ def _parse(data):
         return None
 
 
-def _hex(v):
-    return type(v) is str and bool(canonical.HEX64.match(v))
-
-
 def _record_ok(r, i):
     if sorted(r) != sorted(RECORD_KEYS) or r["schema"] != oc.S_CUTOVER or r["seq"] != i:
         return False
     a, b = r["agent"], r["baselines"]
     return (r["kind"] in ("cutover", "rebaseline", "revoked") and r["effective"] in ("MODEL_B", "MODEL_A")
-            and _hex(r["owner_auth"]) and _hex(r["prev"]) and type(a) is dict and sorted(a) == sorted(AGENT_KEYS)
-            and type(b) is dict and sorted(b) == sorted(BASELINE_KEYS) and all(_hex(x) for x in b.values())
-            and _hex(r["slot_enumeration"]) and _hex(r["tests"]) and type(r["preconditions"]) is list
-            and (r["supersedes"] == "" or _hex(r["supersedes"])) and type(r["utc"]) is int)
+            and is_hex64(r["owner_auth"]) and is_hex64(r["prev"]) and type(a) is dict
+            and sorted(a) == sorted(AGENT_KEYS)
+            and type(b) is dict and sorted(b) == sorted(BASELINE_KEYS) and all(is_hex64(x) for x in b.values())
+            and is_hex64(r["slot_enumeration"]) and is_hex64(r["tests"]) and type(r["preconditions"]) is list
+            and (r["supersedes"] == "" or is_hex64(r["supersedes"])) and type(r["utc"]) is int)
 
 
 def _identity_ok(r, prev_b):
@@ -132,8 +130,8 @@ def head(entries, get_doc, stores, witnesses, floor, mode):
             return _invalid("auth_missing")
         if canonical.digest(doc) != auth or doc.get("verb") != v or doc.get("slot") != oc.CUTOVER_SUBJECT \
                 or doc.get("slot_generation") != s or "op_id" in doc or doc.get("actor_uid") != 501 \
-                or doc.get("trust") != trust or not _hex(doc.get("cutover_record")) \
-                or not _hex(doc.get("cutover_prev")):
+                or doc.get("trust") != trust or not is_hex64(doc.get("cutover_record")) \
+                or not is_hex64(doc.get("cutover_prev")):
             return _invalid("auth_binding")
         docs.append(doc)
     raw = _contiguous(stores["cutovers"], "cutover")
