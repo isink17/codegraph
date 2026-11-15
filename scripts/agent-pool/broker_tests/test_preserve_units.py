@@ -442,7 +442,7 @@ class GitClassification(unittest.TestCase):
         self.assertIn("gitlink_file", reasons)
 
     def test_gitdir_names_compare_case_insensitively(self):
-        for name in (b".git", b".GIT", b".Git", b".gIT", ".g‌it".encode(), "﻿.GIT".encode()):
+        for name in (b".git", b".GIT", b".Git", b".gIT", ".g\u200cit".encode(), "\ufeff.GIT".encode()):
             self.assertTrue(gitclass.is_git_path(b"sub/" + name + b"/HEAD"), name)
         for path in (b".gitignore", b".github/workflows/ci.yml", b"git/HEAD", b"x.git/HEAD", b".git2/HEAD",
                      b"sub/.gi t/HEAD", b"\xff.git/HEAD"):
@@ -451,7 +451,7 @@ class GitClassification(unittest.TestCase):
     def test_nested_repository_under_any_spelling_is_classified(self):
         """B-2: `sub/.GIT` is `sub/.git` on a case-insensitive volume, so its
         alternates, shallow file, gitlink file and defects are findings."""
-        for name in (b".GIT", b".Git", ".g‍it".encode()):
+        for name in (b".GIT", b".Git", ".g\u200dit".encode()):
             def nested(*variant, extra=None):
                 files, _ = pw.git_repo(worktree={b"w": b"x\n"}, variant=variant, prefix=b"sub/")
                 files.update(extra or {})

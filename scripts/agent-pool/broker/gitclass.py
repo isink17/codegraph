@@ -23,7 +23,7 @@ _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
-_HFS_IGNORED = re.compile("[‌-‏‪-‮⁪-⁯﻿]")
+_HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
