@@ -33,7 +33,9 @@ EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE: preserved as bytes, never claimed recoverable through Git.
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
                          "submodule_gitdir", "git_head", "unborn_head"})
-# Q3 INCOMPLETE only (still eligible: restoration never uses Git).
+# Q3 INCOMPLETE only (still eligible: restoration never uses Git). `packed`: a
+# reachable object is not loose but a consistent pack index lists it; its
+# packed content is never inflated or hashed, so it is not verified.
 UNVERIFIED = frozenset({"packed"})
 # Recorded, benign.
 BENIGN = frozenset({"dangling_symref", "residue", "symref", "packed_refs", "nested"})
@@ -205,10 +207,64 @@ def _links(typ, body):
     return []
 
 
+def _idx_names(idx, pack):
+    """The object ids a v2 pack index lists, or None unless the index and its
+    sibling pack are structurally consistent: header, monotonic fan-out that
+    matches the strictly increasing names, bounded count, exact size, offsets
+    inside the pack and distinct, index checksum, pack header count and pack
+    checksum equal to the one the index records. Presence only (R2 K7): no
+    packed object is inflated or hashed."""
+    if pack is None or len(idx) < 1072 or idx[:8] != b"\xfftOc\x00\x00\x00\x02":
+        return None
+    fan = [int.from_bytes(idx[8 + 4 * i:12 + 4 * i], "big") for i in range(256)]
+    n = fan[255]
+    if n > MAX_OBJECTS or any(a > b for a, b in zip(fan, fan[1:])):
+        return None
+    offsets_at, large_at = 1032 + 24 * n, 1032 + 28 * n
+    offs = [int.from_bytes(idx[offsets_at + 4 * k:offsets_at + 4 * k + 4], "big") for k in range(n)]
+    large = sum(1 for o in offs if o & 0x80000000)
+    if len(idx) != large_at + 8 * large + 40 or hashlib.sha1(idx[:-20]).digest() != idx[-20:]:  # noqa: S324
+        return None
+    if len(pack) < 32 or pack[:4] != b"PACK" or int.from_bytes(pack[4:8], "big") not in (2, 3) \
+            or int.from_bytes(pack[8:12], "big") != n or idx[-40:-20] != pack[-20:] \
+            or hashlib.sha1(pack[:-20]).digest() != pack[-20:]:  # noqa: S324 - Git checksums are SHA-1
+        return None
+    names, seen, prev = set(), set(), b""
+    for k in range(n):
+        name = idx[1032 + 20 * k:1052 + 20 * k]
+        b, o = name[0], offs[k]
+        if name <= prev or not (fan[b - 1] if b else 0) <= k < fan[b]:
+            return None
+        if o & 0x80000000:
+            j = o & 0x7FFFFFFF
+            o = int.from_bytes(idx[large_at + 8 * j:large_at + 8 * j + 8], "big") if j < large else 0
+            if o < 0x80000000:
+                return None
+        if not 12 <= o < len(pack) - 20 or o in seen:
+            return None
+        seen.add(o)
+        names.add(name.hex())
+        prev = name
+    return names
+
+
+def _pack_index(r, files):
+    """Ids listed by every pack index of the repository. A malformed index,
+    or one without its matching pack, is `unknown`; a pack without an index
+    lists nothing."""
+    listed = set()
+    for p in sorted(files):
+        if p.startswith(b"objects/pack/") and p.endswith(b".idx") and b"/" not in p[len(b"objects/pack/"):]:
+            got = _idx_names(files[p], files.get(p[:-4] + b".pack"))
+            if got is None:
+                r.features.add("unknown")
+            else:
+                listed |= got
+    return listed
+
+
 def _closure(r, files, tips):
-    packs = any(p.startswith(b"objects/pack/") and p.endswith((b".pack", b".idx")) for p in files)
-    if packs:
-        r.features.add("packed")
+    packed = _pack_index(r, files)
     seen, todo = set(), sorted(tips)
     while todo:
         oid = todo.pop()
@@ -220,7 +276,7 @@ def _closure(r, files, tips):
         seen.add(oid)
         got = _read_object(files, oid)
         if got == "missing":
-            r.features.add("packed" if packs else "missing_object")
+            r.features.add("packed" if oid in packed else "missing_object")
             continue
         if got == "corrupt":
             r.features.add("corrupt_object")

@@ -94,6 +94,23 @@ class Positive(Base):
         self.assertEqual(gitclass.questions({b"": gitclass.classify(b"", files)}, "COMPLETE")[1:4],
                          ("INCOMPLETE", "COMPLETE", "ELIGIBLE"))
 
+    def test_missing_object_beside_a_junk_pack_is_not_preservable(self):
+        """B-3: a pack file name never stands in for the missing object."""
+        files = pw.git_repo(variant=("missing_object",))[0]
+        files[b".git/objects/pack/junk.pack"] = b"not a pack"
+        self.w.fx.trees[SLOT] = files
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+
+    def test_missing_object_beside_an_unrelated_valid_pack_is_not_preservable(self):
+        files = pw.git_repo(variant=("missing_object",))[0]
+        oid, z = pw.gobj(b"blob", b"unrelated\n")
+        pack, idx = pw.pack_pair({oid: pw.zlib.decompress(z)})
+        files[b".git/objects/pack/pack-u.pack"], files[b".git/objects/pack/pack-u.idx"] = pack, idx
+        self.w.fx.trees[SLOT] = files
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+
     def test_shallow_repository_is_not_recovery_eligible(self):
         self.w.fx.trees[SLOT] = pw.git_repo(variant=("shallow",))[0]
         self.ok("adopt", "request")

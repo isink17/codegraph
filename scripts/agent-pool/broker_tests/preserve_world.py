@@ -35,6 +35,38 @@ def gobj(typ, body):
     return hashlib.sha1(raw).hexdigest(), zlib.compress(raw)  # noqa: S324 - Git object ids
 
 
+PACK_TYPES = {b"commit": 1, b"tree": 2, b"blob": 3, b"tag": 4}
+
+
+def reseal(data):
+    """Recomputes the trailing SHA-1 of a pack or pack index."""
+    return data[:-20] + hashlib.sha1(data[:-20]).digest()  # noqa: S324 - Git checksums
+
+
+def pack_pair(raws):
+    """(pack, idx): a version 2 pack of undeltified objects and its version 2
+    index, laid out as Git writes them. `raws` maps an object id to its loose
+    form `type size\\0body`."""
+    body, entries = b"", []
+    for oid in sorted(raws):
+        head, _, data = raws[oid].partition(b"\0")
+        n = len(data)
+        hdr = bytearray([PACK_TYPES[head.split(b" ")[0]] << 4 | n & 15 | (0x80 if n > 15 else 0)])
+        n >>= 4
+        while n:
+            hdr.append(n & 0x7F | (0x80 if n > 0x7F else 0))
+            n >>= 7
+        entry = bytes(hdr) + zlib.compress(data)
+        entries.append((oid, 12 + len(body), zlib.crc32(entry)))
+        body += entry
+    pack = reseal(b"PACK" + (2).to_bytes(4, "big") + len(raws).to_bytes(4, "big") + body + bytes(20))
+    fan = [sum(1 for o, _, _ in entries if int(o[:2], 16) <= i) for i in range(256)]
+    idx = b"\xfftOc" + (2).to_bytes(4, "big") + b"".join(c.to_bytes(4, "big") for c in fan)
+    idx += b"".join(bytes.fromhex(o) for o, _, _ in entries) + b"".join(c.to_bytes(4, "big") for _, _, c in entries)
+    idx += b"".join(off.to_bytes(4, "big") for _, off, _ in entries) + pack[-20:]
+    return pack, reseal(idx + bytes(20))
+
+
 def git_repo(worktree=None, variant=(), prefix=b""):
     """{tree path: bytes} for a worktree and its loose-object `.git`."""
     worktree = worktree if worktree is not None else {b"README": b"hello\n", b"main.go": b"package main\n"}
@@ -58,7 +90,9 @@ def git_repo(worktree=None, variant=(), prefix=b""):
     if "packed_only" in v:
         for oid in objs:
             del g[b"objects/" + oid[:2].encode() + b"/" + oid[2:].encode()]
-        g[b"objects/pack/pack-1.pack"], g[b"objects/pack/pack-1.idx"] = b"PACK-bytes", b"IDX-bytes"
+        pack, idx = pack_pair({oid: zlib.decompress(z) for oid, z in objs.items()})
+        stem = b"objects/pack/pack-" + pack[-20:].hex().encode()
+        g[stem + b".pack"], g[stem + b".idx"] = pack, idx
     if "shallow" in v:
         g[b"shallow"] = coid.encode() + b"\n"
     if "alternates" in v:

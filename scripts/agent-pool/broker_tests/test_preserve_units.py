@@ -504,6 +504,103 @@ class GitClassification(unittest.TestCase):
         self.assertRegex(item, canonical.KEY)
 
 
+def at(data, i, new):
+    return data[:i] + new + data[i + len(new):]
+
+
+def u32(v):
+    return v.to_bytes(4, "big")
+
+
+class PackIndex(unittest.TestCase):
+    """B-3 / R2 K7: a reachable object that is not loose is `packed` only when
+    a consistent version 2 index beside its matching pack lists it."""
+
+    def setUp(self):
+        self.files, self.coid = pw.git_repo(variant=("packed_only",))
+        self.ip = next(p for p in self.files if p.endswith(b".idx"))
+        self.pp = self.ip[:-4] + b".pack"
+        self.idx, self.pack = self.files[self.ip], self.files[self.pp]
+        self.n = int.from_bytes(self.idx[1028:1032], "big")
+
+    def with_pair(self, idx, pack):
+        return classify({**self.files, self.ip: idx, self.pp: pack})
+
+    def unrelated_pair(self):
+        oid, z = pw.gobj(b"blob", b"unrelated\n")
+        pack, idx = pw.pack_pair({oid: pw.zlib.decompress(z)})
+        return {b".git/objects/pack/pack-u.pack": pack, b".git/objects/pack/pack-u.idx": idx}
+
+    def test_listed_objects_are_packed_and_eligible(self):
+        _, q3, q4, q5, reasons, head = classify(self.files)
+        self.assertEqual((q3, q4, q5, reasons, head), ("INCOMPLETE", "COMPLETE", "ELIGIBLE", ["packed"], self.coid))
+        self.assertEqual(len(gitclass._idx_names(self.idx, self.pack)), self.n)
+
+    def test_a_pack_file_name_proves_nothing(self):
+        files, _ = pw.git_repo(variant=("missing_object",))
+        for extra in ({b".git/objects/pack/junk.pack": b"not a pack"}, self.unrelated_pair()):
+            _, _, q4, q5, reasons, _ = classify({**files, **extra})
+            self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"), extra)
+            self.assertIn("missing_object", reasons)
+
+    def test_pack_without_index_and_index_without_pack(self):
+        _, _, q4, _, reasons, _ = classify({p: d for p, d in self.files.items() if p != self.ip})
+        self.assertEqual((q4, reasons), ("INCOMPLETE", ["missing_object"]))
+        _, _, q4, _, reasons, _ = classify({p: d for p, d in self.files.items() if p != self.pp})
+        self.assertEqual((q4, reasons), ("INCOMPLETE", ["missing_object", "unknown"]))
+
+    def test_loose_objects_beside_a_pack_stay_verified(self):
+        files, _ = pw.git_repo()
+        self.assertEqual(classify({**files, **self.unrelated_pair()})[1:5], ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+
+    def test_count_above_the_bound(self):
+        with mock.patch.object(gitclass, "MAX_OBJECTS", self.n - 1):
+            self.assertIsNone(gitclass._idx_names(self.idx, self.pack))
+
+    def test_every_structural_damage_is_unknown(self):
+        idx, pack, n = self.idx, self.pack, self.n
+        seal = pw.reseal
+        names, offs = 1032, 1032 + 24 * n
+        first = idx[names]
+        self.assertGreater(first, 0)
+
+        def repack(p):
+            p = seal(p)
+            return seal(idx[:-40] + p[-20:] + bytes(20)), p
+
+        swapped = idx[:names] + idx[names + 20:names + 40] + idx[names:names + 20] + idx[names + 40:]
+        cases = {
+            "magic": (seal(at(idx, 0, b"\xfftOd")), pack),
+            "version": (seal(at(idx, 4, u32(1))), pack),
+            "fan-out not monotonic": (seal(at(idx, 8 + 4 * 254, u32(n + 1))), pack),
+            "fan-out bucket": (seal(at(idx, 8 + 4 * (first - 1), u32(1))), pack),
+            "names out of order": (seal(swapped), pack),
+            "duplicate name": (seal(at(idx, names + 20, idx[names:names + 20])), pack),
+            "extra bytes": (seal(idx[:-40] + bytes(8) + idx[-40:]), pack),
+            "truncated": (idx[:1100], pack),
+            "index checksum": (at(idx, len(idx) - 1, bytes([idx[-1] ^ 1])), pack),
+            "recorded pack checksum": (seal(at(idx, len(idx) - 40, bytes(20))), pack),
+            "pack trailer": (idx, at(pack, 20, bytes([pack[20] ^ 1]))),
+            "pack resealed after a change": (idx, seal(at(pack, 20, bytes([pack[20] ^ 1])))),
+            "pack object count": repack(at(pack, 8, u32(n + 1))),
+            "pack version": repack(at(pack, 4, u32(4))),
+            "pack magic": repack(at(pack, 0, b"KCAP")),
+            "short pack": (idx, b"PACK"),
+            "offset past the pack": (seal(at(idx, offs, u32(len(pack) - 20))), pack),
+            "offset inside the header": (seal(at(idx, offs, u32(11))), pack),
+            "duplicate offsets": (seal(at(idx, offs + 4, idx[offs:offs + 4])), pack),
+            "large offset without a table entry": (seal(at(idx, offs, u32(0x80000000))), pack),
+            "large offset below 2^31": (seal(at(idx, offs, u32(0x80000000))[:-40] + (12).to_bytes(8, "big")
+                                             + idx[-40:]), pack),
+        }
+        for name, (bad_idx, bad_pack) in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(gitclass._idx_names(bad_idx, bad_pack))
+                _, _, q4, q5, reasons, _ = self.with_pair(bad_idx, bad_pack)
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+
+
 class TypedNeutralization(unittest.TestCase):
     """N-R41-9 through the real H-EST, in a full world."""
 
