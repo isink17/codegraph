@@ -292,11 +292,11 @@ class _Cycle:
         """Q1 from the raw capture (stored INCOMPLETE is trusted only to refuse;
         COMPLETE needs every needed blob); Q2–Q5 from the captured Git bytes."""
         a = Assessment()
-        git = [(bytes.fromhex(p), b) for p, b in es if b".git" in bytes.fromhex(p).split(b"/")]
+        git = [(bytes.fromhex(p), b) for p, b in es if gitclass.is_git_path(bytes.fromhex(p))]
         got = self.blobs(sorted({b for _, b in es}) if full else sorted({b for _, b in git}))
         a.q1 = "COMPLETE" if m["result"] == "COMPLETE" and got is not None else "INCOMPLETE"
         files = {p: got[b] for p, b in git} if got is not None else {}
-        repos = {root: gitclass.classify(root, fs) for root, fs in gitclass.split_repositories(files).items()}
+        repos = gitclass.repositories(files)
         a.q2, a.q3, a.q4, a.q5, a.reasons, a.head = gitclass.questions(repos, a.q1)
         a.top = repos.get(b"")
         if "head_resolved" in m:
@@ -530,7 +530,7 @@ class Preservation:
         need(a.q4 == "COMPLETE", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(raw)")
         need(a.q5 == "ELIGIBLE", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(recovery)")
         need(a.head is not None and a.head == ep_head, Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(head)")
-        members = {"dirty": [p for p, _ in ves if b".git" not in bytes.fromhex(p).split(b"/")],
+        members = {"dirty": [p for p, _ in ves if not gitclass.is_git_path(bytes.fromhex(p))],
                    "untracked": [], "ignored": [], "unpublished_commits": gitclass.unpublished_commit_items(a.top)}
         inv, preserved = inventory_items(vb["manifest"], vm["header"], members)
         need(inv is not None, Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(inventory_size)")

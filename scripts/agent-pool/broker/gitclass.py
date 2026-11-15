@@ -23,6 +23,7 @@ _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
+_HFS_IGNORED = re.compile("[‌-‏‪-‮⁪-⁯﻿]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
@@ -45,19 +46,46 @@ class Repo:
         self.root, self.features, self.head, self.head_oid, self.tips = root, set(), None, None, set()
 
 
-def split_repositories(files):
-    """`files` maps a tree-relative path (bytes) to its bytes. A repository is
-    the prefix before the first `.git` component; a `.git` regular file is a
-    gitlink (linked worktree or submodule checkout) whose objects are elsewhere."""
-    repos = {}
+def is_gitdir_name(c):
+    """R2 K3: a `.git` name compared case-insensitively, also with the code
+    points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and `.Git` count."""
+    if c.lower() == b".git":
+        return True
+    try:
+        return _HFS_IGNORED.sub("", c.decode("utf-8")).lower() == ".git"
+    except UnicodeDecodeError:
+        return False
+
+
+def git_index(parts):
+    """Index of the first administrative-directory component, or None."""
+    return next((i for i, c in enumerate(parts) if is_gitdir_name(c)), None)
+
+
+def is_git_path(path):
+    return git_index(path.split(b"/")) is not None
+
+
+def repositories(files):
+    """{root: Repo} for a captured tree. `files` maps a tree-relative path
+    (bytes) to its bytes. A repository is the prefix before the first `.git`
+    component; a `.git` regular file is a gitlink (linked worktree or submodule
+    checkout) whose objects are elsewhere. A root whose administrative
+    directory is spelled more than one way is ambiguous: `unknown`."""
+    split, names = {}, {}
     for path, data in files.items():
         parts = path.split(b"/")
-        if b".git" not in parts:
+        i = git_index(parts)
+        if i is None:
             continue
-        i = parts.index(b".git")
         root = b"/".join(parts[:i])
-        rel = b"/".join(parts[i + 1:])
-        repos.setdefault(root, {})[rel] = data
+        split.setdefault(root, {})[b"/".join(parts[i + 1:])] = data
+        names.setdefault(root, set()).add(parts[i])
+    repos = {}
+    for root, fs in split.items():
+        repos[root] = classify(root, fs)
+        if len(names[root]) > 1:
+            repos[root].features.add("unknown")
     return repos
 
 

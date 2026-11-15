@@ -104,6 +104,38 @@ class Positive(Base):
         self.ok("adopt", "request")
         self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
 
+    def _nested(self, name, *variant):
+        files, _ = pw.git_repo(worktree={b"work.txt": b"nested agent work\n"}, variant=variant, prefix=b"sub/")
+        if "alternates" in variant:
+            files = {p: d for p, d in files.items() if b"/objects/" not in p or p.endswith(b"alternates")}
+        return {p.replace(b"sub/.git", b"sub/" + name, 1): d for p, d in files.items()}
+
+    def _external_nested_refused(self, name):
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(name, "alternates")}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.fx.irrev, [(self.w.cid(), "move")])
+
+    def test_nested_external_objects_under_dot_git(self):
+        self._external_nested_refused(b".git")
+
+    def test_nested_external_objects_under_upper_case_gitdir(self):
+        """B-2: `sub/.GIT` is the nested gitdir on case-insensitive APFS."""
+        self._external_nested_refused(b".GIT")
+
+    def test_nested_external_objects_under_mixed_case_gitdir(self):
+        self._external_nested_refused(b".Git")
+
+    def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        s, doc = self.w.st(), self.w.last_doc("preservation")
+        dirty = sorted(p.hex() for p in self.w.fx.tree(SLOT) if not gitclass.is_git_path(p))
+        self.assertIn(b"sub/work.txt".hex(), dirty)
+        self.assertFalse(any(b"/.GIT/" in bytes.fromhex(p) for p in dirty))
+        self.assertEqual(doc["inventory"]["dirty"], [preserve.item_id("dirty", s["fs_m"], 0, dirty)])
+
     def test_owner_thaw_from_p7_then_d2(self):
         self.ok("adopt", "request", "freeze-start", "freeze-continue")
         self.ok("thaw")

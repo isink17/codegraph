@@ -379,8 +379,7 @@ class Reconstruction(unittest.TestCase):
 
 
 def classify(files):
-    repos = {r: gitclass.classify(r, fs) for r, fs in gitclass.split_repositories(files).items()}
-    return gitclass.questions(repos, "COMPLETE")
+    return gitclass.questions(gitclass.repositories(files), "COMPLETE")
 
 
 class GitClassification(unittest.TestCase):
@@ -442,14 +441,47 @@ class GitClassification(unittest.TestCase):
         self.assertEqual(q4, "INCOMPLETE")
         self.assertIn("gitlink_file", reasons)
 
+    def test_gitdir_names_compare_case_insensitively(self):
+        for name in (b".git", b".GIT", b".Git", b".gIT", ".g‌it".encode(), "﻿.GIT".encode()):
+            self.assertTrue(gitclass.is_git_path(b"sub/" + name + b"/HEAD"), name)
+        for path in (b".gitignore", b".github/workflows/ci.yml", b"git/HEAD", b"x.git/HEAD", b".git2/HEAD",
+                     b"sub/.gi t/HEAD", b"\xff.git/HEAD"):
+            self.assertFalse(gitclass.is_git_path(path), path)
+
+    def test_nested_repository_under_any_spelling_is_classified(self):
+        """B-2: `sub/.GIT` is `sub/.git` on a case-insensitive volume, so its
+        alternates, shallow file, gitlink file and defects are findings."""
+        for name in (b".GIT", b".Git", ".g‍it".encode()):
+            def nested(*variant, extra=None):
+                files, _ = pw.git_repo(worktree={b"w": b"x\n"}, variant=variant, prefix=b"sub/")
+                files.update(extra or {})
+                return {p.replace(b"sub/.git", b"sub/" + name, 1): d for p, d in files.items()}
+            feats, _, q4, q5, reasons, _ = self.q(extra=nested())
+            self.assertEqual((q4, q5, "nested" in feats), ("COMPLETE", "ELIGIBLE", True), name)
+            _, _, q4, _, reasons, _ = self.q(extra=nested("alternates"))
+            self.assertEqual(q4, "INCOMPLETE", name)
+            self.assertIn("alternates", reasons)
+            self.assertEqual(self.q(extra=nested("shallow"))[3], "NOT_ELIGIBLE", name)
+            self.assertIn("missing_object", self.q(extra=nested("missing_object"))[4])
+            _, _, q4, _, reasons, _ = self.q(extra={b"sub/" + name: b"gitdir: /elsewhere\n"})
+            self.assertEqual(q4, "INCOMPLETE", name)
+            self.assertIn("gitlink_file", reasons)
+
+    def test_two_spellings_of_one_gitdir_are_ambiguous(self):
+        for extra in ({b".GIT/description": b"benign\n"}, {b".Git/HEAD": b"ref: refs/heads/main\n"}):
+            files, _ = pw.git_repo()
+            files.update(extra)
+            _, _, q4, q5, reasons, _ = classify(files)
+            self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]), extra)
+
     def test_no_repository_is_never_eligible(self):
         _, q3, q4, q5, _, head = classify({b"README": b"x"})
         self.assertEqual((q3, q4, q5, head), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", None))
 
     def test_raw_incomplete_is_never_complete(self):
         files, _ = pw.git_repo()
-        repos = {r: gitclass.classify(r, fs) for r, fs in gitclass.split_repositories(files).items()}
-        self.assertEqual(gitclass.questions(repos, "INCOMPLETE")[2:4], ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertEqual(gitclass.questions(gitclass.repositories(files), "INCOMPLETE")[2:4],
+                         ("INCOMPLETE", "NOT_ELIGIBLE"))
 
     def test_object_whose_content_is_not_its_id(self):
         """Valid zlib under another object's id: integrity, not decompression, refuses."""
@@ -466,7 +498,7 @@ class GitClassification(unittest.TestCase):
 
     def test_unpublished_commit_items(self):
         files, coid = pw.git_repo()
-        repo = gitclass.classify(b"", gitclass.split_repositories(files)[b""])
+        repo = gitclass.repositories(files)[b""]
         (item,) = gitclass.unpublished_commit_items(repo)
         self.assertEqual(item, "i" + canonical.sha256(b"commit:" + coid.encode())[:63])
         self.assertRegex(item, canonical.KEY)
