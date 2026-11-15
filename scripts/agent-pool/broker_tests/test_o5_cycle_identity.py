@@ -513,5 +513,78 @@ class Refusals(Base):
         self.assertEqual(len(self.effects), 1)
 
 
+class CarryForward(Base):
+    """PR #545 review N2–N5 (owner disposition 2026-11-15)."""
+
+    def test_w_phase_generation_mismatch_through_invoke(self):
+        """N2: a W-phase `_f_cycle_id` generation mismatch, driven through the
+        merged invoke: UNFINISHED, the burn committed, no intent, no effect, the
+        burn ABANDONED_PRE_INTENT and the release D1."""
+        self.ok("adopt", "request")
+        real = invocation._f_cycle_id
+
+        def skewed(gate, facts, verb, digest, doc):
+            return real(gate, facts, verb, digest, dict(doc, slot_generation=doc["slot_generation"] + 1))
+        with mock.patch.object(invocation, "_f_cycle_id", skewed):
+            self.unfinished_without_effect("freeze-start")
+        self.assertEqual(self.burn_classes(), ["ABANDONED_PRE_INTENT"])
+        self.assertEqual(dict(freeze.release_check(self.env.world, self.env.barrier_id)).get(SLOT), "D1")
+
+    def test_burned_document_of_another_generation_is_not_abandoned(self):
+        """N2: a burned freeze-start whose document names another generation
+        than the library's pre-quarantine generation classifies
+        STATE_UNKNOWN(barrier_binding), never ABANDONED_PRE_INTENT, and the
+        release refuses for the slot."""
+        self.ok("adopt", "request")
+        w = self.env.world
+        head = freeze.head_of(w, w.ledger.entries(), self.docs()).digest
+        doc = o5._owner_doc(self.env, "freeze-start", slot=SLOT, op_id=OP, slot_generation=self.gen + 1,
+                            f_from="NONE", o5={"barrier_id": self.env.barrier_id, "cutover_head": head})
+        o5.burn(self.env, doc)
+        self.assertEqual(self.burn_classes(), ["STATE_UNKNOWN(barrier_binding)"])
+        with self.assertRaises(Refused) as e:
+            freeze.release_check(self.env.world, self.env.barrier_id)
+        self.assertEqual((e.exception.code, e.exception.detail), (Code.STATE_UNKNOWN, "STATE_UNKNOWN(barrier_binding)"))
+
+    def test_harness_effect_rejects_a_foreign_identity(self):
+        """N3: the harness effect itself (World.freeze) refuses an identity that
+        is not the pending intent's cycle, and accepts the right one."""
+        self.ok("adopt", "request", "freeze-start")
+        ctx = types.SimpleNamespace(pre=types.SimpleNamespace(cycle_id=self.expected()))
+        with self.assertRaises(ValueError):
+            self.env.world.freeze("freeze-continue", SLOT, OP, ctx, "c" * 64)
+        res = self.env.world.freeze("freeze-continue", SLOT, OP, ctx, self.expected())
+        self.assertEqual(res.bindings, o5.stamp(res.bindings, SLOT, OP, self.expected()))
+
+    def test_synthetic_check_compares_the_context_cycle(self):
+        """N4: a result consistently stamped with a foreign identity, passed with
+        that same identity, is refused only by the `ctx.pre.cycle_id` comparison."""
+        self.ok("adopt", "request", "freeze-start")
+        prov = self.env.world.o5.preservation
+        gate = types.SimpleNamespace(pre=types.SimpleNamespace(cycle_id=self.expected(), slot=SLOT, op_id=OP))
+        foreign = o5.fresult("REVOKED", "freeze-continue", SLOT, OP, "c" * 64)
+        with self.assertRaisesRegex(ValueError, "not the context's cycle"):
+            type(prov).check_fresult(prov, gate, "freeze-continue", foreign, "c" * 64)
+        first = types.SimpleNamespace(pre=types.SimpleNamespace(cycle_id=None, slot=SLOT, op_id=OP))
+        type(prov).check_fresult(prov, first, "freeze-start", o5.fresult("MOVED", "freeze-start", SLOT, OP, "c" * 64),
+                                 "c" * 64)
+
+    def test_second_freeze_start_after_an_effect_crash_refuses_with_its_code(self):
+        """N5: the exact refusal of a second freeze-start once an intent is pending."""
+        self.ok("adopt", "request")
+        inner = self.env.world.freeze
+
+        def boom(verb, slot, op, ctx, cid):
+            inner(verb, slot, op, ctx, cid)
+            raise Crash("effect:after_header")
+        self.env.world.freeze = boom
+        with self.assertRaises(Crash):
+            self.run_("freeze-start")
+        self.env.world.freeze = inner
+        r = self.run_("freeze-start")
+        self.assertEqual((r.outcome, r.code, r.detail), (Outcome.REFUSED, Code.VERB_NOT_ALLOWED_IN_STATE, ""))
+        self.assertEqual(self.burn_classes(), ["INTENT_PENDING"])
+
+
 if __name__ == "__main__":
     unittest.main()

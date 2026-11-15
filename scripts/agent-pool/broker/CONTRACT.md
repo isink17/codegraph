@@ -248,10 +248,17 @@ Rules worth repeating:
   floor is the only rollback anchor.
 - PR-3a.1 (PR-3b contract R4.1 §2): the effect is
   `freeze(verb, slot, op_id, ctx, cycle_id)` and the PR-3b check is
-  `check_fresult(ctx, verb, result, cycle_id)`. W derives `cycle_id` once,
-  before the F WAL intent, from the burned `freeze-start` (or the
-  authenticated cycle), and the `refreshed` record reuses it. It is a binding,
-  never an authorization, and never a request field.
+  `check_fresult(ctx, verb, result, cycle_id)`. A `freeze-start` W derives
+  `cycle_id` from its own burned, confirmed document before it appends the new
+  F WAL intent. Every later F verb, and every F intent resume, recovers the
+  identity from the original authenticated cycle and validates it; a resume
+  never creates a cycle from its own authorization. The `refreshed` record
+  reuses the same value. It is a binding, never an authorization, and never a
+  request field.
+- PR-3b (`preserve.py`, `journal.py`, `gitclass.py`): the provider reads only
+  what PR-3a selected, through a read-only resolver, and writes nothing. The
+  effect's artifacts are cycle-bound (`journal/<cycle_id>/<seq>`,
+  `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
 
 ## Not in PR-1
 
