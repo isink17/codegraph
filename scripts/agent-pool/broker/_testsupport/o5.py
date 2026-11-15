@@ -323,10 +323,17 @@ class SyntheticPreservation:
         self.calls.append(("discharge",))
         return None
 
-    def check_fresult(self, ctx, verb, fresult):
-        self.calls.append(("check_fresult", verb))
+    def check_fresult(self, ctx, verb, fresult, cycle_id):
+        """Accepts only a result stamped by the effect with this exact cycle
+        identity, and, past freeze-start, only the context's own cycle."""
+        self.calls.append(("check_fresult", verb, cycle_id))
         if "check_fresult" in self.refuse:
             raise ValueError("synthetic check_fresult rejection")
+        pre = ctx.pre
+        if pre.cycle_id is not None and cycle_id != pre.cycle_id:
+            raise ValueError("synthetic check_fresult: cycle identity is not the context's cycle")
+        if fresult.bindings != stamp(fresult.bindings, pre.slot, pre.op_id, cycle_id):
+            raise ValueError("synthetic check_fresult: result not stamped with this cycle identity")
 
 
 class DischargeDouble(SyntheticPreservation):
@@ -344,8 +351,23 @@ class DischargeDouble(SyntheticPreservation):
                             verdict="")
 
 
-def fresult(value, verb, slot, op):
-    """A harness effect result inside the F relation, with deterministic bindings."""
+def stamp(names, slot, op, cycle_id):
+    return {b: h(f"{b}|{slot}|{op}|{cycle_id}") for b in names}
+
+
+def expect_cycle(world, slot, op, cycle_id):
+    """The synthetic effect's own check: `cycle_id` must name the cycle that
+    PR-3a's F WAL derivation gives for the operation's pending intent."""
+    mine = [c for c in freeze.cycles(world, slot, freeze.burned_docs(world, world.ledger.entries()))
+            if c.op_id == op]
+    if not mine or mine[-1].cycle_id != cycle_id:
+        raise ValueError("synthetic effect: cycle identity mismatch")
+    return cycle_id
+
+
+def fresult(value, verb, slot, op, cycle_id):
+    """A harness effect result inside the F relation, with deterministic bindings
+    stamped with the cycle identity."""
     reasons, binds = freeze.RELATION[verb][2][value]
     # The effect's first durable write is the journal header (F4 §7.3).
-    return oc.FResult(value, reasons[0], {b: h(f"{b}|{slot}|{op}") for b in binds + ("journal",)})
+    return oc.FResult(value, reasons[0], stamp(binds + ("journal",), slot, op, cycle_id))

@@ -25,9 +25,9 @@ class Base(unittest.TestCase):
         self.effects = []
         inner = self.env.world.freeze
 
-        def counted(verb, slot, op, ctx):
+        def counted(verb, slot, op, ctx, cid):
             self.effects.append(verb)
-            return inner(verb, slot, op, ctx)
+            return inner(verb, slot, op, ctx, cid)
         self.env.world.freeze = counted
 
     def run_(self, verb, observe=True, **kw):
