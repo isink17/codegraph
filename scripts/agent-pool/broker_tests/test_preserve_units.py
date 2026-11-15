@@ -197,6 +197,11 @@ class Escaped(unittest.TestCase):
         self.assertEqual(self.state(["63"]), "unclassifiable")
         self.assertEqual(self.state(["62", "61"]), "unclassifiable")
 
+    def test_malformed_members_are_unclassifiable_not_an_exception(self):
+        """N-2: unhashable or mixed members refuse instead of raising TypeError."""
+        for bad in ([["61"]], [1, "61"], [{"p": "61"}], [True, "61"]):
+            self.assertEqual(self.state(bad), "unclassifiable", bad)
+
     def test_absent_section_is_unclassifiable(self):
         mem = Mem()
         j = Journal(mem)
@@ -288,6 +293,31 @@ class Reconstruction(unittest.TestCase):
     def mismatch(self, m):
         with self.assertRaises(Mismatch):
             self.cy.entries(m)
+
+    def test_a_file_and_a_path_below_it_refuse(self):
+        """N-6: `a` and `a/b` cannot both be files, adjacent or not."""
+        h = canonical.sha256(b"x")
+        for paths in (["61", "612f62"], ["61", "612d78", "612f62"], ["61", "62", "622f63", "622f632f64"]):
+            self.mismatch(self.manifest([[[p, h] for p in paths]])[0])
+        self.assertEqual(len(self.cy.entries(self.manifest([[["612d78", h], ["612f62", h]]])[0])), 2)
+
+    def test_non_bytes_blob_is_unavailable_not_an_exception(self):
+        """Q3e: a resolver value that is not bytes is a missing blob."""
+        d = canonical.sha256(b"x")
+        self.mem.b[d] = b"x"
+        self.assertEqual(self.cy.blobs([d]), {d: b"x"})
+        for bad in ("x", bytearray(b"x"), memoryview(b"x"), None):
+            self.mem.b[d] = bad
+            self.assertIsNone(self.cy.blobs([d]), type(bad))
+
+    def test_non_bytes_barrier_record_is_unavailable_not_an_exception(self):
+        d = canonical.sha256(b"rec")
+        res = types.SimpleNamespace(barrier=lambda bid, seq: {0: "rec", 1: bytearray(b"rec")}.get(seq))
+        pre = types.SimpleNamespace(holder_chain="b" * 64)
+        with self.assertRaises(Mismatch) as e:
+            preserve.Preservation(res)._barrier_record(pre, d, {"evidence": [["enforcement_record", d]]},
+                                                       ("enforcement_record",))
+        self.assertEqual(e.exception.detail, "enforcement_record_unavailable")
 
     def test_external_index_objects(self):
         """A manifest whose entries need several index objects."""
@@ -473,6 +503,13 @@ class GitClassification(unittest.TestCase):
             files.update(extra)
             _, _, q4, q5, reasons, _ = classify(files)
             self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]), extra)
+
+    def test_config_include_is_external(self):
+        """A config included from outside the captured tree is never preserved."""
+        base = pw.git_repo()[0][b".git/config"]
+        for sect in (b'[include]\n\tpath = /elsewhere/agent.config\n', b'[includeIf "gitdir:/x/"]\n\tpath = y\n'):
+            _, _, q4, q5, reasons, _ = self.q(extra={b".git/config": base + sect})
+            self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["config_include"]), sect)
 
     def test_no_repository_is_never_eligible(self):
         _, q3, q4, q5, _, head = classify({b"README": b"x"})

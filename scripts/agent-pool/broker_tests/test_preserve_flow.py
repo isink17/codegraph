@@ -356,6 +356,41 @@ class Preservation(Base):
         self.w.fx.k["subst"]["verify-preservation"] = lose
         self.rejected("verify-preservation", "fresult_rejected:artifact_mismatch", "VERIFY_INTENT")
 
+    def test_missing_ep_blob_refuses_snapshot_before_the_effect(self):
+        """N-3: on the barrier basis (no handoff yet) a missing EP blob refuses
+        D-SNAP with no effect call, instead of failing after the snapshot."""
+        self.w.to_p13()
+        del self.w.w.o5.stores["artifacts"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
+        self.refused("snapshot", Code.STATE_UNKNOWN, "artifact_mismatch")
+
+    def test_missing_blob_refuses_verify_before_the_effect(self):
+        self.w.to_p13()
+        self.ok("snapshot")
+        del self.w.w.o5.stores["artifacts"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
+        self.refused("verify-preservation", Code.STATE_UNKNOWN, "artifact_mismatch")
+
+    def test_failure_row_past_revoked_needs_a_revoked_journal_point(self):
+        """N-1: SNAPSHOT_FAILED binding a journal head older than `revoked` is
+        rejected; the current head is accepted."""
+        self.w.to_p13()
+        stale = canonical.digest(self.w.st()["records"][1])
+        self.w.fx.k["subst"]["snapshot"] = lambda r: oc.FResult("SNAPSHOT_FAILED", "io", {"journal": stale})
+        self.rejected("snapshot", "fresult_rejected:journal_mismatch", "SNAPSHOT_INTENT")
+
+    def test_failure_row_with_the_current_journal_head_commits(self):
+        self.w.to_p13()
+        head = self.w.st()["head"]
+        self.w.fx.k["subst"]["snapshot"] = lambda r: oc.FResult("SNAPSHOT_FAILED", "io", {"journal": head})
+        self.ok("snapshot")
+        self.assertEqual(self.w.row()[1], "SNAPSHOT_FAILED")
+
+    def test_non_bytes_blob_refuses_release_without_an_exception(self):
+        """Q3e: a store value that is not bytes refuses H-VAL and the discharge."""
+        self.w.to_ready()
+        readme = canonical.sha256(self.w.fx.tree(SLOT)[b"README"])
+        self.w.w.o5.stores["artifacts"].items[f"blob/{readme}"] = "hello\n"
+        self.assertNotIn(rel(self.w.release()), ("D3", "D4", "D3H", "D4H"))
+
     def test_missing_original_blob_makes_thaw_unsafe(self):
         self.ok("adopt", "request", "freeze-start", "freeze-continue")
         acl = self.w.st()["originals"]["acl"]

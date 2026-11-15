@@ -230,7 +230,7 @@ class _Cycle:
         bound respected. Any gap refuses; an incomplete list is never complete."""
         idx = m.get("entry_index")
         need(type(idx) is list and len(idx) <= MAX_INDEX, Code.STATE_UNKNOWN, "artifact_mismatch")
-        out, n = [], 0
+        out, n, files = [], 0, set()
         for i, d in enumerate(idx):
             io = self.obj(d, ("header", "kind", "n", "chunks"))
             ch = io["chunks"]
@@ -244,6 +244,10 @@ class _Cycle:
                 for e in es:
                     need(type(e) is list and len(e) == 2 and path_hex(e[0]) and hex64(e[1])
                          and (not out or e[0] > out[-1][0]), Code.STATE_UNKNOWN, "artifact_mismatch")
+                    p = bytes.fromhex(e[0])
+                    need(not any(p[:i] in files for i, c in enumerate(p) if c == 0x2F), Code.STATE_UNKNOWN,
+                         "artifact_mismatch")
+                    files.add(p)
                     out.append((e[0], e[1]))
                 n += 1
         return out
@@ -283,7 +287,7 @@ class _Cycle:
         out = {}
         for d in digests:
             data = self.r.blob(d)
-            if data is None or canonical.sha256(data) != d:
+            if type(data) is not bytes or canonical.sha256(data) != d:
                 return None
             out[d] = data
         return out
@@ -414,7 +418,7 @@ class Preservation:
             data = self._r.barrier(pre.holder_chain, seq)
             if data is None:
                 break
-            if canonical.sha256(data) == d:
+            if type(data) is bytes and canonical.sha256(data) == d:
                 try:
                     return protocol.parse_doc(data)
                 except Refused:
@@ -499,8 +503,9 @@ class Preservation:
         cy = self._cycle(pre)
         j = cy.journal(inputs["journal_head"])
         journal.require_revoked(j)
-        _, es, _, _ = self._ep(cy, j, inputs["ep_manifest"])
+        _, es, bs, _ = self._ep(cy, j, inputs["ep_manifest"])
         journal.require_no_escaped(j, {p for p, _ in es})
+        need(cy.blobs(bs) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
         return cy, j, es
 
     def _D_SNAP(self, pre, inputs, selection):
@@ -840,6 +845,8 @@ class Preservation:
             need(cy.assess(vm, ves, True).q4 == "COMPLETE", Code.STATE_UNKNOWN, "raw_incomplete")
         elif row in _FAILURE_ROWS:
             if "journal" in b:
-                cy.journal(b["journal"])
+                j = cy.journal(b["journal"])
+                if verb in ("snapshot", "verify-preservation"):
+                    journal.require_revoked(j)
         else:
             raise Mismatch(Code.STATE_UNKNOWN, "fresult_unlisted")

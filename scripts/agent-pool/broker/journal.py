@@ -142,8 +142,8 @@ def escaped_state(j, ep_paths):
     escaped section malformed, oversize, duplicated or naming a path outside
     the EP manifest)."""
     e = j.escaped
-    if not j.revoked or type(e) is not list or len(e) > MAX_ESCAPED or e != sorted(set(e)) \
-            or any(not path_hex(x) or x not in ep_paths for x in e):
+    if not j.revoked or type(e) is not list or len(e) > MAX_ESCAPED or not all(path_hex(x) for x in e) \
+            or e != sorted(set(e)) or any(x not in ep_paths for x in e):
         return "unclassifiable"
     return "present" if e else "empty"
 

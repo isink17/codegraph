@@ -29,7 +29,7 @@ _HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
                      "oversize_ref", "unsupported_object_format", "missing_object", "corrupt_object", "unknown"})
 # Q4 INCOMPLETE(git_external): objects or administration live outside the captured tree.
-EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir"})
+EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE: preserved as bytes, never claimed recoverable through Git.
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
                          "submodule_gitdir", "git_head", "unborn_head"})
@@ -100,6 +100,8 @@ def _config(r, data):
         m = _SECTION.match(line)
         if m:
             section = (m.group(1).lower(), m.group(2))
+            if section[0] in (b"include", b"includeif"):
+                r.features.add("config_include")
             continue
         kv = _KEY_VALUE.match(line)
         if section is None or kv is None:
