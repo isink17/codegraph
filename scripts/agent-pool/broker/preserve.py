@@ -409,11 +409,11 @@ class Preservation:
              Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         return view
 
-    def _barrier_record(self, pre, d, selection, kinds):
-        """R4.1 §4: only a digest the current selection names for `kinds`, and
-        only a record of the holder chain (read by exact key)."""
-        need(hex64(d) and d in {_digest_of(selection, k) for k in kinds}, Code.QUIESCENCE_NOT_ESTABLISHED,
-             "enforcement_record_unselected")
+    def _barrier_record(self, pre, d):
+        """R4.1 §4: `d` is the digest the current selection names (callers pass
+        `_inputs(selection, ...)`), and only a record of the holder chain, read
+        by exact key, matches it."""
+        need(hex64(d), Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_record_unselected")
         for seq in range(4096):
             data = self._r.barrier(pre.holder_chain, seq)
             if data is None:
@@ -643,7 +643,7 @@ class Preservation:
         ups = self._ev(inputs, "uid_process_scan", pre)["data"]
         need(ups.get("processes") == [] and type(ups.get("uids")) is list and ups["uids"]
              and all(type(u) is int for u in ups["uids"]), Code.QUIESCENCE_NOT_ESTABLISHED, "uid_process")
-        rec = self._barrier_record(pre, inputs["enforcement_record"], selection, ("enforcement_record",))
+        rec = self._barrier_record(pre, inputs["enforcement_record"])
         need(rec.get("kind") == "established" and rec.get("barrier_id") == pre.barrier_id == pre.holder_chain,
              Code.STATE_UNKNOWN, "barrier_binding")
         det = rec.get("detail") if type(rec.get("detail")) is dict else {}
@@ -705,7 +705,7 @@ class Preservation:
         need(all(hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         cy = self._cycle(pre)
         need(sup_digest is None or inputs["superseded"] == sup_digest, Code.STATE_UNKNOWN, "barrier_binding")
-        sup = self._barrier_record(pre, inputs["superseded"], selection, ("superseded",))
+        sup = self._barrier_record(pre, inputs["superseded"])
         d = sup.get("detail") if type(sup.get("detail")) is dict else {}
         need(sup.get("kind") == "superseded" and sup.get("barrier_id") == pre.holder_chain
              and (d.get("slot"), d.get("cycle_id"), d.get("g_pre"), d.get("root_id"))

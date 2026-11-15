@@ -315,8 +315,7 @@ class Reconstruction(unittest.TestCase):
         res = types.SimpleNamespace(barrier=lambda bid, seq: {0: "rec", 1: bytearray(b"rec")}.get(seq))
         pre = types.SimpleNamespace(holder_chain="b" * 64)
         with self.assertRaises(Mismatch) as e:
-            preserve.Preservation(res)._barrier_record(pre, d, {"evidence": [["enforcement_record", d]]},
-                                                       ("enforcement_record",))
+            preserve.Preservation(res)._barrier_record(pre, d)
         self.assertEqual(e.exception.detail, "enforcement_record_unavailable")
 
     def test_external_index_objects(self):
