@@ -259,6 +259,16 @@ Rules worth repeating:
   what PR-3a selected, through a read-only resolver, and writes nothing. The
   effect's artifacts are cycle-bound (`journal/<cycle_id>/<seq>`,
   `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
+- PR-3b Git classification: a repository is located by any spelling of its
+  `.git` component (R2 K3: case-insensitive, plus the code points HFS+
+  ignores); two spellings under one root are `unknown`. A reachable object
+  that is not loose is `packed` only when a version 2 index lists it and the
+  index passes bounded structural checks against its sibling pack (R2 K7).
+  That is presence only: packed contents are never inflated or hashed, so a
+  pack and index an agent forged to be self-consistent can list an object the
+  pack does not hold, and the slot still reaches READY and D4 (the recorded
+  counterexample in the cleanup evidence). Closing it needs packed-object
+  verification or a contract change; neither is in PR-3b.
 
 ## Not in PR-1
 
