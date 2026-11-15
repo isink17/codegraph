@@ -101,9 +101,29 @@ class Pool(unittest.TestCase):
         shutil.rmtree(cls.t, True)
 
     def setUp(self):
-        self.leases = self.t / "leases"
+        # One lease directory per test, so a process left over from an earlier
+        # test can never act on this one's; a test that calls setUp again to
+        # start over gets the same directory, emptied.
+        self.leases = self.t / f"leases-{self._testMethodName}"
         shutil.rmtree(self.leases, True)
         self.leases.mkdir()
+        self.env = {**type(self).env, "CG_POOL_LEASES": str(self.leases)}
+
+    def popen(self, *args):
+        """A pool.sh run in the background; cleanup waits for it, or kills it."""
+        p = subprocess.Popen(["/bin/bash", str(POOL), *args], env=self.env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.reap, p)
+        return p
+
+    @staticmethod
+    def reap(p):
+        if p.poll() is None:
+            try:
+                p.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
 
     def put(self, slot, text):
         p = self.leases / f"{slot}.lease"
