@@ -132,7 +132,7 @@ class BurnClassification(unittest.TestCase):
             self.assertEqual(burn_classes(self.env), ["COMPLETED"])
 
     def test_effect_raising_leaves_intent_pending(self):
-        def boom(verb, slot, op, ctx):
+        def boom(verb, slot, op, ctx, cid):
             raise Crash("effect:after_header")
         self.env.world.freeze = boom
         with self.assertRaises(Crash):
@@ -142,7 +142,7 @@ class BurnClassification(unittest.TestCase):
 
     def test_out_of_relation_result_is_unfinished_with_the_intent_pending(self):
         """C1′: an effect result outside the F relation raises in W."""
-        self.env.world.freeze = lambda verb, slot, op, ctx: oc.FResult("VERIFIED", "", {})
+        self.env.world.freeze = lambda verb, slot, op, ctx, cid: oc.FResult("VERIFIED", "", {})
         r = run(self.env, "freeze-start")
         self.assertIs(r.outcome, Outcome.UNFINISHED)
         self.assertEqual(burn_classes(self.env), ["INTENT_PENDING"])
@@ -203,9 +203,9 @@ class RefreshedIntegrity(unittest.TestCase):
         self.effects = []
         inner = self.env.world.freeze
 
-        def counted(verb, slot, op, ctx):
+        def counted(verb, slot, op, ctx, cid):
             self.effects.append(verb)
-            return inner(verb, slot, op, ctx)
+            return inner(verb, slot, op, ctx, cid)
         self.env.world.freeze = counted
 
     def cycle(self):
@@ -331,9 +331,9 @@ class ChainRefreshIntegrity(unittest.TestCase):
         self.effects = []
         inner = self.env.world.freeze
 
-        def counted(verb, slot, op, ctx):
+        def counted(verb, slot, op, ctx, cid):
             self.effects.append(verb)
-            return inner(verb, slot, op, ctx)
+            return inner(verb, slot, op, ctx, cid)
         self.env.world.freeze = counted
 
     def chain(self, bid=None):
@@ -558,8 +558,8 @@ class ChainRefreshIntegrity(unittest.TestCase):
                 kw = {"quarantine": harness.QUARANTINE, "quiescence": harness.QUIESCENCE}.get(verb, {})
                 ok(self, self.env, verb, **kw)
             inner = self.env.world.freeze
-            self.env.world.freeze = lambda verb, slot, op, ctx: (self.effects.append(verb), inner(verb, slot, op,
-                                                                                                  ctx))[1]
+            self.env.world.freeze = lambda verb, slot, op, ctx, cid: (self.effects.append(verb), inner(
+                verb, slot, op, ctx, cid))[1]
             self.bad({"cycle_id": "c" * 64, "completion": "d" * 64})
             for verb in probes:
                 self.refused(verb)

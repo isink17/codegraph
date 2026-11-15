@@ -26,8 +26,9 @@ F_INTENT_VERB = {"MOVE_INTENT": "freeze-start", "REVOKE_INTENT": "freeze-continu
 
 class World:
     """Every store one invocation reads or writes, plus injected producers:
-    observer (PR-2/PR-3 evidence), freeze (PR-3 effects), backups (OD-6),
-    and the id, token and nonce sources."""
+    observer (PR-2/PR-3 evidence), freeze (PR-3 effects, called as
+    freeze(verb, slot, op_id, ctx, cycle_id)), backups (OD-6), and the id,
+    token and nonce sources."""
 
     def __init__(self, library, ctx, *, clock, observer, freeze, backups, ids, tokens, nonces, faults=None,
                  principals_ok=True, one_way=True, window=300, cap=ledger.CAP):
@@ -669,7 +670,7 @@ def _write(world, plan, doc, data, digest, handle, txn, confirmed_at, done):
     elif verb == "adopt":
         world.library.call(txn, "adopt", facts.slot, plan.fields["op_id"], plan.extra["view"])
     elif verb in F_STEP:
-        _f_step(world, plan, facts, txn, verb, digest)
+        _f_step(world, plan, facts, txn, verb, digest, doc)
     elif verb == "custody-destroy":
         _destroy(world, plan, txn, digest, done)
     elif verb == "resume-step":
@@ -697,29 +698,54 @@ def _tierc_verb(world, plan, facts, txn, anchor_append, handle):
     anchor_append("complete", pre, post, verb)
 
 
-def _f_step(world, plan, facts, txn, verb, digest):
+def _existing_cycle_id(cyc, facts):
+    """The authenticated cycle's identity, only if the cycle is this slot's
+    operation at its generation and ends at the operation's last F WAL entry."""
+    if cyc is None or cyc.slot != facts.slot or cyc.op_id != facts.op_id \
+            or cyc.g_pre != o5freeze.gen_of(facts) or not cyc.entries or cyc.entries[-1] != facts.f_entry \
+            or cyc.cycle_id != o5contract.cycle_id(cyc.slot, cyc.g_pre, cyc.op_id, cyc.freeze_start_auth):
+        raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
+    return cyc.cycle_id
+
+
+def _f_cycle_id(gate, facts, verb, digest, doc):
+    """R4.1 §2.1: the canonical cycle identity, computed before the F WAL
+    intent and the effect. A binding, never an authorization."""
+    if gate.cycle is not None:
+        if verb == "freeze-start":
+            raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
+        return _existing_cycle_id(gate.cycle, facts)
+    if verb != "freeze-start" or doc.get("verb") != "freeze-start" or doc.get("slot") != facts.slot \
+            or doc.get("op_id") != facts.op_id or doc.get("slot_generation") != o5freeze.gen_of(facts):
+        raise Refused(Code.STATE_UNKNOWN, "barrier_binding")
+    return o5contract.cycle_id(facts.slot, doc["slot_generation"], facts.op_id, digest)
+
+
+def _f_step(world, plan, facts, txn, verb, digest, doc):
+    cid = _f_cycle_id(plan.o5, facts, verb, digest, doc)
     intent = F_STEP[verb][0]
     world.fwal.append(txn, facts.slot, {"op_id": facts.op_id, "kind": "intent", "value": intent,
                                         "auth_digest": digest})
-    _f_complete(world, plan, facts, txn, verb, digest, digest)
+    _f_complete(world, plan, facts, txn, verb, digest, cid)
 
 
-def _f_complete(world, plan, facts, txn, verb, digest, start_auth):
+def _f_complete(world, plan, facts, txn, verb, digest, cid):
     """C1′: the effect returns an FResult inside the F relation and accepted by
     PR-3b check_fresult; then the completion, then (barrier basis only, R4
-    §2.4) the `refreshed` record in the same CommitTxn."""
+    §2.4) the `refreshed` record in the same CommitTxn. The effect, the check
+    and the record all receive the one canonical cycle identity `cid`."""
+    if type(cid) is not str or not canonical.HEX64.match(cid):
+        raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
     gate = plan.o5
-    res = world.freeze(verb, facts.slot, facts.op_id, gate.ctx)
+    res = world.freeze(verb, facts.slot, facts.op_id, gate.ctx, cid)
     o5freeze.check_result(verb, res)
-    world.o5.preservation.check_fresult(gate.ctx, verb, res)
+    world.o5.preservation.check_fresult(gate.ctx, verb, res, cid)
     utc = world.clock()
     done = {"op_id": facts.op_id, "kind": "complete", "value": res.value, "reason": res.reason,
             "bindings": dict(res.bindings), "auth_digest": digest, "utc": utc}
     world.fwal.append(txn, facts.slot, done)
     chain = gate.chain
     if gate.basis == "barrier" and chain.state == barrier.ESTABLISHED:
-        cid = gate.cycle.cycle_id if gate.cycle is not None else o5contract.cycle_id(
-            facts.slot, facts.op.gen, facts.op_id, start_auth)
         key, data = o5freeze.refreshed_record(chain, digest, facts.slot, cid, done, gate.picked, utc,
                                             o5contract.mode(world))
         world.o5.stores["barriers"].put(txn, key, data)
@@ -796,7 +822,12 @@ def _resume(world, plan, facts, txn, anchor_append, digest, done):
         anchor_append("complete" if complete else "abort", a.pre, a.post, a.verb)
         return
     if mode == "f_intent":
-        _f_complete(world, plan, facts, txn, F_INTENT_VERB[facts.f], digest, facts.f_entry["auth_digest"])
+        # The cycle comes from the original burned freeze-start, never from this resume document.
+        cyc = plan.o5.cycle
+        cid = _existing_cycle_id(cyc, facts)
+        if facts.f == "MOVE_INTENT" and cyc.freeze_start_auth != facts.f_entry["auth_digest"]:
+            raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
+        _f_complete(world, plan, facts, txn, F_INTENT_VERB[facts.f], digest, cid)
         return
     t, original = plan.extra["transition"], plan.extra["original"]
     token = None
