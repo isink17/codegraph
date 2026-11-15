@@ -10,15 +10,11 @@ partial-clone state, extensions and any config the subset does not list.
 Object ids are SHA-1 and are checked only for integrity. They are
 observational values, not collision-resistant identities."""
 
-import hashlib
 import re
-import zlib
 
-from . import fdwalk
+from . import fdwalk, gitbytes
 from .fdwalk import Unknown
-
-HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
-HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
+from .gitbytes import HEX40, HEX64
 _HEAD_REF = re.compile(rb"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
 _SECTION = re.compile(rb'\[([A-Za-z0-9.-]+)(?: "([^"\\\n]*)")?\]\Z')
 _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
@@ -39,7 +35,7 @@ ADMIN_FEATURES = (b"index.lock", b"config.worktree", b"info/sparse-checkout")
 
 
 def valid_component(name):
-    return fdwalk.valid_name(name) and name.lower() != b".git"
+    return fdwalk.valid_name(name) and not gitbytes.is_gitdir_name(name)
 
 
 def valid_path(path):
@@ -129,26 +125,12 @@ def parse_packed_refs(data):
 
 
 def parse_object(oid, raw, limit):
-    """(type, body) of a loose object; its zlib stream is decompressed to at
-    most limit bytes and its SHA-1 must equal oid (integrity only)."""
-    d = zlib.decompressobj()
-    bound = limit + 64
+    """(type, body) of a loose object (gitbytes.loose_object); any problem is
+    Unknown."""
     try:
-        out = d.decompress(raw, bound)
-    except zlib.error:
-        raise Unknown("malformed-object", oid) from None
-    if len(out) >= bound:
-        raise Unknown("limit-exceeded", oid)
-    if not d.eof or d.unconsumed_tail or d.unused_data:
-        raise Unknown("malformed-object", oid)
-    nul = out.find(b"\0", 0, 32)
-    typ, sep, size = out[:max(nul, 0)].partition(b" ")
-    if nul < 0 or not sep or typ not in (b"commit", b"tree", b"blob", b"tag") or not size.isdigit() \
-            or (size[:1] == b"0" and size != b"0") or int(size) != len(out) - nul - 1:
-        raise Unknown("malformed-object", oid)
-    if hashlib.sha1(out).hexdigest().encode() != oid:
-        raise Unknown("malformed-object", oid)
-    return typ, out[nul + 1:]
+        return gitbytes.loose_object(oid.decode(), raw, limit)
+    except gitbytes.Malformed as e:
+        raise Unknown(e.reason, oid) from None
 
 
 def parse_commit_tree(oid, typ, body):

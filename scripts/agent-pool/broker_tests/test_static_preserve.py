@@ -14,8 +14,8 @@ from broker import freeze, o5contract as oc, preserve
 
 BROKER = Path(test_static.BROKER)
 PR3B = {"gitclass.py", "journal.py", "preserve.py"}
-ALLOWED_BROKER = {"barrier", "canonical", "evidence", "freeze", "gitclass", "journal", "libview", "o5contract",
-                  "protocol", "refusal"}
+ALLOWED_BROKER = {"barrier", "canonical", "evidence", "freeze", "gitbytes", "gitclass", "journal", "libview",
+                  "o5contract", "protocol", "refusal"}
 ALLOWED_TOP = {"re", "hashlib", "zlib", "recovery_state"}
 FORBIDDEN_NAMES = {"CommitTxn", "_issue", "_new_ingest", "_ISEAL", "_CSEAL", "_new_capability", "_SEAL", "_produce",
                    "OwnerCapability", "IngestCapability"}

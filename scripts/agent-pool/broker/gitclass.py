@@ -12,10 +12,9 @@ modules may not import; anything outside it is a finding, never a success."""
 
 import hashlib
 import re
-import zlib
 
-HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
-HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
+from . import gitbytes
+from .gitbytes import HEX40, HEX64, is_gitdir_name
 _REF = re.compile(rb"refs/[A-Za-z0-9._/-]{1,240}\Z")
 _HEAD_REF = re.compile(rb"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
 _SECTION = re.compile(rb'\[([A-Za-z0-9.-]+)(?: "([^"\\\n]*)")?\]\Z')
@@ -23,7 +22,6 @@ _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
-_HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
@@ -46,17 +44,6 @@ class Repo:
 
     def __init__(self, root):
         self.root, self.features, self.head, self.head_oid, self.tips = root, set(), None, None, set()
-
-
-def is_gitdir_name(c):
-    """R2 K3: a `.git` name compared case-insensitively, also with the code
-    points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and `.Git` count."""
-    if c.lower() == b".git":
-        return True
-    try:
-        return _HFS_IGNORED.sub("", c.decode("utf-8")).lower() == ".git"
-    except UnicodeDecodeError:
-        return False
 
 
 def git_index(parts):
@@ -168,19 +155,9 @@ def _read_object(files, oid):
     if data is None:
         return "missing"
     try:
-        z = zlib.decompressobj()
-        raw = z.decompress(data, MAX_OBJECT_BYTES + 1)
-        if len(raw) > MAX_OBJECT_BYTES or z.unconsumed_tail or z.unused_data or not z.eof:
-            return "corrupt"
-    except zlib.error:
+        return gitbytes.loose_object(oid, data, MAX_OBJECT_BYTES)
+    except gitbytes.Malformed:
         return "corrupt"
-    if hashlib.sha1(raw).hexdigest() != oid:  # noqa: S324 - Git object ids are SHA-1 (integrity only)
-        return "corrupt"
-    head, sep, body = raw.partition(b"\0")
-    typ, _, size = head.partition(b" ")
-    if not sep or typ not in (b"commit", b"tree", b"blob", b"tag") or not size.isdigit() or int(size) != len(body):
-        return "corrupt"
-    return typ, body
 
 
 def _links(typ, body):
