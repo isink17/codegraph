@@ -322,6 +322,29 @@ class CrossCycle(Base):
         self.w.fx.k["fork_revoked"] = True
         self.rejected("freeze-continue", "fresult_rejected:journal_mismatch", "REVOKE_INTENT")
 
+    def test_revoked_result_must_bind_the_journal_escaped_set(self):
+        self.ok("adopt", "request", "freeze-start")
+        wrong = canonical.digest({"escaped": ["61"]})
+        self.w.fx.k["subst"]["freeze-continue"] = lambda r: oc.FResult(r.value, r.reason, dict(r.bindings,
+                                                                                              escaped=wrong))
+        self.rejected("freeze-continue", "fresult_rejected:escaped", "REVOKE_INTENT")
+
+    def test_verified_result_must_seal_the_snapshotted_manifest(self):
+        """A verify binding over another final manifest of the same cycle."""
+        self.w.to_p13()
+        self.w.handoff()
+        self.ok("snapshot")
+
+        def other_manifest(r):
+            s, fx = self.w.st(), self.w.fx
+            files = {**fx.tree(SLOT), b"README": b"another snapshot\n"}
+            _, fm, fbs = fx.manifest(s, "final", files)
+            v = fx.obj(s, {"header": fx.header(s), "cycle_id": s["cid"], "manifest": fm, "blobs": fbs,
+                           "reverified": True, "sealed_at": self.w.w.clock()})
+            return oc.FResult(r.value, r.reason, dict(r.bindings, verify=v))
+        self.w.fx.k["subst"]["verify-preservation"] = other_manifest
+        self.rejected("verify-preservation", "fresult_rejected:artifact_mismatch", "VERIFY_INTENT")
+
     def test_corrupt_journal_record(self):
         self.ok("adopt", "request", "freeze-start")
         self.w.fx.k["corrupt_revoked"] = True
@@ -747,6 +770,32 @@ class ProtectedBlobs(Base):
         return s["cid"], b, m, idx
 
     # ---- A. H-VAL through the merged invoke
+
+    def test_damage_matrix_over_every_stage(self):
+        """Every stage from REVOKED to READY, a content blob (EP and FS) and an
+        original-attribute blob (EP only), each damage including a value that
+        is not bytes: H-VAL and the discharge refuse, the release grants
+        nothing and nothing raises."""
+        stages = {"revoked": (), "snapshotted": ("snapshot",), "verified": ("snapshot", "verify-preservation"),
+                  "ready": ("snapshot", "verify-preservation", "preservation", "ready")}
+        damages = {"delete": None, "corrupt": lambda b: b"tampered\n", "truncate": lambda b: b[:-1],
+                   "extend": lambda b: b + b"\0", "not bytes": lambda b: b.decode("latin-1")}
+        for stage, verbs in stages.items():
+            for target in ("content", "original"):
+                for how, change in damages.items():
+                    with self.subTest(stage=stage, target=target, how=how):
+                        self.fresh()
+                        self.at_p13()
+                        self.ok(*verbs)
+                        key = f"blob/{self.content() if target == 'content' else self.original()}"
+                        if change is None:
+                            del self.arts[key]
+                        else:
+                            self.arts[key] = change(self.arts[key])
+                        self.denied()
+                        validate, discharge = self.direct(*(("D4", "P18") if stage == "ready" else ()))
+                        self.assertEqual((validate().passed, validate().reasons), (False, ["artifact_mismatch"]))
+                        self.assertIsNone(discharge())
 
     def test_h_val_rehashes_every_early_blob(self):
         """A1–A4, D26: a deleted, corrupted or digest-swapped EP content blob or

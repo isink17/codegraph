@@ -97,6 +97,35 @@ class JournalLineage(unittest.TestCase):
         self.assertFalse(v.revoked)
         self.refuse(lambda: journal.require_revoked(v))
 
+    def test_record_fields_are_checked_per_kind(self):
+        """Each record kind's own fields are validated: a second `revoked`, an
+        unsorted, duplicated or non-hex `linked` list, an unknown `revoke.done`
+        attribute or a non-digest original, an unknown `thaw.done` step."""
+        def chain(*recs):
+            mem = Mem()
+            j, head = Journal(mem), None
+            for kind, extra in recs:
+                head = j.add(kind, **extra)
+            return mem, head
+        start, revoked = ("start", {}), ("revoked", {"escaped": []})
+        ok = ("move.done", {"linked": []})
+        attr = [("revoke.done", {"attr": a, "original": "0" * 63 + "1"}) for a in journal.ATTRS]
+        mem, head = chain(start, ok, *attr, revoked, ("thaw.done", {"attr": "move"}))
+        self.assertTrue(walk(mem, head).revoked)
+        bad = {
+            "second revoked": [start, ok, *attr, revoked, revoked],
+            "linked unsorted": [start, ("move.done", {"linked": ["62", "61"]})],
+            "linked duplicated": [start, ("move.done", {"linked": ["61", "61"]})],
+            "linked not hex": [start, ("move.done", {"linked": ["zz"]})],
+            "unknown attribute": [start, ok, ("revoke.done", {"attr": "xattr", "original": "0" * 63 + "1"})],
+            "original not a digest": [start, ok, ("revoke.done", {"attr": "acl", "original": "1"})],
+            "unknown thaw step": [start, ok, ("thaw.done", {"attr": "xattr"})],
+        }
+        for name, recs in bad.items():
+            with self.subTest(name):
+                mem, head = chain(*recs)
+                self.refuse(lambda: walk(mem, head))
+
     def test_journal_of_another_cycle_refuses(self):
         other = Journal(self.mem, CID2)
         head = other.full()["revoked"]
@@ -334,6 +363,13 @@ class Reconstruction(unittest.TestCase):
         bad[0][1] = "f" * 64
         self.mismatch(self.manifest([self.entries(2), [self.entries(2)[1]] + bad[1:]])[0])
 
+    def test_misnumbered_index_objects_refuse(self):
+        m, chunks, index = self.manifest([self.entries(2, 2 * k) for k in range(4)], per_index=2)
+        self.assertEqual(len(self.cy.entries(m)), 8)
+        self.mismatch({"entry_index": index[::-1]})
+        renumbered = self.put({"header": header(), "kind": "entry_index", "n": 1, "chunks": chunks[:2]})
+        self.mismatch({"entry_index": [renumbered, index[1]]})
+
     def test_reordered_or_misnumbered_chunks_refuse(self):
         m, chunks, index = self.manifest([self.entries(2), self.entries(2, 2)])
         swapped = self.put({"header": header(), "kind": "entry_index", "n": 0, "chunks": chunks[::-1]})
@@ -509,6 +545,23 @@ class GitClassification(unittest.TestCase):
         for sect in (b'[include]\n\tpath = /elsewhere/agent.config\n', b'[includeIf "gitdir:/x/"]\n\tpath = y\n'):
             _, _, q4, q5, reasons, _ = self.q(extra={b".git/config": base + sect})
             self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["config_include"]), sect)
+
+    def test_external_administration_is_never_complete(self):
+        base = pw.git_repo()[0][b".git/config"]
+        for extra in ({b".git/commondir": b"../main/.git\n"}, {b".git/config": base + b"\tworktree = /elsewhere\n"},
+                      {b".git/config": base.replace(b"bare = false", b"bare = true")}):
+            _, _, q4, q5, reasons, _ = self.q(extra=extra)
+            self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["commondir"]), extra)
+
+    def test_object_whose_header_size_is_wrong(self):
+        """A loose object hashed over a header whose size does not match its body."""
+        files, _ = pw.git_repo()
+        raw = b"blob 99\0hello\n"
+        oid = pw.hashlib.sha1(raw).hexdigest()  # noqa: S324 - Git object id
+        files[b".git/objects/" + oid[:2].encode() + b"/" + oid[2:].encode()] = pw.zlib.compress(raw)
+        files[b".git/refs/tags/bad"] = oid.encode() + b"\n"
+        _, _, q4, _, reasons, _ = classify(files)
+        self.assertEqual((q4, reasons), ("INCOMPLETE", ["corrupt_object"]))
 
     def test_no_repository_is_never_eligible(self):
         _, q3, q4, q5, _, head = classify({b"README": b"x"})
