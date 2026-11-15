@@ -131,11 +131,15 @@ scripts/agent-pool/pool.sh recover <action> --pool <path> --slot <slot> ...   # 
 There is no time-based expiry.
 
 Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
-created with `mkdir`). The lock is advisory: it serialises `pool.sh` runs
-and nothing else, so it does not fence a process that writes to the slot or
-the lease directory without taking it. A lock left behind by a crashed run
-blocks the slot and is reported; nothing removes it automatically. The owner
-removes it by hand only after all of these, recorded in evidence:
+created with `mkdir`, holding the taking run's random id in `owner`). The
+lock is advisory: it serialises `pool.sh` runs and nothing else, so it does
+not fence a process that writes to the slot or the lease directory without
+taking it. A run removes only a lock whose `owner` is its own id; a lock it
+cannot remove (missing, replaced or not empty) is reported on stderr, every
+other lock it holds is still released, and its exit status is unchanged. A
+lock left behind by a crashed run blocks the slot and is reported; nothing
+removes it automatically. The owner removes it by hand only after all of
+these, recorded in evidence:
 
 1. No `pool.sh`, `recovery_cli.py`, coordinator or campaign process is
    running (`pgrep -fl 'pool.sh|recovery_cli.py|coordinator.py|campaign.py'`),
@@ -143,7 +147,8 @@ removes it by hand only after all of these, recorded in evidence:
 2. In a synthetic pool, `pool.sh recover inspect --pool <pool> --slot <slot>`
    shows `pending=none` for every operation, or the unfinished transition is
    noted for its exact retry. Inspect takes no lock and changes nothing.
-3. Only then `rmdir <pool>/.<slot>.lock`, never `rm -r`.
+3. Only then `rm <pool>/.<slot>.lock/owner` (if present) and
+   `rmdir <pool>/.<slot>.lock`, never `rm -r`.
 
 `migrate` and `unmigrate` take every slot lock, so one held lock refuses
 them.

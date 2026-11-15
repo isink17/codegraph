@@ -20,6 +20,35 @@ expect() { # expect <exit code> <command...>
 state() { "$POOL" status "$1" | sed -n 1p | sed 's/^[^:]*: //'; }
 token() { sed -n 's/^token=//p' "$CG_POOL_LEASES/$1.lease"; }
 g() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+# racer <name> <command...>: runs one competitor and keeps its command, exit
+# status, stdout and stderr under $T/<name>.*, so a failed race explains itself.
+racer() {
+	local n=$1 rc=0
+	shift
+	printf '%q ' "$@" >"$T/$n.cmd"
+	"$@" >"$T/$n.out" 2>"$T/$n.err" || rc=$?
+	echo "$rc" >"$T/$n.rc"
+}
+wins_of() { grep -lx 0 "$T/$1"*.rc 2>/dev/null | wc -l | tr -d ' '; }
+# Every racer named <prefix>*, then the locks (with their owner ids), leases
+# and slot states left behind.
+race_report() {
+	local f n
+	echo "race $1 in $T:"
+	for f in "$T/$1"*.rc; do
+		n=${f%.rc}
+		echo "  ${n##*/}: exit $(cat "$f"): $(cat "$n.cmd")"
+		sed 's/^/    stdout: /' "$n.out"
+		sed 's/^/    stderr: /' "$n.err"
+	done
+	for f in "$CG_POOL_LEASES"/.*.lock; do
+		[[ -e $f ]] && echo "  lock ${f##*/}: owner $(cat "$f/owner" 2>/dev/null || echo none)"
+	done
+	for f in "$CG_POOL_LEASES"/*.lease; do
+		[[ -e $f ]] && echo "  lease ${f##*/}: $(grep -v '^token=' "$f" | tr '\n' ' ')"
+	done
+	for f in codegraph-worker-a codegraph-worker-b codegraph-review; do echo "  $f: $(state $f)"; done
+}
 # Commits a new file <name>.txt in slot $1.
 change() {
 	echo "$2" >"$CG_POOL_ROOT/$1/$2.txt"
@@ -39,11 +68,12 @@ A=codegraph-worker-a B=codegraph-worker-b R=codegraph-review
 
 # Two simultaneous attempts on one worker: exactly one wins.
 for i in 1 2 3 4 5 6 7 8; do
-	("$POOL" acquire --slot $A --task t$i --agent ag$i >"$T/race$i" 2>&1 && echo ok >>"$T/race$i") &
+	racer acq$i "$POOL" acquire --slot $A --task t$i --agent ag$i &
 done
 wait
-wins=$(grep -l '^ok$' "$T"/race? | wc -l | tr -d ' ')
-[[ $wins == 1 ]] || fail "same-slot race: $wins winners"
+wins=$(wins_of acq)
+[[ $wins == 1 ]] || fail "same-slot race: $wins winners
+$(race_report acq)"
 [[ $(state $A) == busy ]] || fail "leased slot state $(state $A)"
 expect 1 "$POOL" acquire --slot $A --task again --agent x
 
@@ -130,11 +160,12 @@ g -C "$CG_POOL_ROOT/$A" switch -q --detach origin/v2.0
 
 # Concurrent releases of one lease: exactly one succeeds.
 for i in 1 2 3 4; do
-	("$POOL" release --slot $A --token "$TA" >/dev/null 2>&1 && echo ok >"$T/rel$i" || : >"$T/rel$i") &
+	racer rel$i "$POOL" release --slot $A --token "$TA" &
 done
 wait
-wins=$(cat "$T"/rel? | grep -c ok || true)
-[[ $wins == 1 ]] || fail "concurrent release: $wins winners"
+wins=$(wins_of rel)
+[[ $wins == 1 ]] || fail "concurrent release: $wins winners
+$(race_report rel)"
 
 # A detached HEAD whose remote branch was deleted is not treated as pushed.
 "$POOL" acquire --slot $A --task gone --agent x >/dev/null
@@ -767,6 +798,46 @@ expect 0 "$POOL" prepare --slot $A
 expect 0 "$POOL" acquire --slot $A --task normal --agent y
 grep -q "^leased $A token=" "$T/out" || fail "acquire of an unleased slot failed: $(cat "$T/out")"
 expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# Lock cleanup. A run removes only a lock that carries its own id, reports
+# one it cannot remove without changing its exit status, and still releases
+# every other lock it holds. Each case removes or replaces a held lock while
+# the run is inside, as an outside process would.
+lock_hook() { # lock_hook <dir> <program> <trigger argument> <shell commands>
+	mkdir -p "$1"
+	{
+		echo '#!/bin/sh'
+		echo "for a in \"\$@\"; do [ \"\$a\" = $3 ] && { $4; break; }; done"
+		echo "exec \"$2\" \"\$@\""
+	} >"$1/hook"
+	chmod +x "$1/hook"
+}
+LA=$CG_POOL_LEASES/.$A.lock
+lock_hook "$T/gone" "$(command -v git)" fetch "rm -f '$LA/owner'; rmdir '$LA'"
+mv "$T/gone/hook" "$T/gone/git"
+expect 0 "$POOL" acquire --slot $A --task lockgone --agent x
+expect 0 env PATH="$T/gone:$PATH" "$POOL" release --slot $A --token "$(token $A)"
+grep -q "lock $LA not removed" "$T/out" || fail "a vanished lock was not reported: $(cat "$T/out")"
+[[ ! -e $CG_POOL_LEASES/$A.lease && ! -e $LA ]] || fail "release with a vanished lock left a lease or a lock"
+
+lock_hook "$T/foreign" "$(command -v git)" fetch "rm -f '$LA/owner'; rmdir '$LA'; mkdir '$LA'"
+mv "$T/foreign/hook" "$T/foreign/git"
+expect 0 "$POOL" acquire --slot $A --task lockforeign --agent x
+expect 0 env PATH="$T/foreign:$PATH" "$POOL" release --slot $A --token "$(token $A)"
+grep -q "lock $LA not removed" "$T/out" || fail "a foreign lock was not reported: $(cat "$T/out")"
+[[ -d $LA && ! -e $LA/owner ]] || fail "release removed a lock another run created"
+[[ ! -d $LA ]] || rmdir "$LA"
+
+lock_hook "$T/multi" "$(command -v python3)" unmigrate "rm -f '$LA/owner'; rmdir '$LA'"
+expect 1 env CG_POOL_PYTHON="$T/multi/hook" "$POOL" unmigrate
+grep -q "lock $LA not removed" "$T/out" || fail "unmigrate did not report the vanished lock: $(cat "$T/out")"
+for s in $A $B $R; do
+	[[ ! -e $CG_POOL_LEASES/.$s.lock ]] || fail "unmigrate left the $s lock behind: $(cat "$T/out")"
+done
+
+for f in "$CG_POOL_LEASES"/.*.lock; do
+	[[ ! -e $f ]] || fail "a slot lock was left behind: $f"
+done
 
 if ((fails)); then
 	echo "$fails failure(s)"

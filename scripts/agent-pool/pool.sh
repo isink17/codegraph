@@ -74,15 +74,27 @@ read_cwds() {
 
 # Every lease change of a slot happens under its lock. mkdir is atomic; a
 # lock left by a crashed run is reported, never broken automatically.
-# migrate and unmigrate hold every slot lock at once.
+# migrate and unmigrate hold every slot lock at once. The lock directory
+# holds this run's random id in `owner`: a run removes only a lock whose id
+# is its own, and a failed removal is reported without changing the exit
+# status, so every other held lock is still released.
 LOCKS=()
-trap 'for l in ${LOCKS[@]+"${LOCKS[@]}"}; do rmdir "$l"; done' EXIT
+LOCK_ID=""
+trap 'for l in ${LOCKS[@]+"${LOCKS[@]}"}; do drop_lock "$l" || :; done' EXIT
 lock_slot() {
-	mkdir "$LEASES/.$1.lock" 2>/dev/null || return 1
-	LOCKS+=("$LEASES/.$1.lock")
+	local l="$LEASES/.$1.lock"
+	[[ -n $LOCK_ID ]] || LOCK_ID=$(random_token)
+	mkdir "$l" 2>/dev/null || return 1
+	echo "$LOCK_ID" >"$l/owner" || { rmdir "$l"; return 1; }
+	LOCKS+=("$l")
+}
+drop_lock() {
+	[[ $(cat "$1/owner" 2>/dev/null) == "$LOCK_ID" ]] && rm "$1/owner" && rmdir "$1" && return 0
+	echo "pool.sh: lock $1 not removed: missing, not held by this run, or not empty; nothing was broken" >&2
+	return 1
 }
 unlock_slot() {
-	rmdir "${LOCKS[${#LOCKS[@]}-1]}"
+	drop_lock "${LOCKS[${#LOCKS[@]}-1]}" || :
 	unset "LOCKS[${#LOCKS[@]}-1]"
 }
 
