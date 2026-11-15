@@ -718,15 +718,16 @@ class Preservation:
         need(src["data"].get("root_id") == pre.root_id, Code.STATE_UNKNOWN, "barrier_binding")
         j = cy.journal(inputs["journal_head"])
         journal.require_revoked(j)
-        self._ep(cy, j, inputs["ep_manifest"])
+        protected = set(self._ep(cy, j, inputs["ep_manifest"])[2])
         bound = [inputs["ep_manifest"], inputs["journal_head"]]
         if "fs_manifest" in kinds:
-            cy.binding(inputs["fs_manifest"], "final")
+            protected |= set(cy.binding(inputs["fs_manifest"], "final")[3])
             bound.append(inputs["fs_manifest"])
         if "fs_manifest_verified" in kinds:
-            _, _, ves, _ = cy.binding(inputs["fs_manifest_verified"], "final", verify=True)
-            need(cy.blobs(sorted({b for _, b in ves})) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
+            protected |= set(cy.binding(inputs["fs_manifest_verified"], "final", verify=True)[3])
             bound.append(inputs["fs_manifest_verified"])
+        # V-2 / R2 §3.2: every protected EP and FS blob (entries and originals) is re-read and re-hashed on every call.
+        need(cy.blobs(sorted(protected)) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
         need(_isolated(self._ev(inputs, "artifact_isolation", pre)["data"], bound), Code.QUIESCENCE_NOT_ESTABLISHED,
              "artifact_isolation")
         lv = self._library(pre, inputs["library_record"], (rs.QUIESCENT, rs.PRESERVED, rs.READY))

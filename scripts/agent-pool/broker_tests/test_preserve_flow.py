@@ -293,11 +293,18 @@ class Preservation(Base):
         self.rejected("snapshot", "fresult_rejected:mutated", "SNAPSHOT_INTENT")
 
     def test_missing_blob_at_verify(self):
+        """A blob lost before the effect fails H-VAL (ProtectedBlobs); one lost
+        during the verify effect is rejected by `check_fresult`."""
         self.w.to_p13()
         self.w.handoff()
         self.ok("snapshot")
         readme = canonical.sha256(self.w.fx.tree(SLOT)[b"README"])
-        del self.w.w.o5.stores["artifacts"].items[f"blob/{readme}"]
+        arts = self.w.w.o5.stores["artifacts"].items
+
+        def lose(r):
+            del arts[f"blob/{readme}"]
+            return r
+        self.w.fx.k["subst"]["verify-preservation"] = lose
         self.rejected("verify-preservation", "fresult_rejected:artifact_mismatch", "VERIFY_INTENT")
 
     def test_missing_original_blob_makes_thaw_unsafe(self):
@@ -593,6 +600,353 @@ class Invariants(Base):
         self.assertIsNone(self.w.res.burned_doc(d))
         o5.burn(self.w.env, {"v": 1, "verb": "freeze-start", "slot": SLOT})
         self.assertIsNotNone(self.w.res.burned_doc(d))
+
+
+# ------------------------------------------------------------------ protected blob integrity (PR #546 B-1)
+
+DENIED = (Code.VERB_NOT_ALLOWED_IN_STATE.value, "barrier_in_use(preservation_dependent)")
+
+
+class ProtectedBlobs(Base):
+    """R4 §6.3 V-2, R2 §3.2, R4 §8.4: H-VAL and every D3/D3H/D4/D4H discharge
+    re-read and re-hash every protected EP blob (entries and originals) and
+    every bound FS blob on each call; no earlier result stands in for it."""
+
+    def fresh(self):
+        self.w = pw.World()
+        self.addCleanup(self.w.close)
+
+    @property
+    def arts(self):
+        return self.w.w.o5.stores["artifacts"].items
+
+    def content(self, name=b"README"):
+        return canonical.sha256(self.w.fx.tree(SLOT)[name])
+
+    def original(self):
+        return self.w.st()["originals"]["acl"]
+
+    def tamper(self, d, how):
+        key = f"blob/{d}"
+        if how == "delete":
+            del self.arts[key]
+        elif how == "corrupt":
+            self.arts[key] = b"tampered\n"
+        else:
+            self.arts[key] = next(v for k, v in sorted(self.arts.items()) if k.startswith("blob/") and k != key)
+
+    def denied(self, bid=None):
+        """The whole release refuses: no discharge, no effect, no write."""
+        self.w.observe()
+        before = (pw.store_bytes(self.w), len(self.w.fx.calls), list(self.w.fx.irrev))
+        self.assertEqual(self.w.release(bid), DENIED)
+        self.assertEqual((pw.store_bytes(self.w), len(self.w.fx.calls), self.w.fx.irrev), before)
+
+    def at_p13(self):
+        self.w.to_p13()
+        self.w.handoff()
+
+    def direct(self, kind="D3", row="P13"):
+        """(handoff_validate, discharge) on the release basis PR-3a builds now."""
+        self.w.observe()
+        pre, sel = freeze.basis_for(self.w.w, SLOT, "release", release_target=self.w.env.barrier_id, kind=kind)
+        chain = o5.chain(self.w.env, self.w.env.barrier_id)
+        view = types.SimpleNamespace(slot=SLOT, row=row, f=pre.f, current=self.w.cycles()[-1])
+        return (lambda: self.w.prov.handoff_validate(pre, sel.public(), None),
+                lambda: self.w.prov.discharge(view, chain, pre, sel.public()))
+
+    def early_objects(self):
+        s = self.w.st()
+        b = pw.protocol.parse_doc(self.w.res.artifact(s["cid"], s["early"]))
+        m = pw.protocol.parse_doc(self.w.res.artifact(s["cid"], b["manifest"]))
+        idx = pw.protocol.parse_doc(self.w.res.artifact(s["cid"], m["entry_index"][0]))
+        return s["cid"], b, m, idx
+
+    # ---- A. H-VAL through the merged invoke
+
+    def test_h_val_rehashes_every_early_blob(self):
+        """A1–A4, D26: a deleted, corrupted or digest-swapped EP content blob or
+        original-attribute blob fails H-VAL; the snapshot effect never runs."""
+        self.at_p13()
+        self.ok("snapshot")
+        for target in ("content", "original"):
+            for how in ("delete", "corrupt", "swap"):
+                with self.subTest(target=target, how=how):
+                    self.fresh()
+                    self.at_p13()
+                    self.tamper(self.content() if target == "content" else self.original(), how)
+                    self.refused("snapshot", Code.QUIESCENCE_NOT_ESTABLISHED, "handoff_invalid")
+                    validate, _ = self.direct()
+                    self.assertEqual((validate().passed, validate().reasons), (False, ["artifact_mismatch"]))
+                    self.assertEqual(self.w.row(), ("P13", "REVOKED"))
+
+    def test_early_data_without_a_snapshot_is_evaluable(self):
+        """A5, A6: before any FS manifest the EP set alone is validated; missing
+        or corrupted manifest metadata refuses."""
+        self.at_p13()
+        validate, discharge = self.direct()
+        self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
+        cid, b, m, idx = self.early_objects()
+        other = self.arts[f"artifact/{cid}/{b['blobs']}"]
+        for key, how, why in ((b["blobs"], "delete", "evidence_unavailable"),
+                              (b["blobs"], "truncate", "evidence_unavailable"),
+                              (b["manifest"], "swap", "artifact_mismatch")):
+            with self.subTest(key=key, how=how):
+                k = f"artifact/{cid}/{key}"
+                good = self.arts[k]
+                self.addCleanup(self.arts.__setitem__, k, good)
+                if how == "delete":
+                    del self.arts[k]
+                else:
+                    self.arts[k] = good[:-1] if how == "truncate" else other
+                self.assertEqual((validate().passed, validate().reasons, discharge()), (False, [why], None))
+                self.denied()
+                self.arts[k] = good
+        self.assertEqual(discharge().kind, "D3")
+
+    # ---- B. D3 / D3H
+
+    def test_d3_refused_over_a_damaged_protected_blob(self):
+        """B7–B9, B12, B14: intact EP copy gives D3; a deleted or corrupted
+        protected blob refuses the whole release with no write or effect."""
+        self.at_p13()
+        self.assertEqual(rel(self.w.release()), "D3")
+        for target in ("content", "original"):
+            for how in ("delete", "corrupt"):
+                with self.subTest(target=target, how=how):
+                    self.fresh()
+                    self.at_p13()
+                    self.tamper(self.content() if target == "content" else self.original(), how)
+                    self.denied()
+                    self.assertEqual(o5.chain(self.w.env, self.w.env.barrier_id).state, "ESTABLISHED")
+
+    def test_final_snapshot_blob_before_verification(self):
+        """B10: at SNAPSHOTTED, before any verified binding, a damaged FS blob
+        refuses D3 and the verify effect."""
+        for how in ("delete", "corrupt"):
+            with self.subTest(how=how):
+                self.fresh()
+                self.at_p13()
+                self.ok("snapshot")
+                self.w.observe()
+                self.assertEqual(rel(self.w.release()), "D3")
+                self.tamper(self.content(), how)
+                self.denied()
+                self.refused("verify-preservation", Code.QUIESCENCE_NOT_ESTABLISHED, "handoff_invalid")
+
+    def test_d3h_after_a_historical_handoff(self):
+        """B11: the historical kind runs the same validation."""
+        for how in ("delete", "corrupt"):
+            with self.subTest(how=how):
+                self.fresh()
+                self.at_p13()
+                o5.release_chain(self.w.env, self.w.env.barrier_id)
+                b2 = o5.synthetic_barrier(self.w.env, [SLOT, OTHER])
+                self.assertEqual(rel(self.w.release(b2)), "D3H")
+                self.tamper(self.original(), how)
+                self.denied(b2)
+
+    def test_another_slot_cannot_supply_a_replacement(self):
+        """B13: a valid blob of another slot, present under its own digest or
+        placed under this slot's digest, never satisfies this slot's set."""
+        self.at_p13()
+        mine = self.original()
+        theirs = b"original|acl|" + OTHER.encode()
+        self.arts[f"blob/{canonical.sha256(theirs)}"] = theirs
+        del self.arts[f"blob/{mine}"]
+        self.denied()
+        self.arts[f"blob/{mine}"] = theirs
+        self.denied()
+
+    # ---- C. D4 / D4H
+
+    def test_d4_refused_over_a_damaged_protected_blob(self):
+        """C15–C17, C19: READY and its gate documents do not stand in for the
+        bytes; the EP originals are checked at P18 as well."""
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        for target in ("content", "original"):
+            for how in ("delete", "corrupt"):
+                with self.subTest(target=target, how=how):
+                    self.fresh()
+                    self.w.to_ready()
+                    self.assertEqual(self.w.row(), ("P18", "VERIFIED"))
+                    self.tamper(self.content() if target == "content" else self.original(), how)
+                    self.denied()
+                    _, discharge = self.direct("D4", "P18")
+                    self.assertIsNone(discharge())
+
+    def test_d4h_after_a_historical_handoff(self):
+        """C18."""
+        for target in ("content", "original"):
+            with self.subTest(target=target):
+                self.fresh()
+                self.w.to_ready()
+                o5.release_chain(self.w.env, self.w.env.barrier_id)
+                b3 = o5.synthetic_barrier(self.w.env, [SLOT])
+                self.assertEqual(rel(self.w.release(b3)), "D4H")
+                self.tamper(self.content() if target == "content" else self.original(), "corrupt")
+                self.denied(b3)
+
+    # ---- D. temporal and adversarial
+
+    def test_no_earlier_result_is_reused(self):
+        """C20, D21: validate, damage, validate again, restore."""
+        self.at_p13()
+        validate, discharge = self.direct()
+        self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
+        d = self.content()
+        good = self.arts[f"blob/{d}"]
+        self.tamper(d, "corrupt")
+        self.assertEqual((validate().passed, discharge()), (False, None))
+        self.arts[f"blob/{d}"] = good
+        self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
+
+    def test_protected_bytes_change_between_v_and_r(self):
+        """D22: R re-runs H-VAL; nothing is written and the effect never runs."""
+        self.at_p13()
+        d = self.content()
+        good = self.arts[f"blob/{d}"]
+        self.w.observe()
+        before = (self.w.env.snapshot(), pw.store_bytes(self.w), len(self.w.fx.calls))
+        seen = []
+        real = self.w.prov.handoff_validate
+
+        def spy(*a):
+            v = real(*a)
+            seen.append(v.passed)
+            return v
+        self.w.prov.handoff_validate = spy
+        r = self.w.run("snapshot", confirm_hook=lambda: self.tamper(d, "corrupt"))
+        self.assertEqual(outcome(r), ("REFUSED", "QUIESCENCE_NOT_ESTABLISHED", "handoff_invalid"))
+        self.assertEqual(seen, [True, False])
+        self.arts[f"blob/{d}"] = good
+        self.w.observe()
+        self.assertEqual(len(self.w.fx.calls), before[2])
+        self.assertEqual(self.w.row(), ("P13", "REVOKED"))
+        self.ok("snapshot")
+
+    def test_agent_original_mutation_is_not_a_veto(self):
+        """D23: the agent-writable working tree changes after the handoff; the
+        protected copies are intact, so H-VAL and D3 still pass."""
+        self.at_p13()
+        self.w.fx.trees[SLOT] = dict(self.w.fx.tree(SLOT))
+        self.w.fx.trees[SLOT][b"README"] = b"rewritten by the agent\n"
+        self.w.fx.trees[SLOT][b"new-file"] = b"agent\n"
+        validate, discharge = self.direct()
+        self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
+        self.assertEqual(rel(self.w.release()), "D3")
+
+    def test_two_cycles_check_only_their_own_inventory(self):
+        """D24: a blob only the thawed cycle bound is irrelevant to the next
+        cycle; a blob only the current cycle bound is checked."""
+        tree = dict(self.w.fx.tree(SLOT))
+        self.w.fx.trees[SLOT] = dict(tree)
+        self.w.fx.trees[SLOT][b"only-first"] = b"first cycle\n"
+        self.ok("adopt", "request", "freeze-start", "freeze-continue", "thaw")
+        first = self.content(b"only-first")
+        self.w.fx.trees[SLOT] = dict(tree)
+        self.w.fx.trees[SLOT][b"only-second"] = b"second cycle\n"
+        self.ok("freeze-start", "freeze-continue", "quarantine", "quiescence")
+        self.w.handoff()
+        s = self.w.st()
+        self.assertNotIn(first, pw.protocol.parse_doc(self.w.res.artifact(s["cid"], s["ep_bs"]))["set"])
+        self.tamper(first, "corrupt")
+        self.assertEqual(rel(self.w.release()), "D3")
+        self.tamper(self.content(b"only-second"), "corrupt")
+        self.denied()
+
+    def test_previous_cycle_blob_set_binding(self):
+        """D25: the previous cycle's valid early binding in the selection fails
+        H-VAL and the discharge (the journal pins this cycle's EP)."""
+        self.ok("adopt", "request", "freeze-start", "freeze-continue", "thaw")
+        s1 = dict(self.w.st())
+        self.ok("freeze-start", "freeze-continue", "quarantine", "quiescence")
+        self.w.handoff()
+        self.w.observe()
+        pre, sel = freeze.basis_for(self.w.w, SLOT, "release", release_target=self.w.env.barrier_id, kind="D3")
+        pub = sel.public()
+        sub = dict(pub, provider_inputs=sorted([k, s1["early"] if k == "ep_manifest" else v]
+                                               for k, v in pub["provider_inputs"]))
+        v = self.w.prov.handoff_validate(pre, sub, None)
+        self.assertEqual((v.passed, v.reasons), (False, ["barrier_binding"]))
+        view = types.SimpleNamespace(slot=SLOT, row="P13", f=pre.f, current=self.w.cycles()[-1])
+        chain = o5.chain(self.w.env, self.w.env.barrier_id)
+        self.assertIsNone(self.w.prov.discharge(view, chain, pre, sub))
+        self.assertEqual(self.w.prov.discharge(view, chain, pre, pub).kind, "D3")
+
+    def test_one_blob_in_a_chunked_inventory(self):
+        """D27, D29: many chunks over several index objects; one damaged blob,
+        a missing chunk or a malformed index object refuses."""
+        self.w.fx.k["per_chunk"], self.w.fx.k["per_index"] = 2, 2
+        self.w.fx.trees[SLOT] = dict(self.w.fx.tree(SLOT))
+        self.w.fx.trees[SLOT].update({b"f%02d" % i: b"file %d\n" % i for i in range(9)})
+        self.at_p13()
+        cid, _, m, idx = self.early_objects()
+        self.assertGreater(len(m["entry_index"]), 1)
+        validate, discharge = self.direct()
+        self.assertEqual(discharge().kind, "D3")
+        for key, mutate, why in ((f"blob/{self.content(b'f08')}", lambda v: b"tampered\n", "artifact_mismatch"),
+                                 (f"artifact/{cid}/{idx['chunks'][-1]}", None, "evidence_unavailable"),
+                                 (f"artifact/{cid}/{m['entry_index'][-1]}",
+                                  lambda v: self.arts[f"artifact/{cid}/{m['entry_index'][0]}"], "artifact_mismatch")):
+            with self.subTest(key=key):
+                good = self.arts[key]
+                self.addCleanup(self.arts.__setitem__, key, good)
+                if mutate is None:
+                    del self.arts[key]
+                else:
+                    self.arts[key] = mutate(good)
+                self.assertEqual((validate().reasons, discharge()), ([why], None))
+                self.denied()
+                self.arts[key] = good
+        self.assertEqual(discharge().kind, "D3")
+
+    def test_omitted_blob_set_member(self):
+        """D28: a blob set missing one member of entries ∪ originals is
+        refused when the effect first binds it."""
+        self.ok("adopt", "request")
+        self.w.fx.k["bs_drop"] = True
+        self.rejected("freeze-start", "fresult_rejected:artifact_mismatch", "MOVE_INTENT")
+
+    def test_each_bound_set_is_rehashed_on_its_own(self):
+        """The EP, FS and verified sets are each re-hashed. While FS ⊆ EP a
+        member bound by only one set cannot occur, so one is forced here."""
+        self.w.to_verified()
+        validate, discharge = self.direct()
+        self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
+        phantom = canonical.sha256(b"never stored")
+        real = preserve._Cycle.binding
+        for target in ("early", "final", "verify"):
+            def extra(cy, d, phase, verify=False, target=target):
+                b, m, es, bs = real(cy, d, phase, verify)
+                hit = {"early": phase == "early", "final": phase == "final" and not verify, "verify": verify}[target]
+                return b, m, es, sorted(bs + [phantom]) if hit else bs
+            with self.subTest(target=target), mock.patch.object(preserve._Cycle, "binding", extra):
+                self.assertEqual((validate().passed, validate().reasons, discharge()),
+                                 (False, ["artifact_mismatch"], None))
+
+    def test_the_complete_authenticated_set_is_rehashed(self):
+        """D30 and the full set: on the positive path every discharge re-hashes
+        exactly entries ∪ originals of each bound set, recomputed here."""
+        self.at_p13()
+        s = self.w.st()
+        want = set(pw.protocol.parse_doc(self.w.res.artifact(s["cid"], s["ep_bs"]))["set"])
+        self.assertEqual(want, {canonical.sha256(v) for v in self.w.fx.tree(SLOT).values()}
+                         | set(s["originals"].values()))
+        asked = []
+        real = preserve._Cycle.blobs
+
+        def spy(cy, digests):
+            asked.append(set(digests))
+            return real(cy, digests)
+        with mock.patch.object(preserve._Cycle, "blobs", spy):
+            self.assertEqual(rel(self.w.release()), "D3")
+            self.assertIn(want, asked)
+            self.ok("snapshot", "verify-preservation", "preservation", "ready")
+            asked.clear()
+            self.assertEqual(rel(self.w.release()), "D4")
+            self.assertIn(want, asked)
 
 
 # ------------------------------------------------------------------ BX-1 (PR #545 N1, mandatory)

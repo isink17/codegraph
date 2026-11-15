@@ -105,7 +105,8 @@ class Effects:
         self.trees = {}
         self.k = {"escaped": [], "fs_mutate": False, "crash": set(), "crash_seq0": 0, "crash_snapshot": 0,
                   "crash_thaw": 0, "result": "COMPLETE", "subst": {}, "hdr": None, "per_chunk": 4096,
-                  "per_index": 512, "drop_original": False, "corrupt_revoked": False, "fork_revoked": False}
+                  "per_index": 512, "drop_original": False, "corrupt_revoked": False, "fork_revoked": False,
+                  "bs_drop": False}
         self.state, self.calls, self.irrev, self.latest = {}, [], [], {}
 
     @property
@@ -172,6 +173,8 @@ class Effects:
         if phase == "early":
             m["originals"] = s["originals"]
             blobs |= set(s["originals"].values())
+            if self.k["bs_drop"]:
+                blobs.discard(min(blobs))
         md = self.obj(s, m)
         bs = self.obj(s, {"header": self.header(s), "set": sorted(blobs)})
         return self.obj(s, {"header": self.header(s), "cycle_id": s["cid"], "manifest": md, "blobs": bs}), md, bs
