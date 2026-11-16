@@ -22,11 +22,15 @@ token() { sed -n 's/^token=//p' "$CG_POOL_LEASES/$1.lease"; }
 g() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
 # racer <name> <command...>: runs one competitor and keeps its command, exit
 # status, stdout and stderr under $T/<name>.*, so a failed race explains itself.
+# Its mkdir, rmdir and rm calls on slot locks go to $T/locktrace.log.
+mkdir "$T/locktrace"
+for c in mkdir rmdir rm; do ln -s "${POOL%/pool.sh}/lock_trace.sh" "$T/locktrace/$c"; done
 racer() {
 	local n=$1 rc=0
 	shift
 	printf '%q ' "$@" >"$T/$n.cmd"
-	"$@" >"$T/$n.out" 2>"$T/$n.err" || rc=$?
+	LOCK_TRACE=$T/locktrace.log LOCK_TRACE_PATH=$PATH LOCK_TRACE_NAME=$n PATH="$T/locktrace:$PATH" \
+		"$@" >"$T/$n.out" 2>"$T/$n.err" || rc=$?
 	echo "$rc" >"$T/$n.rc"
 }
 wins_of() { grep -lx 0 "$T/$1"*.rc 2>/dev/null | wc -l | tr -d ' '; }
@@ -41,14 +45,19 @@ race_report() {
 		sed 's/^/    stdout: /' "$n.out"
 		sed 's/^/    stderr: /' "$n.err"
 	done
+	echo "  lock events:"
+	grep "^$1" "$T/locktrace.log" 2>/dev/null | sed 's/^/    /' || :
 	for f in "$CG_POOL_LEASES"/.*.lock; do
-		[[ -e $f ]] && echo "  lock ${f##*/}: owner $(cat "$f/owner" 2>/dev/null || echo none)"
+		[[ -e $f ]] && echo "  lock ${f##*/}: inode $(ls -di "$f" | awk '{print $1}') owner $(cat "$f/owner" 2>/dev/null || echo none)"
 	done
 	for f in "$CG_POOL_LEASES"/*.lease; do
 		[[ -e $f ]] && echo "  lease ${f##*/}: $(grep -v '^token=' "$f" | tr '\n' ' ')"
 	done
 	for f in codegraph-worker-a codegraph-worker-b codegraph-review; do echo "  $f: $(state $f)"; done
 }
+# pool.sh reports a held lock that vanished or was replaced and carries on, so
+# the outcome alone would not show it: any such report fails the race.
+lock_vanished() { grep -q " not removed: " "$T/$1"*.err 2>/dev/null; }
 # Commits a new file <name>.txt in slot $1.
 change() {
 	echo "$2" >"$CG_POOL_ROOT/$1/$2.txt"
@@ -73,6 +82,8 @@ done
 wait
 wins=$(wins_of acq)
 [[ $wins == 1 ]] || fail "same-slot race: $wins winners
+$(race_report acq)"
+! lock_vanished acq || fail "same-slot race: a held lock vanished
 $(race_report acq)"
 [[ $(state $A) == busy ]] || fail "leased slot state $(state $A)"
 expect 1 "$POOL" acquire --slot $A --task again --agent x
@@ -165,6 +176,8 @@ done
 wait
 wins=$(wins_of rel)
 [[ $wins == 1 ]] || fail "concurrent release: $wins winners
+$(race_report rel)"
+! lock_vanished rel || fail "concurrent release: a held lock vanished
 $(race_report rel)"
 
 # A detached HEAD whose remote branch was deleted is not treated as pushed.
@@ -441,18 +454,30 @@ expect 0 "$POOL" release --slot $B --token "$(token $B)"
 # Whatever interleaving wins, no lease appears or vanishes unexpectedly and a
 # leased slot is never moved by prepare.
 advance_base race
-for i in 1 2 3 4; do ("$POOL" prepare --slot $A >/dev/null 2>&1 || :) & done
-("$POOL" acquire --slot $A --task race --agent x >"$T/acq" 2>&1 && echo ok >>"$T/acq" || :) &
+for i in 1 2 3 4; do racer prep$i "$POOL" prepare --slot $A & done
+racer prepacq "$POOL" acquire --slot $A --task race --agent x &
 wait
+! lock_vanished prep || fail "prepare race: a held lock vanished
+$(race_report prep)"
 if lease_exists $A; then
-	grep -q '^ok$' "$T/acq" || fail "lease without a winning acquire"
+	[[ $(cat "$T/prepacq.rc") == 0 ]] || fail "lease without a winning acquire
+$(race_report prep)"
 	("$POOL" release --slot $A --token "$(token $A)" >"$T/rel" 2>&1 && echo ok >>"$T/rel" || :) &
 	("$POOL" prepare --slot $A >/dev/null 2>&1 || :) &
 	wait
 	grep -q '^ok$' "$T/rel" || lease_exists $A || fail "lease vanished without release"
 else
-	grep -q '^ok$' "$T/acq" && fail "winning acquire left no lease"
-	[[ $(head_of $A) == "$(base_of)" ]] || fail "concurrent prepares left $A behind"
+	[[ $(cat "$T/prepacq.rc") != 0 ]] || fail "winning acquire left no lease
+$(race_report prep)"
+	# The racing acquire can hold the lock through every prepare's attempt and
+	# then refuse because $A is behind; only a prepare that got the lock had
+	# to move it.
+	if [[ $(head_of $A) != "$(base_of)" ]]; then
+		for f in "$T"/prep?.err; do
+			grep -q "^$A lock held: " "$f" || { fail "concurrent prepares left $A behind
+$(race_report prep)"; break; }
+		done
+	fi
 fi
 if lease_exists $A; then "$POOL" release --slot $A --token "$(token $A)" >/dev/null; fi
 "$POOL" prepare --slot $B >/dev/null
