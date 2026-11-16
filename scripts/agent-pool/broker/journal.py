@@ -48,6 +48,13 @@ def path_hex(v):
     return type(v) is str and bool(_PATH_HEX.match(v))
 
 
+def valid_component(c):
+    """One path component as the capture walk (`fdwalk.valid_name`) accepts
+    it (R2 §3.2): a manifest path with an empty, `.` or `..` component names a
+    file another spelling also names."""
+    return 0 < len(c) <= 255 and c not in (b".", b"..") and b"\0" not in c
+
+
 def parse(data, code=Code.PROVENANCE_INSUFFICIENT, detail="evidence_unavailable"):
     """Strict canonical parse of one effect-produced object, bounded by the
     R4.1 §3.4 per-object limit. Returns (object, sha256)."""

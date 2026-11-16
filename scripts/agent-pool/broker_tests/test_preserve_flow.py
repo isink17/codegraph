@@ -166,6 +166,38 @@ class Positive(Base):
     def test_nested_external_objects_under_mixed_case_gitdir(self):
         self._external_nested_refused(b".Git")
 
+    def _aliased_object(self, spelling):
+        """The real `.git/objects/..` path holds junk; `spelling(path)` names
+        the same file another way and holds the valid object."""
+        files = pw.git_repo()[0]
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        files[spelling(k)], files[k] = files[k], b"junk"
+        return files
+
+    def test_manifest_path_with_an_invalid_component_is_rejected(self):
+        """R2 §3.2: `/.git/x` and `.git/x` name one file, so a manifest that
+        lists both never verifies the bytes Git would read (never D4)."""
+        for name, spelling in (("leading slash", lambda k: b"/" + k), ("dot", lambda k: b"./" + k),
+                               ("dot dot", lambda k: b"w/../" + k), ("empty", lambda k: k.replace(b"/", b"//", 1))):
+            with self.subTest(name):
+                self.w = pw.World(**self.world_kw)
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = self._aliased_object(spelling)
+                self.ok("adopt", "request")
+                self.rejected("freeze-start", "fresult_rejected:artifact_mismatch", "MOVE_INTENT")
+                self.assertEqual(self.w.release(), DENIED)
+
+    def test_case_alias_of_a_gitdir_path_is_not_preservable(self):
+        """`.git/OBJECTS/..` is `.git/objects/..` on APFS: the valid object is
+        classified, but junk under the other spelling may be what lands there."""
+        files = pw.git_repo()[0]
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        files[k.replace(b"objects", b"OBJECTS", 1)] = b"junk"
+        self.w.fx.trees[SLOT] = files
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
     def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
         self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
         self.w.to_ready()

@@ -318,7 +318,7 @@ class Reconstruction(unittest.TestCase):
         return {"entry_index": index}, chunks, index
 
     def entries(self, n, start=0):
-        return [["%06x" % i, canonical.sha256(str(i).encode())] for i in range(start, start + n)]
+        return [[(b"f%06d" % i).hex(), canonical.sha256(str(i).encode())] for i in range(start, start + n)]
 
     def mismatch(self, m):
         with self.assertRaises(Mismatch):
@@ -330,6 +330,16 @@ class Reconstruction(unittest.TestCase):
         for paths in (["61", "612f62"], ["61", "612d78", "612f62"], ["61", "62", "622f63", "622f632f64"]):
             self.mismatch(self.manifest([[[p, h] for p in paths]])[0])
         self.assertEqual(len(self.cy.entries(self.manifest([[["612d78", h], ["612f62", h]]])[0])), 2)
+
+    def test_every_path_component_is_one_the_capture_walk_accepts(self):
+        """R2 §3.2: an empty, `.` or `..` component, a NUL or a component over
+        255 bytes refuses; 255 bytes is accepted."""
+        h = canonical.sha256(b"x")
+        for bad in (b"/.git/HEAD", b"./a", b"a/./b", b"a/../b", b"a//b", b"a/", b"a/\0b", b"a/" + b"n" * 256):
+            with self.subTest(bad):
+                self.mismatch(self.manifest([[[bad.hex(), h]]])[0])
+        ok = b"a/" + b"n" * 255
+        self.assertEqual(self.cy.entries(self.manifest([[[ok.hex(), h]]])[0]), [(ok.hex(), h)])
 
     def test_non_bytes_blob_is_unavailable_not_an_exception(self):
         """Q3e: a resolver value that is not bytes is a missing blob."""
@@ -539,6 +549,28 @@ class GitClassification(unittest.TestCase):
             files.update(extra)
             _, _, q4, q5, reasons, _ = classify(files)
             self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]), extra)
+
+    def test_two_paths_that_name_one_file_are_ambiguous(self):
+        """Distinct captured paths that one APFS volume stores as one file:
+        the bytes classified need not be the bytes restored there."""
+        files, _ = pw.git_repo()
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        cafe, cafe_nfd = "caf\u00e9/".encode(), "cafe\u0301/".encode()
+        nested, _ = pw.git_repo(prefix=cafe)
+        for name, extra in (("same path below the gitdir", {b"/" + k: b"junk"}),
+                            ("case", {k.replace(b"objects", b"OBJECTS", 1): b"junk"}),
+                            ("ignorable code point", {k.replace(b"objects", "obj\u200cects".encode(), 1): b"junk"}),
+                            ("normalization of the root",
+                             {**nested, **{cafe_nfd + q[len(cafe):]: d for q, d in nested.items()}})):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        both = {**nested, **{cafe_nfd + q[len(cafe):]: d for q, d in nested.items()}}
+        repos = gitclass.repositories({p: d for p, d in both.items() if gitclass.is_git_path(p)})
+        self.assertEqual({r: "unknown" in repos[r].features for r in repos}, {cafe[:-1]: True, cafe_nfd[:-1]: True})
+        _, _, q4, q5, reasons, _ = classify({**files, **nested, b"README.md": b"x", b"readme": b"x"})
+        self.assertEqual((q4, q5, reasons), ("COMPLETE", "ELIGIBLE", []))
 
     def test_config_include_is_external(self):
         """A config included from outside the captured tree is never preserved."""

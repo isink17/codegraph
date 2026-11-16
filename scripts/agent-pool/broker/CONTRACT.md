@@ -261,7 +261,12 @@ Rules worth repeating:
   `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
 - PR-3b Git classification: a repository is located by any spelling of its
   `.git` component (R2 K3: case-insensitive, plus the code points HFS+
-  ignores); two spellings under one root are `unknown`. A reachable object
+  ignores); two spellings under one root are `unknown`. So are two captured
+  paths that name one file: the same path below one root, or paths equal on
+  a case- and normalization-insensitive volume (APFS, HFS+). A manifest path
+  with an empty, `.` or `..` component, a NUL or a component over 255 bytes
+  is not one the capture walk produces (R2 §3.2) and refuses as
+  `artifact_mismatch`. A reachable object
   that is not loose is `packed` only when a version 2 index lists it and the
   index passes bounded structural checks against its sibling pack (R2 K7).
   That is presence only: packed contents are never inflated or hashed, so a

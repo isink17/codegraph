@@ -12,6 +12,7 @@ modules may not import; anything outside it is a finding, never a success."""
 
 import hashlib
 import re
+import unicodedata
 import zlib
 
 HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
@@ -85,22 +86,44 @@ def repositories(files):
     (bytes) to its bytes. A repository is the prefix before the first `.git`
     component; a `.git` regular file is a gitlink (linked worktree or submodule
     checkout) whose objects are elsewhere. A root whose administrative
-    directory is spelled more than one way is ambiguous: `unknown`."""
-    split, names = {}, {}
+    directory is spelled more than one way is ambiguous: `unknown`. So is a
+    root with two captured paths that name one file, either as the same path
+    below the administrative directory or on a case- and
+    normalization-insensitive volume: the bytes read here need not be the
+    bytes that end up there."""
+    split, names, folded, ambiguous = {}, {}, {}, set()
     for path, data in files.items():
         parts = path.split(b"/")
         i = git_index(parts)
         if i is None:
             continue
         root = b"/".join(parts[:i])
-        split.setdefault(root, {})[b"/".join(parts[i + 1:])] = data
+        fs = split.setdefault(root, {})
+        sub = b"/".join(parts[i + 1:])
+        if sub in fs:
+            ambiguous.add(root)
+        fs[sub] = data
         names.setdefault(root, set()).add(parts[i])
+        f = _fold(path)
+        if f in folded:
+            ambiguous |= {root, folded[f]}
+        folded[f] = root
     repos = {}
     for root, fs in split.items():
         repos[root] = classify(root, fs)
-        if len(names[root]) > 1:
+        if len(names[root]) > 1 or root in ambiguous:
             repos[root].features.add("unknown")
     return repos
+
+
+def _fold(path):
+    """The name APFS or HFS+ (case-insensitive, normalization-insensitive)
+    stores `path` under; folding too much only refuses."""
+    try:
+        s = path.decode("utf-8")
+    except UnicodeDecodeError:
+        return path.lower()
+    return unicodedata.normalize("NFD", _HFS_IGNORED.sub("", s)).casefold()
 
 
 def _config(r, data):
