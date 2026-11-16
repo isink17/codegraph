@@ -880,7 +880,7 @@ mkdir -p "$T/linger"
 # No here-documents: the coordinator runs this file in a sandbox that refuses
 # their temporary files.
 printf '%s\n' '#!/bin/sh' 'fd=3' 'while [ $fd -lt 64 ]; do' \
-	'	{ true >&$fd; } 2>/dev/null && echo $fd' '	fd=$((fd + 1))' 'done' >"$T/linger/fds"
+	'	( true >&$fd ) 2>/dev/null && echo $fd' '	fd=$((fd + 1))' 'done' >"$T/linger/fds"
 printf '%s\n' '#!/bin/sh' 'case " $* " in' '*" fetch "* | *" status "*)' \
 	'	if [ ! -e "$LINGER/pid" ]; then' \
 	'		"$LINGER/fds" >"$LINGER/fds.git"' \
