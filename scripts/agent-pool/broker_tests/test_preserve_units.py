@@ -341,6 +341,13 @@ class Reconstruction(unittest.TestCase):
         ok = b"a/" + b"n" * 255
         self.assertEqual(self.cy.entries(self.manifest([[[ok.hex(), h]]])[0]), [(ok.hex(), h)])
 
+    def test_path_depth_is_the_capture_walks(self):
+        """NB-6: at most `fdwalk.Limits.max_depth` (64) separators, as captured."""
+        h = canonical.sha256(b"x")
+        ok = b"/".join([b"d"] * 64 + [b"f"])
+        self.assertEqual(len(self.cy.entries(self.manifest([[[ok.hex(), h]]])[0])), 1)
+        self.mismatch(self.manifest([[[b"/".join([b"d"] * 65 + [b"f"]).hex(), h]]])[0])
+
     def test_non_bytes_blob_is_unavailable_not_an_exception(self):
         """Q3e: a resolver value that is not bytes is a missing blob."""
         d = canonical.sha256(b"x")
@@ -561,6 +568,7 @@ class GitClassification(unittest.TestCase):
         nested, _ = pw.git_repo(prefix=cafe)
         for name, extra in (("same path below the gitdir", {b"/" + k: b"junk"}),
                             ("case", {k.replace(b"objects", b"OBJECTS", 1): b"junk"}),
+                            ("case of the last component", {b".git/refs/heads/MAIN": files[b".git/refs/heads/main"]}),
                             ("ignorable code point", {k.replace(b"objects", "obj\u200cects".encode(), 1): b"junk"}),
                             ("normalization of the root",
                              {**nested, **{cafe_nfd + q[len(cafe):]: d for q, d in nested.items()}})):
@@ -595,6 +603,43 @@ class GitClassification(unittest.TestCase):
                 self.assertIn("unknown", reasons)
         repos = gitclass.repositories({**files, **sub}, [*files, *sub, b"Sub2", b"sub.txt"])
         self.assertEqual(gitclass.questions(repos, "COMPLETE")[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_administrative_names_match_as_apfs_matches_them(self):
+        """B-1 (6b85f780 review): Git on APFS opens `.git/Shallow` as `shallow`
+        and `.git/INFO/grafts` as `info/grafts`, so a case variant of a name
+        read here is a file Git sees and this classifier would not."""
+        files, coid = pw.git_repo()
+        oid = coid.encode()
+        cfg = files[b".git/config"]
+        for name, change in (("Shallow", {b".git/Shallow": oid + b"\n"}),
+                             ("SHALLOW", {b".git/SHALLOW": oid + b"\n"}),
+                             ("info/Grafts", {b".git/info/Grafts": oid + b"\n"}),
+                             ("INFO/grafts", {b".git/INFO/grafts": oid + b"\n"}),
+                             ("Packed-Refs", {b".git/Packed-Refs": b"f" * 40 + b" refs/heads/x\n"}),
+                             ("Commondir", {b".git/Commondir": b"../elsewhere\n"}),
+                             ("objects/Info/alternates", {b".git/objects/Info/alternates": b"/elsewhere\n"}),
+                             ("Config only", {b".git/config": None,
+                                              b".git/Config": cfg + b"[extensions]\n\tobjectformat = sha256\n"})):
+            with self.subTest(name):
+                got = {p: d for p, d in {**files, **change}.items() if d is not None}
+                _, _, q4, q5, reasons, _ = classify(got)
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        legit = {b".git/logs/HEAD": b"x", b".git/ORIG_HEAD": oid + b"\n", b".git/FETCH_HEAD": b"",
+                 b".git/COMMIT_EDITMSG": b"m\n", b".git/description": b"d\n", b".git/info/exclude": b"",
+                 b".git/hooks/pre-commit.sample": b"", b".git/refs/heads/Feature": oid + b"\n"}
+        self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_one_directory_spelled_two_ways_is_ambiguous(self):
+        """APFS keeps the first spelling of a directory, so `refs/heads/Feat/a`
+        and `refs/heads/feat/b` land in one directory."""
+        files, coid = pw.git_repo()
+        both = {**files, b".git/refs/heads/Feat/a": coid.encode() + b"\n",
+                b".git/refs/heads/feat/b": coid.encode() + b"\n"}
+        _, _, q4, q5, reasons, _ = classify(both)
+        self.assertEqual((q4, q5, "unknown" in reasons), ("INCOMPLETE", "NOT_ELIGIBLE", True))
+        del both[b".git/refs/heads/Feat/a"]
+        self.assertEqual(classify(both)[2:5], ("COMPLETE", "ELIGIBLE", []))
 
     def test_config_include_is_external(self):
         """A config included from outside the captured tree is never preserved."""

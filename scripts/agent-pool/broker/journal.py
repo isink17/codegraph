@@ -48,6 +48,11 @@ def path_hex(v):
     return type(v) is str and bool(_PATH_HEX.match(v))
 
 
+# The capture walk's default `fdwalk.Limits.max_depth`: no captured path has
+# more separators.
+MAX_PATH_DEPTH = 64
+
+
 def valid_component(c):
     """One path component as the capture walk (`fdwalk.valid_name`) accepts
     it (R2 §3.2): a manifest path with an empty, `.` or `..` component names a

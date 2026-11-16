@@ -263,12 +263,16 @@ Rules worth repeating:
   `.git` component (R2 K3: case-insensitive, plus the code points HFS+
   ignores); two spellings under one root are `unknown`. So is a root with a
   path that shares a file or directory with another manifest path (worktree
-  paths included): the same path below the root, or a file named twice or a
-  file named like a directory on a case- and normalization-insensitive volume
-  (APFS, HFS+). So is a git path that is not UTF-8. A manifest path
-  with an empty, `.` or `..` component, a NUL or a component over 255 bytes
-  is not one the capture walk produces (R2 §3.2) and refuses as
-  `artifact_mismatch`. A reachable object
+  paths included): the same path below the root, or a file named twice, a
+  file named like a directory or one directory spelled two ways on a case-
+  and normalization-insensitive volume (APFS, HFS+). So is a git path that
+  is not UTF-8, and a path below the gitdir that APFS would open as one of
+  the administrative names the classifier reads (`shallow`, `info/grafts`,
+  `config`, `packed-refs`, `commondir`, `objects/info/alternates`, `refs`,
+  ...) under another spelling: Git reads it, a byte comparison would not. A
+  manifest path with an empty, `.` or `..` component, a NUL, a component
+  over 255 bytes or more than 64 separators is not one the capture walk
+  produces (R2 §3.2) and refuses as `artifact_mismatch`. A reachable object
   that is not loose is `packed` only when a version 2 index lists it and the
   index passes bounded structural checks against its sibling pack (R2 K7).
   That is presence only: packed contents are never inflated or hashed, so a

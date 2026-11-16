@@ -144,14 +144,25 @@ def _utf8(path):
 
 def _shared(paths):
     """Folded names two captured paths share on APFS or HFS+: one file named
-    twice, or a file that is also another path's directory."""
-    files, dirs, twice = set(), set(), set()
+    twice, a file that is also another path's directory, or one directory
+    spelled two ways."""
+    files, dirs, twice = set(), {}, set()
     for p in paths:
         f = _fold(p)
         (twice if f in files else files).add(f)
-        parts = f.split("/")
-        dirs.update("/".join(parts[:k]) for k in range(1, len(parts)))
-    return twice | (files & dirs)
+        raw, parts = p.split(b"/"), f.split("/")
+        for k in range(1, len(parts)):
+            dirs.setdefault("/".join(parts[:k]), set()).add(b"/".join(raw[:k]))
+    return twice | (files & dirs.keys()) | {d for d, spellings in dirs.items() if len(spellings) > 1}
+
+
+def _prefixes(paths):
+    """Every path in `paths` and every directory above one."""
+    out = set()
+    for p in paths:
+        parts = p.split(b"/")
+        out.update(b"/".join(parts[:k]) for k in range(1, len(parts) + 1))
+    return out
 
 
 def _config(r, data):
@@ -426,11 +437,23 @@ def _closure(r, files, tips, commits):
             r.features.add("corrupt_object")
 
 
+# Every administrative path below the gitdir that `classify` reads by name.
+# Git on APFS opens them case-insensitively, so another spelling is the same
+# file to Git and an unseen one here.
+_ADMIN = frozenset({b"HEAD", b"config", b"shallow", b"packed-refs", b"commondir", b"reftable", b"modules",
+                    b"info", b"info/grafts", b"objects", b"objects/info", b"objects/info/alternates",
+                    b"objects/info/http-alternates", b"objects/pack", b"refs", b"refs/heads",
+                    b"refs/replace"})
+_ADMIN_FOLDED = frozenset(_fold(a) for a in _ADMIN)
+
+
 def classify(root, files):
     """One repository's findings. `files` maps the gitdir-relative path to bytes."""
     r = Repo(root)
     if b"" in files:
         r.features.add("gitlink_file")
+    if any(_fold(q) in _ADMIN_FOLDED and q not in _ADMIN for q in _prefixes(files)):
+        r.features.add("unknown")
     if b"config" in files:
         _config(r, files[b"config"])
     for name, feat in ((b"shallow", "shallow"), (b"objects/info/alternates", "alternates"),

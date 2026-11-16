@@ -206,6 +206,15 @@ class Positive(Base):
         self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
         self.assertEqual(self.w.release(), DENIED)
 
+    def test_shallow_file_under_another_spelling_is_not_preservable(self):
+        """B-1: an agent can write `.git/Shallow` on APFS; Git reads it as
+        `shallow`, so the repository is not recovery-eligible."""
+        files, coid = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**files, b".git/Shallow": coid.encode() + b"\n"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
     def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
         self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
         self.w.to_ready()

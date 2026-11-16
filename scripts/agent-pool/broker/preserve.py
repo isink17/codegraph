@@ -245,7 +245,7 @@ class _Cycle:
                     need(type(e) is list and len(e) == 2 and path_hex(e[0]) and hex64(e[1])
                          and (not out or e[0] > out[-1][0]), Code.STATE_UNKNOWN, "artifact_mismatch")
                     p = bytes.fromhex(e[0])
-                    need(all(valid_component(c) for c in p.split(b"/"))
+                    need(p.count(b"/") <= journal.MAX_PATH_DEPTH and all(valid_component(c) for c in p.split(b"/"))
                          and not any(p[:i] in files for i, c in enumerate(p) if c == 0x2F), Code.STATE_UNKNOWN,
                          "artifact_mismatch")
                     files.add(p)
