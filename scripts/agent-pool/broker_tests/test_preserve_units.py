@@ -573,8 +573,24 @@ class GitClassification(unittest.TestCase):
         self.assertEqual(gitclass.questions(gitclass.repositories(files), "INCOMPLETE")[2:4],
                          ("INCOMPLETE", "NOT_ELIGIBLE"))
 
+    def test_valid_commit_under_another_id(self):
+        """Only the SHA-1 differs: a decompressible, canonically sized commit
+        of valid structure whose links resolve, stored under the HEAD commit's
+        id. Only the integrity check can refuse it (mutant G4)."""
+        files, coid = pw.git_repo()
+        raw = pw.zlib.decompress(files[pw.loose_key(coid)])
+        body = raw.split(b"\0", 1)[1].replace(b"\nm\n", b"\nanother message\n")
+        other = b"commit %d\0" % len(body) + body
+        self.assertNotEqual(pw.hashlib.sha1(other).hexdigest(), coid)  # noqa: S324
+        files[pw.loose_key(coid)] = pw.zlib.compress(other)
+        _, q3, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["corrupt_object"]))
+
     def test_object_whose_content_is_not_its_id(self):
-        """Valid zlib under another object's id: integrity, not decompression, refuses."""
+        """Valid zlib under another object's id: integrity, not decompression, refuses.
+        Since link types are checked, a blob in the commit's place is also a
+        wrong type, so this test alone no longer proves the SHA-1 check;
+        `test_valid_commit_under_another_id` does."""
         files, coid = pw.git_repo()
         _, other = pw.gobj(b"blob", b"something else\n")
         files[b".git/objects/" + coid[:2].encode() + b"/" + coid[2:].encode()] = other
@@ -651,6 +667,25 @@ def object_rows():
         t, raw = gobj(b"tag", body)
         return {**hist, t: raw}, {b"refs/heads/main": child, b"refs/tags/v1": t}, bad, "corrupt_object", git
 
+    def tagged_raw(header, body, want=bad, finding="corrupt_object"):
+        raw = header + b"\0" + body
+        oid = pw.hashlib.sha1(raw).hexdigest()  # noqa: S324 - Git object id
+        return {**hist, oid: raw}, {b"refs/heads/main": child, b"refs/tags/x": oid}, want, finding, want is bad
+
+    def head_raw(header, body):
+        raw = header + b"\0" + body
+        oid = pw.hashlib.sha1(raw).hexdigest()  # noqa: S324 - Git object id
+        return {**base, root: root_raw, oid: raw}, {b"refs/heads/main": oid}, bad, "corrupt_object", True
+
+    def date_case(seconds, want=bad):
+        c, raw = commit(head=b"tree " + tree.encode() + b"\nauthor A <a@example.com> " + seconds + b" +0000\n"
+                        + COMMITTER)
+        return {**base, c: raw}, {b"refs/heads/main": c}, want, None if want is ok else "corrupt_object", want is bad
+
+    child_body = child_raw.split(b"\0", 1)[1]
+    sigtag = (b"mergetag object " + root.encode() + b"\n type commit\n tag v0\n tagger " + AUTHOR[7:-1]
+              + b"\n \n v0\n")
+    mt, mt_raw = commit(parents=(child, root), tail=sigtag, msg=b"\nmerge v0\n")
     entry = b"100644 README\0" + bytes.fromhex(blob)
     missing = gobj(b"blob", b"never stored\n")[0]
     sub = "5" * 40
@@ -723,6 +758,34 @@ def object_rows():
                                                         + bytes.fromhex(tree)), bad, "corrupt_object", True),
         "tree entry name over 255 bytes": (*tree_case(b"100644 " + b"n" * 256 + b"\0" + bytes.fromhex(blob)), bad,
                                            "corrupt_object", None),
+        "valid empty blob": tagged_raw(b"blob 0", b"", ok, None),
+        "leading-zero blob size": tagged_raw(b"blob 06", b"hello\n"),
+        "size with a plus sign": tagged_raw(b"blob +6", b"hello\n"),
+        "empty size": tagged_raw(b"blob ", b""),
+        "declared size larger than the body": tagged_raw(b"blob 7", b"hello\n"),
+        "declared size smaller than the body": tagged_raw(b"blob 5", b"hello\n"),
+        "header without NUL in 32 bytes": tagged_raw(b"blob " + b"0" * 40, b""),
+        "header without a size": tagged_raw(b"blob", b""),
+        "leading-zero size on the HEAD commit": head_raw(b"commit 0%d" % len(child_body), child_body),
+        "continuation after tree": (*broken(head=b"tree " + tree.encode() + b"\n x\n" + AUTHOR + COMMITTER), bad,
+                                    "corrupt_object", True),
+        "continuation after author": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + b" x\n" + COMMITTER),
+                                      bad, "corrupt_object", True),
+        "continuation after committer": (*broken(tail=b" parent " + root.encode() + b"\n", objs=hist), bad,
+                                         "corrupt_object", None),
+        "continuation after an unsupported header": (*broken(tail=b"encoding UTF-8\n x\n"), bad, "corrupt_object",
+                                                     None),
+        "tagger time past Git's limit": tagged(b"object %s\ntype commit\ntag v1\ntagger A <a@example.com> "
+                                               b"9999999999999999999 +0000\n\nx\n"),
+        "continuation after a tag object": tagged(b"object %s\n x\ntype commit\ntag v1\ntagger %s\nx\n"),
+        "valid mergetag on a merge": ({**hist, merge: merge_raw, mt: mt_raw}, {b"refs/heads/main": mt}, ok, None,
+                                      False),
+        "time 2^63-2": date_case(b"%d" % ((1 << 63) - 2), ok),
+        "time 2^63-1, the largest Git accepts": date_case(b"%d" % ((1 << 63) - 1), ok),
+        "time 2^63": date_case(b"%d" % (1 << 63)),
+        "time 9999999999999999999": date_case(b"9" * 19),
+        "time 2^64-1": date_case(b"%d" % ((1 << 64) - 1)),
+        "time 2^64, 20 digits": date_case(b"%d" % (1 << 64)),
     }
     return rows
 

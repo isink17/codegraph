@@ -270,9 +270,11 @@ Rules worth repeating:
 - PR-3b object structure (R2 §2.1: a property that cannot be established is
   never success). A reachable loose object with the right SHA-1 is verified
   only when its structure is in the supported subset and every link has the
-  type its referrer requires. A commit has one `tree`, zero or more
-  `parent`, one `author` and one `committer`, in Git's fsck order and ident
-  form, and repeats no mandatory header later. A tag has `object`, `type`,
+  type its referrer requires. Its header size is canonical decimal. A commit
+  has one `tree`, zero or more `parent`, one `author` and one `committer`,
+  in Git's fsck order and ident form (seconds at most 2^63-1, Git's
+  `date_overflows` bound), repeats no mandatory header later, and continues
+  only `gpgsig`, `gpgsig-sha256` and `mergetag` on following lines. A tag has `object`, `type`,
   `tag` and an optional `tagger`, and its target has the declared type. A
   tree has the PR-2 observer's modes, valid distinct names other than `.git`,
   in Git's order. HEAD and branches name commits. Anything else is

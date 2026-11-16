@@ -27,7 +27,13 @@ _TYPES = (b"commit", b"tree", b"blob", b"tag")
 # Tree entry mode: the type its object must have; a gitlink is not followed.
 _MODES = {b"100644": b"blob", b"100755": b"blob", b"120000": b"blob", b"40000": b"tree", b"160000": None}
 # Git's fsck_ident: `name <email> seconds +hhmm`, name nonempty, no zero padding.
-_IDENT = re.compile(rb"[^<>\n]+ <[^<>\n]*> (?:0|[1-9][0-9]{0,18}) [+-][0-9]{4}\Z")
+_IDENT = re.compile(rb"[^<>\n]+ <[^<>\n]*> (0|[1-9][0-9]{0,19}) [+-][0-9]{4}\Z")
+# Git's date_overflows: the seconds must fit a signed 64-bit time_t.
+_TIME_MAX = (1 << 63) - 1
+# Object header size: canonical decimal, as Git writes it and the PR-2 observer reads it.
+_SIZE = re.compile(rb"(?:0|[1-9][0-9]*)\Z")
+# The only headers Git continues on following lines (leading space).
+_MULTILINE = frozenset({b"gpgsig", b"gpgsig-sha256", b"mergetag"})
 _HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
@@ -182,18 +188,19 @@ def _read_object(files, oid):
         return "corrupt"
     if hashlib.sha1(raw).hexdigest() != oid:  # noqa: S324 - Git object ids are SHA-1 (integrity only)
         return "corrupt"
-    head, sep, body = raw.partition(b"\0")
-    typ, _, size = head.partition(b" ")
-    if not sep or typ not in _TYPES or not size.isdigit() or int(size) != len(body):
+    nul = raw.find(b"\0", 0, 32)
+    typ, sep, size = raw[:max(nul, 0)].partition(b" ")
+    if nul < 0 or not sep or typ not in _TYPES or not _SIZE.match(size) or int(size) != len(raw) - nul - 1:
         return "corrupt"
-    return typ, body
+    return typ, raw[nul + 1:]
 
 
 def _headers(body):
     """[(key, value)] of a commit or tag header, up to the blank line or the
-    end of an empty message; a continuation line (leading space, as in
-    `gpgsig`) belongs to the header before it. None unless every header line
-    is `key value` and the header is newline-terminated without NUL."""
+    end of an empty message; a continuation line (leading space) belongs to
+    the header before it and is allowed only after `gpgsig`,
+    `gpgsig-sha256` or `mergetag`. None unless every header line is
+    `key value` and the header is newline-terminated without NUL."""
     end = body.find(b"\n\n")
     head = body[:end + 1] if end >= 0 else body
     if not head.endswith(b"\n") or b"\0" in head:
@@ -201,12 +208,17 @@ def _headers(body):
     out = []
     for line in head[:-1].split(b"\n"):
         key, sp, val = line.partition(b" ")
-        if not key and out:
+        if not key and out and out[-1][0] in _MULTILINE:
             continue
         if not key or not sp:
             return None
         out.append((key, val))
     return out
+
+
+def _ident(value):
+    m = _IDENT.match(value)
+    return m is not None and int(m.group(1)) <= _TIME_MAX
 
 
 def _commit_links(body):
@@ -220,7 +232,7 @@ def _commit_links(body):
     n = keys.count(b"parent")
     if keys[:n + 3] != [b"tree"] + [b"parent"] * n + [b"author", b"committer"] \
             or set(keys[n + 3:]) & {b"tree", b"parent", b"author", b"committer"} \
-            or not all(HEX40.match(v) for _, v in h[:n + 1]) or not all(_IDENT.match(v) for _, v in h[n + 1:n + 3]):
+            or not all(HEX40.match(v) for _, v in h[:n + 1]) or not all(_ident(v) for _, v in h[n + 1:n + 3]):
         return None
     return [(h[0][1].decode(), b"tree")] + [(v.decode(), b"commit") for _, v in h[1:n + 1]]
 
@@ -235,7 +247,7 @@ def _tag_links(body):
     m = 4 if keys[3:4] == [b"tagger"] else 3
     if keys[:3] != [b"object", b"type", b"tag"] or set(keys[m:]) & {b"object", b"type", b"tag", b"tagger"} \
             or not HEX40.match(h[0][1]) or h[1][1] not in _TYPES or not h[2][1] \
-            or (m == 4 and not _IDENT.match(h[3][1])):
+            or (m == 4 and not _ident(h[3][1])):
         return None
     return [(h[0][1].decode(), h[1][1])]
 

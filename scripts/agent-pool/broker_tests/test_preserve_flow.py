@@ -643,7 +643,15 @@ class MalformedObjects(Base):
         on_dup = _commit(b"tree " + dup_id.encode() + b"\n" + self.IDENT + b"\nm\n")
         parent_tree = _commit(b"tree " + toid.encode() + b"\nparent " + toid.encode() + b"\n" + self.IDENT + b"\nm\n")
         sha = lambda raw: pw.hashlib.sha1(raw).hexdigest()  # noqa: E731,S324
-        return {"missing tree": _with_head(loose, [no_tree], sha(no_tree)),
+        good = _commit(b"tree " + toid.encode() + b"\n" + self.IDENT + b"\nm\n").split(b"\0", 1)[1]
+        zero_size = b"commit 0%d\0" % len(good) + good
+        continued = _commit(b"tree " + toid.encode() + b"\n hidden\n" + self.IDENT + b"\nm\n")
+        overflow = _commit(b"tree " + toid.encode() + b"\nauthor a <a@x> 9999999999999999999 +0000\n"
+                           b"committer a <a@x> 0 +0000\n\nm\n")
+        return {"leading-zero object size": _with_head(loose, [zero_size], sha(zero_size)),
+                "continuation inside the mandatory headers": _with_head(loose, [continued], sha(continued)),
+                "author time past Git's limit": _with_head(loose, [overflow], sha(overflow)),
+                "missing tree": _with_head(loose, [no_tree], sha(no_tree)),
                 "tree names a blob": _with_head(loose, [to_blob], sha(to_blob)),
                 "duplicate tree entries": _with_head(loose, [dup, on_dup], sha(on_dup)),
                 "parent names a tree": _with_head(loose, [parent_tree], sha(parent_tree))}
