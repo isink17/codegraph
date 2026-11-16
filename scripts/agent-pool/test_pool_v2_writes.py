@@ -45,7 +45,7 @@ class Migrated(Pool):
 
     def setUp(self):
         super().setUp()
-        self.outputs = []
+        self.outputs, self.bg_runs = [], []
         for s in SLOTS:
             git("-C", str(self.t / "slots" / s), "checkout", "-q", "--detach", "origin/v2.0")
 
@@ -60,9 +60,30 @@ class Migrated(Pool):
             for tok in getattr(self, "tokens", []):
                 self.assertNotIn(tok, p.name)
         self.assertEqual([p.name for p in self.leases.iterdir() if p.name.endswith(".lock")], [],
-                         "a slot lock was left behind")
+                         "a slot lock was left behind\n" + self.diagnostics())
         self.assertEqual([p.name for p in self.leases.iterdir() if p.name.endswith(".tmp")], [],
                          "a temporary record was left behind")
+
+    def finish(self, procs):
+        """(stdout, stderr) of each background run, recorded with its command
+        and exit status for failure messages."""
+        outs = []
+        for p in procs:
+            out, err = p.communicate(timeout=120)
+            self.outputs.append(out + err)
+            self.bg_runs.append(f"{' '.join(p.args[2:])}: exit {p.returncode}\n  stdout: {out!r}\n  stderr: {err!r}")
+            outs.append((out, err))
+        return outs
+
+    def diagnostics(self):
+        """The background runs, then each lock left in the lease directory with
+        the owner id inside it, and the lease directory listing."""
+        lines = list(self.bg_runs)
+        for p in sorted(self.leases.iterdir()):
+            owner = p / "owner"
+            lines.append(f"{p.name}: " + (f"owner {owner.read_text().strip()}" if owner.exists()
+                                          else "dir" if p.is_dir() else "file"))
+        return "\n".join(lines)
 
     def migrate(self):
         p = self.pool("migrate")
@@ -479,57 +500,51 @@ class MarkerRaces(Migrated):
                 lock.rmdir()
 
     def test_migrate_against_concurrent_acquires(self):
-        procs = [subprocess.Popen(["/bin/bash", str(POOL), "acquire", "--slot", "auto", "--task", "t", "--agent",
-                                   f"ag{i}"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for i in range(4)]
-        mig = subprocess.run(["/bin/bash", str(POOL), "migrate"], env=self.env, capture_output=True, text=True)
-        outs = [p.communicate(timeout=120) for p in procs]
+        procs = [self.popen("acquire", "--slot", "auto", "--task", "t", "--agent", f"ag{i}") for i in range(4)]
+        mig = self.popen("migrate")
+        outs = self.finish(procs + [mig])[:4]
         self.tokens = [t for out, _ in outs for _, t in LEASED.findall(out)]
         leased = [s for out, _ in outs for s, _ in LEASED.findall(out)]
-        self.assertEqual(len(leased), len(set(leased)), "one slot leased twice")
+        why = self.diagnostics()
+        self.assertEqual(len(leased), len(set(leased)), "one slot leased twice\n" + why)
         if mig.returncode == 0:
             # Migration saw no lease, so every acquire ran in version 2 mode or found its slot taken.
-            self.assertEqual((self.leases / ".schema").read_text(), "2\n")
+            self.assertEqual((self.leases / ".schema").read_text(), "2\n", why)
             for s in SLOTS:
                 state = self.rec(s).state
-                self.assertEqual(state, "leased" if s in leased else "free")
+                self.assertEqual(state, "leased" if s in leased else "free", why)
         else:
-            self.assertFalse((self.leases / ".schema").exists())
+            self.assertFalse((self.leases / ".schema").exists(), why)
             for s in SLOTS:
                 path = self.leases / f"{s}.lease"
                 if s in leased:
-                    self.assertIn("\ntoken=", "\n" + path.read_text())
+                    self.assertIn("\ntoken=", "\n" + path.read_text(), why)
                 else:
-                    self.assertFalse(path.exists(), "a refused migration wrote a record")
+                    self.assertFalse(path.exists(), "a refused migration wrote a record\n" + why)
 
 
 class Races(Migrated):
     def test_concurrent_acquires_of_one_slot_have_one_winner(self):
         self.migrate()
-        procs = [subprocess.Popen(["/bin/bash", str(POOL), "acquire", "--slot", A, "--task", "t", "--agent",
-                                   f"ag{i}"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for i in range(8)]
-        outs = [p.communicate(timeout=120)[0] for p in procs]
+        procs = [self.popen("acquire", "--slot", A, "--task", "t", "--agent", f"ag{i}") for i in range(8)]
+        outs = [out for out, _ in self.finish(procs)]
         wins = [m for out in outs for m in LEASED.findall(out)]
         self.tokens = [t for _, t in wins]
-        self.assertEqual(len(wins), 1, outs)
+        self.assertEqual(len(wins), 1, self.diagnostics())
         r = self.rec(A)
         self.assertEqual((r.generation, r.token), (1, wins[0][1]))
 
     def test_release_against_acquire_never_issues_one_generation_twice(self):
         self.migrate()
         _, token = self.acquire(A)
-        rel = subprocess.Popen(["/bin/bash", str(POOL), "release", "--slot", A, "--token", token], env=self.env,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        acq = [subprocess.Popen(["/bin/bash", str(POOL), "acquire", "--slot", A, "--task", "t", "--agent", "x"],
-                                env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-               for _ in range(3)]
-        out, err = rel.communicate(timeout=120)
-        self.assertEqual(rel.returncode, 0, out + err)
-        wins = [m for p in acq for m in LEASED.findall(p.communicate(timeout=120)[0])]
+        rel = self.popen("release", "--slot", A, "--token", token)
+        acq = [self.popen("acquire", "--slot", A, "--task", "t", "--agent", "x") for _ in range(3)]
+        outs = self.finish([rel] + acq)
+        self.assertEqual(rel.returncode, 0, self.diagnostics())
+        wins = [m for out, _ in outs[1:] for m in LEASED.findall(out)]
         self.tokens += [t for _, t in wins]
         r = self.rec(A)
-        self.assertLessEqual(len(wins), 1)
+        self.assertLessEqual(len(wins), 1, self.diagnostics())
         if wins:
             self.assertEqual((r.state, r.generation, r.token), ("leased", 2, wins[0][1]))
         else:

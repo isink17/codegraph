@@ -5,7 +5,7 @@ set -euo pipefail
 POOL=$(cd "$(dirname "$0")" && pwd)/pool.sh
 T=$(mktemp -d "${TMPDIR:-/tmp}/pool-test.XXXXXX") || exit 1
 T=$(cd "$T" && pwd -P) || exit 1
-trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'kill $(cat "$T/linger/all" 2>/dev/null) 2>/dev/null || :; chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds CG_POOL_REPO=$T/seed
 : >"$T/cwds"
 fails=0
@@ -20,6 +20,35 @@ expect() { # expect <exit code> <command...>
 state() { "$POOL" status "$1" | sed -n 1p | sed 's/^[^:]*: //'; }
 token() { sed -n 's/^token=//p' "$CG_POOL_LEASES/$1.lease"; }
 g() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+# racer <name> <command...>: runs one competitor and keeps its command, exit
+# status, stdout and stderr under $T/<name>.*, so a failed race explains itself.
+racer() {
+	local n=$1 rc=0
+	shift
+	printf '%q ' "$@" >"$T/$n.cmd"
+	"$@" >"$T/$n.out" 2>"$T/$n.err" || rc=$?
+	echo "$rc" >"$T/$n.rc"
+}
+wins_of() { grep -lx 0 "$T/$1"*.rc 2>/dev/null | wc -l | tr -d ' '; }
+# Every racer named <prefix>*, then the locks (with their owner ids), leases
+# and slot states left behind.
+race_report() {
+	local f n
+	echo "race $1 in $T:"
+	for f in "$T/$1"*.rc; do
+		n=${f%.rc}
+		echo "  ${n##*/}: exit $(cat "$f"): $(cat "$n.cmd")"
+		sed 's/^/    stdout: /' "$n.out"
+		sed 's/^/    stderr: /' "$n.err"
+	done
+	for f in "$CG_POOL_LEASES"/.*.lock; do
+		[[ -e $f ]] && echo "  lock ${f##*/}: owner $(cat "$f/owner" 2>/dev/null || echo none)"
+	done
+	for f in "$CG_POOL_LEASES"/*.lease; do
+		[[ -e $f ]] && echo "  lease ${f##*/}: $(grep -v '^token=' "$f" | tr '\n' ' ')"
+	done
+	for f in codegraph-worker-a codegraph-worker-b codegraph-review; do echo "  $f: $(state $f)"; done
+}
 # Commits a new file <name>.txt in slot $1.
 change() {
 	echo "$2" >"$CG_POOL_ROOT/$1/$2.txt"
@@ -39,11 +68,12 @@ A=codegraph-worker-a B=codegraph-worker-b R=codegraph-review
 
 # Two simultaneous attempts on one worker: exactly one wins.
 for i in 1 2 3 4 5 6 7 8; do
-	("$POOL" acquire --slot $A --task t$i --agent ag$i >"$T/race$i" 2>&1 && echo ok >>"$T/race$i") &
+	racer acq$i "$POOL" acquire --slot $A --task t$i --agent ag$i &
 done
 wait
-wins=$(grep -l '^ok$' "$T"/race? | wc -l | tr -d ' ')
-[[ $wins == 1 ]] || fail "same-slot race: $wins winners"
+wins=$(wins_of acq)
+[[ $wins == 1 ]] || fail "same-slot race: $wins winners
+$(race_report acq)"
 [[ $(state $A) == busy ]] || fail "leased slot state $(state $A)"
 expect 1 "$POOL" acquire --slot $A --task again --agent x
 
@@ -130,11 +160,12 @@ g -C "$CG_POOL_ROOT/$A" switch -q --detach origin/v2.0
 
 # Concurrent releases of one lease: exactly one succeeds.
 for i in 1 2 3 4; do
-	("$POOL" release --slot $A --token "$TA" >/dev/null 2>&1 && echo ok >"$T/rel$i" || : >"$T/rel$i") &
+	racer rel$i "$POOL" release --slot $A --token "$TA" &
 done
 wait
-wins=$(cat "$T"/rel? | grep -c ok || true)
-[[ $wins == 1 ]] || fail "concurrent release: $wins winners"
+wins=$(wins_of rel)
+[[ $wins == 1 ]] || fail "concurrent release: $wins winners
+$(race_report rel)"
 
 # A detached HEAD whose remote branch was deleted is not treated as pushed.
 "$POOL" acquire --slot $A --task gone --agent x >/dev/null
@@ -767,6 +798,141 @@ expect 0 "$POOL" prepare --slot $A
 expect 0 "$POOL" acquire --slot $A --task normal --agent y
 grep -q "^leased $A token=" "$T/out" || fail "acquire of an unleased slot failed: $(cat "$T/out")"
 expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+# Lock cleanup. A run removes only a lock that carries its own id, reports
+# one it cannot remove without changing its exit status, and still releases
+# every other lock it holds. Each case removes or replaces a held lock while
+# the run is inside, as an outside process would.
+lock_hook() { # lock_hook <dir> <program> <trigger argument> <shell commands>
+	mkdir -p "$1"
+	{
+		echo '#!/bin/sh'
+		echo "for a in \"\$@\"; do [ \"\$a\" = $3 ] && { $4; break; }; done"
+		echo "exec \"$2\" \"\$@\""
+	} >"$1/hook"
+	chmod +x "$1/hook"
+}
+LA=$CG_POOL_LEASES/.$A.lock
+lock_hook "$T/gone" "$(command -v git)" fetch "rm -f '$LA/owner'; rmdir '$LA'"
+mv "$T/gone/hook" "$T/gone/git"
+expect 0 "$POOL" acquire --slot $A --task lockgone --agent x
+expect 0 env PATH="$T/gone:$PATH" "$POOL" release --slot $A --token "$(token $A)"
+grep -q "lock $LA not removed" "$T/out" || fail "a vanished lock was not reported: $(cat "$T/out")"
+[[ ! -e $CG_POOL_LEASES/$A.lease && ! -e $LA ]] || fail "release with a vanished lock left a lease or a lock"
+
+lock_hook "$T/foreign" "$(command -v git)" fetch "rm -f '$LA/owner'; rmdir '$LA'; mkdir '$LA'"
+mv "$T/foreign/hook" "$T/foreign/git"
+expect 0 "$POOL" acquire --slot $A --task lockforeign --agent x
+expect 0 env PATH="$T/foreign:$PATH" "$POOL" release --slot $A --token "$(token $A)"
+grep -q "lock $LA not removed" "$T/out" || fail "a foreign lock was not reported: $(cat "$T/out")"
+[[ -d $LA && ! -e $LA/owner ]] || fail "release removed a lock another run created"
+[[ ! -d $LA ]] || rmdir "$LA"
+
+# acquire silences each slot's routine refusals on the auto path, never the
+# lock report: explicit and auto acquire both report a lock that vanished or
+# was replaced while held, keep their exit status and lease, and break nothing.
+for mode in "--slot $A" "--slot auto"; do
+	expect 0 env PATH="$T/gone:$PATH" "$POOL" acquire $mode --task lockgone --agent x
+	grep -q "^leased $A token=" "$T/out" || fail "acquire $mode with a vanished lock did not lease $A: $(cat "$T/out")"
+	grep -q "lock $LA not removed" "$T/out" || fail "acquire $mode hid the vanished-lock report: $(cat "$T/out")"
+	[[ ! -e $LA ]] || fail "acquire $mode left a lock behind"
+	expect 0 "$POOL" release --slot $A --token "$(token $A)"
+	expect 0 env PATH="$T/foreign:$PATH" "$POOL" acquire $mode --task lockforeign --agent x
+	grep -q "lock $LA not removed" "$T/out" || fail "acquire $mode hid the foreign-lock report: $(cat "$T/out")"
+	[[ -d $LA && ! -e $LA/owner ]] || fail "acquire $mode removed a lock another run created"
+	rmdir "$LA"
+	expect 0 "$POOL" release --slot $A --token "$(token $A)"
+done
+"$POOL" prepare --all >/dev/null 2>&1 || true
+# The report comes when the lock is let go, before the outcome: here worker A
+# is not idle, so explicit acquire refuses it and auto acquire moves on to B.
+before() { # before <text> <later text>: both in $T/out, in that order
+	awk -v a="$1" -v b="$2" 'index($0, a) && !x { x = NR } index($0, b) && !y { y = NR } END { exit !(x && y && x < y) }' "$T/out"
+}
+echo dirty >"$CG_POOL_ROOT/$A/dirty.txt"
+expect 1 env PATH="$T/gone:$PATH" "$POOL" acquire --slot $A --task lockorder --agent x
+before "lock $LA not removed" "$A not leased" || fail "explicit acquire reported the vanished lock late: $(cat "$T/out")"
+expect 0 env PATH="$T/gone:$PATH" "$POOL" acquire --slot auto --task lockorder --agent x
+before "lock $LA not removed" "leased $B token=" || fail "auto acquire reported the vanished lock late: $(cat "$T/out")"
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+rm "$CG_POOL_ROOT/$A/dirty.txt"
+# A busy first worker is passed over quietly and the second one is leased.
+expect 0 "$POOL" acquire --slot $A --task busy --agent x
+expect 0 "$POOL" acquire --slot auto --task second --agent y
+grep -q "^leased $B token=" "$T/out" || fail "auto acquire did not take $B: $(cat "$T/out")"
+[[ $(grep -c . "$T/out") == 1 ]] || fail "auto acquire reported routine refusals: $(cat "$T/out")"
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
+lock_hook "$T/multi" "$(command -v python3)" unmigrate "rm -f '$LA/owner'; rmdir '$LA'"
+expect 1 env CG_POOL_PYTHON="$T/multi/hook" "$POOL" unmigrate
+grep -q "lock $LA not removed" "$T/out" || fail "unmigrate did not report the vanished lock: $(cat "$T/out")"
+for s in $A $B $R; do
+	[[ ! -e $CG_POOL_LEASES/.$s.lock ]] || fail "unmigrate left the $s lock behind: $(cat "$T/out")"
+done
+
+# git leaves processes behind that close fds 0-2 and keep every other
+# descriptor they inherited (a detached `gc --auto` after fetch, the fsmonitor
+# daemon after status). A caller that reads pool.sh's output to EOF must get
+# it while such a process still runs, with and without a lock report, and
+# pool.sh must hand git no descriptor its caller did not.
+mkdir -p "$T/linger"
+# No here-documents: the coordinator runs this file in a sandbox that refuses
+# their temporary files.
+printf '%s\n' '#!/bin/sh' 'fd=3' 'while [ $fd -lt 64 ]; do' \
+	'	( true >&$fd ) 2>/dev/null && echo $fd' '	fd=$((fd + 1))' 'done' >"$T/linger/fds"
+printf '%s\n' '#!/bin/sh' 'case " $* " in' '*" fetch "* | *" status "*)' \
+	'	if [ ! -e "$LINGER/pid" ]; then' \
+	'		"$LINGER/fds" >"$LINGER/fds.git"' \
+	'		[ -z "${LINGER_DROP_LOCK:-}" ] || { rm -f "$LINGER_LOCK/owner"; rmdir "$LINGER_LOCK"; }' \
+	'		sh -c '"'"'exec <&- >&- 2>&-; echo $$ >>"$1/all"; echo $$ >"$1/pid.new"; mv "$1/pid.new" "$1/pid"; exec sleep 60'"'"' sh "$LINGER" &' \
+	'		i=0; while [ ! -e "$LINGER/pid" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' \
+	'	fi' '	;;' 'esac' 'exec "$LINGER_GIT" "$@"' >"$T/linger/git"
+chmod +x "$T/linger/fds" "$T/linger/git"
+"$T/linger/fds" >"$T/linger/fds.caller"
+linger() { # linger <label> <expected exit> <env assignments and pool.sh arguments...>
+	local label=$1 want=$2 got=0 pid extra
+	shift 2
+	rm -f "$T/linger/pid" "$T/linger/fds.git"
+	# The command substitution reads stdout and stderr to EOF.
+	out=$(env PATH="$T/linger:$PATH" LINGER="$T/linger" LINGER_LOCK="$LA" LINGER_GIT="$(command -v git)" "$@" 2>&1) || got=$?
+	printf '%s\n' "$out" >"$T/out"
+	pid=$(cat "$T/linger/pid" 2>/dev/null) || { fail "$label: the git stand-in left no process"; return; }
+	kill -0 "$pid" 2>/dev/null || fail "$label: pool.sh's output reached EOF only after git's leftover process exited"
+	kill "$pid" 2>/dev/null || :
+	while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+	[[ $got == "$want" ]] || fail "$label exited $got, want $want: $out"
+	extra=$(grep -vxFf "$T/linger/fds.caller" "$T/linger/fds.git" | tr '\n' ' ') || :
+	[[ -z $extra ]] || fail "$label: git inherited descriptors its caller did not pass: $extra"
+}
+linger "auto acquire" 0 "$POOL" acquire --slot auto --task linger --agent x
+grep -q "^leased $A token=" "$T/out" || fail "auto acquire beside a lingering git did not lease $A: $(cat "$T/out")"
+linger "status" 0 "$POOL" status
+linger "release" 0 "$POOL" release --slot $A --token "$(token $A)"
+for mode in auto $A; do
+	linger "acquire --slot $mode with a vanished lock" 0 LINGER_DROP_LOCK=1 "$POOL" acquire --slot $mode --task linger --agent x
+	grep -q "^leased $A token=" "$T/out" || fail "acquire --slot $mode beside a lingering git did not lease $A: $(cat "$T/out")"
+	grep -q "lock $LA not removed" "$T/out" || fail "acquire --slot $mode beside a lingering git hid the lock report: $(cat "$T/out")"
+	[[ ! -e $LA ]] || fail "acquire --slot $mode beside a lingering git left a lock behind"
+	linger "release after --slot $mode" 0 "$POOL" release --slot $A --token "$(token $A)"
+done
+
+# A lock report written to a stderr pipe whose reader is gone must not kill
+# the run after it leased the slot.
+for mode in auto $A; do
+	rc=$(PATH="$T/gone:$PATH" python3 -c '
+import os, subprocess, sys
+r, w = os.pipe()
+os.close(r)
+print(subprocess.run(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).returncode)' "$POOL" acquire --slot $mode --task brokenpipe --agent x)
+	[[ $rc == 0 ]] || fail "acquire --slot $mode with a vanished lock and a gone stderr reader exited $rc"
+	[[ -e $CG_POOL_LEASES/$A.lease && ! -e $LA ]] || fail "acquire --slot $mode with a gone stderr reader left no lease or a lock"
+	expect 0 "$POOL" release --slot $A --token "$(token $A)"
+done
+
+for f in "$CG_POOL_LEASES"/.*.lock; do
+	[[ ! -e $f ]] || fail "a slot lock was left behind: $f"
+done
 
 if ((fails)); then
 	echo "$fails failure(s)"
