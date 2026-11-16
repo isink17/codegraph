@@ -442,10 +442,12 @@ class Reconstruction(unittest.TestCase):
 
     def test_oversize_object_refuses(self):
         """Every artifact object is <= 49,152 bytes (R4.1 §3.4)."""
-        big = [["%04x" % i + "ab" * 40, canonical.sha256(str(i).encode())] for i in range(400)]
+        big = [[(b"f%04d" % i).hex() + "ab" * 40, canonical.sha256(str(i).encode())] for i in range(400)]
         self.assertGreater(len(canonical.canon({"header": header(), "kind": "entries", "n": 0, "entries": big})),
                            journal.MAX_OBJECT)
         self.mismatch(self.manifest([big])[0])
+        with mock.patch.object(journal, "MAX_OBJECT", 1 << 20):
+            self.assertEqual(len(self.cy.entries(self.manifest([big])[0])), 400)
 
     def test_chunk_of_another_cycle_is_unreadable(self):
         m, chunks, _ = self.manifest([self.entries(2)])
@@ -571,6 +573,28 @@ class GitClassification(unittest.TestCase):
         self.assertEqual({r: "unknown" in repos[r].features for r in repos}, {cafe[:-1]: True, cafe_nfd[:-1]: True})
         _, _, q4, q5, reasons, _ = classify({**files, **nested, b"README.md": b"x", b"readme": b"x"})
         self.assertEqual((q4, q5, reasons), ("COMPLETE", "ELIGIBLE", []))
+
+    def test_a_file_that_is_another_paths_directory_is_ambiguous(self):
+        """On APFS a file `.git/OBJECTS` and the directory `.git/objects/`
+        cannot both exist, so neither the objects nor the file restore as
+        classified. Worktree paths count (`captured`), and a git path that is
+        not UTF-8 has no APFS name."""
+        files, _ = pw.git_repo()
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        sub, _ = pw.git_repo(prefix=b"sub/")
+        for name, gitfiles, captured in (
+                ("file over the objects directory", {**files, b".git/OBJECTS": b"x"}, None),
+                ("file over a fan-out directory", {**files, k[:15].upper(): b"x"}, None),
+                ("file over the refs directory", {**files, b".git/Refs": b"x"}, None),
+                ("worktree file over a nested root", {**files, **sub}, [*files, *sub, b"Sub"]),
+                ("root that is not UTF-8", {**files, **{b"\xff" + q: d for q, d in sub.items()}}, None)):
+            with self.subTest(name):
+                repos = gitclass.repositories(gitfiles, captured)
+                _, _, q4, q5, reasons, _ = gitclass.questions(repos, "COMPLETE")
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        repos = gitclass.repositories({**files, **sub}, [*files, *sub, b"Sub2", b"sub.txt"])
+        self.assertEqual(gitclass.questions(repos, "COMPLETE")[2:5], ("COMPLETE", "ELIGIBLE", []))
 
     def test_config_include_is_external(self):
         """A config included from outside the captured tree is never preserved."""

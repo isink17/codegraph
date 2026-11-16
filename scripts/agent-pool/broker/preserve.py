@@ -301,7 +301,7 @@ class _Cycle:
         got = self.blobs(sorted({b for _, b in es}) if full else sorted({b for _, b in git}))
         a.q1 = "COMPLETE" if m["result"] == "COMPLETE" and got is not None else "INCOMPLETE"
         files = {p: got[b] for p, b in git} if got is not None else {}
-        repos = gitclass.repositories(files)
+        repos = gitclass.repositories(files, [bytes.fromhex(p) for p, _ in es])
         a.q2, a.q3, a.q4, a.q5, a.reasons, a.head = gitclass.questions(repos, a.q1)
         a.top = repos.get(b"")
         if "head_resolved" in m:

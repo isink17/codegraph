@@ -198,6 +198,14 @@ class Positive(Base):
         self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
         self.assertEqual(self.w.release(), DENIED)
 
+    def test_worktree_file_over_a_nested_repository_is_not_preservable(self):
+        """A worktree file `Sub` and the nested repository `sub/.git` cannot
+        both exist on APFS; the manifest's worktree paths are compared too."""
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".git"), b"Sub": b"x\n"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
     def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
         self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
         self.w.to_ready()

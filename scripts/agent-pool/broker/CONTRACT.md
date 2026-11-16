@@ -261,9 +261,11 @@ Rules worth repeating:
   `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
 - PR-3b Git classification: a repository is located by any spelling of its
   `.git` component (R2 K3: case-insensitive, plus the code points HFS+
-  ignores); two spellings under one root are `unknown`. So are two captured
-  paths that name one file: the same path below one root, or paths equal on
-  a case- and normalization-insensitive volume (APFS, HFS+). A manifest path
+  ignores); two spellings under one root are `unknown`. So is a root with a
+  path that shares a file or directory with another manifest path (worktree
+  paths included): the same path below the root, or a file named twice or a
+  file named like a directory on a case- and normalization-insensitive volume
+  (APFS, HFS+). So is a git path that is not UTF-8. A manifest path
   with an empty, `.` or `..` component, a NUL or a component over 255 bytes
   is not one the capture walk produces (R2 §3.2) and refuses as
   `artifact_mismatch`. A reachable object

@@ -81,17 +81,20 @@ def is_git_path(path):
     return git_index(path.split(b"/")) is not None
 
 
-def repositories(files):
+def repositories(files, captured=None):
     """{root: Repo} for a captured tree. `files` maps a tree-relative path
     (bytes) to its bytes. A repository is the prefix before the first `.git`
     component; a `.git` regular file is a gitlink (linked worktree or submodule
     checkout) whose objects are elsewhere. A root whose administrative
     directory is spelled more than one way is ambiguous: `unknown`. So is a
-    root with two captured paths that name one file, either as the same path
-    below the administrative directory or on a case- and
+    root with a path that shares a file or directory with another captured
+    path (`captured`: every manifest path, default `files`), either as the
+    same path below the administrative directory or on a case- and
     normalization-insensitive volume: the bytes read here need not be the
-    bytes that end up there."""
-    split, names, folded, ambiguous = {}, {}, {}, set()
+    bytes that end up there. A path that is not UTF-8 has no name on such a
+    volume at all."""
+    shared = _shared(files if captured is None else captured)
+    split, names, ambiguous = {}, {}, set()
     for path, data in files.items():
         parts = path.split(b"/")
         i = git_index(parts)
@@ -104,10 +107,9 @@ def repositories(files):
             ambiguous.add(root)
         fs[sub] = data
         names.setdefault(root, set()).add(parts[i])
-        f = _fold(path)
-        if f in folded:
-            ambiguous |= {root, folded[f]}
-        folded[f] = root
+        f = _fold(path).split("/")
+        if any("/".join(f[:k]) in shared for k in range(1, len(f) + 1)) or not _utf8(path):
+            ambiguous.add(root)
     repos = {}
     for root, fs in split.items():
         repos[root] = classify(root, fs)
@@ -117,13 +119,39 @@ def repositories(files):
 
 
 def _fold(path):
-    """The name APFS or HFS+ (case-insensitive, normalization-insensitive)
-    stores `path` under; folding too much only refuses."""
+    """`path` as APFS or HFS+ compares names (case-insensitive,
+    normalization-insensitive), one component at a time; folding too much
+    only refuses. A component that is not UTF-8 (APFS refuses those) stays
+    apart from every UTF-8 one."""
+    out = []
+    for c in path.split(b"/"):
+        try:
+            s = c.decode("utf-8")
+        except UnicodeDecodeError:
+            out.append("\0" + c.decode("latin-1").lower())
+            continue
+        out.append(unicodedata.normalize("NFD", _HFS_IGNORED.sub("", s)).casefold())
+    return "/".join(out)
+
+
+def _utf8(path):
     try:
-        s = path.decode("utf-8")
+        path.decode("utf-8")
     except UnicodeDecodeError:
-        return path.lower()
-    return unicodedata.normalize("NFD", _HFS_IGNORED.sub("", s)).casefold()
+        return False
+    return True
+
+
+def _shared(paths):
+    """Folded names two captured paths share on APFS or HFS+: one file named
+    twice, or a file that is also another path's directory."""
+    files, dirs, twice = set(), set(), set()
+    for p in paths:
+        f = _fold(p)
+        (twice if f in files else files).add(f)
+        parts = f.split("/")
+        dirs.update("/".join(parts[:k]) for k in range(1, len(parts)))
+    return twice | (files & dirs)
 
 
 def _config(r, data):
