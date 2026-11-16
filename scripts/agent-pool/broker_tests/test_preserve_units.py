@@ -4,6 +4,7 @@ classification over byte fixtures, escaped-set classification and typed
 neutralization (N-R41-9). Inputs are built in memory; nothing reads a live
 path."""
 
+import os
 import types
 import unittest
 from unittest import mock
@@ -591,6 +592,257 @@ class GitClassification(unittest.TestCase):
         (item,) = gitclass.unpublished_commit_items(repo)
         self.assertEqual(item, "i" + canonical.sha256(b"commit:" + coid.encode())[:63])
         self.assertRegex(item, canonical.KEY)
+
+
+def gobj(typ, body):
+    """(id, loose form) built here, not by the code under test."""
+    raw = typ + b" " + str(len(body)).encode() + b"\0" + body
+    return pw.hashlib.sha1(raw).hexdigest(), raw  # noqa: S324 - Git object ids
+
+
+AUTHOR = b"author A U Thor <a@example.com> 1762819200 +0000\n"
+COMMITTER = b"committer C O Mitter <c@example.com> 1762819200 -0130\n"
+SIG = (b"gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEEfixture\n =AbCd\n"
+       b" -----END PGP SIGNATURE-----\n")
+
+
+def object_rows():
+    """{case: (objects, refs, expected (q3, q4, q5), finding, git fsck must object)}.
+    Every object is hand-written bytes. `git fsck --strict` is the independent
+    oracle in `test_git_fsck_agrees`; None marks a case where PR-3b is
+    deliberately stricter than Git: uppercase hex, which Git parses but never
+    writes; a mandatory header repeated after the ones Git reads, which Git
+    ignores; a tree entry name longer than a file name can be."""
+    blob, blob_raw = gobj(b"blob", b"hello\n")
+    tree, tree_raw = gobj(b"tree", b"100644 README\0" + bytes.fromhex(blob))
+    empty, empty_raw = gobj(b"tree", b"")
+    base = {blob: blob_raw, tree: tree_raw}
+
+    def commit(tree_id=tree, parents=(), head=None, tail=b"", msg=b"\nm\n"):
+        lines = head if head is not None else (b"tree " + tree_id.encode() + b"\n"
+                                               + b"".join(b"parent " + p.encode() + b"\n" for p in parents)
+                                               + AUTHOR + COMMITTER)
+        return gobj(b"commit", lines + tail + msg)
+
+    root, root_raw = commit()
+    child, child_raw = commit(parents=(root,))
+    merge, merge_raw = commit(parents=(child, root))
+    signed, signed_raw = commit(parents=(root,), tail=SIG, msg=b"\nsigned\n")
+    on_empty, on_empty_raw = commit(tree_id=empty, msg=b"")
+    tag, tag_raw = gobj(b"tag", b"object " + child.encode() + b"\ntype commit\ntag v1\ntagger "
+                        + AUTHOR[7:] + b"\nrelease\n")
+    wrong_tag, wrong_tag_raw = gobj(b"tag", tag_raw.split(b"\0", 1)[1].replace(b"type commit", b"type tree"))
+    hist = {**base, root: root_raw, child: child_raw}
+    ok, bad = ("VERIFIED", "COMPLETE", "ELIGIBLE"), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE")
+
+    def broken(head=None, objs=(), **kw):
+        c, raw = commit(head=head, **kw)
+        return {**base, **dict(objs), c: raw}, {b"refs/heads/main": c}
+
+    def tree_case(body, extra=()):
+        t, raw = gobj(b"tree", body)
+        c, craw = commit(tree_id=t)
+        return {**base, **dict(extra), t: raw, c: craw}, {b"refs/heads/main": c}
+
+    def tagged(fmt, git=True):
+        ident = AUTHOR[7:]
+        body = fmt % ((child.encode(), ident, child.encode()) if fmt.count(b"%s") == 3 else
+                      (child.encode(), ident) if fmt.count(b"%s") == 2 else (child.encode(),))
+        t, raw = gobj(b"tag", body)
+        return {**hist, t: raw}, {b"refs/heads/main": child, b"refs/tags/v1": t}, bad, "corrupt_object", git
+
+    entry = b"100644 README\0" + bytes.fromhex(blob)
+    missing = gobj(b"blob", b"never stored\n")[0]
+    sub = "5" * 40
+    rows = {
+        "valid ordinary commit": (hist, {b"refs/heads/main": child}, ok, None, False),
+        "valid root commit": ({**base, root: root_raw}, {b"refs/heads/main": root}, ok, None, False),
+        "valid merge commit": ({**hist, merge: merge_raw}, {b"refs/heads/main": merge}, ok, None, False),
+        "valid signed commit, multiline gpgsig": ({**base, root: root_raw, signed: signed_raw},
+                                                  {b"refs/heads/main": signed}, ok, None, False),
+        "valid empty tree, empty message": ({empty: empty_raw, on_empty: on_empty_raw},
+                                            {b"refs/heads/main": on_empty}, ok, None, False),
+        "valid annotated tag": ({**hist, tag: tag_raw}, {b"refs/heads/main": child, b"refs/tags/v1": tag},
+                                ok, None, False),
+        "valid gitlink, submodule commit not in this store": (*tree_case(entry + b"160000 sub\0"
+                                                                         + bytes.fromhex(sub)), ok, "gitlink",
+                                                              False),
+        "commit without tree": (*broken(head=AUTHOR + COMMITTER), bad, "corrupt_object", True),
+        "commit with two tree headers": (*broken(head=b"tree %s\ntree %s\n" % (tree.encode(), tree.encode())
+                                                 + AUTHOR + COMMITTER), bad, "corrupt_object", True),
+        "malformed tree id": (*broken(head=b"tree " + tree[:39].encode() + b"\n" + AUTHOR + COMMITTER),
+                              bad, "corrupt_object", True),
+        "uppercase tree id": (*broken(head=b"tree " + tree.upper().encode() + b"\n" + AUTHOR + COMMITTER),
+                              bad, "corrupt_object", None),
+        "tree header names a blob": (*broken(tree_id=blob), bad, "corrupt_object", True),
+        "parent names a tree": (*broken(parents=(tree,)), bad, "corrupt_object", True),
+        "author without email": (*broken(head=b"tree " + tree.encode() + b"\nauthor A U Thor 1762819200 +0000\n"
+                                         + COMMITTER), bad, "corrupt_object", True),
+        "committer missing": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR), bad, "corrupt_object",
+                              True),
+        "parent after author": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + b"parent " + root.encode()
+                                        + b"\n" + COMMITTER, objs=hist), bad, "corrupt_object", True),
+        "unterminated header": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER[:-1], msg=b""),
+                                bad, "corrupt_object", True),
+        "second tree after committer": (*broken(tail=b"tree " + tree.encode() + b"\n"), bad, "corrupt_object",
+                                        None),
+        "tree entry to a missing blob": (*tree_case(b"100644 README\0" + bytes.fromhex(missing)), bad,
+                                         "missing_object", True),
+        "invalid tree mode": (*tree_case(b"100777 README\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "zero-padded directory mode": (*tree_case(b"040000 d\0" + bytes.fromhex(tree)), bad, "corrupt_object",
+                                       True),
+        "directory entry names a blob": (*tree_case(b"40000 d\0" + bytes.fromhex(blob)), bad, "corrupt_object",
+                                         True),
+        "file entry names a tree": (*tree_case(b"100644 f\0" + bytes.fromhex(tree)), bad, "corrupt_object", True),
+        "duplicate tree entries": (*tree_case(entry + entry), bad, "corrupt_object", True),
+        "entries out of order": (*tree_case(b"100644 b\0" + bytes.fromhex(blob) + b"100644 a\0"
+                                            + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "truncated tree record": (*tree_case(entry[:-5]), bad, "corrupt_object", True),
+        ".git entry in a tree": (*tree_case(b"100644 .git\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "tag declares the wrong type": ({**hist, wrong_tag: wrong_tag_raw},
+                                        {b"refs/heads/main": child, b"refs/tags/v1": wrong_tag}, bad,
+                                        "corrupt_object", True),
+        "branch names a tag object": ({**hist, tag: tag_raw}, {b"refs/heads/main": tag}, bad, "corrupt_object",
+                                      True),
+        "tag type is not an object type": tagged(b"object %s\ntype bogus\ntag v1\ntagger %s\nx\n"),
+        "tag with a malformed tagger": tagged(b"object %s\ntype commit\ntag v1\ntagger nobody 0 +0000\n\nx\n"),
+        "tag with an empty name": tagged(b"object %s\ntype commit\ntag \ntagger %s\nx\n"),
+        "tag repeats its object header": tagged(b"object %s\ntype commit\ntag v1\ntagger %s"
+                                                b"object %s\n\nx\n", git=None),
+        "NUL in a commit header": (*broken(tail=b"encoding UTF\0-8\n"), bad, "corrupt_object", True),
+        "unterminated optional header": (*broken(tail=b"encoding UTF-8", msg=b""), bad, "corrupt_object", True),
+        "continuation line before tree": (*broken(head=b" x\ntree " + tree.encode() + b"\n" + AUTHOR + COMMITTER),
+                                          bad, "corrupt_object", True),
+        "author with an empty name": (*broken(head=b"tree " + tree.encode() + b"\nauthor <a@example.com> 0 +0000\n"
+                                              + COMMITTER), bad, "corrupt_object", True),
+        "zero-padded author time": (*broken(head=b"tree " + tree.encode() + b"\nauthor A <a@example.com> 01 +0000\n"
+                                            + COMMITTER), bad, "corrupt_object", True),
+        "tree entry named dot": (*tree_case(b"100644 .\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "tree entry named dot-dot": (*tree_case(b"100644 ..\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "file and directory with one name": (*tree_case(b"100644 a\0" + bytes.fromhex(blob) + b"40000 a\0"
+                                                        + bytes.fromhex(tree)), bad, "corrupt_object", True),
+        "tree entry name over 255 bytes": (*tree_case(b"100644 " + b"n" * 256 + b"\0" + bytes.fromhex(blob)), bad,
+                                           "corrupt_object", None),
+    }
+    return rows
+
+
+def object_files(objs, refs):
+    g = {b".git/HEAD": b"ref: refs/heads/main\n",
+         b".git/config": b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"}
+    g.update({b".git/" + name: oid.encode() + b"\n" for name, oid in refs.items()})
+    g.update({pw.loose_key(oid): pw.zlib.compress(raw) for oid, raw in objs.items()})
+    return g
+
+
+class GitObjects(unittest.TestCase):
+    """A loose object whose SHA-1 is right is not semantically verified unless
+    its structure and every link's type are: mandatory commit headers, tree
+    modes and names, and the type each link requires."""
+
+    def test_matrix(self):
+        for case, (objs, refs, want, finding, _) in object_rows().items():
+            with self.subTest(case):
+                feats, q3, q4, q5, reasons, _ = classify(object_files(objs, refs))
+                self.assertEqual((q3, q4, q5), want)
+                if finding:
+                    self.assertIn(finding, feats)
+                if want[0] != "VERIFIED":
+                    self.assertEqual(reasons, [finding])
+
+    def test_git_fsck_agrees(self):
+        """Independent oracle: Git itself, in a disposable fixture repository,
+        objects to every case PR-3b refuses and to none it verifies."""
+        from gitfixture import GIT, Lab
+        if GIT is None:
+            self.skipTest("git not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        for n, (case, (objs, refs, _, _, objects)) in enumerate(object_rows().items()):
+            if objects is None:
+                continue
+            with self.subTest(case):
+                r = lab.path(f"r{n}")
+                lab.git(lab.root, "init", "-q", r)
+                for p, d in object_files(objs, refs).items():
+                    if p != b".git/config":
+                        lab.write(r, p.decode(), d)
+                p = lab.git(r, "fsck", "--strict", "--no-dangling", "--no-progress", check=False)
+                noted = p.returncode != 0 or bool(p.stderr.strip())
+                self.assertEqual(noted, objects, p.stderr.decode(errors="replace"))
+
+    def test_shared_object_checked_against_every_referrer(self):
+        """One object reached first as the blob a tree entry wants, then as a
+        commit's tree: the second link's type is still checked."""
+        blob, blob_raw = gobj(b"blob", b"x\n")
+        tree, tree_raw = gobj(b"tree", b"100644 x\0" + bytes.fromhex(blob))
+        good, good_raw = gobj(b"commit", b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER + b"\nm\n")
+        bad, bad_raw = gobj(b"commit", b"tree " + blob.encode() + b"\nparent " + good.encode() + b"\n"
+                            + AUTHOR + COMMITTER + b"\nm\n")
+        objs = {blob: blob_raw, tree: tree_raw, good: good_raw, bad: bad_raw}
+        for refs in ({b"refs/heads/main": bad}, {b"refs/heads/main": good, b"refs/tags/t": bad}):
+            with self.subTest(refs):
+                _, q3, _, q5, reasons, _ = classify(object_files(objs, refs))
+                self.assertEqual((q3, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["corrupt_object"]))
+
+    def test_old_tag_without_tagger_and_tag_of_a_blob(self):
+        blob, blob_raw = gobj(b"blob", b"x\n")
+        objs, base = object_rows()["valid ordinary commit"][:2]
+        for body in (b"object " + base[b"refs/heads/main"].encode() + b"\ntype commit\ntag old\n\nv\n",
+                     b"object " + blob.encode() + b"\ntype blob\ntag key\ntagger " + AUTHOR[7:] + b"\nk\n"):
+            t, raw = gobj(b"tag", body)
+            _, q3, _, q5, _, _ = classify(object_files({**objs, blob: blob_raw, t: raw},
+                                                       {**base, b"refs/tags/t": t}))
+            self.assertEqual((q3, q5), ("VERIFIED", "ELIGIBLE"), body)
+
+    def test_repository_written_by_git(self):
+        """Git's own objects: a merge, an annotated tag, a gitlink, an
+        executable file, a symlink, a subdirectory and a commit of the empty
+        tree are all verified."""
+        from gitfixture import EMPTY_TREE, GIT, Lab
+        if GIT is None:
+            self.skipTest("git not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        r = lab.path("repo")
+        lab.git(lab.root, "init", "-q", r)
+        lab.write(r, "a.txt", b"a\n")
+        lab.write(r, "bin/run", b"#!/bin/sh\n", mode=0o755)
+        os.symlink("a.txt", os.path.join(r, "link"))
+        lab.git(r, "add", "-A")
+        lab.git(r, "commit", "-q", "-m", "root")
+        lab.git(r, "switch", "-q", "-c", "side")
+        lab.write(r, "b.txt", b"b\n")
+        lab.git(r, "add", "b.txt")
+        lab.git(r, "commit", "-q", "-m", "side")
+        lab.git(r, "switch", "-q", "main")
+        lab.git(r, "update-index", "--add", "--cacheinfo", "160000," + "5" * 40 + ",sub")
+        lab.git(r, "commit", "-q", "-m", "gitlink")
+        lab.git(r, "merge", "-q", "--no-ff", "-m", "merge", "side")
+        lab.git(r, "tag", "-a", "-m", "release", "v1")
+        self.assertEqual(lab.git(r, "hash-object", "-w", "-t", "tree", os.devnull).stdout.strip().decode(),
+                         EMPTY_TREE)
+        empty = lab.git(r, "commit-tree", EMPTY_TREE, "-m", "empty").stdout.strip()
+        lab.git(r, "update-ref", "refs/heads/empty", empty)
+        lab.git(r, "fsck", "--strict", "--no-dangling", "--no-progress")
+        files = {}
+        for d, _, names in os.walk(r):
+            for n in names:
+                p = os.path.join(d, n)
+                if not os.path.islink(p):
+                    with open(p, "rb") as f:
+                        files[os.path.relpath(p, r).encode()] = f.read()
+        feats, q3, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        self.assertIn("gitlink", feats)
+
+    def test_links_parse_only_the_header(self):
+        """Message lines that look like headers are not links."""
+        tree, tree_raw = gobj(b"tree", b"")
+        c, raw = gobj(b"commit", b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER
+                      + b"\ntree " + b"0" * 40 + b"\nparent " + b"1" * 40 + b"\n")
+        _, q3, _, q5, _, _ = classify(object_files({tree: tree_raw, c: raw}, {b"refs/heads/main": c}))
+        self.assertEqual((q3, q5), ("VERIFIED", "ELIGIBLE"))
 
 
 def at(data, i, new):

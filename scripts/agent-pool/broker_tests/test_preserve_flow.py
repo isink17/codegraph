@@ -55,6 +55,26 @@ class Base(unittest.TestCase):
         self.assertEqual((self.w.env.snapshot(), pw.store_bytes(self.w), len(self.w.fx.calls)), before)
         return r
 
+    def stuck_at_move(self):
+        """Rejected after the move: one irreversible step, no revoke, the
+        barrier held, every later verb refused with no effect or write, and
+        the F resume re-runs the idempotent effect only to be rejected again."""
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        cid = self.w.cid()
+        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
+        self.assertEqual([r["kind"] for r in self.w.st()["records"]], ["start", "move.done"])
+        self.assertEqual(self.w.row(), ("P7", "MOVE_INTENT"))
+        self.assertEqual(self.w.release(), DENIED)
+        for verb in ("freeze-start", "freeze-continue", "quarantine", "quiescence", "snapshot",
+                     "verify-preservation", "preservation", "ready", "thaw"):
+            with self.subTest(verb):
+                self.refused(verb, Code.VERB_NOT_ALLOWED_IN_STATE, "")
+        self.rejected("resume-step", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
+        self.assertEqual(self.w.release(), DENIED)
+        self.assertEqual((self.w.last_doc("preservation"), self.w.last_doc("ready")), (None, None))
+
 
 # ------------------------------------------------------------------ positive traces
 
@@ -469,26 +489,6 @@ class PackedObjects(Base):
         files = {p: d for p, d in loose.items() if p != pw.loose_key(toid)}
         return pw.with_pack(files, {toid: b"blob 4\0junk"})
 
-    def stuck_at_move(self):
-        """Rejected after the move: one irreversible step, no revoke, the
-        barrier held, every later verb refused with no effect or write, and
-        the F resume re-runs the idempotent effect only to be rejected again."""
-        self.ok("adopt", "request")
-        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
-        cid = self.w.cid()
-        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
-        self.assertEqual([r["kind"] for r in self.w.st()["records"]], ["start", "move.done"])
-        self.assertEqual(self.w.row(), ("P7", "MOVE_INTENT"))
-        self.assertEqual(self.w.release(), DENIED)
-        for verb in ("freeze-start", "freeze-continue", "quarantine", "quiescence", "snapshot",
-                     "verify-preservation", "preservation", "ready", "thaw"):
-            with self.subTest(verb):
-                self.refused(verb, Code.VERB_NOT_ALLOWED_IN_STATE, "")
-        self.rejected("resume-step", "fresult_rejected:not_preservable", "MOVE_INTENT")
-        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
-        self.assertEqual(self.w.release(), DENIED)
-        self.assertEqual((self.w.last_doc("preservation"), self.w.last_doc("ready")), (None, None))
-
     def test_forged_pack_never_reaches_ready_or_d4(self):
         self.w.fx.trees[SLOT] = self.forged()
         self.stuck_at_move()
@@ -565,7 +565,8 @@ class PackedObjects(Base):
             for d, _, names in os.walk(r):
                 for n in names:
                     p = os.path.join(d, n)
-                    out[os.path.relpath(p, r).encode()] = open(p, "rb").read()
+                    with open(p, "rb") as f:
+                        out[os.path.relpath(p, r).encode()] = f.read()
             return out
 
         loose = tree()
@@ -585,6 +586,127 @@ class PackedObjects(Base):
         self.ok("adopt", "request", slot=OTHER)
         self.assertEqual(outcome(self.w.run("freeze-start", slot=OTHER)), ("UNFINISHED",))
         self.assertEqual(self.w.row(OTHER), ("P7", "MOVE_INTENT"))
+
+
+def _superseded_links():
+    """The walker of PR #546 at 2ab37d65 (ids only, no structure or type
+    check), used only to reach later gates and prove each refuses a
+    malformed reachable object on its own."""
+    def links(r, typ, body):
+        out = []
+        if typ in (b"commit", b"tag"):
+            for line in body.split(b"\n"):
+                if not line:
+                    break
+                key, _, val = line.partition(b" ")
+                if key in ((b"tree", b"parent") if typ == b"commit" else (b"object",)):
+                    out.append((val.decode(), None))
+        elif typ == b"tree":
+            i = 0
+            while i < len(body):
+                sp, nul = body.find(b" ", i), body.find(b"\0", i)
+                if body[i:sp] != b"160000":
+                    out.append((body[nul + 1:nul + 21].hex(), None))
+                i = nul + 21
+        return out
+    return mock.patch.object(gitclass, "_links", links)
+
+
+def _with_head(files, raw_objects, head):
+    """`files` plus hand-built loose objects, `refs/heads/main` moved to `head`."""
+    out = {**files, b".git/refs/heads/main": head.encode() + b"\n"}
+    for raw in raw_objects:
+        out[pw.loose_key(pw.hashlib.sha1(raw).hexdigest())] = pw.zlib.compress(raw)  # noqa: S324
+    return out
+
+
+def _commit(body):
+    return b"commit %d\0" % len(body) + body
+
+
+class MalformedObjects(Base):
+    """A hash-consistent loose object whose structure or link types are not
+    Git's is not semantic verification (Q3) and not recovery evidence (Q5).
+    Like R4.2, the first refusal is `check_fresult` after the freeze-start
+    move effect ran; D-QUAR and D-PRES refuse on their own."""
+    IDENT = b"author a <a@x> 0 +0000\ncommitter a <a@x> 0 +0000\n"
+
+    def cases(self):
+        loose, coid = pw.git_repo()
+        toid, _ = pw.head_tree(loose, coid)
+        blob = pw.gobj(b"blob", b"hello\n")[0]
+        no_tree = _commit(self.IDENT + b"\nno tree header\n")
+        to_blob = _commit(b"tree " + blob.encode() + b"\n" + self.IDENT + b"\nm\n")
+        entry = b"100644 README\0" + bytes.fromhex(blob)
+        dup = b"tree %d\0" % (2 * len(entry)) + entry + entry
+        dup_id = pw.hashlib.sha1(dup).hexdigest()  # noqa: S324
+        on_dup = _commit(b"tree " + dup_id.encode() + b"\n" + self.IDENT + b"\nm\n")
+        parent_tree = _commit(b"tree " + toid.encode() + b"\nparent " + toid.encode() + b"\n" + self.IDENT + b"\nm\n")
+        sha = lambda raw: pw.hashlib.sha1(raw).hexdigest()  # noqa: E731,S324
+        return {"missing tree": _with_head(loose, [no_tree], sha(no_tree)),
+                "tree names a blob": _with_head(loose, [to_blob], sha(to_blob)),
+                "duplicate tree entries": _with_head(loose, [dup, on_dup], sha(on_dup)),
+                "parent names a tree": _with_head(loose, [parent_tree], sha(parent_tree))}
+
+    def test_never_reach_ready_or_d4(self):
+        for case, files in self.cases().items():
+            with self.subTest(case):
+                self.w = pw.World()
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = files
+                self.stuck_at_move()
+
+    def test_quarantine_refuses_on_its_own(self):
+        self.w.fx.trees[SLOT] = self.cases()["missing tree"]
+        with _superseded_links():
+            self.ok("adopt", "request", "freeze-start")
+        self.ok("freeze-continue")
+        self.refused("quarantine", Code.PROVENANCE_INSUFFICIENT, "not_preservable(corrupt_object)")
+
+    def test_preservation_and_ready_refuse_on_their_own(self):
+        """Past every earlier gate under the superseded walker, D-PRES still
+        recomputes Q3-Q5 and refuses; READY and D4 stay unreachable. D3 never
+        claims preservation and still re-hashes the protected copy."""
+        files = self.cases()["tree names a blob"]
+        self.w.fx.trees[SLOT] = files
+        with _superseded_links():
+            self.w.to_verified()
+        self.refused("preservation", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(raw)")
+        self.refused("ready", Code.VERB_NOT_ALLOWED_IN_STATE, "")
+        self.assertEqual(self.w.row(), ("P13", "VERIFIED"))
+        self.w.observe()
+        self.assertEqual(rel(self.w.release()), "D3")
+        head = files[b".git/refs/heads/main"][:40].decode()
+        obj = self.w.fx.tree(SLOT)[pw.loose_key(head)]
+        self.w.w.o5.stores["artifacts"].items[f"blob/{canonical.sha256(obj)}"] = obj[:-1]
+        self.w.observe()
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_second_cycle_is_classified_from_its_own_bytes(self):
+        self.ok("adopt", "request", "freeze-start", "freeze-continue", "thaw")
+        c1 = self.w.cid()
+        self.w.fx.trees[SLOT] = self.cases()["missing tree"]
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertNotEqual(self.w.cid(), c1)
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_gitlink_without_submodule_state_reaches_d4(self):
+        """R4 §5.2 (B25): a gitlink entry alone is benign. The submodule commit
+        lives in another object store, so it is recorded (Q2 `gitlink`) and
+        not followed; a checked-out submodule is a nested repository or a
+        gitlink file and is classified as such."""
+        loose, coid = pw.git_repo()
+        toid, traw = pw.head_tree(loose, coid)
+        body = traw.split(b"\0", 1)[1] + b"160000 sub\0" + bytes.fromhex("5" * 40)
+        tree = b"tree %d\0" % len(body) + body
+        c = _commit(b"tree " + pw.hashlib.sha1(tree).hexdigest().encode() + b"\n" + self.IDENT  # noqa: S324
+                    + b"\nm\n")
+        files = _with_head(loose, [tree, c], pw.hashlib.sha1(c).hexdigest())  # noqa: S324
+        feats, q3, q4, q5, _, _ = gitclass.questions(gitclass.repositories(files), "COMPLETE")
+        self.assertEqual((q3, q4, q5, "gitlink" in feats), ("VERIFIED", "COMPLETE", "ELIGIBLE", True))
+        self.w.fx.trees[SLOT] = files
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
 
 
 class Escaped(Base):

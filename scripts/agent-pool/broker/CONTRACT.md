@@ -267,6 +267,29 @@ Rules worth repeating:
   That is presence only: packed contents are never inflated or hashed, so a
   pack and index an agent forged to be self-consistent can list an object the
   pack does not hold. Under R4.2 below, `packed` makes Q5 `NOT_ELIGIBLE`.
+- PR-3b object structure (R2 §2.1: a property that cannot be established is
+  never success). A reachable loose object with the right SHA-1 is verified
+  only when its structure is in the supported subset and every link has the
+  type its referrer requires. A commit has one `tree`, zero or more
+  `parent`, one `author` and one `committer`, in Git's fsck order and ident
+  form, and repeats no mandatory header later. A tag has `object`, `type`,
+  `tag` and an optional `tagger`, and its target has the declared type. A
+  tree has the PR-2 observer's modes, valid distinct names other than `.git`,
+  in Git's order. HEAD and branches name commits. Anything else is
+  `corrupt_object`, a defect: Q3 and Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`. This
+  is stricter than Git where Git only tolerates (uppercase hex, zero-padded or
+  legacy modes).
+- PR-3b gitlinks (R4 §5.2, B25: a gitlink entry alone is benign). A `160000`
+  entry is recorded as the benign Q2 feature `gitlink` and not followed: the
+  submodule commit lives in another object store. A checked-out submodule is
+  a nested repository or a gitlink file and is classified as one. Q5 covers
+  the bytes the slot held; it says nothing about submodule content that was
+  never in the slot.
+- PR-4 prerequisite. Every `not_preservable` refusal (R4.2 and the object
+  rules above) is `check_fresult` rejecting after the freeze-start move ran;
+  F stays `MOVE_INTENT` and the resume never repeats an irreversible step.
+  PR-4 needs a pre-effect eligibility check and an owner-authorized recovery
+  path for such a slot. PR-3b provides neither.
 
 ## Owner amendment R4.2 to the PR-3b contract (2026-11-16)
 

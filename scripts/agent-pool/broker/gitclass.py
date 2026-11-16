@@ -23,6 +23,11 @@ _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
+_TYPES = (b"commit", b"tree", b"blob", b"tag")
+# Tree entry mode: the type its object must have; a gitlink is not followed.
+_MODES = {b"100644": b"blob", b"100755": b"blob", b"120000": b"blob", b"40000": b"tree", b"160000": None}
+# Git's fsck_ident: `name <email> seconds +hhmm`, name nonempty, no zero padding.
+_IDENT = re.compile(rb"[^<>\n]+ <[^<>\n]*> (?:0|[1-9][0-9]{0,18}) [+-][0-9]{4}\Z")
 _HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
@@ -39,7 +44,7 @@ UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts"
 # hashed, so nothing proves the pack holds it.
 UNVERIFIED = frozenset({"packed"})
 # Recorded, benign.
-BENIGN = frozenset({"dangling_symref", "residue", "symref", "packed_refs", "nested"})
+BENIGN = frozenset({"dangling_symref", "residue", "symref", "packed_refs", "nested", "gitlink"})
 
 
 class Repo:
@@ -179,34 +184,97 @@ def _read_object(files, oid):
         return "corrupt"
     head, sep, body = raw.partition(b"\0")
     typ, _, size = head.partition(b" ")
-    if not sep or typ not in (b"commit", b"tree", b"blob", b"tag") or not size.isdigit() or int(size) != len(body):
+    if not sep or typ not in _TYPES or not size.isdigit() or int(size) != len(body):
         return "corrupt"
     return typ, body
 
 
-def _links(typ, body):
-    """Object ids an intact commit, tag or tree refers to (gitlinks excluded)."""
-    if typ in (b"commit", b"tag"):
-        out = []
-        for line in body.split(b"\n"):
-            if not line:
-                break
-            key, _, val = line.partition(b" ")
-            if key in ((b"tree", b"parent") if typ == b"commit" else (b"object",)):
-                if not HEX40.match(val):
-                    return None
-                out.append(val.decode())
-        return out
+def _headers(body):
+    """[(key, value)] of a commit or tag header, up to the blank line or the
+    end of an empty message; a continuation line (leading space, as in
+    `gpgsig`) belongs to the header before it. None unless every header line
+    is `key value` and the header is newline-terminated without NUL."""
+    end = body.find(b"\n\n")
+    head = body[:end + 1] if end >= 0 else body
+    if not head.endswith(b"\n") or b"\0" in head:
+        return None
+    out = []
+    for line in head[:-1].split(b"\n"):
+        key, sp, val = line.partition(b" ")
+        if not key and out:
+            continue
+        if not key or not sp:
+            return None
+        out.append((key, val))
+    return out
+
+
+def _commit_links(body):
+    """Git's fsck commit order: one `tree`, zero or more `parent`, one
+    `author`, one `committer`, then optional headers that never repeat a
+    mandatory key."""
+    h = _headers(body)
+    if h is None:
+        return None
+    keys = [k for k, _ in h]
+    n = keys.count(b"parent")
+    if keys[:n + 3] != [b"tree"] + [b"parent"] * n + [b"author", b"committer"] \
+            or set(keys[n + 3:]) & {b"tree", b"parent", b"author", b"committer"} \
+            or not all(HEX40.match(v) for _, v in h[:n + 1]) or not all(_IDENT.match(v) for _, v in h[n + 1:n + 3]):
+        return None
+    return [(h[0][1].decode(), b"tree")] + [(v.decode(), b"commit") for _, v in h[1:n + 1]]
+
+
+def _tag_links(body):
+    """`object`, `type`, `tag`, an optional `tagger` (old tags lack it), then
+    optional headers; the target must have the declared type."""
+    h = _headers(body)
+    if h is None:
+        return None
+    keys = [k for k, _ in h]
+    m = 4 if keys[3:4] == [b"tagger"] else 3
+    if keys[:3] != [b"object", b"type", b"tag"] or set(keys[m:]) & {b"object", b"type", b"tag", b"tagger"} \
+            or not HEX40.match(h[0][1]) or h[1][1] not in _TYPES or not h[2][1] \
+            or (m == 4 and not _IDENT.match(h[3][1])):
+        return None
+    return [(h[0][1].decode(), h[1][1])]
+
+
+def _tree_links(r, body):
+    """The subset of the PR-2 observer (`gitraw.parse_tree`): known modes,
+    valid distinct names in Git's tree order, whole 20-byte ids. A gitlink is
+    a submodule commit outside this object store: recorded, not followed."""
+    out, i, prev, names = [], 0, None, set()
+    while i < len(body):
+        sp = body.find(b" ", i, i + 7)
+        nul = body.find(b"\0", sp + 1) if sp >= 0 else -1
+        if sp < 0 or nul < 0 or nul + 21 > len(body):
+            return None
+        mode, name = body[i:sp], body[sp + 1:nul]
+        if mode not in _MODES or not 0 < len(name) <= 255 or name in (b".", b"..") or b"/" in name \
+                or is_gitdir_name(name) or name in names:
+            return None
+        key = name + b"/" if mode == b"40000" else name
+        if prev is not None and key <= prev:
+            return None
+        if _MODES[mode] is None:
+            r.features.add("gitlink")
+        else:
+            out.append((body[nul + 1:nul + 21].hex(), _MODES[mode]))
+        names.add(name)
+        prev, i = key, nul + 21
+    return out
+
+
+def _links(r, typ, body):
+    """[(id, required type)] an intact object refers to, or None when its
+    structure is outside the supported subset."""
+    if typ == b"commit":
+        return _commit_links(body)
+    if typ == b"tag":
+        return _tag_links(body)
     if typ == b"tree":
-        out, i = [], 0
-        while i < len(body):
-            sp, nul = body.find(b" ", i), body.find(b"\0", i)
-            if sp < 0 or nul < sp or nul + 21 > len(body):
-                return None
-            if body[i:sp] != b"160000":
-                out.append(body[nul + 1:nul + 21].hex())
-            i = nul + 21
-        return out
+        return _tree_links(r, body)
     return []
 
 
@@ -266,29 +334,33 @@ def _pack_index(r, files):
     return listed
 
 
-def _closure(r, files, tips):
+def _closure(r, files, tips, commits):
+    """Walks every object reachable from `tips`; `commits` must be commits
+    (HEAD and branches, as Git's fsck requires). A link to an object of
+    another type than its referrer requires is `corrupt_object`."""
     packed = _pack_index(r, files)
-    seen, todo = set(), sorted(tips)
+    kinds, todo = {}, [(oid, b"commit" if oid in commits else None) for oid in sorted(tips)]
     while todo:
-        oid = todo.pop()
-        if oid in seen:
-            continue
-        if len(seen) >= MAX_OBJECTS:
-            r.features.add("unknown")
-            return
-        seen.add(oid)
-        got = _read_object(files, oid)
-        if got == "missing":
-            r.features.add("packed" if oid in packed else "missing_object")
-            continue
-        if got == "corrupt":
+        oid, want = todo.pop()
+        if oid not in kinds:
+            if len(kinds) >= MAX_OBJECTS:
+                r.features.add("unknown")
+                return
+            got = _read_object(files, oid)
+            kinds[oid] = None
+            if got == "missing":
+                r.features.add("packed" if oid in packed else "missing_object")
+            elif got == "corrupt":
+                r.features.add("corrupt_object")
+            else:
+                links = _links(r, *got)
+                if links is None:
+                    r.features.add("corrupt_object")
+                else:
+                    kinds[oid] = got[0]
+                    todo.extend(links)
+        if want is not None and kinds[oid] is not None and kinds[oid] != want:
             r.features.add("corrupt_object")
-            continue
-        links = _links(*got)
-        if links is None:
-            r.features.add("corrupt_object")
-            continue
-        todo.extend(x for x in links if x not in seen)
 
 
 def classify(root, files):
@@ -341,7 +413,8 @@ def classify(root, files):
                 r.head_oid = target[1]
             r.head = {"kind": "symbolic"}
     r.tips = {val for kind, val in refs.values() if kind != "sym"} | ({r.head_oid} if r.head_oid else set())
-    _closure(r, files, r.tips)
+    branches = {val for name, (kind, val) in refs.items() if kind != "sym" and name.startswith(b"refs/heads/")}
+    _closure(r, files, r.tips, branches | ({r.head_oid} if r.head_oid else set()))
     return r
 
 
