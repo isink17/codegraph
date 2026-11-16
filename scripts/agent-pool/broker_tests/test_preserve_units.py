@@ -467,6 +467,38 @@ def classify(files):
     return gitclass.questions(gitclass.repositories(files), "COMPLETE")
 
 
+def captured(root):
+    """{tree path: bytes} of every regular file under `root`, as a capture
+    walk would hand them over (symlinks are not files here)."""
+    files = {}
+    for d, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.islink(p):
+                with open(p, "rb") as f:
+                    files[os.path.relpath(p, root).encode()] = f.read()
+    return files
+
+
+def git_lab(test):
+    from gitfixture import GIT, Lab
+    if GIT is None:
+        test.skipTest("git not installed")
+    lab = Lab()
+    test.addCleanup(lab.cleanup)
+    return lab
+
+
+def three_commits(lab):
+    r = lab.path("repo")
+    lab.git(lab.root, "init", "-q", r)
+    for i in range(3):
+        lab.write(r, "a.txt", b"%d\n" % i)
+        lab.git(r, "add", "a.txt")
+        lab.git(r, "commit", "-q", "-m", str(i))
+    return r
+
+
 class GitClassification(unittest.TestCase):
     def q(self, *variant, extra=None):
         files, _ = pw.git_repo(variant=variant)
@@ -629,6 +661,67 @@ class GitClassification(unittest.TestCase):
                  b".git/COMMIT_EDITMSG": b"m\n", b".git/description": b"d\n", b".git/info/exclude": b"",
                  b".git/hooks/pre-commit.sample": b"", b".git/refs/heads/Feature": oid + b"\n"}
         self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_commit_graph_is_never_trusted(self):
+        """NB-7: Git takes parents and generation numbers from a commit-graph
+        instead of the verified commits, and recovery has no step that drops
+        or rebuilds it, so any commit-graph makes the repository unsupported.
+        Its bytes are still preserved (Q4)."""
+        files, _ = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        chain = b".git/objects/info/commit-graphs/"
+        for name, extra in (("single file", {b".git/objects/info/commit-graph": b"CGPH"}),
+                            ("split chain", {chain + b"commit-graph-chain": b"0" * 40 + b"\n",
+                                             chain + b"graph-" + b"0" * 40 + b".graph": b"CGPH"}),
+                            ("empty", {b".git/objects/info/commit-graph": b""}),
+                            ("nested repository", {**nested, b"vendor/lib/.git/objects/info/commit-graph": b"CGPH"})):
+            with self.subTest(name):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("commit_graph", reasons)
+        for name in (b".git/objects/info/Commit-Graph", b".git/objects/info/COMMIT-GRAPHS/commit-graph-chain"):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, name: b"CGPH"})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        self.assertEqual(classify({**files, b".git/objects/info/commit-graph.lock": b"CGPH"})[2:5],
+                         ("COMPLETE", "ELIGIBLE", []))
+
+    def test_commit_graph_written_by_git_is_refused(self):
+        """The same repository is eligible until Git writes a commit-graph,
+        single or split."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        self.assertEqual(classify(captured(r))[1:5], ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        for args in (("--reachable",), ("--reachable", "--split")):
+            with self.subTest(args):
+                lab.git(r, "commit-graph", "write", "--no-progress", *args)
+                files = captured(r)
+                self.assertTrue(any(p.startswith(b".git/objects/info/commit-graph") for p in files))
+                self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["commit_graph"]))
+
+    def test_replace_refs_loose_or_packed(self):
+        """NB-8: Git applies a `refs/replace/*` ref from packed-refs exactly as
+        a loose one, so both are the same finding."""
+        files, coid = pw.git_repo()
+        name = b"refs/replace/" + coid.encode()
+        loose = {b".git/" + name: coid.encode() + b"\n"}
+        packed = {b".git/packed-refs": b"# pack-refs with: peeled fully-peeled sorted \n" + coid.encode() + b" " + name
+                  + b"\n"}
+        for case, extra in (("loose", loose), ("packed", packed), ("both", {**loose, **packed})):
+            with self.subTest(case):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["replace_refs"]))
+
+    def test_packed_replace_ref_written_by_git_is_refused(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        lab.git(r, "replace", "HEAD~1", "HEAD~2")
+        lab.git(r, "pack-refs", "--all")
+        files = captured(r)
+        self.assertFalse([p for p in files if p.startswith(b".git/refs/replace/")], "the replace ref is still loose")
+        self.assertIn(b"refs/replace/", files[b".git/packed-refs"])
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["replace_refs"]))
 
     def test_one_directory_spelled_two_ways_is_ambiguous(self):
         """APFS keeps the first spelling of a directory, so `refs/heads/Feat/a`
@@ -989,14 +1082,7 @@ class GitObjects(unittest.TestCase):
         empty = lab.git(r, "commit-tree", EMPTY_TREE, "-m", "empty").stdout.strip()
         lab.git(r, "update-ref", "refs/heads/empty", empty)
         lab.git(r, "fsck", "--strict", "--no-dangling", "--no-progress")
-        files = {}
-        for d, _, names in os.walk(r):
-            for n in names:
-                p = os.path.join(d, n)
-                if not os.path.islink(p):
-                    with open(p, "rb") as f:
-                        files[os.path.relpath(p, r).encode()] = f.read()
-        feats, q3, q4, q5, reasons, _ = classify(files)
+        feats, q3, q4, q5, reasons, _ = classify(captured(r))
         self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
         self.assertIn("gitlink", feats)
 

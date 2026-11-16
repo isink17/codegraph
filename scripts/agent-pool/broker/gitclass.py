@@ -43,8 +43,11 @@ DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malf
 # Q4 INCOMPLETE(git_external): objects or administration live outside the captured tree.
 EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE: preserved as bytes, never claimed recoverable through Git.
+# `commit_graph`: Git reads parents and generations from a commit-graph
+# instead of the verified commits, and recovery has no step that drops or
+# rebuilds it, so the Git view after a restore is not the verified one.
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
-                         "submodule_gitdir", "git_head", "unborn_head"})
+                         "submodule_gitdir", "git_head", "unborn_head", "commit_graph"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE, Q4 unchanged (owner amendment R4.2 to
 # R2 K7 / R4 §5.2 / P2). `packed`: a reachable object is not loose but a
 # consistent pack index lists it; its packed content is never inflated or
@@ -230,6 +233,8 @@ def _packed(r, data, refs):
         if HEX40.match(oid) and _REF.match(name):
             refs.setdefault(name, ("packed", oid.decode()))
             last = name
+            if name.startswith(b"refs/replace/"):
+                r.features.add("replace_refs")
         elif HEX64.match(oid):
             r.features.add("unsupported_object_format")
         else:
@@ -442,7 +447,8 @@ def _closure(r, files, tips, commits):
 # file to Git and an unseen one here.
 _ADMIN = frozenset({b"HEAD", b"config", b"shallow", b"packed-refs", b"commondir", b"reftable", b"modules",
                     b"info", b"info/grafts", b"objects", b"objects/info", b"objects/info/alternates",
-                    b"objects/info/http-alternates", b"objects/pack", b"refs", b"refs/heads",
+                    b"objects/info/http-alternates", b"objects/info/commit-graph",
+                    b"objects/info/commit-graphs", b"objects/pack", b"refs", b"refs/heads",
                     b"refs/replace"})
 _ADMIN_FOLDED = frozenset(_fold(a) for a in _ADMIN)
 
@@ -458,7 +464,9 @@ def classify(root, files):
         _config(r, files[b"config"])
     for name, feat in ((b"shallow", "shallow"), (b"objects/info/alternates", "alternates"),
                        (b"objects/info/http-alternates", "alternates"), (b"info/grafts", "grafts"),
-                       (b"commondir", "commondir"), (b"reftable", "reftable")):
+                       (b"commondir", "commondir"), (b"reftable", "reftable"),
+                       (b"objects/info/commit-graph", "commit_graph"),
+                       (b"objects/info/commit-graphs", "commit_graph")):
         if name in files or any(p.startswith(name + b"/") for p in files):
             r.features.add(feat)
     if any(p.startswith(b"modules/") for p in files):

@@ -298,6 +298,30 @@ Rules worth repeating:
   a nested repository or a gitlink file and is classified as one. Q5 covers
   the bytes the slot held; it says nothing about submodule content that was
   never in the slot.
+- PR-3b history views. A commit-graph (`objects/info/commit-graph` or
+  anything under `objects/info/commit-graphs/`) is a rebuildable Git cache
+  that is never trusted: Git takes parents and generation numbers from it
+  instead of the commits, so a forged or stale graph changes Git's history
+  without changing a verified object. Restore copies bytes and never runs
+  Git (R4 §5.4), and PR-3b has no step that drops or rebuilds the graph, so
+  ignoring it cannot be enforced here. Any commit-graph is therefore the
+  unsupported finding `commit_graph`, like grafts and replace refs (F5 G12):
+  Q3 `INCOMPLETE`, Q4 unchanged (its bytes are preserved), Q5
+  `NOT_ELIGIBLE`. Another spelling of either name is `unknown`. Git writes a
+  graph on `gc`, which also packs the objects, so such a slot is already
+  `NOT_ELIGIBLE(packed)` under R4.2. A `refs/replace/*` name is
+  `replace_refs` whether the ref is loose or a `packed-refs` line.
+- Recorded head on a case-insensitive volume (not changed in PR-3b). Git on
+  APFS reads a loose ref under another case (`refs/heads/Main`) for a
+  packed ref (`refs/heads/main`); the classifier compares ref names as
+  bytes and records the packed oid. Both oids are verified tips and their
+  objects are preserved, but the preservation document's `head` names the
+  packed commit, not Git's. With a synthetic final observation that reuses
+  the classifier this reaches P18 and D4. READY refuses it
+  (`NOT_CLEAN(head)`) when `final_observation.head_resolved` is the commit
+  the PR-2 observer resolves through the OS, which is Git's. PR-4 must
+  produce `head_resolved` that way; the observer's CLEAN status alone does
+  not catch this case once the index matches Git's HEAD.
 - PR-4 prerequisite. Every `not_preservable` refusal (R4.2 and the object
   rules above) is `check_fresult` rejecting after the freeze-start move ran;
   F stays `MOVE_INTENT` and the resume never repeats an irreversible step.
