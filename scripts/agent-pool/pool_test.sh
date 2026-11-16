@@ -471,12 +471,15 @@ else
 $(race_report prep)"
 	# The racing acquire can hold the lock through every prepare's attempt and
 	# then refuse because $A is behind; only a prepare that got the lock had
-	# to move it.
+	# to move it. The trace, not only each prepare's own message, shows who
+	# got the lock.
 	if [[ $(head_of $A) != "$(base_of)" ]]; then
 		for f in "$T"/prep?.err; do
 			grep -q "^$A lock held: " "$f" || { fail "concurrent prepares left $A behind
 $(race_report prep)"; break; }
 		done
+		! grep -q "^prep[0-9] mkdir exit=0 " "$T/locktrace.log" || fail "a prepare took the lock and left $A behind
+$(race_report prep)"
 	fi
 fi
 if lease_exists $A; then "$POOL" release --slot $A --token "$(token $A)" >/dev/null; fi
