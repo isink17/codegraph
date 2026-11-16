@@ -33,9 +33,10 @@ EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE: preserved as bytes, never claimed recoverable through Git.
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
                          "submodule_gitdir", "git_head", "unborn_head"})
-# Q3 INCOMPLETE only (still eligible: restoration never uses Git). `packed`: a
-# reachable object is not loose but a consistent pack index lists it; its
-# packed content is never inflated or hashed, so it is not verified.
+# Q3 INCOMPLETE and Q5 NOT_ELIGIBLE, Q4 unchanged (owner amendment R4.2 to
+# R2 K7 / R4 §5.2 / P2). `packed`: a reachable object is not loose but a
+# consistent pack index lists it; its packed content is never inflated or
+# hashed, so nothing proves the pack holds it.
 UNVERIFIED = frozenset({"packed"})
 # Recorded, benign.
 BENIGN = frozenset({"dangling_symref", "residue", "symref", "packed_refs", "nested"})
@@ -357,7 +358,8 @@ def questions(repos, q1):
         else "INCOMPLETE"
     q4 = "COMPLETE" if q1 == "COMPLETE" and top is not None and not feats & (DEFECTS | EXTERNAL) else "INCOMPLETE"
     head = top.head_oid if top is not None else None
-    q5 = "ELIGIBLE" if q4 == "COMPLETE" and head is not None and not feats & UNSUPPORTED else "NOT_ELIGIBLE"
+    q5 = "ELIGIBLE" if q4 == "COMPLETE" and head is not None and not feats & (UNSUPPORTED | UNVERIFIED) \
+        else "NOT_ELIGIBLE"
     return sorted(feats), q3, q4, q5, reasons, head
 
 

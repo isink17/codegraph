@@ -67,6 +67,24 @@ def pack_pair(raws):
     return pack, reseal(idx + bytes(20))
 
 
+def loose_key(oid):
+    return b".git/objects/" + oid[:2].encode() + b"/" + oid[2:].encode()
+
+
+def head_tree(files, coid):
+    """(tree id, loose form) of the commit `coid` stored loose in `files`."""
+    toid = zlib.decompress(files[loose_key(coid)]).split(b"\0", 1)[1][5:45].decode()
+    return toid, zlib.decompress(files[loose_key(toid)])
+
+
+def with_pack(files, raws, name=b"f"):
+    """`files` plus a consistent pack and index holding `raws` ({listed id:
+    loose form}); the id is never checked against the content."""
+    pack, idx = pack_pair(raws)
+    stem = b".git/objects/pack/pack-" + name
+    return {**files, stem + b".pack": pack, stem + b".idx": idx}
+
+
 def git_repo(worktree=None, variant=(), prefix=b""):
     """{tree path: bytes} for a worktree and its loose-object `.git`."""
     worktree = worktree if worktree is not None else {b"README": b"hello\n", b"main.go": b"package main\n"}

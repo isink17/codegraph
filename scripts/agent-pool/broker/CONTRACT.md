@@ -266,9 +266,40 @@ Rules worth repeating:
   index passes bounded structural checks against its sibling pack (R2 K7).
   That is presence only: packed contents are never inflated or hashed, so a
   pack and index an agent forged to be self-consistent can list an object the
-  pack does not hold, and the slot still reaches READY and D4 (the recorded
-  counterexample in the cleanup evidence). Closing it needs packed-object
-  verification or a contract change; neither is in PR-3b.
+  pack does not hold. Under R4.2 below, `packed` makes Q5 `NOT_ELIGIBLE`.
+
+## Owner amendment R4.2 to the PR-3b contract (2026-11-16)
+
+A narrow safety amendment to approved R4.1. It supersedes only the
+packed-only ELIGIBLE/READY assumption of R2 K7, R4 §5.2 (row "Packed-only
+objects": `eligible`) and acceptance test P2 ("READY reached"). Historical
+contracts and evidence stay as written.
+
+- **Rule.** When any reachable object of any captured repository is known
+  only through a pack index (feature `packed`), Q5 is
+  `NOT_ELIGIBLE(packed)`. This covers valid packed-only and mixed
+  repositories, deltified objects and forged self-consistent packs alike,
+  because PR-3b never verifies packed contents or their closure. No trusted
+  packed-content verifier exists; adding one needs its own review.
+- **Unchanged.** Q1 (raw capture) and Q4 (R2 §2.1: is preservation complete)
+  keep their meaning: a complete capture of a packed repository is still Q1
+  and Q4 `COMPLETE`. Q3 stays `INCOMPLETE(packed)` and is still never read as
+  a gate; the Q2 feature `packed` feeds Q5 directly. A structurally invalid
+  index, or an index without its pack, stays `unknown` (Q4 `INCOMPLETE`).
+- **Not a blanket refusal.** A pack file alone changes nothing: when every
+  reachable object is a verified loose object, unrelated or duplicate packs
+  are ignored and the slot stays eligible.
+- **Where it refuses.** The EP manifest is the output of the freeze-start
+  move effect, so the first refusal is `check_fresult` rejecting
+  (`freeze-start`, MOVED) with `not_preservable` after the move ran: F stays
+  `MOVE_INTENT`, no attribute is revoked, the barrier stays held and the
+  release refuses, the F resume repeats the idempotent effect and is rejected
+  again. This is the existing path of every other `NOT_ELIGIBLE` reason
+  (shallow, unborn HEAD, alternates). D-QUAR and D-PRES recompute Q5 and
+  refuse on their own; READY needs D-PRES, and D4 needs READY.
+- **P2 as amended.** Packed-only: freeze-start rejected `not_preservable`;
+  recomputed Q1 `COMPLETE`, Q3 `INCOMPLETE`, Q4 `COMPLETE`, Q5
+  `NOT_ELIGIBLE`; no preservation document, no READY, no D4.
 
 ## Not in PR-1
 

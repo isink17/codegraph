@@ -461,7 +461,7 @@ class GitClassification(unittest.TestCase):
     def test_feature_matrix(self):
         rows = {
             ("packed_refs",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
-            ("packed_only",): ("INCOMPLETE", "COMPLETE", "ELIGIBLE"),
+            ("packed_only",): ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"),
             ("symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("dangling_symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("detached",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
@@ -620,9 +620,11 @@ class PackIndex(unittest.TestCase):
         pack, idx = pw.pack_pair({oid: pw.zlib.decompress(z)})
         return {b".git/objects/pack/pack-u.pack": pack, b".git/objects/pack/pack-u.idx": idx}
 
-    def test_listed_objects_are_packed_and_eligible(self):
+    def test_listed_objects_are_packed_and_not_eligible(self):
+        """R4.2: index presence is not content verification."""
         _, q3, q4, q5, reasons, head = classify(self.files)
-        self.assertEqual((q3, q4, q5, reasons, head), ("INCOMPLETE", "COMPLETE", "ELIGIBLE", ["packed"], self.coid))
+        self.assertEqual((q3, q4, q5, reasons, head),
+                         ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"], self.coid))
         self.assertEqual(len(gitclass._idx_names(self.idx, self.pack)), self.n)
 
     def test_a_pack_file_name_proves_nothing(self):
@@ -688,6 +690,78 @@ class PackIndex(unittest.TestCase):
                 _, _, q4, q5, reasons, _ = self.with_pair(bad_idx, bad_pack)
                 self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
                 self.assertIn("unknown", reasons)
+
+
+def packed_rows():
+    """{case: (files, q1, (q1, q3, q4, q5), reasons)} for owner amendment R4.2.
+    A reachable object known only through a pack index is never content
+    verified, so Q5 is NOT_ELIGIBLE whatever the pack holds; Q1 and Q4 keep
+    their R2 meaning; loose objects decide whenever they are present."""
+    loose, coid = pw.git_repo()
+    toid, traw = pw.head_tree(loose, coid)
+    no_tree = {p: d for p, d in loose.items() if p != pw.loose_key(toid)}
+    raws = {p[13:].replace(b"/", b"").decode(): pw.zlib.decompress(d)
+            for p, d in loose.items() if p.startswith(b".git/objects/")}
+    readme = next(r for r in raws.values() if r == b"blob 6\0hello\n")
+    body = b"100644 OTHER\0" + bytes(20)
+    wrong_tree = b"tree %d\0" % len(body) + body
+    packed = pw.git_repo(variant=("packed_only",))[0]
+    ip = next(p for p in packed if p.endswith(b".idx"))
+    nested = pw.git_repo(variant=("packed_only",), prefix=b"vendor/lib/")[0]
+    unrelated = pw.with_pack(loose, {pw.gobj(b"blob", b"unrelated\n")[0]: b"blob 10\0unrelated\n"}, b"u")
+    ok, pk = ("COMPLETE", "VERIFIED", "COMPLETE", "ELIGIBLE"), ("COMPLETE", "INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE")
+    gone = ("COMPLETE", "INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE")
+    return {
+        "01 loose only": (loose, "COMPLETE", ok, []),
+        "02 packed only": (packed, "COMPLETE", pk, ["packed"]),
+        "03 forged: index lists the tree, the pack holds a blob the repository has": (
+            pw.with_pack(no_tree, {toid: readme}), "COMPLETE", pk, ["packed"]),
+        "04 forged: index lists the tree, the pack holds an object that exists nowhere": (
+            pw.with_pack(no_tree, {toid: b"blob 0\0"}), "COMPLETE", pk, ["packed"]),
+        "05 forged: index lists the tree, the pack holds a different tree": (
+            pw.with_pack(no_tree, {toid: wrong_tree}), "COMPLETE", pk, ["packed"]),
+        "06a pack without its index": ({p: d for p, d in packed.items() if p != ip}, "COMPLETE", gone,
+                                       ["missing_object"]),
+        "06b corrupt index": ({**packed, ip: packed[ip][:-1] + bytes([packed[ip][-1] ^ 1])}, "COMPLETE", gone,
+                              ["missing_object", "unknown"]),
+        "07 index without its pack": ({p: d for p, d in packed.items() if not p.endswith(b".pack")}, "COMPLETE",
+                                      gone, ["missing_object", "unknown"]),
+        "09 mixed: loose commit and blobs, genuine packed tree": (
+            pw.with_pack(no_tree, {toid: traw}), "COMPLETE", pk, ["packed"]),
+        "09b nested repository with packed objects": ({**loose, **nested}, "COMPLETE", pk, ["packed"]),
+        "10a unrelated pack, every reachable object loose": (unrelated, "COMPLETE", ok, []),
+        "10b every reachable object loose and in a genuine pack": (pw.with_pack(loose, raws), "COMPLETE", ok, []),
+        "10c loose object beside a forged pack entry for its id": (
+            pw.with_pack(loose, {toid: readme}), "COMPLETE", ok, []),
+        "11 complete raw capture, unverified packed objects": (packed, "COMPLETE", pk, ["packed"]),
+        "12a incomplete raw capture, loose": (loose, "INCOMPLETE", ("INCOMPLETE", "VERIFIED", "INCOMPLETE",
+                                                                    "NOT_ELIGIBLE"), []),
+        "12b incomplete raw capture, packed": (packed, "INCOMPLETE", ("INCOMPLETE", "INCOMPLETE", "INCOMPLETE",
+                                                                      "NOT_ELIGIBLE"), ["packed"]),
+    }
+
+
+class PackedEligibility(unittest.TestCase):
+    def test_matrix(self):
+        for case, (files, q1, want, reasons) in packed_rows().items():
+            with self.subTest(case):
+                _, q3, q4, q5, got, _ = gitclass.questions(gitclass.repositories(files), q1)
+                self.assertEqual(((q1, q3, q4, q5), got), (want, reasons))
+
+    def test_forged_entries_really_differ_from_the_listed_object(self):
+        """The forged rows list an id whose packed bytes do not hash to it."""
+        for case, (files, *_rest) in packed_rows().items():
+            if case[:2] in ("03", "04", "05"):
+                pack = next(d for p, d in files.items() if p.endswith(b".pack"))
+                idx = next(d for p, d in files.items() if p.endswith(b".idx"))
+                (listed,) = gitclass._idx_names(idx, pack)
+                i = 12
+                while pack[i] & 0x80:
+                    i += 1
+                body = pw.zlib.decompressobj().decompress(pack[i + 1:])
+                typ = {1: b"commit", 2: b"tree", 3: b"blob"}[pack[12] >> 4 & 7]
+                raw = typ + b" " + str(len(body)).encode() + b"\0" + body
+                self.assertNotEqual(pw.hashlib.sha1(raw).hexdigest(), listed, case)  # noqa: S324
 
 
 class TypedNeutralization(unittest.TestCase):
