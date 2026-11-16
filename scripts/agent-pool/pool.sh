@@ -77,7 +77,9 @@ read_cwds() {
 # migrate and unmigrate hold every slot lock at once. The lock directory
 # holds this run's random id in `owner`: a run removes only a lock whose id
 # is its own, and a failed removal is reported without changing the exit
-# status, so every other held lock is still released.
+# status, so every other held lock is still released. The report goes to fd
+# 9, the caller's stderr, so it survives `try_acquire ... 2>/dev/null`.
+exec 9>&2 || exec 9>/dev/null
 LOCKS=()
 LOCK_ID=""
 trap 'for l in ${LOCKS[@]+"${LOCKS[@]}"}; do drop_lock "$l" || :; done' EXIT
@@ -90,7 +92,7 @@ lock_slot() {
 }
 drop_lock() {
 	[[ $(cat "$1/owner" 2>/dev/null) == "$LOCK_ID" ]] && rm "$1/owner" && rmdir "$1" && return 0
-	echo "pool.sh: lock $1 not removed: missing, not held by this run, or not empty; nothing was broken" >&2
+	echo "pool.sh: lock $1 not removed: missing, not held by this run, or not empty; nothing was broken" >&9
 	return 1
 }
 unlock_slot() {

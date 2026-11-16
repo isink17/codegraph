@@ -828,6 +828,30 @@ grep -q "lock $LA not removed" "$T/out" || fail "a foreign lock was not reported
 [[ -d $LA && ! -e $LA/owner ]] || fail "release removed a lock another run created"
 [[ ! -d $LA ]] || rmdir "$LA"
 
+# acquire silences each slot's routine refusals on the auto path, never the
+# lock report: explicit and auto acquire both report a lock that vanished or
+# was replaced while held, keep their exit status and lease, and break nothing.
+for mode in "--slot $A" "--slot auto"; do
+	expect 0 env PATH="$T/gone:$PATH" "$POOL" acquire $mode --task lockgone --agent x
+	grep -q "^leased $A token=" "$T/out" || fail "acquire $mode with a vanished lock did not lease $A: $(cat "$T/out")"
+	grep -q "lock $LA not removed" "$T/out" || fail "acquire $mode hid the vanished-lock report: $(cat "$T/out")"
+	[[ ! -e $LA ]] || fail "acquire $mode left a lock behind"
+	expect 0 "$POOL" release --slot $A --token "$(token $A)"
+	expect 0 env PATH="$T/foreign:$PATH" "$POOL" acquire $mode --task lockforeign --agent x
+	grep -q "lock $LA not removed" "$T/out" || fail "acquire $mode hid the foreign-lock report: $(cat "$T/out")"
+	[[ -d $LA && ! -e $LA/owner ]] || fail "acquire $mode removed a lock another run created"
+	rmdir "$LA"
+	expect 0 "$POOL" release --slot $A --token "$(token $A)"
+done
+# A busy first worker is passed over quietly and the second one is leased.
+"$POOL" prepare --all >/dev/null 2>&1 || true
+expect 0 "$POOL" acquire --slot $A --task busy --agent x
+expect 0 "$POOL" acquire --slot auto --task second --agent y
+grep -q "^leased $B token=" "$T/out" || fail "auto acquire did not take $B: $(cat "$T/out")"
+[[ $(grep -c . "$T/out") == 1 ]] || fail "auto acquire reported routine refusals: $(cat "$T/out")"
+expect 0 "$POOL" release --slot $B --token "$(token $B)"
+expect 0 "$POOL" release --slot $A --token "$(token $A)"
+
 lock_hook "$T/multi" "$(command -v python3)" unmigrate "rm -f '$LA/owner'; rmdir '$LA'"
 expect 1 env CG_POOL_PYTHON="$T/multi/hook" "$POOL" unmigrate
 grep -q "lock $LA not removed" "$T/out" || fail "unmigrate did not report the vanished lock: $(cat "$T/out")"
