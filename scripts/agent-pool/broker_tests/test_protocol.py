@@ -41,6 +41,14 @@ def gen_d(rng, depth=0):
 
 
 class Canonical(unittest.TestCase):
+    def test_is_hex64_matches_the_helpers_it_replaced(self):
+        good = "0123456789abcdef" * 4
+        for v in (good, "0" * 64):
+            self.assertTrue(canonical.is_hex64(v), v)
+        for v in (good.upper(), good[:-1], good + "0", good[:-1] + "g", good + "\n", " " + good[1:], "", None,
+                  good.encode(), 0, [good], "\uff10" * 64):
+            self.assertFalse(canonical.is_hex64(v), repr(v))
+
     def test_canon_equals_library_digest_on_d(self):
         rng = random.Random(7)
         for _ in range(2000):
