@@ -1516,6 +1516,24 @@ class PackedRefsAsGitReadsThem(unittest.TestCase):
         self.refused(b"# other\n" + body)
         self.refused(HDR + HDR + body)
 
+    def test_header_bytes_git_would_cut_short_are_refused(self):
+        """Git reads the traits as a C string: after a NUL it still sees
+        `sorted` or `fully-peeled`, and a token split on bytes would not."""
+        o = self.o
+        shadowed = pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b"))
+        loose = {b".git/refs/heads/b": o.c2.encode() + b"\n"}
+        for header in (b"# pack-refs with: peeled fully-peeled sorted\0\n",
+                       b"# pack-refs with: sorted\0 \n", b"# pack-refs with: sorted\0x\n"):
+            with self.subTest(header):
+                self.refused(header + shadowed, extra=loose)
+        self.refused(b"# pack-refs with: peeled fully-peeled\0\n"
+                     + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1")))
+        for header in (b"# pack-refs with: sorted\t\n", b"# pack-refs with: sorted\r\n",
+                       "# pack-refs with: sorted\u00a0\n".encode()):
+            with self.subTest(header):
+                self.refused(header + pw.packed_lines((o.c2, b"refs/heads/main")))
+        self.eligible(b"# pack-refs with: \n" + pw.packed_lines((o.c2, b"refs/heads/main")))
+
     def test_sorted_header_requires_sorted_names(self):
         """Git binary-searches a file that claims `sorted`: an unsorted one
         hides HEAD's branch and lists a packed value a loose ref shadows."""
@@ -1602,6 +1620,20 @@ class PackedRefsAgainstRealGit(unittest.TestCase):
         self.write_packed(packed.replace(line, line + forged.encode() + b" refs/heads/main\n"))
         self.assertEqual(self.rev("HEAD"), forged)
         self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+    def test_nul_in_header_git_still_reads_sorted(self):
+        """With `sorted\\0` Git binary-searches and lists a packed value that a
+        loose ref shadows; the classifier refuses the header."""
+        main = self.rev("HEAD")
+        other = self.rev("HEAD~2")
+        self.write_packed(b"# pack-refs with: peeled fully-peeled sorted\0\n" + main.encode() + b" refs/heads/main\n"
+                          + other.encode() + b" refs/heads/b\n")
+        self.lab.write(self.r, ".git/refs/heads/b", main.encode() + b"\n")
+        self.files = captured(self.r)
+        listed = self.git("for-each-ref", "--format=%(refname) %(objectname)").splitlines()
+        self.assertIn("refs/heads/b " + other, listed)
+        self.assertIn("refs/heads/b " + main, listed)
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["malformed_packed"]))
 
     def test_forged_peel_git_reports_is_refused(self):
         v1, peel = self.rev("v1"), self.rev("v1^{}")

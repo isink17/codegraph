@@ -474,7 +474,7 @@ eligible.
   this without a typed manifest; the PR-4 entry criterion (NB-16, under
   "PR-4 prerequisite" above) is what closes it.
 
-### packed-refs as Git reads it (B-1, N-1, N-2, 2026-11-17)
+### packed-refs: the subset whose Git reading was measured (B-1, N-1, N-2, 2026-11-17)
 
 Git resolves a packed ref by binary search, trusts a `^` line as the ref's
 peeled value and, under some headers, trusts its absence. The classifier
@@ -498,9 +498,12 @@ disposable repositories:
   is refused there; without such a header Git peels the tag itself and a
   missing line is accepted. A line a loose ref shadows is never read by Git
   and is not checked.
-- **Header and order.** The header is accepted only as the first line and
-  only with Git's prefix `# pack-refs with: ` (Git 2.54 refuses the file
-  otherwise). Under a `sorted` trait the names must be in increasing byte
+- **Header and order.** The header is accepted only as the first line, only
+  with Git's prefix `# pack-refs with: ` (Git 2.54 refuses the file
+  otherwise) and only when its traits are printable ASCII and spaces. Git
+  reads the traits as a C string, so with `sorted\0` or `fully-peeled\0`
+  Git still sees the trait while a byte-wise split does not; the review of
+  498983ad reached D4 that way. Under a `sorted` trait the names must be in increasing byte
   order: with an unsorted file Git 2.38 no longer found HEAD's branch, and
   `for-each-ref` listed the packed value of a name a loose ref shadows,
   whose object the classifier never verified.

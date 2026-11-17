@@ -24,7 +24,9 @@ _REF_BAD = re.compile(rb"[~^:?*\[\\]|\.\.|@\{|//|/\.|\.lock(?:/|\Z)|[/.]\Z")
 _HEAD_REF = re.compile(rb"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
 _SECTION = re.compile(rb'\[([A-Za-z0-9.-]+)(?: "([^"\\\n]*)")?\]\Z')
 _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
-_PACKED_HEADER = b"# pack-refs with: "
+# Git reads the traits as a C string, so a NUL or other control byte would
+# hide a trait from this parser and not from Git.
+_PACKED_HEADER = re.compile(rb"# pack-refs with: ([ -~]*)\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
@@ -228,20 +230,25 @@ def _valid_ref(name):
 
 
 def _packed(r, data, refs):
-    """Parses `packed-refs` as Git reads it and returns ({name: peel id or
-    None}, header traits). Anything Git would read differently is
+    """Parses the measured subset of `packed-refs` (CONTRACT.md) and returns
+    ({name: peel id or None}, header traits). Outside it is
     `malformed_packed`: a repeated name (Git may resolve either line), a
-    header that is not the first line, a `^` line not directly after a ref,
-    and names out of order under a `sorted` header (Git then binary-searches
-    and can miss a ref or expose a packed value a loose ref shadows)."""
+    header that is not the first line or holds a byte other than printable
+    ASCII, a `^` line not directly after a ref, and names out of order under
+    a `sorted` header (Git then binary-searches and can miss a ref or expose
+    a packed value a loose ref shadows)."""
     lines = data.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
     else:
         r.features.add("malformed_packed")
     traits = set()
-    if lines and lines[0].startswith(_PACKED_HEADER):
-        traits = set(lines.pop(0)[len(_PACKED_HEADER):].split(b" "))
+    if lines and lines[0].startswith(b"#"):
+        m = _PACKED_HEADER.match(lines.pop(0))
+        if m is None:
+            r.features.add("malformed_packed")
+        else:
+            traits = set(m.group(1).split(b" "))
     peels, last, prev = {}, None, None
     for line in lines:
         if line.startswith(b"^"):
@@ -295,11 +302,14 @@ def _check_peels(r, files, refs, peels, traits):
     trusts its absence. Either must match the verified objects. A line that
     a loose ref shadows is never read. A broken tag chain is reported by
     `_closure` already."""
+    peeled = {}
     for name, peel in peels.items():
         kind, oid = refs[name]
         if kind != "packed":
             continue
-        want = _peeled(files, oid)
+        if oid not in peeled:
+            peeled[oid] = _peeled(files, oid)
+        want = peeled[oid]
         knows = b"fully-peeled" in traits or (b"peeled" in traits and name.startswith(b"refs/tags/"))
         if want is not False and peel != want and (peel is not None or knows):
             r.features.add("malformed_packed")

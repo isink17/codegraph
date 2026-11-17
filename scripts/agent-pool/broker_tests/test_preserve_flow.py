@@ -799,6 +799,14 @@ class PackedRefs(Base):
                   extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
         self.stuck_at_move()
 
+    def test_sorted_trait_behind_a_nul(self):
+        """The reviewed head reached D4 here: Git still read `sorted`."""
+        o = pw.packed_world()[1]
+        self.slot(b"# pack-refs with: peeled fully-peeled sorted\0\n"
+                  + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b")),
+                  extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
+        self.stuck_at_move()
+
     def test_head_name_git_rejects(self):
         o = pw.packed_world()[1]
         self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/../x")), head=b"ref: refs/heads/../x\n")
