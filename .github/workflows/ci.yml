@@ -166,6 +166,9 @@ jobs:
         with:
           # test_pool_v2 extracts every historical pool.sh from git.
           fetch-depth: 0
+      - name: mkdir exclusivity probe (diagnostic)
+        working-directory: scripts/agent-pool
+        run: timeout 300 bash mkdir_probe.sh "$RUNNER_TEMP/mkdir-probe"
       - name: Pool and recovery suites
         working-directory: scripts/agent-pool
         run: |
@@ -173,6 +176,12 @@ jobs:
           python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes test_recovery_gate test_recovery_cli
           python3 -m unittest discover -s broker_tests -t broker_tests
           bash pool_test.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mkdir-probe-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mkdir-probe
+          retention-days: 90
 
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.

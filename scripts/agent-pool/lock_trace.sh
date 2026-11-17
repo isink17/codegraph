@@ -5,6 +5,8 @@
 # (LOCK_TRACE_NAME), the command, its exit status, pid and parent pid, the
 # lock's inode and owner id before and after, and the arguments. A held lock
 # that vanishes without a traced removal was removed by something else.
+# The exit status is the command's, not its syscall's, and before and after
+# are sampled around the command, so they may include other runs' changes.
 op=${0##*/}
 real=$(PATH=$LOCK_TRACE_PATH command -v "$op") || exit 127
 lock=
