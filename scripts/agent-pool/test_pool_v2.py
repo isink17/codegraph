@@ -109,9 +109,9 @@ class Pool(unittest.TestCase):
         self.leases.mkdir()
         self.env = {**type(self).env, "CG_POOL_LEASES": str(self.leases)}
 
-    def popen(self, *args):
+    def popen(self, *args, **env):
         """A pool.sh run in the background; cleanup waits for it, or kills it."""
-        p = subprocess.Popen(["/bin/bash", str(POOL), *args], env=self.env, stdout=subprocess.PIPE,
+        p = subprocess.Popen(["/bin/bash", str(POOL), *args], env={**self.env, **env}, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.reap, p)
         return p

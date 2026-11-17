@@ -45,7 +45,14 @@ class Migrated(Pool):
 
     def setUp(self):
         super().setUp()
-        self.outputs, self.bg_runs = [], []
+        self.outputs, self.bg_runs, self.bg_names = [], [], {}
+        shim = self.t / "locktrace"
+        if not shim.exists():
+            shim.mkdir()
+            for c in ("mkdir", "rmdir", "rm"):
+                (shim / c).symlink_to(HERE / "lock_trace.sh")
+        self.trace = self.t / f"locktrace-{self._testMethodName}.log"
+        self.trace.unlink(missing_ok=True)
         for s in SLOTS:
             git("-C", str(self.t / "slots" / s), "checkout", "-q", "--detach", "origin/v2.0")
 
@@ -59,10 +66,21 @@ class Migrated(Pool):
         for p in self.leases.rglob("*"):
             for tok in getattr(self, "tokens", []):
                 self.assertNotIn(tok, p.name)
+        # pool.sh reports a held lock that vanished or was replaced and carries on.
+        self.assertFalse([o for o in self.outputs if " not removed: " in o],
+                         "a held lock vanished\n" + self.diagnostics())
         self.assertEqual([p.name for p in self.leases.iterdir() if p.name.endswith(".lock")], [],
                          "a slot lock was left behind\n" + self.diagnostics())
         self.assertEqual([p.name for p in self.leases.iterdir() if p.name.endswith(".tmp")], [],
                          "a temporary record was left behind")
+
+    def popen(self, *args):
+        """A background run whose slot-lock mkdir, rmdir and rm calls are traced (lock_trace.sh)."""
+        name = f"{args[0]}{len(self.bg_names)}"
+        p = super().popen(*args, PATH=f"{self.t / 'locktrace'}{os.pathsep}{self.env['PATH']}",
+                          LOCK_TRACE=str(self.trace), LOCK_TRACE_PATH=self.env["PATH"], LOCK_TRACE_NAME=name)
+        self.bg_names[p.pid] = name
+        return p
 
     def finish(self, procs):
         """(stdout, stderr) of each background run, recorded with its command
@@ -71,18 +89,23 @@ class Migrated(Pool):
         for p in procs:
             out, err = p.communicate(timeout=120)
             self.outputs.append(out + err)
-            self.bg_runs.append(f"{' '.join(p.args[2:])}: exit {p.returncode}\n  stdout: {out!r}\n  stderr: {err!r}")
+            self.bg_runs.append(f"{self.bg_names.get(p.pid, '?')}: {' '.join(p.args[2:])}: exit {p.returncode}\n"
+                                f"  stdout: {out!r}\n  stderr: {err!r}")
             outs.append((out, err))
         return outs
 
     def diagnostics(self):
-        """The background runs, then each lock left in the lease directory with
-        the owner id inside it, and the lease directory listing."""
+        """The background runs, their slot-lock events, then each lock left in
+        the lease directory with its inode and owner id, and the lease
+        directory listing."""
         lines = list(self.bg_runs)
+        lines.append("lock events:")
+        if self.trace.exists():
+            lines += ["  " + ln for ln in self.trace.read_text().splitlines()]
         for p in sorted(self.leases.iterdir()):
             owner = p / "owner"
-            lines.append(f"{p.name}: " + (f"owner {owner.read_text().strip()}" if owner.exists()
-                                          else "dir" if p.is_dir() else "file"))
+            lines.append(f"{p.name}: " + (f"inode {p.stat().st_ino} owner {owner.read_text().strip()}"
+                                          if owner.exists() else "dir" if p.is_dir() else "file"))
         return "\n".join(lines)
 
     def migrate(self):
