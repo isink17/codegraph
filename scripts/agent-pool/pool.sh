@@ -72,18 +72,48 @@ read_cwds() {
 	fi
 }
 
-# Every lease change of a slot happens under its lock. mkdir is atomic; a
-# lock left by a crashed run is reported, never broken automatically.
-# migrate and unmigrate hold every slot lock at once.
+# Every lease change of a slot happens under its lock. A lock left by a
+# crashed run is reported, never broken automatically. migrate and unmigrate
+# hold every slot lock at once. The lock directory holds this run's random id
+# in `owner`: a run removes only a lock whose id is its own, and a failed
+# removal is reported without changing the exit status, so every other held
+# lock is still released. The report is kept in this shell while HOLD_REPORTS
+# is set, so it outlives `try_acquire ... 2>/dev/null` without a descriptor
+# that git's detached children would keep.
 LOCKS=()
-trap 'for l in ${LOCKS[@]+"${LOCKS[@]}"}; do rmdir "$l"; done' EXIT
+LOCK_ID=""
+LOCK_REPORTS=()
+HOLD_REPORTS=0
+trap 'for l in ${LOCKS[@]+"${LOCKS[@]}"}; do drop_lock "$l" || :; done; report_locks' EXIT
 lock_slot() {
-	mkdir "$LEASES/.$1.lock" 2>/dev/null || return 1
-	LOCKS+=("$LEASES/.$1.lock")
+	local l="$LEASES/.$1.lock"
+	[[ -n $LOCK_ID ]] || LOCK_ID=$(random_token)
+	mkdir "$l" 2>/dev/null || return 1
+	# The lock is taken by creating owner with O_EXCL (noclobber), not by
+	# mkdir: uutils mkdir 0.10.0 (Ubuntu 26.04) exits 0 when it lost the race
+	# to create the directory. On any failure the directory may be another
+	# run's, so it is left alone. noclobber opens an existing non-regular
+	# owner without O_EXCL; the check after the write refuses that.
+	(set -C; printf '%s\n' "$LOCK_ID" >"$l/owner") 2>/dev/null || return 1
+	[[ -f $l/owner && ! -L $l/owner ]] && [[ $(cat "$l/owner" 2>/dev/null) == "$LOCK_ID" ]] || return 1
+	LOCKS+=("$l")
+}
+drop_lock() {
+	[[ $(cat "$1/owner" 2>/dev/null) == "$LOCK_ID" ]] && rm "$1/owner" && rmdir "$1" && return 0
+	LOCK_REPORTS+=("pool.sh: lock $1 not removed: missing, not held by this run, or not empty; nothing was broken")
+	return 1
+}
+# The subshell takes a SIGPIPE from a gone stderr reader, so the run keeps
+# its exit status and lease.
+report_locks() {
+	((HOLD_REPORTS == 0 && ${#LOCK_REPORTS[@]} > 0)) || return 0
+	(printf '%s\n' "${LOCK_REPORTS[@]}" >&2) || :
+	LOCK_REPORTS=()
 }
 unlock_slot() {
-	rmdir "${LOCKS[${#LOCKS[@]}-1]}"
+	drop_lock "${LOCKS[${#LOCKS[@]}-1]}" || :
 	unset "LOCKS[${#LOCKS[@]}-1]"
+	report_locks
 }
 
 slot_in_use() {
@@ -554,8 +584,10 @@ cmd_acquire() {
 	if [[ $slot == auto ]]; then
 		((review == 0)) || die "--review needs --slot $REVIEW" 2
 		for s in "${WORKERS[@]}"; do
-			rc=0
+			rc=0 HOLD_REPORTS=1
 			try_acquire "$s" 2>/dev/null || rc=$?
+			HOLD_REPORTS=0
+			report_locks
 			((rc != 0)) || return 0
 			# 4: a lease may exist that no caller holds; never move on to the next slot.
 			((rc != 4)) || die "$s: a lease was written but not confirmed; owner must inspect"

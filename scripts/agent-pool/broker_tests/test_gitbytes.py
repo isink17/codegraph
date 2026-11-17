@@ -56,10 +56,16 @@ class LooseObjects(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(both(oid, data), ("malformed-object", "corrupt"))
 
-    def test_the_size_bound_is_the_same(self):
+    def test_each_reader_keeps_its_own_size_bound(self):
         oid, data = loose(b"blob 100\0" + b"x" * 100)
         self.assertEqual(both(oid, data, limit=200)[1][0], b"blob")
         self.assertEqual(both(oid, data, limit=40), ("limit-exceeded", "corrupt"))
+        # 109 inflated bytes: classification accepts at most MAX_OBJECT_BYTES,
+        # the observer fewer than its limit + 64.
+        self.assertEqual(both(oid, data, limit=109)[1][0], b"blob")
+        self.assertEqual(both(oid, data, limit=108)[1], "corrupt")
+        self.assertEqual(both(oid, data, limit=46)[0][0], b"blob")
+        self.assertEqual(both(oid, data, limit=45)[0], "limit-exceeded")
 
 
 class GitdirNames(unittest.TestCase):
@@ -71,6 +77,13 @@ class GitdirNames(unittest.TestCase):
         for name in (b".gitignore", b".github", b"git", b"x.git"):
             self.assertFalse(gitbytes.is_gitdir_name(name), name)
             self.assertTrue(gitraw.valid_component(name), name)
+
+    def test_only_the_exact_name_is_a_repository(self):
+        for name in (b".GIT", b".Git", ".g\u200cit".encode(), "\ufeff.git".encode()):
+            repos = gitclass.repositories({b"sub/" + name + b"/HEAD": b"ref: refs/heads/main\n"})
+            self.assertIn("unknown", repos[b"sub"].features, name)
+        repos = gitclass.repositories({b"sub/.git/HEAD": b"ref: refs/heads/main\n"})
+        self.assertNotIn("unknown", repos[b"sub"].features)
 
 
 if __name__ == "__main__":

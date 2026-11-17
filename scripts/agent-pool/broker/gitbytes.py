@@ -10,7 +10,8 @@ import zlib
 HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
 HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
 OBJECT_TYPES = (b"commit", b"tree", b"blob", b"tag")
-_HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
+HFS_IGNORED = re.compile("[‌-‏‪-‮⁪-⁯﻿]")
+_SIZE = re.compile(rb"(?:0|[1-9][0-9]*)\Z")
 
 
 class Malformed(ValueError):
@@ -23,23 +24,25 @@ class Malformed(ValueError):
 
 
 def is_gitdir_name(c):
-    """R2 K3: a `.git` name compared case-insensitively, also with the code
-    points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and `.Git` count."""
+    """R2 K3 detection: a `.git` name compared case-insensitively, also with
+    the code points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and
+    `.g<U+200C>it` count. Detection only: `gitclass.repositories` accepts
+    only the exact `.git` as a repository."""
     if c.lower() == b".git":
         return True
     try:
-        return _HFS_IGNORED.sub("", c.decode("utf-8")).lower() == ".git"
+        return HFS_IGNORED.sub("", c.decode("utf-8")).lower() == ".git"
     except UnicodeDecodeError:
         return False
 
 
-def loose_object(oid, raw, limit):
-    """(type, body) of the loose object `oid` (hex str): its zlib stream is
-    complete and inflates to under `limit` + 64 bytes, its header is
-    `type size\\0` with a canonical decimal size equal to the body length, and
-    the SHA-1 of the whole is `oid` (integrity only). Raises Malformed."""
+def loose_object(oid, raw, bound):
+    """(type, body) of the loose object `oid` (40 hex bytes): its zlib stream
+    is complete and inflates to fewer than `bound` bytes (each caller keeps
+    its own bound), its header is `type size\\0` within 32 bytes with a
+    canonical decimal size equal to the body length, and the SHA-1 of the
+    whole is `oid` (integrity only). Raises Malformed."""
     d = zlib.decompressobj()
-    bound = limit + 64
     try:
         out = d.decompress(raw, bound)
     except zlib.error:
@@ -50,9 +53,8 @@ def loose_object(oid, raw, limit):
         raise Malformed("malformed-object")
     nul = out.find(b"\0", 0, 32)
     typ, sep, size = out[:max(nul, 0)].partition(b" ")
-    if nul < 0 or not sep or typ not in OBJECT_TYPES or not size.isdigit() \
-            or (size[:1] == b"0" and size != b"0") or int(size) != len(out) - nul - 1:
+    if nul < 0 or not sep or typ not in OBJECT_TYPES or not _SIZE.match(size) or int(size) != len(out) - nul - 1:
         raise Malformed("malformed-object")
-    if hashlib.sha1(out).hexdigest() != oid:  # noqa: S324 - Git object ids are SHA-1 (integrity only)
+    if hashlib.sha1(out).hexdigest().encode() != oid:  # noqa: S324 - Git object ids are SHA-1 (integrity only)
         raise Malformed("malformed-object")
     return typ, out[nul + 1:]

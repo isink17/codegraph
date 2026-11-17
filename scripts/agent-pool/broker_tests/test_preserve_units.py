@@ -4,7 +4,10 @@ classification over byte fixtures, escaped-set classification and typed
 neutralization (N-R41-9). Inputs are built in memory; nothing reads a live
 path."""
 
+import os
+import subprocess
 import types
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -317,7 +320,7 @@ class Reconstruction(unittest.TestCase):
         return {"entry_index": index}, chunks, index
 
     def entries(self, n, start=0):
-        return [["%06x" % i, canonical.sha256(str(i).encode())] for i in range(start, start + n)]
+        return [[(b"f%06d" % i).hex(), canonical.sha256(str(i).encode())] for i in range(start, start + n)]
 
     def mismatch(self, m):
         with self.assertRaises(Mismatch):
@@ -329,6 +332,23 @@ class Reconstruction(unittest.TestCase):
         for paths in (["61", "612f62"], ["61", "612d78", "612f62"], ["61", "62", "622f63", "622f632f64"]):
             self.mismatch(self.manifest([[[p, h] for p in paths]])[0])
         self.assertEqual(len(self.cy.entries(self.manifest([[["612d78", h], ["612f62", h]]])[0])), 2)
+
+    def test_every_path_component_is_one_the_capture_walk_accepts(self):
+        """R2 §3.2: an empty, `.` or `..` component, a NUL or a component over
+        255 bytes refuses; 255 bytes is accepted."""
+        h = canonical.sha256(b"x")
+        for bad in (b"/.git/HEAD", b"./a", b"a/./b", b"a/../b", b"a//b", b"a/", b"a/\0b", b"a/" + b"n" * 256):
+            with self.subTest(bad):
+                self.mismatch(self.manifest([[[bad.hex(), h]]])[0])
+        ok = b"a/" + b"n" * 255
+        self.assertEqual(self.cy.entries(self.manifest([[[ok.hex(), h]]])[0]), [(ok.hex(), h)])
+
+    def test_path_depth_is_the_capture_walks(self):
+        """NB-6: at most `fdwalk.Limits.max_depth` (64) separators, as captured."""
+        h = canonical.sha256(b"x")
+        ok = b"/".join([b"d"] * 64 + [b"f"])
+        self.assertEqual(len(self.cy.entries(self.manifest([[[ok.hex(), h]]])[0])), 1)
+        self.mismatch(self.manifest([[[b"/".join([b"d"] * 65 + [b"f"]).hex(), h]]])[0])
 
     def test_non_bytes_blob_is_unavailable_not_an_exception(self):
         """Q3e: a resolver value that is not bytes is a missing blob."""
@@ -431,10 +451,12 @@ class Reconstruction(unittest.TestCase):
 
     def test_oversize_object_refuses(self):
         """Every artifact object is <= 49,152 bytes (R4.1 §3.4)."""
-        big = [["%04x" % i + "ab" * 40, canonical.sha256(str(i).encode())] for i in range(400)]
+        big = [[(b"f%04d" % i).hex() + "ab" * 40, canonical.sha256(str(i).encode())] for i in range(400)]
         self.assertGreater(len(canonical.canon({"header": header(), "kind": "entries", "n": 0, "entries": big})),
                            journal.MAX_OBJECT)
         self.mismatch(self.manifest([big])[0])
+        with mock.patch.object(journal, "MAX_OBJECT", 1 << 20):
+            self.assertEqual(len(self.cy.entries(self.manifest([big])[0])), 400)
 
     def test_chunk_of_another_cycle_is_unreadable(self):
         m, chunks, _ = self.manifest([self.entries(2)])
@@ -445,6 +467,62 @@ class Reconstruction(unittest.TestCase):
 
 def classify(files):
     return gitclass.questions(gitclass.repositories(files), "COMPLETE")
+
+
+def captured(root):
+    """{tree path: bytes} of every regular file under `root`, as a capture
+    walk would hand them over (symlinks are not files here)."""
+    files = {}
+    for d, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(d, n)
+            if not os.path.islink(p):
+                with open(p, "rb") as f:
+                    files[os.path.relpath(p, root).encode()] = f.read()
+    return files
+
+
+def git_lab(test):
+    from gitfixture import GIT, Lab
+    if GIT is None:
+        test.skipTest("git not installed")
+    lab = Lab()
+    test.addCleanup(lab.cleanup)
+    return lab
+
+
+def three_commits(lab):
+    r = lab.path("repo")
+    lab.git(lab.root, "init", "-q", r)
+    for i in range(3):
+        lab.write(r, "a.txt", b"%d\n" % i)
+        lab.git(r, "add", "a.txt")
+        lab.git(r, "commit", "-q", "-m", str(i))
+    return r
+
+
+def restore(lab, files, name):
+    """A file-only restore of `files` into a new directory: a directory exists
+    only above a captured file, which is all the untyped manifest can say."""
+    root = lab.path(name)
+    os.mkdir(root)
+    for p, d in files.items():
+        lab.write(root, os.fsdecode(p), d)
+    return root
+
+
+def discover(lab, cwd):
+    """(git dir, HEAD) as the installed Git discovers them from `cwd`, never
+    above the lab, or the error Git prints."""
+    from gitfixture import GIT, SAFE
+    p = subprocess.run([GIT, *SAFE, "rev-parse", "--git-dir", "HEAD"], cwd=cwd, capture_output=True, timeout=120,
+                       env={**lab.env, "GIT_CEILING_DIRECTORIES": str(lab.root)})
+    return tuple(p.stdout.decode().split()) if p.returncode == 0 else p.stderr.decode()
+
+
+# Spellings Git's `is_hfs_dotgit` or a case-insensitive volume may treat as `.git`.
+ALIASES = (b".GIT", b".Git", ".g\u200cit".encode(), ".g\u200dit".encode(), "\u200e.git".encode(),
+           ".git\u200f".encode(), ".g\u202ait".encode(), ".gi\u206ft".encode(), "\ufeff.git".encode())
 
 
 class GitClassification(unittest.TestCase):
@@ -460,8 +538,9 @@ class GitClassification(unittest.TestCase):
 
     def test_feature_matrix(self):
         rows = {
-            ("packed_refs",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
-            ("packed_only",): ("INCOMPLETE", "COMPLETE", "ELIGIBLE"),
+            ("packed_refs",): ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"),
+            ("packed_refs", "loose_tag"): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
+            ("packed_only",): ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"),
             ("symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("dangling_symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("detached",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
@@ -485,6 +564,7 @@ class GitClassification(unittest.TestCase):
         self.assertIn("alternates", self.q("alternates")[4])
         self.assertIn("unborn_head", self.q("unborn")[4])
         self.assertIn("packed", self.q("packed_only")[4])
+        self.assertEqual(self.q("packed_refs")[4], ["refs_dir"])
         self.assertIn("residue", self.q("lock")[0])
         self.assertIn("dangling_symref", self.q("dangling_symref")[0])
 
@@ -515,14 +595,16 @@ class GitClassification(unittest.TestCase):
 
     def test_nested_repository_under_any_spelling_is_classified(self):
         """B-2: `sub/.GIT` is `sub/.git` on a case-insensitive volume, so its
-        alternates, shallow file, gitlink file and defects are findings."""
+        alternates, shallow file, gitlink file and defects are findings. Only
+        the exact `.git` is accepted, so the alias itself is `unknown`."""
         for name in (b".GIT", b".Git", ".g\u200dit".encode()):
             def nested(*variant, extra=None):
                 files, _ = pw.git_repo(worktree={b"w": b"x\n"}, variant=variant, prefix=b"sub/")
                 files.update(extra or {})
                 return {p.replace(b"sub/.git", b"sub/" + name, 1): d for p, d in files.items()}
             feats, _, q4, q5, reasons, _ = self.q(extra=nested())
-            self.assertEqual((q4, q5, "nested" in feats), ("COMPLETE", "ELIGIBLE", True), name)
+            self.assertEqual((q4, q5, "nested" in feats, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", True, ["unknown"]),
+                             name)
             _, _, q4, _, reasons, _ = self.q(extra=nested("alternates"))
             self.assertEqual(q4, "INCOMPLETE", name)
             self.assertIn("alternates", reasons)
@@ -538,6 +620,203 @@ class GitClassification(unittest.TestCase):
             files.update(extra)
             _, _, q4, q5, reasons, _ = classify(files)
             self.assertEqual((q4, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]), extra)
+
+    def test_two_paths_that_name_one_file_are_ambiguous(self):
+        """Distinct captured paths that one APFS volume stores as one file:
+        the bytes classified need not be the bytes restored there."""
+        files, _ = pw.git_repo()
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        cafe, cafe_nfd = "caf\u00e9/".encode(), "cafe\u0301/".encode()
+        nested, _ = pw.git_repo(prefix=cafe)
+        for name, extra in (("same path below the gitdir", {b"/" + k: b"junk"}),
+                            ("case", {k.replace(b"objects", b"OBJECTS", 1): b"junk"}),
+                            ("case of the last component", {b".git/refs/heads/MAIN": files[b".git/refs/heads/main"]}),
+                            ("ignorable code point", {k.replace(b"objects", "obj\u200cects".encode(), 1): b"junk"}),
+                            ("normalization of the root",
+                             {**nested, **{cafe_nfd + q[len(cafe):]: d for q, d in nested.items()}})):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        both = {**nested, **{cafe_nfd + q[len(cafe):]: d for q, d in nested.items()}}
+        repos = gitclass.repositories({p: d for p, d in both.items() if gitclass.is_git_path(p)})
+        self.assertEqual({r: "unknown" in repos[r].features for r in repos}, {cafe[:-1]: True, cafe_nfd[:-1]: True})
+        _, _, q4, q5, reasons, _ = classify({**files, **nested, b"README.md": b"x", b"readme": b"x"})
+        self.assertEqual((q4, q5, reasons), ("COMPLETE", "ELIGIBLE", []))
+
+    def test_a_file_that_is_another_paths_directory_is_ambiguous(self):
+        """On APFS a file `.git/OBJECTS` and the directory `.git/objects/`
+        cannot both exist, so neither the objects nor the file restore as
+        classified. Worktree paths count (`captured`), and a git path that is
+        not UTF-8 has no APFS name."""
+        files, _ = pw.git_repo()
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        sub, _ = pw.git_repo(prefix=b"sub/")
+        for name, gitfiles, captured in (
+                ("file over the objects directory", {**files, b".git/OBJECTS": b"x"}, None),
+                ("file over a fan-out directory", {**files, k[:15].upper(): b"x"}, None),
+                ("file over the refs directory", {**files, b".git/Refs": b"x"}, None),
+                ("worktree file over a nested root", {**files, **sub}, [*files, *sub, b"Sub"]),
+                ("root that is not UTF-8", {**files, **{b"\xff" + q: d for q, d in sub.items()}}, None)):
+            with self.subTest(name):
+                repos = gitclass.repositories(gitfiles, captured)
+                _, _, q4, q5, reasons, _ = gitclass.questions(repos, "COMPLETE")
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        repos = gitclass.repositories({**files, **sub}, [*files, *sub, b"Sub2", b"sub.txt"])
+        self.assertEqual(gitclass.questions(repos, "COMPLETE")[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_administrative_names_match_as_apfs_matches_them(self):
+        """B-1 (6b85f780 review): Git on APFS opens `.git/Shallow` as `shallow`
+        and `.git/INFO/grafts` as `info/grafts`, so a case variant of a name
+        read here is a file Git sees and this classifier would not."""
+        files, coid = pw.git_repo()
+        oid = coid.encode()
+        cfg = files[b".git/config"]
+        for name, change in (("Shallow", {b".git/Shallow": oid + b"\n"}),
+                             ("SHALLOW", {b".git/SHALLOW": oid + b"\n"}),
+                             ("info/Grafts", {b".git/info/Grafts": oid + b"\n"}),
+                             ("INFO/grafts", {b".git/INFO/grafts": oid + b"\n"}),
+                             ("Packed-Refs", {b".git/Packed-Refs": b"f" * 40 + b" refs/heads/x\n"}),
+                             ("Commondir", {b".git/Commondir": b"../elsewhere\n"}),
+                             ("objects/Info/alternates", {b".git/objects/Info/alternates": b"/elsewhere\n"}),
+                             ("Config only", {b".git/config": None,
+                                              b".git/Config": cfg + b"[extensions]\n\tobjectformat = sha256\n"})):
+            with self.subTest(name):
+                got = {p: d for p, d in {**files, **change}.items() if d is not None}
+                _, _, q4, q5, reasons, _ = classify(got)
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        legit = {b".git/logs/HEAD": b"x", b".git/ORIG_HEAD": oid + b"\n", b".git/FETCH_HEAD": b"",
+                 b".git/COMMIT_EDITMSG": b"m\n", b".git/description": b"d\n", b".git/info/exclude": b"",
+                 b".git/hooks/pre-commit.sample": b"", b".git/refs/heads/Feature": oid + b"\n"}
+        self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_administrative_directory_captured_as_an_entry_is_unknown(self):
+        """NB-13: an entry at a name Git opens as a directory may be a symbolic
+        link the capture recorded without its type; restored, Git reads packs,
+        alternates, grafts or refs outside the slot. Detached HEAD keeps
+        `refs` from failing as `unborn_head`."""
+        self.assertLessEqual(gitclass._ADMIN_DIRS, gitclass._ADMIN)
+        for variant in ((), ("detached",)):
+            files, _ = pw.git_repo(variant=variant)
+            self.assertEqual(classify(files)[2:5], ("COMPLETE", "ELIGIBLE", []))
+            for name in (b"objects/pack", b"objects/info", b"info", b"refs", b"modules", b"objects",
+                         b"refs/heads", b"refs/replace", b"objects/info/commit-graphs",
+                         b"objects/pack/multi-pack-index.d", b"reftable", b"objects/Pack", b"OBJECTS/pack",
+                         b"Objects/Info", b"INFO", "obj‌ects/pack".encode()):
+                with self.subTest(variant=variant, name=name):
+                    got = {p: d for p, d in files.items()
+                           if p != b".git/" + name and not p.startswith(b".git/" + name + b"/")}
+                    got[b".git/" + name] = b"/elsewhere/dir"
+                    _, _, q4, q5, reasons, _ = classify(got)
+                    self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                    self.assertIn("unknown", reasons)
+        files, coid = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        _, _, q4, q5, reasons, _ = classify({**files, **nested, b"vendor/lib/.git/objects/pack": b"/elsewhere"})
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+        legit = {b".git/info/exclude": b"", b".git/objects/info/packs": b"\n", b".git/refs/tags/v1": coid.encode() + b"\n",
+                 b"objects/pack": b"x", b"info": b"x", b"refs": b"x", b"src/objects": b"x"}
+        self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_git_follows_a_symlinked_pack_directory_outside_the_repository(self):
+        """NB-13 against real Git: `.git/objects/pack` linked to an outside
+        directory holding a forged pack changes what Git reads for HEAD."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        coid = lab.git(r, "rev-parse", "HEAD").stdout.decode().strip()
+        tree = lab.git(r, "cat-file", "commit", "HEAD").stdout.split(b"\n", 1)[0]
+        forged = tree + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        outside = lab.path("outside")
+        for p, d in pw.with_pack({}, {coid: b"commit %d\0" % len(forged) + forged}).items():
+            lab.write(outside, os.path.basename(p.decode()), d)
+        pack_dir = os.path.join(r, ".git", "objects", "pack")
+        os.rmdir(pack_dir)
+        try:
+            os.symlink(outside, pack_dir)
+        except OSError as e:
+            self.skipTest(f"symbolic links unavailable: {e}")
+        self.assertEqual(lab.git(r, "log", "--format=%s").stdout.strip(), b"forged")
+        files = captured(r)
+        self.assertEqual(classify(files)[2:5], ("COMPLETE", "ELIGIBLE", []))
+        files[b".git/objects/pack"] = os.fsencode(os.readlink(pack_dir))
+        _, _, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+
+    def test_commit_graph_is_never_trusted(self):
+        """NB-7: Git takes parents and generation numbers from a commit-graph
+        instead of the verified commits, and recovery has no step that drops
+        or rebuilds it, so any commit-graph makes the repository unsupported.
+        Its bytes are still preserved (Q4)."""
+        files, _ = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        chain = b".git/objects/info/commit-graphs/"
+        for name, extra in (("single file", {b".git/objects/info/commit-graph": b"CGPH"}),
+                            ("split chain", {chain + b"commit-graph-chain": b"0" * 40 + b"\n",
+                                             chain + b"graph-" + b"0" * 40 + b".graph": b"CGPH"}),
+                            ("empty", {b".git/objects/info/commit-graph": b""}),
+                            ("nested repository", {**nested, b"vendor/lib/.git/objects/info/commit-graph": b"CGPH"})):
+            with self.subTest(name):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("commit_graph", reasons)
+        for name in (b".git/objects/info/Commit-Graph", b".git/objects/info/COMMIT-GRAPHS/commit-graph-chain"):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, name: b"CGPH"})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        self.assertEqual(classify({**files, b".git/objects/info/commit-graph.lock": b"CGPH"})[2:5],
+                         ("COMPLETE", "ELIGIBLE", []))
+
+    def test_commit_graph_written_by_git_is_refused(self):
+        """The same repository is eligible until Git writes a commit-graph,
+        single or split."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        self.assertEqual(classify(captured(r))[1:5], ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        for args in (("--reachable",), ("--reachable", "--split")):
+            with self.subTest(args):
+                lab.git(r, "commit-graph", "write", "--no-progress", *args)
+                files = captured(r)
+                self.assertTrue(any(p.startswith(b".git/objects/info/commit-graph") for p in files))
+                self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["commit_graph"]))
+
+    def test_replace_refs_loose_or_packed(self):
+        """NB-8: Git applies a `refs/replace/*` ref from packed-refs exactly as
+        a loose one, so both are the same finding."""
+        files, coid = pw.git_repo()
+        name = b"refs/replace/" + coid.encode()
+        loose = {b".git/" + name: coid.encode() + b"\n"}
+        packed = {b".git/packed-refs": b"# pack-refs with: peeled fully-peeled sorted \n" + coid.encode() + b" " + name
+                  + b"\n"}
+        for case, extra in (("loose", loose), ("packed", packed), ("both", {**loose, **packed})):
+            with self.subTest(case):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["replace_refs"]))
+
+    def test_packed_replace_ref_written_by_git_is_refused(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        lab.git(r, "replace", "HEAD~1", "HEAD~2")
+        lab.git(r, "pack-refs", "--all")
+        files = captured(r)
+        self.assertFalse([p for p in files if p.startswith(b".git/refs/replace/")], "the replace ref is still loose")
+        self.assertIn(b"refs/replace/", files[b".git/packed-refs"])
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir", "replace_refs"]))
+
+    def test_one_directory_spelled_two_ways_is_ambiguous(self):
+        """APFS keeps the first spelling of a directory, so `refs/heads/Feat/a`
+        and `refs/heads/feat/b` land in one directory."""
+        files, coid = pw.git_repo()
+        both = {**files, b".git/refs/heads/Feat/a": coid.encode() + b"\n",
+                b".git/refs/heads/feat/b": coid.encode() + b"\n"}
+        _, _, q4, q5, reasons, _ = classify(both)
+        self.assertEqual((q4, q5, "unknown" in reasons), ("INCOMPLETE", "NOT_ELIGIBLE", True))
+        del both[b".git/refs/heads/Feat/a"]
+        self.assertEqual(classify(both)[2:5], ("COMPLETE", "ELIGIBLE", []))
 
     def test_config_include_is_external(self):
         """A config included from outside the captured tree is never preserved."""
@@ -572,8 +851,24 @@ class GitClassification(unittest.TestCase):
         self.assertEqual(gitclass.questions(gitclass.repositories(files), "INCOMPLETE")[2:4],
                          ("INCOMPLETE", "NOT_ELIGIBLE"))
 
+    def test_valid_commit_under_another_id(self):
+        """Only the SHA-1 differs: a decompressible, canonically sized commit
+        of valid structure whose links resolve, stored under the HEAD commit's
+        id. Only the integrity check can refuse it (mutant G4)."""
+        files, coid = pw.git_repo()
+        raw = pw.zlib.decompress(files[pw.loose_key(coid)])
+        body = raw.split(b"\0", 1)[1].replace(b"\nm\n", b"\nanother message\n")
+        other = b"commit %d\0" % len(body) + body
+        self.assertNotEqual(pw.hashlib.sha1(other).hexdigest(), coid)  # noqa: S324
+        files[pw.loose_key(coid)] = pw.zlib.compress(other)
+        _, q3, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["corrupt_object"]))
+
     def test_object_whose_content_is_not_its_id(self):
-        """Valid zlib under another object's id: integrity, not decompression, refuses."""
+        """Valid zlib under another object's id: integrity, not decompression, refuses.
+        Since link types are checked, a blob in the commit's place is also a
+        wrong type, so this test alone no longer proves the SHA-1 check;
+        `test_valid_commit_under_another_id` does."""
         files, coid = pw.git_repo()
         _, other = pw.gobj(b"blob", b"something else\n")
         files[b".git/objects/" + coid[:2].encode() + b"/" + coid[2:].encode()] = other
@@ -591,6 +886,297 @@ class GitClassification(unittest.TestCase):
         (item,) = gitclass.unpublished_commit_items(repo)
         self.assertEqual(item, "i" + canonical.sha256(b"commit:" + coid.encode())[:63])
         self.assertRegex(item, canonical.KEY)
+
+
+def gobj(typ, body):
+    """(id, loose form) built here, not by the code under test."""
+    raw = typ + b" " + str(len(body)).encode() + b"\0" + body
+    return pw.hashlib.sha1(raw).hexdigest(), raw  # noqa: S324 - Git object ids
+
+
+AUTHOR = b"author A U Thor <a@example.com> 1762819200 +0000\n"
+COMMITTER = b"committer C O Mitter <c@example.com> 1762819200 -0130\n"
+SIG = (b"gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEEfixture\n =AbCd\n"
+       b" -----END PGP SIGNATURE-----\n")
+
+
+def object_rows():
+    """{case: (objects, refs, expected (q3, q4, q5), finding, git fsck must object)}.
+    Every object is hand-written bytes. `git fsck --strict` is the independent
+    oracle in `test_git_fsck_agrees`; None marks a case where PR-3b is
+    deliberately stricter than Git: uppercase hex, which Git parses but never
+    writes; a mandatory header repeated after the ones Git reads, which Git
+    ignores; a tree entry name longer than a file name can be."""
+    blob, blob_raw = gobj(b"blob", b"hello\n")
+    tree, tree_raw = gobj(b"tree", b"100644 README\0" + bytes.fromhex(blob))
+    empty, empty_raw = gobj(b"tree", b"")
+    base = {blob: blob_raw, tree: tree_raw}
+
+    def commit(tree_id=tree, parents=(), head=None, tail=b"", msg=b"\nm\n"):
+        lines = head if head is not None else (b"tree " + tree_id.encode() + b"\n"
+                                               + b"".join(b"parent " + p.encode() + b"\n" for p in parents)
+                                               + AUTHOR + COMMITTER)
+        return gobj(b"commit", lines + tail + msg)
+
+    root, root_raw = commit()
+    child, child_raw = commit(parents=(root,))
+    merge, merge_raw = commit(parents=(child, root))
+    signed, signed_raw = commit(parents=(root,), tail=SIG, msg=b"\nsigned\n")
+    on_empty, on_empty_raw = commit(tree_id=empty, msg=b"")
+    tag, tag_raw = gobj(b"tag", b"object " + child.encode() + b"\ntype commit\ntag v1\ntagger "
+                        + AUTHOR[7:] + b"\nrelease\n")
+    wrong_tag, wrong_tag_raw = gobj(b"tag", tag_raw.split(b"\0", 1)[1].replace(b"type commit", b"type tree"))
+    hist = {**base, root: root_raw, child: child_raw}
+    ok, bad = ("VERIFIED", "COMPLETE", "ELIGIBLE"), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE")
+
+    def broken(head=None, objs=(), **kw):
+        c, raw = commit(head=head, **kw)
+        return {**base, **dict(objs), c: raw}, {b"refs/heads/main": c}
+
+    def tree_case(body, extra=()):
+        t, raw = gobj(b"tree", body)
+        c, craw = commit(tree_id=t)
+        return {**base, **dict(extra), t: raw, c: craw}, {b"refs/heads/main": c}
+
+    def tagged(fmt, git=True):
+        ident = AUTHOR[7:]
+        body = fmt % ((child.encode(), ident, child.encode()) if fmt.count(b"%s") == 3 else
+                      (child.encode(), ident) if fmt.count(b"%s") == 2 else (child.encode(),))
+        t, raw = gobj(b"tag", body)
+        return {**hist, t: raw}, {b"refs/heads/main": child, b"refs/tags/v1": t}, bad, "corrupt_object", git
+
+    def tagged_raw(header, body, want=bad, finding="corrupt_object"):
+        raw = header + b"\0" + body
+        oid = pw.hashlib.sha1(raw).hexdigest()  # noqa: S324 - Git object id
+        return {**hist, oid: raw}, {b"refs/heads/main": child, b"refs/tags/x": oid}, want, finding, want is bad
+
+    def head_raw(header, body):
+        raw = header + b"\0" + body
+        oid = pw.hashlib.sha1(raw).hexdigest()  # noqa: S324 - Git object id
+        return {**base, root: root_raw, oid: raw}, {b"refs/heads/main": oid}, bad, "corrupt_object", True
+
+    def date_case(seconds, want=bad):
+        c, raw = commit(head=b"tree " + tree.encode() + b"\nauthor A <a@example.com> " + seconds + b" +0000\n"
+                        + COMMITTER)
+        return {**base, c: raw}, {b"refs/heads/main": c}, want, None if want is ok else "corrupt_object", want is bad
+
+    child_body = child_raw.split(b"\0", 1)[1]
+    sigtag = (b"mergetag object " + root.encode() + b"\n type commit\n tag v0\n tagger " + AUTHOR[7:-1]
+              + b"\n \n v0\n")
+    mt, mt_raw = commit(parents=(child, root), tail=sigtag, msg=b"\nmerge v0\n")
+    entry = b"100644 README\0" + bytes.fromhex(blob)
+    missing = gobj(b"blob", b"never stored\n")[0]
+    sub = "5" * 40
+    rows = {
+        "valid ordinary commit": (hist, {b"refs/heads/main": child}, ok, None, False),
+        "valid root commit": ({**base, root: root_raw}, {b"refs/heads/main": root}, ok, None, False),
+        "valid merge commit": ({**hist, merge: merge_raw}, {b"refs/heads/main": merge}, ok, None, False),
+        "valid signed commit, multiline gpgsig": ({**base, root: root_raw, signed: signed_raw},
+                                                  {b"refs/heads/main": signed}, ok, None, False),
+        "valid empty tree, empty message": ({empty: empty_raw, on_empty: on_empty_raw},
+                                            {b"refs/heads/main": on_empty}, ok, None, False),
+        "valid annotated tag": ({**hist, tag: tag_raw}, {b"refs/heads/main": child, b"refs/tags/v1": tag},
+                                ok, None, False),
+        "valid gitlink, submodule commit not in this store": (*tree_case(entry + b"160000 sub\0"
+                                                                         + bytes.fromhex(sub)), ok, "gitlink",
+                                                              False),
+        "commit without tree": (*broken(head=AUTHOR + COMMITTER), bad, "corrupt_object", True),
+        "commit with two tree headers": (*broken(head=b"tree %s\ntree %s\n" % (tree.encode(), tree.encode())
+                                                 + AUTHOR + COMMITTER), bad, "corrupt_object", True),
+        "malformed tree id": (*broken(head=b"tree " + tree[:39].encode() + b"\n" + AUTHOR + COMMITTER),
+                              bad, "corrupt_object", True),
+        "uppercase tree id": (*broken(head=b"tree " + tree.upper().encode() + b"\n" + AUTHOR + COMMITTER),
+                              bad, "corrupt_object", None),
+        "tree header names a blob": (*broken(tree_id=blob), bad, "corrupt_object", True),
+        "parent names a tree": (*broken(parents=(tree,)), bad, "corrupt_object", True),
+        "author without email": (*broken(head=b"tree " + tree.encode() + b"\nauthor A U Thor 1762819200 +0000\n"
+                                         + COMMITTER), bad, "corrupt_object", True),
+        "committer missing": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR), bad, "corrupt_object",
+                              True),
+        "parent after author": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + b"parent " + root.encode()
+                                        + b"\n" + COMMITTER, objs=hist), bad, "corrupt_object", True),
+        "unterminated header": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER[:-1], msg=b""),
+                                bad, "corrupt_object", True),
+        "second tree after committer": (*broken(tail=b"tree " + tree.encode() + b"\n"), bad, "corrupt_object",
+                                        None),
+        "tree entry to a missing blob": (*tree_case(b"100644 README\0" + bytes.fromhex(missing)), bad,
+                                         "missing_object", True),
+        "invalid tree mode": (*tree_case(b"100777 README\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "zero-padded directory mode": (*tree_case(b"040000 d\0" + bytes.fromhex(tree)), bad, "corrupt_object",
+                                       True),
+        "directory entry names a blob": (*tree_case(b"40000 d\0" + bytes.fromhex(blob)), bad, "corrupt_object",
+                                         True),
+        "file entry names a tree": (*tree_case(b"100644 f\0" + bytes.fromhex(tree)), bad, "corrupt_object", True),
+        "duplicate tree entries": (*tree_case(entry + entry), bad, "corrupt_object", True),
+        "entries out of order": (*tree_case(b"100644 b\0" + bytes.fromhex(blob) + b"100644 a\0"
+                                            + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "truncated tree record": (*tree_case(entry[:-5]), bad, "corrupt_object", True),
+        ".git entry in a tree": (*tree_case(b"100644 .git\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "tag declares the wrong type": ({**hist, wrong_tag: wrong_tag_raw},
+                                        {b"refs/heads/main": child, b"refs/tags/v1": wrong_tag}, bad,
+                                        "corrupt_object", True),
+        "branch names a tag object": ({**hist, tag: tag_raw}, {b"refs/heads/main": tag}, bad, "corrupt_object",
+                                      True),
+        "tag type is not an object type": tagged(b"object %s\ntype bogus\ntag v1\ntagger %s\nx\n"),
+        "tag with a malformed tagger": tagged(b"object %s\ntype commit\ntag v1\ntagger nobody 0 +0000\n\nx\n"),
+        "tag with an empty name": tagged(b"object %s\ntype commit\ntag \ntagger %s\nx\n"),
+        "tag repeats its object header": tagged(b"object %s\ntype commit\ntag v1\ntagger %s"
+                                                b"object %s\n\nx\n", git=None),
+        "NUL in a commit header": (*broken(tail=b"encoding UTF\0-8\n"), bad, "corrupt_object", True),
+        "unterminated optional header": (*broken(tail=b"encoding UTF-8", msg=b""), bad, "corrupt_object", True),
+        "continuation line before tree": (*broken(head=b" x\ntree " + tree.encode() + b"\n" + AUTHOR + COMMITTER),
+                                          bad, "corrupt_object", True),
+        "author with an empty name": (*broken(head=b"tree " + tree.encode() + b"\nauthor <a@example.com> 0 +0000\n"
+                                              + COMMITTER), bad, "corrupt_object", True),
+        "zero-padded author time": (*broken(head=b"tree " + tree.encode() + b"\nauthor A <a@example.com> 01 +0000\n"
+                                            + COMMITTER), bad, "corrupt_object", True),
+        "tree entry named dot": (*tree_case(b"100644 .\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "tree entry named dot-dot": (*tree_case(b"100644 ..\0" + bytes.fromhex(blob)), bad, "corrupt_object", True),
+        "file and directory with one name": (*tree_case(b"100644 a\0" + bytes.fromhex(blob) + b"40000 a\0"
+                                                        + bytes.fromhex(tree)), bad, "corrupt_object", True),
+        "tree entry name over 255 bytes": (*tree_case(b"100644 " + b"n" * 256 + b"\0" + bytes.fromhex(blob)), bad,
+                                           "corrupt_object", None),
+        "valid empty blob": tagged_raw(b"blob 0", b"", ok, None),
+        "leading-zero blob size": tagged_raw(b"blob 06", b"hello\n"),
+        "size with a plus sign": tagged_raw(b"blob +6", b"hello\n"),
+        "empty size": tagged_raw(b"blob ", b""),
+        "declared size larger than the body": tagged_raw(b"blob 7", b"hello\n"),
+        "declared size smaller than the body": tagged_raw(b"blob 5", b"hello\n"),
+        "header without NUL in 32 bytes": tagged_raw(b"blob " + b"0" * 40, b""),
+        "header without a size": tagged_raw(b"blob", b""),
+        "leading-zero size on the HEAD commit": head_raw(b"commit 0%d" % len(child_body), child_body),
+        "continuation after tree": (*broken(head=b"tree " + tree.encode() + b"\n x\n" + AUTHOR + COMMITTER), bad,
+                                    "corrupt_object", True),
+        "continuation after author": (*broken(head=b"tree " + tree.encode() + b"\n" + AUTHOR + b" x\n" + COMMITTER),
+                                      bad, "corrupt_object", True),
+        "continuation after committer": (*broken(tail=b" parent " + root.encode() + b"\n", objs=hist), bad,
+                                         "corrupt_object", None),
+        "continuation after an unsupported header": (*broken(tail=b"encoding UTF-8\n x\n"), bad, "corrupt_object",
+                                                     None),
+        "tagger time past Git's limit": tagged(b"object %s\ntype commit\ntag v1\ntagger A <a@example.com> "
+                                               b"9999999999999999999 +0000\n\nx\n"),
+        "continuation after a tag object": tagged(b"object %s\n x\ntype commit\ntag v1\ntagger %s\nx\n"),
+        "valid mergetag on a merge": ({**hist, merge: merge_raw, mt: mt_raw}, {b"refs/heads/main": mt}, ok, None,
+                                      False),
+        "time 2^63-2": date_case(b"%d" % ((1 << 63) - 2), ok),
+        "time 2^63-1, the largest Git accepts": date_case(b"%d" % ((1 << 63) - 1), ok),
+        "time 2^63": date_case(b"%d" % (1 << 63)),
+        "time 9999999999999999999": date_case(b"9" * 19),
+        "time 2^64-1": date_case(b"%d" % ((1 << 64) - 1)),
+        "time 2^64, 20 digits": date_case(b"%d" % (1 << 64)),
+    }
+    return rows
+
+
+def object_files(objs, refs):
+    g = {b".git/HEAD": b"ref: refs/heads/main\n",
+         b".git/config": b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"}
+    g.update({b".git/" + name: oid.encode() + b"\n" for name, oid in refs.items()})
+    g.update({pw.loose_key(oid): pw.zlib.compress(raw) for oid, raw in objs.items()})
+    return g
+
+
+class GitObjects(unittest.TestCase):
+    """A loose object whose SHA-1 is right is not semantically verified unless
+    its structure and every link's type are: mandatory commit headers, tree
+    modes and names, and the type each link requires."""
+
+    def test_matrix(self):
+        for case, (objs, refs, want, finding, _) in object_rows().items():
+            with self.subTest(case):
+                feats, q3, q4, q5, reasons, _ = classify(object_files(objs, refs))
+                self.assertEqual((q3, q4, q5), want)
+                if finding:
+                    self.assertIn(finding, feats)
+                if want[0] != "VERIFIED":
+                    self.assertEqual(reasons, [finding])
+
+    def test_git_fsck_agrees(self):
+        """Independent oracle: Git itself, in a disposable fixture repository,
+        objects to every case PR-3b refuses and to none it verifies."""
+        from gitfixture import GIT, Lab
+        if GIT is None:
+            self.skipTest("git not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        for n, (case, (objs, refs, _, _, objects)) in enumerate(object_rows().items()):
+            if objects is None:
+                continue
+            with self.subTest(case):
+                r = lab.path(f"r{n}")
+                lab.git(lab.root, "init", "-q", r)
+                for p, d in object_files(objs, refs).items():
+                    if p != b".git/config":
+                        lab.write(r, p.decode(), d)
+                p = lab.git(r, "fsck", "--strict", "--no-dangling", "--no-progress", check=False)
+                noted = p.returncode != 0 or bool(p.stderr.strip())
+                self.assertEqual(noted, objects, p.stderr.decode(errors="replace"))
+
+    def test_shared_object_checked_against_every_referrer(self):
+        """One object reached first as the blob a tree entry wants, then as a
+        commit's tree: the second link's type is still checked."""
+        blob, blob_raw = gobj(b"blob", b"x\n")
+        tree, tree_raw = gobj(b"tree", b"100644 x\0" + bytes.fromhex(blob))
+        good, good_raw = gobj(b"commit", b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER + b"\nm\n")
+        bad, bad_raw = gobj(b"commit", b"tree " + blob.encode() + b"\nparent " + good.encode() + b"\n"
+                            + AUTHOR + COMMITTER + b"\nm\n")
+        objs = {blob: blob_raw, tree: tree_raw, good: good_raw, bad: bad_raw}
+        for refs in ({b"refs/heads/main": bad}, {b"refs/heads/main": good, b"refs/tags/t": bad}):
+            with self.subTest(refs):
+                _, q3, _, q5, reasons, _ = classify(object_files(objs, refs))
+                self.assertEqual((q3, q5, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", ["corrupt_object"]))
+
+    def test_old_tag_without_tagger_and_tag_of_a_blob(self):
+        blob, blob_raw = gobj(b"blob", b"x\n")
+        objs, base = object_rows()["valid ordinary commit"][:2]
+        for body in (b"object " + base[b"refs/heads/main"].encode() + b"\ntype commit\ntag old\n\nv\n",
+                     b"object " + blob.encode() + b"\ntype blob\ntag key\ntagger " + AUTHOR[7:] + b"\nk\n"):
+            t, raw = gobj(b"tag", body)
+            _, q3, _, q5, _, _ = classify(object_files({**objs, blob: blob_raw, t: raw},
+                                                       {**base, b"refs/tags/t": t}))
+            self.assertEqual((q3, q5), ("VERIFIED", "ELIGIBLE"), body)
+
+    def test_repository_written_by_git(self):
+        """Git's own objects: a merge, an annotated tag, a gitlink, an
+        executable file, a symlink, a subdirectory and a commit of the empty
+        tree are all verified."""
+        from gitfixture import EMPTY_TREE, GIT, Lab
+        if GIT is None:
+            self.skipTest("git not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        r = lab.path("repo")
+        lab.git(lab.root, "init", "-q", r)
+        lab.write(r, "a.txt", b"a\n")
+        lab.write(r, "bin/run", b"#!/bin/sh\n", mode=0o755)
+        os.symlink("a.txt", os.path.join(r, "link"))
+        lab.git(r, "add", "-A")
+        lab.git(r, "commit", "-q", "-m", "root")
+        lab.git(r, "switch", "-q", "-c", "side")
+        lab.write(r, "b.txt", b"b\n")
+        lab.git(r, "add", "b.txt")
+        lab.git(r, "commit", "-q", "-m", "side")
+        lab.git(r, "switch", "-q", "main")
+        lab.git(r, "update-index", "--add", "--cacheinfo", "160000," + "5" * 40 + ",sub")
+        lab.git(r, "commit", "-q", "-m", "gitlink")
+        lab.git(r, "merge", "-q", "--no-ff", "-m", "merge", "side")
+        lab.git(r, "tag", "-a", "-m", "release", "v1")
+        self.assertEqual(lab.git(r, "hash-object", "-w", "-t", "tree", os.devnull).stdout.strip().decode(),
+                         EMPTY_TREE)
+        empty = lab.git(r, "commit-tree", EMPTY_TREE, "-m", "empty").stdout.strip()
+        lab.git(r, "update-ref", "refs/heads/empty", empty)
+        lab.git(r, "fsck", "--strict", "--no-dangling", "--no-progress")
+        feats, q3, q4, q5, reasons, _ = classify(captured(r))
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        self.assertIn("gitlink", feats)
+
+    def test_links_parse_only_the_header(self):
+        """Message lines that look like headers are not links."""
+        tree, tree_raw = gobj(b"tree", b"")
+        c, raw = gobj(b"commit", b"tree " + tree.encode() + b"\n" + AUTHOR + COMMITTER
+                      + b"\ntree " + b"0" * 40 + b"\nparent " + b"1" * 40 + b"\n")
+        _, q3, _, q5, _, _ = classify(object_files({tree: tree_raw, c: raw}, {b"refs/heads/main": c}))
+        self.assertEqual((q3, q5), ("VERIFIED", "ELIGIBLE"))
 
 
 def at(data, i, new):
@@ -620,9 +1206,11 @@ class PackIndex(unittest.TestCase):
         pack, idx = pw.pack_pair({oid: pw.zlib.decompress(z)})
         return {b".git/objects/pack/pack-u.pack": pack, b".git/objects/pack/pack-u.idx": idx}
 
-    def test_listed_objects_are_packed_and_eligible(self):
+    def test_listed_objects_are_packed_and_not_eligible(self):
+        """R4.2: index presence is not content verification."""
         _, q3, q4, q5, reasons, head = classify(self.files)
-        self.assertEqual((q3, q4, q5, reasons, head), ("INCOMPLETE", "COMPLETE", "ELIGIBLE", ["packed"], self.coid))
+        self.assertEqual((q3, q4, q5, reasons, head),
+                         ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"], self.coid))
         self.assertEqual(len(gitclass._idx_names(self.idx, self.pack)), self.n)
 
     def test_a_pack_file_name_proves_nothing(self):
@@ -688,6 +1276,623 @@ class PackIndex(unittest.TestCase):
                 _, _, q4, q5, reasons, _ = self.with_pair(bad_idx, bad_pack)
                 self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
                 self.assertIn("unknown", reasons)
+
+
+def packed_rows():
+    """{case: (files, q1, (q1, q3, q4, q5), reasons)} for owner amendment R4.2
+    and its amendment 1. A reachable object that any pack index lists is never
+    content verified, so Q5 is NOT_ELIGIBLE whatever the pack holds, also when
+    a verified loose copy exists (Git reads the pack first); Q1 and Q4 keep
+    their R2 meaning; only packs that list no reachable object are ignored."""
+    loose, coid = pw.git_repo()
+    toid, traw = pw.head_tree(loose, coid)
+    no_tree = {p: d for p, d in loose.items() if p != pw.loose_key(toid)}
+    raws = {p[13:].replace(b"/", b"").decode(): pw.zlib.decompress(d)
+            for p, d in loose.items() if p.startswith(b".git/objects/")}
+    readme = next(r for r in raws.values() if r == b"blob 6\0hello\n")
+    body = b"100644 OTHER\0" + bytes(20)
+    wrong_tree = b"tree %d\0" % len(body) + body
+    packed = pw.git_repo(variant=("packed_only",))[0]
+    ip = next(p for p in packed if p.endswith(b".idx"))
+    nested = pw.git_repo(variant=("packed_only",), prefix=b"vendor/lib/")[0]
+    unrelated = pw.with_pack(loose, {pw.gobj(b"blob", b"unrelated\n")[0]: b"blob 10\0unrelated\n"}, b"u")
+    craw = pw.zlib.decompress(loose[pw.loose_key(coid)])
+    fbody = b"tree " + toid.encode() + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+    objects = {p: d for p, d in loose.items() if not p.startswith(b".git/objects/")}
+    bad_tree = {**loose, pw.loose_key(toid): pw.zlib.compress(wrong_tree)}
+    ok, pk = ("COMPLETE", "VERIFIED", "COMPLETE", "ELIGIBLE"), ("COMPLETE", "INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE")
+    gone = ("COMPLETE", "INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE")
+    return {
+        "01 loose only": (loose, "COMPLETE", ok, []),
+        "02 packed only": (packed, "COMPLETE", pk, ["packed"]),
+        "03 forged: index lists the tree, the pack holds a blob the repository has": (
+            pw.with_pack(no_tree, {toid: readme}), "COMPLETE", pk, ["packed"]),
+        "04 forged: index lists the tree, the pack holds an object that exists nowhere": (
+            pw.with_pack(no_tree, {toid: b"blob 0\0"}), "COMPLETE", pk, ["packed"]),
+        "05 forged: index lists the tree, the pack holds a different tree": (
+            pw.with_pack(no_tree, {toid: wrong_tree}), "COMPLETE", pk, ["packed"]),
+        "06a pack without its index": ({p: d for p, d in packed.items() if p != ip}, "COMPLETE", gone,
+                                       ["missing_object"]),
+        "06b corrupt index": ({**packed, ip: packed[ip][:-1] + bytes([packed[ip][-1] ^ 1])}, "COMPLETE", gone,
+                              ["missing_object", "unknown"]),
+        "07 index without its pack": ({p: d for p, d in packed.items() if not p.endswith(b".pack")}, "COMPLETE",
+                                      gone, ["missing_object", "unknown"]),
+        "09 mixed: loose commit and blobs, genuine packed tree": (
+            pw.with_pack(no_tree, {toid: traw}), "COMPLETE", pk, ["packed"]),
+        "09b nested repository with packed objects": ({**loose, **nested}, "COMPLETE", pk, ["packed"]),
+        "10a unrelated pack, every reachable object loose": (unrelated, "COMPLETE", ok, []),
+        "10b every reachable object loose and in a genuine pack (repack without -d)": (
+            pw.with_pack(loose, raws), "COMPLETE", pk, ["packed"]),
+        "10c verified loose tree, a forged pack entry for its id": (
+            pw.with_pack(loose, {toid: readme}), "COMPLETE", pk, ["packed"]),
+        "10d verified loose HEAD commit, a forged pack entry for its id": (
+            pw.with_pack(loose, {coid: b"commit %d\0" % len(fbody) + fbody}), "COMPLETE", pk, ["packed"]),
+        "10e two genuine indexes list every object, every object loose": (
+            pw.with_pack(pw.with_pack(loose, raws, b"a"), raws, b"b"), "COMPLETE", pk, ["packed"]),
+        "10f two genuine indexes list every object, none loose": (
+            pw.with_pack(pw.with_pack(objects, raws, b"a"), raws, b"b"), "COMPLETE", pk, ["packed"]),
+        "10g genuine and forged indexes list the HEAD commit, loose copy verified": (
+            pw.with_pack(pw.with_pack(loose, {coid: craw}, b"a"), {coid: b"commit %d\0" % len(fbody) + fbody}, b"b"),
+            "COMPLETE", pk, ["packed"]),
+        "10h a listed object's loose copy is corrupt: still a defect": (
+            pw.with_pack(bad_tree, {toid: traw}), "COMPLETE", gone, ["corrupt_object", "packed"]),
+        "10j an index lists every object, another one an unrelated blob": (
+            pw.with_pack(unrelated, raws, b"a"), "COMPLETE", pk, ["packed"]),
+        "10k an unrelated index sorts before a forged index listing the HEAD commit": (
+            pw.with_pack(unrelated, {coid: b"commit %d\0" % len(fbody) + fbody}, b"z"), "COMPLETE", pk, ["packed"]),
+        "10i multi-pack-index, every reachable object loose": (
+            {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"}, "COMPLETE", pk, ["multi_pack_index"]),
+        "11 complete raw capture, unverified packed objects": (packed, "COMPLETE", pk, ["packed"]),
+        "12a incomplete raw capture, loose": (loose, "INCOMPLETE", ("INCOMPLETE", "VERIFIED", "INCOMPLETE",
+                                                                    "NOT_ELIGIBLE"), []),
+        "12b incomplete raw capture, packed": (packed, "INCOMPLETE", ("INCOMPLETE", "INCOMPLETE", "INCOMPLETE",
+                                                                      "NOT_ELIGIBLE"), ["packed"]),
+    }
+
+
+class PackedEligibility(unittest.TestCase):
+    def test_matrix(self):
+        for case, (files, q1, want, reasons) in packed_rows().items():
+            with self.subTest(case):
+                _, q3, q4, q5, got, _ = gitclass.questions(gitclass.repositories(files), q1)
+                self.assertEqual(((q1, q3, q4, q5), got), (want, reasons))
+
+    def test_forged_entries_really_differ_from_the_listed_object(self):
+        """The forged rows list an id whose packed bytes do not hash to it."""
+        for case, (files, *_rest) in packed_rows().items():
+            if case[:2] in ("03", "04", "05") or case[:3] in ("10c", "10d"):
+                pack = next(d for p, d in files.items() if p.endswith(b".pack"))
+                idx = next(d for p, d in files.items() if p.endswith(b".idx"))
+                (listed,) = gitclass._idx_names(idx, pack)
+                i = 12
+                while pack[i] & 0x80:
+                    i += 1
+                body = pw.zlib.decompressobj().decompress(pack[i + 1:])
+                typ = {1: b"commit", 2: b"tree", 3: b"blob"}[pack[12] >> 4 & 7]
+                raw = typ + b" " + str(len(body)).encode() + b"\0" + body
+                self.assertNotEqual(pw.hashlib.sha1(raw).hexdigest(), listed, case)  # noqa: S324
+
+
+class PackListingOutranksLoose(unittest.TestCase):
+    """R4.2 amendment 1 (NB-12) against real Git: Git reads a listed packed
+    entry before a verified loose copy, so the classifier must refuse."""
+
+    def git_out(self, lab, r, *args):
+        return lab.git(r, *args).stdout
+
+    def test_git_reads_a_forged_pack_entry_over_the_verified_loose_head(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        self.assertEqual(classify(captured(r))[1:5], ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        coid = self.git_out(lab, r, "rev-parse", "HEAD").decode().strip()
+        true_body = self.git_out(lab, r, "cat-file", "commit", "HEAD")
+        tree = true_body.split(b"\n", 1)[0]
+        forged = tree + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        files = pw.with_pack(captured(r), {coid: b"commit %d\0" % len(forged) + forged})
+        for p, d in files.items():
+            lab.write(r, p.decode(), d)
+        loose = pw.zlib.decompress(files[pw.loose_key(coid)])
+        self.assertEqual(pw.hashlib.sha1(loose).hexdigest(), coid)  # noqa: S324
+        self.assertEqual(self.git_out(lab, r, "cat-file", "commit", coid), forged)
+        self.assertEqual(self.git_out(lab, r, "log", "--format=%s").strip(), b"forged")
+        self.assertEqual(classify(captured(r))[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"]))
+
+    def test_repack_without_d_is_not_eligible(self):
+        """`git repack -a` without `-d` keeps every loose object and packs it
+        too: Git's legitimate loose-and-packed layout, now unsupported."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        before = captured(r)
+        lab.git(r, "repack", "-a", "-q")
+        files = captured(r)
+        loose = {p for p in before if p.startswith(b".git/objects/") and len(p) == 54}
+        self.assertTrue(loose)
+        self.assertTrue(loose <= set(files))
+        idx = next(p for p in files if p.endswith(b".idx"))
+        listed = gitclass._idx_names(files[idx], files[idx[:-4] + b".pack"])
+        self.assertEqual({(p[13:15] + p[16:]).decode() for p in loose}, listed)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"]))
+        lab.git(r, "multi-pack-index", "write")
+        self.assertIn(b".git/objects/pack/multi-pack-index", captured(r))
+        self.assertEqual(classify(captured(r))[1:5],
+                         ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["multi_pack_index", "packed"]))
+
+    def test_version_1_index_is_unknown(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        lab.git(r, "repack", "-a", "-d", "-q")
+        pack = next(p for p in captured(r) if p.endswith(b".pack"))
+        lab.git(r, "index-pack", "--index-version=1", "-o", "v1.idx", pack.decode())
+        files = captured(r)
+        idx = next(p for p in files if p.endswith(b".idx") and p.startswith(b".git/"))
+        files[idx] = files.pop(b"v1.idx")
+        self.assertNotEqual(files[idx][:4], b"\xfftOc")
+        _, _, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+
+    def test_multi_pack_index_is_never_trusted(self):
+        files, _ = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        d = b".git/objects/pack/multi-pack-index.d/"
+        for name, extra in (("single file", {b".git/objects/pack/multi-pack-index": b"MIDX"}),
+                            ("incremental chain", {d + b"multi-pack-index-chain": b"0" * 40 + b"\n",
+                                                   d + b"multi-pack-index-" + b"0" * 40 + b".midx": b"MIDX"}),
+                            ("empty", {b".git/objects/pack/multi-pack-index": b""}),
+                            ("nested repository",
+                             {**nested, b"vendor/lib/.git/objects/pack/multi-pack-index": b"MIDX"})):
+            with self.subTest(name):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5, reasons),
+                                 ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["multi_pack_index"]))
+        for name in (b".git/objects/pack/Multi-Pack-Index", b".git/objects/pack/MULTI-PACK-INDEX.D/x"):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, name: b"MIDX"})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        self.assertEqual(classify({**files, b".git/objects/pack/multi-pack-index.lock": b"MIDX"})[2:5],
+                         ("COMPLETE", "ELIGIBLE", []))
+
+
+HDR = b"# pack-refs with: peeled fully-peeled sorted \n"
+UNSORTED = b"# pack-refs with: peeled fully-peeled \n"
+
+
+class PackedRefsAsGitReadsThem(unittest.TestCase):
+    """packed-refs must mean one thing to Git and to the classifier: what
+    Git could read differently (a repeated name, a forged or missing peel, a
+    name Git rejects, a header or order Git does not accept) is
+    `malformed_packed`, never a verified ref."""
+
+    def setUp(self):
+        self.files, self.o = pw.packed_world()
+
+    def q(self, packed, head=b"ref: refs/heads/main\n", extra=None):
+        files = {**self.files, b".git/packed-refs": packed, b".git/HEAD": head, **(extra or {})}
+        return classify(files)
+
+    def refused(self, packed, finding="malformed_packed", **kw):
+        _, q3, q4, q5, reasons, _ = self.q(packed, **kw)
+        self.assertEqual((q3, q4, q5), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"), packed)
+        self.assertIn(finding, reasons, packed)
+
+    def eligible(self, packed, **kw):
+        _, q3, q4, q5, reasons, head = self.q(packed, **kw)
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []), packed)
+        return head
+
+    def test_unique_refs_with_peeled_tags_stay_eligible(self):
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, b"refs/heads/side"), (o.t1, b"refs/tags/v1"), (o.c1,),
+                     (o.t2, b"refs/tags/v2"), (o.c1,), (o.c1, b"refs/tags/v3"))
+        self.assertEqual(self.eligible(HDR + body), o.c2)
+        self.assertEqual(self.eligible(b"# pack-refs with: peeled sorted \n" + body), o.c2)
+        self.eligible(body)
+
+    def test_repeated_name_is_malformed_in_every_layout(self):
+        o = self.o
+        main = b"refs/heads/main"
+        for case, body in (
+                ("verified first", pw.packed_lines((o.c2, main), (o.f, main))),
+                ("forged first", pw.packed_lines((o.f, main), (o.c2, main))),
+                ("identical", pw.packed_lines((o.c2, main), (o.c2, main))),
+                ("separated", pw.packed_lines((o.c2, main), (o.c1, b"refs/heads/x"), (o.f, main))),
+                ("tag repeated with peel lines", pw.packed_lines((o.c2, main), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                                       (o.t1, b"refs/tags/v1"), (o.c1,))),
+                ("tag repeated with another peel", pw.packed_lines((o.c2, main), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                                         (o.c2, b"refs/tags/v1")))):
+            for header in (HDR, b""):
+                with self.subTest(case, header=header):
+                    self.refused(header + body)
+
+    def test_a_loose_ref_still_shadows_its_packed_line(self):
+        o = self.o
+        loose = {b".git/refs/heads/main": o.c2.encode() + b"\n"}
+        self.assertEqual(self.eligible(HDR + pw.packed_lines((o.f, b"refs/heads/main")), extra=loose), o.c2)
+
+    def test_peel_lines_must_match_the_verified_tag_chain(self):
+        o = self.o
+        main = (o.c2, b"refs/heads/main")
+        for case, body in (
+                ("peel to another commit", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c2,))),
+                ("peel to an absent object", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), ("1" * 40,))),
+                ("peel of a tag of a tag stops early", pw.packed_lines(main, (o.t2, b"refs/tags/v2"), (o.t1,))),
+                ("peel on a commit ref", pw.packed_lines(main, (o.c1,))),
+                ("two peel lines", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c1,), (o.c1,))),
+                ("peel before any ref", pw.packed_lines((o.c1,), main)),
+                ("peel that is not 40 hex", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c1.upper(),))),
+                ("missing peel under fully-peeled", pw.packed_lines(main, (o.t1, b"refs/tags/v1")))):
+            with self.subTest(case):
+                self.refused(HDR + body)
+        self.refused(b"# pack-refs with: peeled \n" + pw.packed_lines(main, (o.t1, b"refs/tags/v1")))
+
+    def test_peel_absence_is_trusted_only_where_git_trusts_it(self):
+        """Without a header, or under `peeled` outside `refs/tags/`, Git peels
+        a tag itself."""
+        o = self.o
+        self.eligible(pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1")))
+        self.eligible(b"# pack-refs with: peeled sorted \n" + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/x/t")))
+
+    def test_shadowed_line_peel_is_not_read(self):
+        o = self.o
+        loose = {b".git/refs/tags/v1": o.t1.encode() + b"\n"}
+        self.eligible(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.c2,)), extra=loose)
+
+    def test_header_must_be_the_first_line_git_accepts(self):
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"))
+        self.refused(body + HDR)
+        self.refused(b"# pack-refs with:peeled fully-peeled sorted \n" + body)
+        self.refused(b"# other\n" + body)
+        self.refused(HDR + HDR + body)
+
+    def test_header_bytes_git_would_cut_short_are_refused(self):
+        """Git reads the traits as a C string: after a NUL it still sees
+        `sorted` or `fully-peeled`, and a token split on bytes would not."""
+        o = self.o
+        shadowed = pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b"))
+        loose = {b".git/refs/heads/b": o.c2.encode() + b"\n"}
+        for header in (b"# pack-refs with: peeled fully-peeled sorted\0\n",
+                       b"# pack-refs with: sorted\0 \n", b"# pack-refs with: sorted\0x\n"):
+            with self.subTest(header):
+                self.refused(header + shadowed, extra=loose)
+        self.refused(b"# pack-refs with: peeled fully-peeled\0\n"
+                     + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1")))
+        for header in (b"# pack-refs with: sorted\t\n", b"# pack-refs with: sorted\r\n",
+                       "# pack-refs with: sorted\u00a0\n".encode()):
+            with self.subTest(header):
+                self.refused(header + pw.packed_lines((o.c2, b"refs/heads/main")))
+        self.eligible(b"# pack-refs with: \n" + pw.packed_lines((o.c2, b"refs/heads/main")))
+
+    def test_sorted_header_requires_sorted_names(self):
+        """Git binary-searches a file that claims `sorted`: an unsorted one
+        hides HEAD's branch and lists a packed value a loose ref shadows."""
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b"), (o.c1, b"refs/heads/a"))
+        loose = {b".git/refs/heads/b": o.c2.encode() + b"\n"}
+        self.refused(HDR + body, extra=loose)
+        self.refused(b"# pack-refs with: sorted\n" + body, extra=loose)
+        self.eligible(b"# pack-refs with: peeled fully-peeled \n" + body, extra=loose)
+        self.eligible(body, extra=loose)
+
+    def test_ref_names_follow_git_check_ref_format(self):
+        o = self.o
+        bad = (b"refs/heads/a..b", b"refs/heads/x.lock", b"refs/heads/x.lock/y", b"refs/heads/x.", b"refs/heads/.x",
+               b"refs/heads/a/.b", b"refs/heads/.", b"refs/heads//x", b"refs/heads/x/", b"refs/heads/a b",
+               b"refs/heads/a\tb", b"refs/heads/a\x7fb", b"refs/heads/a~b", b"refs/heads/a^b", b"refs/heads/a:b",
+               b"refs/heads/a?b", b"refs/heads/a*b", b"refs/heads/a[b", b"refs/heads/a\\b", b"refs/heads/a@{b",
+               b"refs/", b"refs/heads/" + b"x" * 240)
+        for name in bad:
+            with self.subTest(name):
+                self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+                self.refused(UNSORTED + pw.packed_lines((o.c2, name)), head=b"ref: " + name + b"\n", finding="malformed_head")
+                self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main")), finding="malformed_ref",
+                             extra={b".git/refs/heads/alias": b"ref: " + name + b"\n"})
+        for name in (b"refs/heads/a.b", b"refs/heads/v1.2/x", b"refs/heads/x.lockx", b"refs/heads/a.lock.b",
+                     b"refs/heads/@", b"refs/heads/a@b", b"refs/heads/a+b", b"refs/heads/a-b_c", b"refs/heads/A,b=c"):
+            with self.subTest(name):
+                self.eligible(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+        self.eligible(HDR + pw.packed_lines((o.c2, b"refs/heads/a.b")), head=b"ref: refs/heads/a.b\n")
+
+    def test_name_git_opens_as_a_lock_file_in_another_case(self):
+        """On APFS Git opens `refs/heads/x.LOCK` as the loose file `x.lock`,
+        which is skipped here as residue and never verified."""
+        o = self.o
+        forged = {b".git/refs/heads/feature.lock": o.f.encode() + b"\n"}
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/feature.LOCK"), (o.c2, b"refs/heads/main")),
+                     finding="unknown", extra=forged)
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/main.LOCK")), finding="unknown",
+                     head=b"ref: refs/heads/main.LOCK\n", extra={b".git/refs/heads/main.lock": o.f.encode() + b"\n"})
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/main")), finding="unknown",
+                     extra={b".git/refs/heads/alias": b"ref: refs/heads/x.LOCK\n",
+                            b".git/refs/heads/x.lock": o.f.encode() + b"\n"})
+        _, q3, q4, q5, reasons, _ = self.q(HDR + pw.packed_lines((o.c2, b"refs/heads/main")), extra=forged)
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+
+    def test_peel_walks_each_tag_once(self):
+        """A chain of n tags, each packed with its peel line and the
+        outermost first, reads each tag once rather than once per ref."""
+        o, files = self.o, dict(self.files)
+        prev, typ, chain = o.c1, b"commit", []
+        for i in range(60):
+            prev, z = pw.gobj(b"tag", b"object " + prev.encode() + b"\ntype " + typ + b"\ntag t%d\ntagger a <a> 0 +0000\n\nt\n" % i)
+            files[pw.loose_key(prev)], typ = z, b"tag"
+            chain.append(prev)
+        body = pw.packed_lines((o.c2, b"refs/heads/main"),
+                               *[p for i, t in reversed(list(enumerate(chain)))
+                                 for p in ((t, b"refs/tags/t%03d" % (99 - i)), (o.c1,))])
+        self.files = files
+        real, calls = gitclass._read_object, []
+        with mock.patch.object(gitclass, "_read_object", side_effect=lambda f, oid: calls.append(oid) or real(f, oid)):
+            self.eligible(HDR + body)
+        peel_reads = len(calls) - len(set(calls))
+        self.assertLessEqual(peel_reads, len(chain) + 2)
+
+    def test_head_names_outside_the_observer_subset_are_unsupported(self):
+        """Git accepts `refs/heads/a+b`; the PR-2 observer resolves HEAD only
+        through [A-Za-z0-9._/-], so the bytes stay complete but not eligible."""
+        o = self.o
+        _, q3, q4, q5, reasons, _ = self.q(HDR + pw.packed_lines((o.c2, b"refs/heads/a+b")), head=b"ref: refs/heads/a+b\n")
+        self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["git_head"]))
+
+    def test_non_ascii_names_stay_outside_the_supported_subset(self):
+        """Git accepts `refs/heads/fünf`; the supported subset is the PR-2
+        observer's printable ASCII, so such a name refuses rather than verifies."""
+        o = self.o
+        name = "refs/heads/fünf".encode()
+        self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+        self.refused(UNSORTED + pw.packed_lines((o.c2, name)), head=b"ref: " + name + b"\n", finding="malformed_head")
+
+
+class PackedRefsAgainstRealGit(unittest.TestCase):
+    """The classifier against what the installed Git reads from the same
+    packed-refs bytes."""
+
+    def setUp(self):
+        self.lab = git_lab(self)
+        self.r = three_commits(self.lab)
+        self.git("tag", "-a", "-m", "t", "v1", "HEAD~2")
+        self.git("tag", "-a", "-m", "t", "v2", "v1")
+        self.git("tag", "light", "HEAD~1")
+        self.git("pack-refs", "--all")
+        self.files = captured(self.r)
+
+    def git(self, *args):
+        return self.lab.git(self.r, *args).stdout.decode().strip()
+
+    def rev(self, ref):
+        return self.git("rev-parse", ref)
+
+    def write_packed(self, data):
+        with open(os.path.join(self.r, ".git", "packed-refs"), "wb") as f:
+            f.write(data)
+        self.files = captured(self.r)
+
+    def test_git_written_annotated_and_nested_tags_are_eligible(self):
+        """Eligible once one loose ref keeps `refs/` in the manifest; with
+        every ref packed it is `refs_dir` (GitdirReconstruction)."""
+        self.assertEqual(sum(p.startswith(b".git/refs/") for p in self.files), 0)
+        self.assertIn(b"\n^", self.files[b".git/packed-refs"])
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.git("update-ref", "refs/heads/side", "HEAD~1")
+        self.files = captured(self.r)
+        self.assertEqual(classify(self.files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.rev("HEAD")))
+
+    def test_repeated_branch_line_git_reads_is_refused(self):
+        """Git resolves HEAD to the second line; before the fix the classifier
+        verified only the first and called the slot eligible."""
+        head, packed = self.rev("HEAD"), self.files[b".git/packed-refs"]
+        tree = self.rev("HEAD^{tree}")
+        forged = self.lab.git(self.r, "commit-tree", "-m", "FORGED", tree).stdout.decode().strip()
+        line = head.encode() + b" refs/heads/main\n"
+        self.assertIn(line, packed)
+        self.write_packed(packed.replace(line, line + forged.encode() + b" refs/heads/main\n"))
+        self.assertEqual(self.rev("HEAD"), forged)
+        self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+    def test_nul_in_header_git_still_reads_sorted(self):
+        """With `sorted\\0` Git binary-searches and lists a packed value that a
+        loose ref shadows; the classifier refuses the header."""
+        main = self.rev("HEAD")
+        other = self.rev("HEAD~2")
+        self.write_packed(b"# pack-refs with: peeled fully-peeled sorted\0\n" + main.encode() + b" refs/heads/main\n"
+                          + other.encode() + b" refs/heads/b\n")
+        self.lab.write(self.r, ".git/refs/heads/b", main.encode() + b"\n")
+        self.files = captured(self.r)
+        listed = self.git("for-each-ref", "--format=%(refname) %(objectname)").splitlines()
+        self.assertIn("refs/heads/b " + other, listed)
+        self.assertIn("refs/heads/b " + main, listed)
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["malformed_packed"]))
+
+    def test_lock_file_git_opens_for_another_case(self):
+        tree = self.rev("HEAD^{tree}")
+        forged = self.lab.git(self.r, "commit-tree", "-m", "FORGED", tree).stdout.decode().strip()
+        head = self.rev("HEAD")
+        self.write_packed(b"# pack-refs with: peeled fully-peeled sorted \n" + head.encode() + b" refs/heads/feature.LOCK\n"
+                          + head.encode() + b" refs/heads/main\n")
+        self.lab.write(self.r, ".git/refs/heads/feature.lock", forged.encode() + b"\n")
+        if not os.path.exists(os.path.join(self.r, ".git", "refs", "heads", "feature.LOCK")):
+            self.skipTest("case-sensitive volume")
+        self.files = captured(self.r)
+        self.assertEqual(self.rev("refs/heads/feature.LOCK"), forged)
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_forged_peel_git_reports_is_refused(self):
+        v1, peel = self.rev("v1"), self.rev("v1^{}")
+        packed = self.files[b".git/packed-refs"]
+        line = v1.encode() + b" refs/tags/v1\n^" + peel.encode() + b"\n"
+        self.assertIn(line, packed)
+        other = self.rev("HEAD")
+        self.write_packed(packed.replace(line, line.replace(peel.encode(), other.encode())))
+        self.assertIn(other + " refs/tags/v1^{}", self.git("show-ref", "-d", "v1"))
+        self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+
+class GitdirReconstruction(unittest.TestCase):
+    """B-1: Git accepts a gitdir only with HEAD, `objects` and `refs`
+    (`is_git_directory`). The untyped manifest records files, so a restore
+    creates `refs` only above a captured ref file. Without one Git rejects
+    the restored `.git` and may open a forged bare repository at the slot
+    root instead (CONTRACT.md, "Restorable gitdir")."""
+
+    def setUp(self):
+        self.lab = git_lab(self)
+        self.r = three_commits(self.lab)
+        self.head = self.git("rev-parse", "HEAD")
+
+    def git(self, *args):
+        return self.lab.git(self.r, *args).stdout.decode().strip()
+
+    def test_pack_refs_all_leaves_no_ref_file_and_is_refused(self):
+        self.git("pack-refs", "--all")
+        refs = os.path.join(self.r, ".git", "refs")
+        self.assertTrue(os.path.isdir(os.path.join(refs, "heads")))
+        self.assertEqual([n for _, _, names in os.walk(refs) for n in names], [])
+        files = captured(self.r)
+        self.assertFalse([p for p in files if p.startswith(b".git/refs")])
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.assertEqual(discover(self.lab, self.r), (".git", self.head))
+        self.assertIn("not a git repository", discover(self.lab, restore(self.lab, files, "restored")))
+
+    def test_empty_refs_directories_are_not_captured_and_not_needed(self):
+        """`refs/tags` stays empty and out of the manifest; one captured ref
+        file is enough for Git to accept the restored gitdir."""
+        self.assertEqual(os.listdir(os.path.join(self.r, ".git", "refs", "tags")), [])
+        files = captured(self.r)
+        self.assertEqual([p for p in files if p.startswith(b".git/refs")], [b".git/refs/heads/main"])
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.head))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "restored")), (".git", self.head))
+
+    def test_forged_bare_repository_at_the_slot_root(self):
+        """Every ref packed: Git opens the forged root, the classifier refuses.
+        One loose ref: Git keeps the slot's `.git` and the slot is eligible."""
+        self.git("pack-refs", "--all")
+        files, forged = pw.forge_bare(captured(self.r), self.head)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "packed")), (".", forged))
+        self.git("update-ref", "refs/heads/side", "HEAD~1")
+        files, forged = pw.forge_bare(captured(self.r), self.head)
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.head))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "loose")), (".git", self.head))
+
+    def test_nested_repository_without_a_ref_file(self):
+        """Git in a nested repository whose `refs` did not restore opens the
+        enclosing repository instead; the slot is refused."""
+        sub = os.path.join(self.r, "vendor", "lib")
+        os.makedirs(sub)
+        self.lab.git(sub, "init", "-q")
+        self.lab.write(sub, "x.txt", b"nested\n")
+        self.lab.git(sub, "add", "x.txt")
+        self.lab.git(sub, "commit", "-q", "-m", "n")
+        nested = self.lab.git(sub, "rev-parse", "HEAD").stdout.decode().strip()
+        self.assertEqual(classify(captured(self.r))[2:5], ("COMPLETE", "ELIGIBLE", []))
+        self.lab.git(sub, "pack-refs", "--all")
+        files = captured(self.r)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        got = discover(self.lab, os.path.join(restore(self.lab, files, "restored"), "vendor", "lib"))
+        self.assertEqual(got[1:], (self.head,))
+        self.assertNotEqual(self.head, nested)
+
+    def test_synthetic_nested_and_top_level(self):
+        top, _ = pw.git_repo()
+        packed = pw.git_repo(variant=("packed_refs",))[0]
+        for where, files in (("top", packed),
+                             ("nested", {**top, **pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]}),
+                             ("a sibling of refs", {**packed, b".git/refs.bak": b"x\n", b".git/refsx/y": b"x\n"})):
+            with self.subTest(where):
+                _, q3, q4, q5, reasons, _ = classify(files)
+                self.assertEqual((q3, q4, q5), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("refs_dir", reasons)
+        nested = pw.git_repo(variant=("packed_refs", "loose_tag"), prefix=b"vendor/lib/")[0]
+        self.assertEqual(classify({**top, **nested})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_a_gitlink_file_has_no_refs_of_its_own(self):
+        _, _, q4, _, reasons, _ = classify({**pw.git_repo()[0], b"sub/.git": b"gitdir: /elsewhere\n"})
+        self.assertEqual((q4, "gitlink_file" in reasons, "refs_dir" in reasons), ("INCOMPLETE", True, False))
+
+
+class GitdirSpelling(unittest.TestCase):
+    """B-2: Git on APFS does not open `.g\\u200cit` as `.git`, and on a
+    case-sensitive volume not `.GIT` either. Another spelling is detected as
+    an administrative directory (R2 K3) but accepted as a repository only as
+    the exact bytes `.git`; any other spelling is `unknown`."""
+
+    def test_exact_name_is_the_control(self):
+        files, coid = pw.git_repo()
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], coid))
+        self.assertEqual(classify(pw.forge_bare(files, coid)[0])[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], coid))
+
+    def test_every_alias_is_detected_and_unknown(self):
+        files, coid = pw.git_repo()
+        forged, _ = pw.forge_bare(files, coid)
+        for name in ALIASES:
+            with self.subTest(name):
+                self.assertTrue(gitclass.is_git_path(name + b"/HEAD"))
+                for tree in (pw.respell(files, name), pw.respell(forged, name)):
+                    self.assertEqual(set(gitclass.repositories(tree)), {b""})
+                    self.assertEqual(classify(tree)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_competing_spellings(self):
+        files, coid = pw.git_repo()
+        forged, _ = pw.forge_bare(files, coid)
+        ign = ".g\u200cit".encode()
+        for names in ((b".git", ign), (b".git", b".GIT"), (b".GIT", ign), (b".GIT", b".Git", ign)):
+            with self.subTest(names):
+                tree = {**forged}
+                for n in names:
+                    tree.update(pw.respell(files, n))
+                self.assertEqual(classify(tree)[2:5], ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_nested_alias_beside_an_exact_top_level_gitdir(self):
+        top, _ = pw.git_repo()
+        for name in ALIASES:
+            nested = pw.git_repo(prefix=b"sub/")[0]
+            nested = {p.replace(b"sub/.git/", b"sub/" + name + b"/", 1): d for p, d in nested.items()}
+            with self.subTest(name):
+                repos = gitclass.repositories({**top, **nested})
+                self.assertEqual(("unknown" in repos[b""].features, "unknown" in repos[b"sub"].features), (False, True))
+                self.assertEqual(classify({**top, **nested})[2:5], ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_unicode_normalization(self):
+        """`.git` is ASCII: every normalization form leaves it unchanged, and
+        a look-alike that no volume folds to `.git` is worktree content, so
+        the slot has no repository and is refused. A root spelled NFD alone
+        is an exact `.git` repository; NFC and NFD of one root are `unknown`
+        (test_two_paths_that_name_one_file_are_ambiguous)."""
+        for form in ("NFC", "NFD", "NFKC", "NFKD"):
+            self.assertEqual(unicodedata.normalize(form, ".git"), ".git")
+        files, coid = pw.git_repo()
+        for name in (".gi\u0307t", "\uff0egit", ".g\u0131t", ".gi\u0301t"):
+            with self.subTest(name):
+                tree = pw.respell(files, name.encode())
+                self.assertFalse(gitclass.is_git_path(name.encode() + b"/HEAD"))
+                self.assertEqual(gitclass.repositories(tree), {})
+                self.assertEqual(classify(tree)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", []))
+        nfd = "cafe\u0301/".encode()
+        self.assertEqual(classify({**files, **pw.git_repo(prefix=nfd)[0]})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+
+class GitdirSpellingAgainstRealGit(unittest.TestCase):
+    """What the installed Git discovers for each spelling, on this host's
+    volume, with a forged bare repository at the slot root."""
+
+    def test_git_discovery_of_each_spelling(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        head = lab.git(r, "rev-parse", "HEAD").stdout.decode().strip()
+        forged_files, forged = pw.forge_bare(captured(r), head)
+        lab.write(lab.root, "CaseProbe", b"")
+        folds_case = os.path.exists(os.path.join(lab.root, "caseprobe"))
+        self.assertEqual(discover(lab, restore(lab, forged_files, "exact")), (".git", head))
+        for i, name in enumerate(ALIASES):
+            with self.subTest(name):
+                tree = pw.respell(forged_files, name)
+                self.assertEqual(classify(tree)[3], "NOT_ELIGIBLE")
+                got = discover(lab, restore(lab, tree, "alias%d" % i))
+                if folds_case and name.lower() == b".git":
+                    self.assertEqual(got, (".git", head))  # APFS opens `.GIT`: a documented over-refusal
+                else:
+                    self.assertEqual(got, (".", forged))
 
 
 class TypedNeutralization(unittest.TestCase):

@@ -7,6 +7,7 @@ real effect writer is PR-4 (P-B1 option (b))."""
 
 import hashlib
 import json
+import types
 import zlib
 
 import harness
@@ -67,6 +68,24 @@ def pack_pair(raws):
     return pack, reseal(idx + bytes(20))
 
 
+def loose_key(oid):
+    return b".git/objects/" + oid[:2].encode() + b"/" + oid[2:].encode()
+
+
+def head_tree(files, coid):
+    """(tree id, loose form) of the commit `coid` stored loose in `files`."""
+    toid = zlib.decompress(files[loose_key(coid)]).split(b"\0", 1)[1][5:45].decode()
+    return toid, zlib.decompress(files[loose_key(toid)])
+
+
+def with_pack(files, raws, name=b"f"):
+    """`files` plus a consistent pack and index holding `raws` ({listed id:
+    loose form}); the id is never checked against the content."""
+    pack, idx = pack_pair(raws)
+    stem = b".git/objects/pack/pack-" + name
+    return {**files, stem + b".pack": pack, stem + b".idx": idx}
+
+
 def git_repo(worktree=None, variant=(), prefix=b""):
     """{tree path: bytes} for a worktree and its loose-object `.git`."""
     worktree = worktree if worktree is not None else {b"README": b"hello\n", b"main.go": b"package main\n"}
@@ -84,9 +103,11 @@ def git_repo(worktree=None, variant=(), prefix=b""):
     for oid, z in objs.items():
         g[b"objects/" + oid[:2].encode() + b"/" + oid[2:].encode()] = z
     v = set(variant)
-    if "packed_refs" in v or "packed_only" in v:
+    if "packed_refs" in v:
         del g[b"refs/heads/main"]
         g[b"packed-refs"] = b"# pack-refs with: peeled fully-peeled sorted \n" + coid.encode() + b" refs/heads/main\n"
+    if "loose_tag" in v:
+        g[b"refs/tags/v0"] = coid.encode() + b"\n"
     if "packed_only" in v:
         for oid in objs:
             del g[b"objects/" + oid[:2].encode() + b"/" + oid[2:].encode()]
@@ -124,6 +145,46 @@ def git_repo(worktree=None, variant=(), prefix=b""):
     out = {prefix + p: d for p, d in worktree.items()}
     out.update({prefix + b".git/" + p: d for p, d in g.items()})
     return out, coid
+
+
+def packed_world():
+    """(files, ids) with a second commit, an annotated tag `v1` on the first
+    and an annotated tag `v2` that tags `v1`; every ref but the loose tag
+    `refs/tags/loose` (which keeps `refs/` restorable) lives in packed-refs
+    and the caller writes that file."""
+    files, c1 = git_repo()
+    toid, _ = head_tree(files, c1)
+    c2, z2 = gobj(b"commit", b"tree " + toid.encode() + b"\nparent " + c1.encode()
+                  + b"\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nsecond\n")
+    t1, zt1 = gobj(b"tag", b"object " + c1.encode() + b"\ntype commit\ntag v1\ntagger a <a> 0 +0000\n\nt\n")
+    t2, zt2 = gobj(b"tag", b"object " + t1.encode() + b"\ntype tag\ntag v2\ntagger a <a> 0 +0000\n\nt\n")
+    f, zf = gobj(b"commit", b"tree " + toid.encode() + b"\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\nFORGED\n")
+    for oid, z in ((c2, z2), (t1, zt1), (t2, zt2), (f, zf)):
+        files[loose_key(oid)] = z
+    del files[b".git/refs/heads/main"]
+    files[b".git/refs/tags/loose"] = c1.encode() + b"\n"
+    return files, types.SimpleNamespace(c1=c1, c2=c2, t1=t1, t2=t2, f=f)
+
+
+def forge_bare(files, head):
+    """`files` plus a bare repository at the slot root whose HEAD is a forged
+    commit over `head`'s tree; the slot's loose objects are copied there."""
+    toid, _ = head_tree(files, head)
+    fc, fz = gobj(b"commit", b"tree " + toid.encode() + b"\nauthor e <e> 0 +0000\ncommitter e <e> 0 +0000\n\nFORGED\n")
+    out = {**files, b"HEAD": b"ref: refs/heads/main\n", b"refs/heads/main": fc.encode() + b"\n",
+           b"objects/" + fc[:2].encode() + b"/" + fc[2:].encode(): fz}
+    out.update({p[5:]: d for p, d in files.items() if p.startswith(b".git/objects/")})
+    return out, fc
+
+
+def respell(files, name):
+    """`files` with the slot's `.git` component spelled `name`."""
+    return {(name + p[4:] if p.startswith(b".git/") else p): d for p, d in files.items()}
+
+
+def packed_lines(*pairs):
+    """packed-refs lines: (oid, name) for a ref, (oid,) for a `^` line."""
+    return b"".join((b"^" + p[0].encode() if len(p) == 1 else p[0].encode() + b" " + p[1]) + b"\n" for p in pairs)
 
 
 # ------------------------------------------------------------------ synthetic PR-4 effects (test-owned stores)

@@ -4,6 +4,7 @@ and a test-only PR-4 effect stand-in that writes test-owned stores. Every
 expected value is recomputed here; negative traces assert that no unintended
 effect or persistent write happened."""
 
+import os
 import types
 import unittest
 from unittest import mock
@@ -17,6 +18,7 @@ from broker.stores import Crash
 from preserve_world import OTHER, SLOT, outcome, rel
 
 PRES_KEYS = {"head", "complete", "inventory", "preserved", "artifact"}
+HDR = b"# pack-refs with: peeled fully-peeled sorted \n"
 
 
 class Base(unittest.TestCase):
@@ -54,6 +56,26 @@ class Base(unittest.TestCase):
         self.assertEqual((self.w.env.snapshot(), pw.store_bytes(self.w), len(self.w.fx.calls)), before)
         return r
 
+    def stuck_at_move(self):
+        """Rejected after the move: one irreversible step, no revoke, the
+        barrier held, every later verb refused with no effect or write, and
+        the F resume re-runs the idempotent effect only to be rejected again."""
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        cid = self.w.cid()
+        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
+        self.assertEqual([r["kind"] for r in self.w.st()["records"]], ["start", "move.done"])
+        self.assertEqual(self.w.row(), ("P7", "MOVE_INTENT"))
+        self.assertEqual(self.w.release(), DENIED)
+        for verb in ("freeze-start", "freeze-continue", "quarantine", "quiescence", "snapshot",
+                     "verify-preservation", "preservation", "ready", "thaw"):
+            with self.subTest(verb):
+                self.refused(verb, Code.VERB_NOT_ALLOWED_IN_STATE, "")
+        self.rejected("resume-step", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.fx.irrev, [(cid, "move")])
+        self.assertEqual(self.w.release(), DENIED)
+        self.assertEqual((self.w.last_doc("preservation"), self.w.last_doc("ready")), (None, None))
+
 
 # ------------------------------------------------------------------ positive traces
 
@@ -83,16 +105,18 @@ class Positive(Base):
         self.assertEqual(self.w.fx.irrev, [(s["cid"], "move")] + [(s["cid"], "revoke:" + a) for a in journal.ATTRS])
 
     def test_unsupported_git_with_complete_raw_bytes(self):
-        """P-C4: packed-only objects: raw COMPLETE, Q3 INCOMPLETE; READY reached
-        and no document field claims semantic verification."""
+        """P-C4 as amended by R4.2 (supersedes P2's READY): packed-only objects
+        keep raw COMPLETE, Q3 INCOMPLETE and Q4 COMPLETE, but Q5 is
+        NOT_ELIGIBLE, so freeze-start is rejected after the move."""
         self.w.fx.trees[SLOT] = pw.git_repo(variant=("packed_only",))[0]
-        self.w.to_ready()
-        self.assertEqual(self.w.row()[0], "P18")
-        doc = self.w.last_doc("preservation")
-        self.assertNotIn("semantics", repr(doc))
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        s = self.w.st()
+        m = pw.protocol.parse_doc(self.w.res.artifact(s["cid"], s["ep_m"]))
+        self.assertEqual(m["result"], "COMPLETE")
         files = {p[5:]: d for p, d in self.w.fx.tree(SLOT).items() if p.startswith(b".git/")}
         self.assertEqual(gitclass.questions({b"": gitclass.classify(b"", files)}, "COMPLETE")[1:4],
-                         ("INCOMPLETE", "COMPLETE", "ELIGIBLE"))
+                         ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
 
     def test_missing_object_beside_a_junk_pack_is_not_preservable(self):
         """B-3: a pack file name never stands in for the missing object."""
@@ -143,15 +167,80 @@ class Positive(Base):
     def test_nested_external_objects_under_mixed_case_gitdir(self):
         self._external_nested_refused(b".Git")
 
-    def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
-        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
+    def _aliased_object(self, spelling):
+        """The real `.git/objects/..` path holds junk; `spelling(path)` names
+        the same file another way and holds the valid object."""
+        files = pw.git_repo()[0]
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        files[spelling(k)], files[k] = files[k], b"junk"
+        return files
+
+    def test_manifest_path_with_an_invalid_component_is_rejected(self):
+        """R2 §3.2: `/.git/x` and `.git/x` name one file, so a manifest that
+        lists both never verifies the bytes Git would read (never D4)."""
+        for name, spelling in (("leading slash", lambda k: b"/" + k), ("dot", lambda k: b"./" + k),
+                               ("dot dot", lambda k: b"w/../" + k), ("empty", lambda k: k.replace(b"/", b"//", 1))):
+            with self.subTest(name):
+                self.w = pw.World(**self.world_kw)
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = self._aliased_object(spelling)
+                self.ok("adopt", "request")
+                self.rejected("freeze-start", "fresult_rejected:artifact_mismatch", "MOVE_INTENT")
+                self.assertEqual(self.w.release(), DENIED)
+
+    def test_case_alias_of_a_gitdir_path_is_not_preservable(self):
+        """`.git/OBJECTS/..` is `.git/objects/..` on APFS: the valid object is
+        classified, but junk under the other spelling may be what lands there."""
+        files = pw.git_repo()[0]
+        k = next(p for p in files if p.startswith(b".git/objects/"))
+        files[k.replace(b"objects", b"OBJECTS", 1)] = b"junk"
+        self.w.fx.trees[SLOT] = files
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_worktree_file_over_a_nested_repository_is_not_preservable(self):
+        """A worktree file `Sub` and the nested repository `sub/.git` cannot
+        both exist on APFS; the manifest's worktree paths are compared too."""
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".git"), b"Sub": b"x\n"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_shallow_file_under_another_spelling_is_not_preservable(self):
+        """B-1: an agent can write `.git/Shallow` on APFS; Git reads it as
+        `shallow`, so the repository is not recovery-eligible."""
+        files, coid = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**files, b".git/Shallow": coid.encode() + b"\n"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_pack_directory_captured_as_an_entry_is_not_preservable(self):
+        """NB-13: the entry may be a symbolic link that restore recreates, and
+        Git then reads packs outside the slot."""
+        files, _ = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**files, b".git/objects/pack": b"/elsewhere/pack"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_plain_nested_repository_reaches_d4_outside_the_dirty_inventory(self):
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".git")}
         self.w.to_ready()
         self.assertEqual(rel(self.w.release()), "D4")
         s, doc = self.w.st(), self.w.last_doc("preservation")
         dirty = sorted(p.hex() for p in self.w.fx.tree(SLOT) if not gitclass.is_git_path(p))
         self.assertIn(b"sub/work.txt".hex(), dirty)
-        self.assertFalse(any(b"/.GIT/" in bytes.fromhex(p) for p in dirty))
+        self.assertFalse(any(b"/.git/" in bytes.fromhex(p) for p in dirty))
         self.assertEqual(doc["inventory"]["dirty"], [preserve.item_id("dirty", s["fs_m"], 0, dirty)])
+
+    def test_plain_nested_upper_case_repository_is_not_preservable(self):
+        """B-2 (2026-11-17): only the exact `.git` is a repository; `sub/.GIT`
+        stays out of the dirty inventory but refuses (`unknown`)."""
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
+        self.assertFalse(any(b"/.GIT/" in p for p in self.w.fx.tree(SLOT) if not gitclass.is_git_path(p)))
+        self.stuck_at_move()
 
     def test_owner_thaw_from_p7_then_d2(self):
         self.ok("adopt", "request", "freeze-start", "freeze-continue")
@@ -442,6 +531,441 @@ class Preservation(Base):
 
 
 # ------------------------------------------------------------------ escaped files (OD-R4-1)
+
+def _old_policy(real=gitclass.questions):
+    """The superseded R2 K7 rule (packed objects recovery eligible), used only
+    to reach later gates and prove each refuses unverified packed evidence."""
+    def questions(repos, q1):
+        feats, q3, q4, q5, reasons, head = real(repos, q1)
+        if q4 == "COMPLETE" and head is not None and not set(feats) & gitclass.UNSUPPORTED:
+            q5 = "ELIGIBLE"
+        return feats, q3, q4, q5, reasons, head
+    return mock.patch.object(gitclass, "questions", questions)
+
+
+class PackedObjects(Base):
+    """Owner amendment R4.2 and its amendment 1: a reachable object that any
+    pack index lists is not recovery evidence, also beside a verified loose
+    copy (Git reads the pack first). The refusal happens in `check_fresult`
+    after the freeze-start move effect ran (the EP manifest is that effect's
+    output); nothing later can commit, discharge or replay past it."""
+
+    def forged(self):
+        loose, coid = pw.git_repo()
+        toid, _ = pw.head_tree(loose, coid)
+        files = {p: d for p, d in loose.items() if p != pw.loose_key(toid)}
+        return pw.with_pack(files, {toid: b"blob 4\0junk"})
+
+    def test_forged_pack_never_reaches_ready_or_d4(self):
+        self.w.fx.trees[SLOT] = self.forged()
+        self.stuck_at_move()
+
+    def test_mixed_loose_and_genuine_packed_objects(self):
+        loose, coid = pw.git_repo()
+        toid, traw = pw.head_tree(loose, coid)
+        self.w.fx.trees[SLOT] = pw.with_pack({p: d for p, d in loose.items() if p != pw.loose_key(toid)},
+                                             {toid: traw})
+        self.stuck_at_move()
+
+    def shadowed_head(self):
+        """NB-12: every object loose and verified; a self-consistent pack lists
+        the HEAD commit's id and holds another commit."""
+        loose, coid = pw.git_repo()
+        toid, _ = pw.head_tree(loose, coid)
+        body = b"tree " + toid.encode() + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        return pw.with_pack(loose, {coid: b"commit %d\0" % len(body) + body})
+
+    def test_pack_entry_shadowing_a_verified_loose_head_never_reaches_d4(self):
+        self.w.fx.trees[SLOT] = self.shadowed_head()
+        self.stuck_at_move()
+
+    def test_shadowed_head_refused_by_quarantine_on_its_own(self):
+        self.w.fx.trees[SLOT] = self.shadowed_head()
+        with _old_policy():
+            self.ok("adopt", "request", "freeze-start")
+        self.ok("freeze-continue")
+        self.refused("quarantine", Code.PROVENANCE_INSUFFICIENT, "not_preservable(packed)")
+
+    def test_duplicate_representations_never_reach_d4(self):
+        loose, _ = pw.git_repo()
+        raws = {p[13:].replace(b"/", b"").decode(): pw.zlib.decompress(d)
+                for p, d in loose.items() if p.startswith(b".git/objects/")}
+        for name, files in (("loose and one genuine pack", pw.with_pack(loose, raws)),
+                            ("loose and two genuine packs", pw.with_pack(pw.with_pack(loose, raws, b"a"), raws, b"b")),
+                            ("unrelated pack sorts before a forged HEAD entry",
+                             pw.with_pack(self.shadowed_head(), {pw.gobj(b"blob", b"unrelated\n")[0]:
+                                                                 b"blob 10\0unrelated\n"}, b"a")),
+                            ("multi-pack-index", {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"})):
+            with self.subTest(name):
+                self.w.close()
+                self.w = pw.World()
+                self.w.fx.trees[SLOT] = files
+                self.stuck_at_move()
+
+    def test_signed_merged_repository_written_by_git_reaches_d4(self):
+        """Loose-only history Git wrote with SSH-signed commits, a signed tag
+        merged with `mergetag` and a merge commit, plus an unrelated pack."""
+        import shutil
+        import subprocess
+        from gitfixture import GIT, Lab
+        if GIT is None or shutil.which("ssh-keygen") is None:
+            self.skipTest("git or ssh-keygen not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        r, key = lab.path("repo"), lab.path("key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True, capture_output=True,
+                       env=lab.env, timeout=60)
+        sign = ("-c", "gpg.format=ssh", "-c", "user.signingkey=" + key + ".pub")
+        lab.git(lab.root, "init", "-q", r)
+        for branch, name in (("main", "a"), ("side", "s"), ("main", "m")):
+            if branch == "side":
+                lab.git(r, "checkout", "-q", "-b", "side")
+            elif name == "m":
+                lab.git(r, *sign, "tag", "-s", "-m", "signed", "v1")
+                lab.git(r, "checkout", "-q", "main")
+            lab.write(r, name, name.encode() + b"\n")
+            lab.git(r, "add", name)
+            lab.git(r, *sign, "commit", "-q", "-S", "-m", name)
+        lab.git(r, *sign, "merge", "-q", "-S", "--no-ff", "-m", "merge v1", "v1")
+        files = {}
+        for d, _, names in os.walk(r):
+            for n in names:
+                with open(os.path.join(d, n), "rb") as f:
+                    files[os.path.relpath(os.path.join(d, n), r).encode()] = f.read()
+        merge = pw.zlib.decompress(files[pw.loose_key(lab.git(r, "rev-parse", "HEAD").stdout.decode().strip())])
+        self.assertIn(b"\nmergetag object ", merge)
+        self.assertIn(b"\ngpgsig -----BEGIN SSH SIGNATURE-----", merge)
+        self.assertEqual(lab.git(r, "fsck", "--full", "--strict", "--no-dangling").returncode, 0)
+        oid = pw.gobj(b"blob", b"unrelated\n")[0]
+        self.assertNotIn(pw.loose_key(oid), files)
+        self.w.fx.trees[SLOT] = pw.with_pack(files, {oid: b"blob 10\0unrelated\n"}, b"u")
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+
+    def test_unrelated_pack_beside_loose_objects_reaches_d4(self):
+        oid, z = pw.gobj(b"blob", b"unrelated\n")
+        self.w.fx.trees[SLOT] = pw.with_pack(pw.git_repo()[0], {oid: pw.zlib.decompress(z)}, b"u")
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+
+    def test_second_cycle_does_not_inherit_eligibility(self):
+        """Cycle 1 (loose, eligible) thaws; the agent repacks; cycle 2 is
+        classified from its own EP bytes. Every manifest's stored `questions`
+        claims ELIGIBLE and is never read."""
+        self.ok("adopt", "request", "freeze-start", "freeze-continue", "thaw")
+        c1 = self.w.cid()
+        self.w.fx.trees[SLOT] = pw.git_repo(variant=("packed_only",))[0]
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertNotEqual(self.w.cid(), c1)
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_quarantine_refuses_packed_evidence_on_its_own(self):
+        self.w.fx.trees[SLOT] = self.forged()
+        with _old_policy():
+            self.ok("adopt", "request", "freeze-start")
+        self.ok("freeze-continue")
+        self.refused("quarantine", Code.PROVENANCE_INSUFFICIENT, "not_preservable(packed)")
+
+    def test_preservation_and_ready_refuse_packed_evidence_on_their_own(self):
+        """Past the earlier gates under the superseded rule, D-PRES still
+        recomputes Q5 and refuses, so READY and D4 stay unreachable; D3 (the
+        barrier discharge that never claims preservation) is unaffected and
+        still re-hashes the protected copy of the forged pack."""
+        self.w.fx.trees[SLOT] = self.forged()
+        with _old_policy():
+            self.w.to_verified()
+        self.refused("preservation", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(recovery)")
+        self.refused("ready", Code.VERB_NOT_ALLOWED_IN_STATE, "")
+        self.assertEqual(self.w.row(), ("P13", "VERIFIED"))
+        self.w.observe()
+        self.assertEqual(rel(self.w.release()), "D3")
+        pack = next(d for p, d in self.w.fx.tree(SLOT).items() if p.endswith(b".pack"))
+        self.w.w.o5.stores["artifacts"].items[f"blob/{canonical.sha256(pack)}"] = pack[:-1]
+        self.w.observe()
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_packed_repository_written_by_git(self):
+        """A real repository: loose as Git committed it reaches D4; after
+        `git gc --aggressive` (deltified objects, no loose ones) it is not
+        recovery eligible."""
+        from gitfixture import GIT, Lab
+        if GIT is None:
+            self.skipTest("git not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        r = lab.path("repo")
+        lab.git(lab.root, "init", "-q", r)
+        text = [b"line %d of a file long enough to deltify\n" % i for i in range(200)]
+        for n in range(4):
+            text[n * 7] = b"edit %d\n" % n
+            lab.write(r, "f.txt", b"".join(text))
+            lab.git(r, "add", "f.txt")
+            lab.git(r, "commit", "-q", "-m", str(n))
+
+        def tree():
+            out = {}
+            for d, _, names in os.walk(r):
+                for n in names:
+                    p = os.path.join(d, n)
+                    with open(p, "rb") as f:
+                        out[os.path.relpath(p, r).encode()] = f.read()
+            return out
+
+        loose = tree()
+        lab.git(r, "gc", "-q", "--aggressive")
+        packed = tree()
+        self.assertFalse(any(p.startswith(b".git/objects/") and len(p) == 54 for p in packed))
+        idx = next(p for p in packed if p.endswith(b".idx"))
+        listing = lab.git(r, "verify-pack", "-v", os.path.join(r, idx.decode())).stdout
+        self.assertRegex(listing, rb"chain length = [1-9]")
+        for files, want in ((loose, ("VERIFIED", "COMPLETE", "ELIGIBLE")),
+                            (packed, ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))):
+            self.assertEqual(gitclass.questions(gitclass.repositories(files), "COMPLETE")[1:4], want)
+        self.w.fx.trees[SLOT] = loose
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        self.w.fx.trees[OTHER] = packed
+        self.ok("adopt", "request", slot=OTHER)
+        self.assertEqual(outcome(self.w.run("freeze-start", slot=OTHER)), ("UNFINISHED",))
+        self.assertEqual(self.w.row(OTHER), ("P7", "MOVE_INTENT"))
+
+
+def _superseded_links():
+    """The walker of PR #546 at 2ab37d65 (ids only, no structure or type
+    check), used only to reach later gates and prove each refuses a
+    malformed reachable object on its own."""
+    def links(r, typ, body):
+        out = []
+        if typ in (b"commit", b"tag"):
+            for line in body.split(b"\n"):
+                if not line:
+                    break
+                key, _, val = line.partition(b" ")
+                if key in ((b"tree", b"parent") if typ == b"commit" else (b"object",)):
+                    out.append((val.decode(), None))
+        elif typ == b"tree":
+            i = 0
+            while i < len(body):
+                sp, nul = body.find(b" ", i), body.find(b"\0", i)
+                if body[i:sp] != b"160000":
+                    out.append((body[nul + 1:nul + 21].hex(), None))
+                i = nul + 21
+        return out
+    return mock.patch.object(gitclass, "_links", links)
+
+
+def _with_head(files, raw_objects, head):
+    """`files` plus hand-built loose objects, `refs/heads/main` moved to `head`."""
+    out = {**files, b".git/refs/heads/main": head.encode() + b"\n"}
+    for raw in raw_objects:
+        out[pw.loose_key(pw.hashlib.sha1(raw).hexdigest())] = pw.zlib.compress(raw)  # noqa: S324
+    return out
+
+
+def _commit(body):
+    return b"commit %d\0" % len(body) + body
+
+
+class PackedRefs(Base):
+    """packed-refs that Git reads differently from the classifier is refused
+    after the move, never READY or D4; a valid one still reaches D4."""
+
+    def slot(self, packed, head=b"ref: refs/heads/main\n", extra=None):
+        files, o = pw.packed_world()
+        self.w.fx.trees[SLOT] = {**files, b".git/packed-refs": packed, b".git/HEAD": head, **(extra or {})}
+        return o
+
+    def test_valid_packed_refs_with_tags_reach_d4(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                        (o.t2, b"refs/tags/v2"), (o.c1,)))
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        self.assertEqual(self.w.last_doc("preservation")["head"], o.c2)
+
+    def test_repeated_branch_line_git_reads_second(self):
+        """Git 2.38 and 2.54 resolve HEAD to the forged second line; this
+        slot used to reach D4 with the first line's commit as its head."""
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/main")))
+        self.stuck_at_move()
+
+    def test_repeated_branch_line_forged_first(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.f, b"refs/heads/main"), (o.c2, b"refs/heads/main")))
+        self.stuck_at_move()
+
+    def test_forged_peel_line(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.f,)))
+        self.stuck_at_move()
+
+    def test_unsorted_names_under_a_sorted_header(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b")),
+                  extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_sorted_trait_behind_a_nul(self):
+        """The reviewed head reached D4 here: Git still read `sorted`."""
+        o = pw.packed_world()[1]
+        self.slot(b"# pack-refs with: peeled fully-peeled sorted\0\n"
+                  + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b")),
+                  extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_head_name_git_opens_as_a_lock_file(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main.LOCK")), head=b"ref: refs/heads/main.LOCK\n",
+                  extra={b".git/refs/heads/main.lock": o.f.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_branch_name_git_opens_as_a_lock_file(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/feature.LOCK"), (o.c2, b"refs/heads/main")),
+                  extra={b".git/refs/heads/feature.lock": o.f.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_head_name_git_rejects(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/../x")), head=b"ref: refs/heads/../x\n")
+        self.stuck_at_move()
+
+
+class RestorableGitdir(Base):
+    """B-1 and B-2 end to end: a slot whose gitdir Git may not open after a
+    file-only restore, beside a forged bare repository at the slot root, is
+    refused after the move and never reaches READY or D4."""
+
+    def test_every_ref_packed(self):
+        self.w.fx.trees[SLOT] = pw.git_repo(variant=("packed_refs",))[0]
+        self.stuck_at_move()
+
+    def test_every_ref_packed_beside_a_forged_bare_root(self):
+        files, coid = pw.git_repo(variant=("packed_refs",))
+        self.w.fx.trees[SLOT] = pw.forge_bare(files, coid)[0]
+        self.stuck_at_move()
+
+    def test_nested_repository_with_every_ref_packed(self):
+        nested = pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **nested}
+        self.stuck_at_move()
+
+    def test_one_loose_ref_beside_a_forged_bare_root_reaches_d4(self):
+        files, coid = pw.git_repo(variant=("packed_refs", "loose_tag"))
+        self.w.fx.trees[SLOT] = pw.forge_bare(files, coid)[0]
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        self.assertEqual(self.w.last_doc("preservation")["head"], coid)
+
+    def test_gitdir_alias_beside_a_forged_bare_root(self):
+        files, coid = pw.git_repo()
+        forged = pw.forge_bare(files, coid)[0]
+        for name in (".g\u200cit".encode(), b".GIT"):
+            with self.subTest(name):
+                self.w = pw.World(**self.world_kw)
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = pw.respell(forged, name)
+                self.stuck_at_move()
+
+    def test_competing_gitdir_spellings(self):
+        files, coid = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**pw.forge_bare(files, coid)[0], **pw.respell(files, ".g\u200cit".encode())}
+        self.stuck_at_move()
+
+
+class MalformedObjects(Base):
+    """A hash-consistent loose object whose structure or link types are not
+    Git's is not semantic verification (Q3) and not recovery evidence (Q5).
+    Like R4.2, the first refusal is `check_fresult` after the freeze-start
+    move effect ran; D-QUAR and D-PRES refuse on their own."""
+    IDENT = b"author a <a@x> 0 +0000\ncommitter a <a@x> 0 +0000\n"
+
+    def cases(self):
+        loose, coid = pw.git_repo()
+        toid, _ = pw.head_tree(loose, coid)
+        blob = pw.gobj(b"blob", b"hello\n")[0]
+        no_tree = _commit(self.IDENT + b"\nno tree header\n")
+        to_blob = _commit(b"tree " + blob.encode() + b"\n" + self.IDENT + b"\nm\n")
+        entry = b"100644 README\0" + bytes.fromhex(blob)
+        dup = b"tree %d\0" % (2 * len(entry)) + entry + entry
+        dup_id = pw.hashlib.sha1(dup).hexdigest()  # noqa: S324
+        on_dup = _commit(b"tree " + dup_id.encode() + b"\n" + self.IDENT + b"\nm\n")
+        parent_tree = _commit(b"tree " + toid.encode() + b"\nparent " + toid.encode() + b"\n" + self.IDENT + b"\nm\n")
+        sha = lambda raw: pw.hashlib.sha1(raw).hexdigest()  # noqa: E731,S324
+        good = _commit(b"tree " + toid.encode() + b"\n" + self.IDENT + b"\nm\n").split(b"\0", 1)[1]
+        zero_size = b"commit 0%d\0" % len(good) + good
+        continued = _commit(b"tree " + toid.encode() + b"\n hidden\n" + self.IDENT + b"\nm\n")
+        overflow = _commit(b"tree " + toid.encode() + b"\nauthor a <a@x> 9999999999999999999 +0000\n"
+                           b"committer a <a@x> 0 +0000\n\nm\n")
+        return {"leading-zero object size": _with_head(loose, [zero_size], sha(zero_size)),
+                "continuation inside the mandatory headers": _with_head(loose, [continued], sha(continued)),
+                "author time past Git's limit": _with_head(loose, [overflow], sha(overflow)),
+                "missing tree": _with_head(loose, [no_tree], sha(no_tree)),
+                "tree names a blob": _with_head(loose, [to_blob], sha(to_blob)),
+                "duplicate tree entries": _with_head(loose, [dup, on_dup], sha(on_dup)),
+                "parent names a tree": _with_head(loose, [parent_tree], sha(parent_tree))}
+
+    def test_never_reach_ready_or_d4(self):
+        for case, files in self.cases().items():
+            with self.subTest(case):
+                self.w = pw.World()
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = files
+                self.stuck_at_move()
+
+    def test_quarantine_refuses_on_its_own(self):
+        self.w.fx.trees[SLOT] = self.cases()["missing tree"]
+        with _superseded_links():
+            self.ok("adopt", "request", "freeze-start")
+        self.ok("freeze-continue")
+        self.refused("quarantine", Code.PROVENANCE_INSUFFICIENT, "not_preservable(corrupt_object)")
+
+    def test_preservation_and_ready_refuse_on_their_own(self):
+        """Past every earlier gate under the superseded walker, D-PRES still
+        recomputes Q3-Q5 and refuses; READY and D4 stay unreachable. D3 never
+        claims preservation and still re-hashes the protected copy."""
+        files = self.cases()["tree names a blob"]
+        self.w.fx.trees[SLOT] = files
+        with _superseded_links():
+            self.w.to_verified()
+        self.refused("preservation", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(raw)")
+        self.refused("ready", Code.VERB_NOT_ALLOWED_IN_STATE, "")
+        self.assertEqual(self.w.row(), ("P13", "VERIFIED"))
+        self.w.observe()
+        self.assertEqual(rel(self.w.release()), "D3")
+        head = files[b".git/refs/heads/main"][:40].decode()
+        obj = self.w.fx.tree(SLOT)[pw.loose_key(head)]
+        self.w.w.o5.stores["artifacts"].items[f"blob/{canonical.sha256(obj)}"] = obj[:-1]
+        self.w.observe()
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_second_cycle_is_classified_from_its_own_bytes(self):
+        self.ok("adopt", "request", "freeze-start", "freeze-continue", "thaw")
+        c1 = self.w.cid()
+        self.w.fx.trees[SLOT] = self.cases()["missing tree"]
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertNotEqual(self.w.cid(), c1)
+        self.assertEqual(self.w.release(), DENIED)
+
+    def test_gitlink_without_submodule_state_reaches_d4(self):
+        """R4 §5.2 (B25): a gitlink entry alone is benign. The submodule commit
+        lives in another object store, so it is recorded (Q2 `gitlink`) and
+        not followed; a checked-out submodule is a nested repository or a
+        gitlink file and is classified as such."""
+        loose, coid = pw.git_repo()
+        toid, traw = pw.head_tree(loose, coid)
+        body = traw.split(b"\0", 1)[1] + b"160000 sub\0" + bytes.fromhex("5" * 40)
+        tree = b"tree %d\0" % len(body) + body
+        c = _commit(b"tree " + pw.hashlib.sha1(tree).hexdigest().encode() + b"\n" + self.IDENT  # noqa: S324
+                    + b"\nm\n")
+        files = _with_head(loose, [tree, c], pw.hashlib.sha1(c).hexdigest())  # noqa: S324
+        feats, q3, q4, q5, _, _ = gitclass.questions(gitclass.repositories(files), "COMPLETE")
+        self.assertEqual((q3, q4, q5, "gitlink" in feats), ("VERIFIED", "COMPLETE", "ELIGIBLE", True))
+        self.w.fx.trees[SLOT] = files
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+
 
 class Escaped(Base):
     def test_non_empty_escaped_set_refuses_quarantine_and_keeps_the_barrier(self):

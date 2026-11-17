@@ -16,7 +16,7 @@ import recovery_state as rs
 
 from . import barrier, canonical, evidence, freeze, gitclass, journal, libview, o5contract as oc, protocol
 from .canonical import is_hex64
-from .journal import Mismatch, need, path_hex
+from .journal import Mismatch, need, path_hex, valid_component
 from .refusal import Code, Refused
 
 M_SCHEMA = "codegraph.o5.manifest/v2"
@@ -235,7 +235,8 @@ class _Cycle:
                     need(type(e) is list and len(e) == 2 and path_hex(e[0]) and is_hex64(e[1])
                          and (not out or e[0] > out[-1][0]), Code.STATE_UNKNOWN, "artifact_mismatch")
                     p = bytes.fromhex(e[0])
-                    need(not any(p[:i] in files for i, c in enumerate(p) if c == 0x2F), Code.STATE_UNKNOWN,
+                    need(p.count(b"/") <= journal.MAX_PATH_DEPTH and all(valid_component(c) for c in p.split(b"/"))
+                         and not any(p[:i] in files for i, c in enumerate(p) if c == 0x2F), Code.STATE_UNKNOWN,
                          "artifact_mismatch")
                     files.add(p)
                     out.append((e[0], e[1]))
@@ -290,7 +291,7 @@ class _Cycle:
         got = self.blobs(sorted({b for _, b in es}) if full else sorted({b for _, b in git}))
         a.q1 = "COMPLETE" if m["result"] == "COMPLETE" and got is not None else "INCOMPLETE"
         files = {p: got[b] for p, b in git} if got is not None else {}
-        repos = gitclass.repositories(files)
+        repos = gitclass.repositories(files, [bytes.fromhex(p) for p, _ in es])
         a.q2, a.q3, a.q4, a.q5, a.reasons, a.head = gitclass.questions(repos, a.q1)
         a.top = repos.get(b"")
         if "head_resolved" in m:

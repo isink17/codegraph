@@ -128,7 +128,7 @@ def parse_object(oid, raw, limit):
     """(type, body) of a loose object (gitbytes.loose_object); any problem is
     Unknown."""
     try:
-        return gitbytes.loose_object(oid.decode(), raw, limit)
+        return gitbytes.loose_object(oid, raw, limit + 64)
     except gitbytes.Malformed as e:
         raise Unknown(e.reason, oid) from None
 

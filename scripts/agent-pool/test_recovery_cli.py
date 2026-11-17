@@ -1062,6 +1062,7 @@ class Locks(Cli):
         # The documented procedure: inspect read-only, see nothing unfinished, then remove the lock by hand.
         ins = self.recover("inspect", A, op)
         self.assertIn("pending=none", ins.stdout)
+        (lock / "owner").unlink(missing_ok=True)
         lock.rmdir()
         self.ok("request", A, op)
 

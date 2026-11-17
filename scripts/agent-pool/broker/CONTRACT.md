@@ -38,6 +38,7 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 | `_testsupport/` | test-only capability and evidence producers (LB5) |
 | `fdwalk.py` (PR-2) | descriptor-relative, no-follow, bounded reads |
 | `gitraw.py` (PR-2) | strict-subset config, HEAD, refs, loose commit and tree objects |
+| `gitbytes.py` | pure byte primitives `gitraw` and `gitclass` share: hex ids, `.git` name detection, loose-object decoding; each caller keeps its own size bound and error policy |
 | `indexverify.py` (PR-2) | index parser, worktree comparison, `observe`, result model |
 
 ## Clarifications made in PR-1
@@ -261,14 +262,367 @@ Rules worth repeating:
   `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
 - PR-3b Git classification: a repository is located by any spelling of its
   `.git` component (R2 K3: case-insensitive, plus the code points HFS+
-  ignores); two spellings under one root are `unknown`. A reachable object
-  that is not loose is `packed` only when a version 2 index lists it and the
-  index passes bounded structural checks against its sibling pack (R2 K7).
-  That is presence only: packed contents are never inflated or hashed, so a
-  pack and index an agent forged to be self-consistent can list an object the
-  pack does not hold, and the slot still reaches READY and D4 (the recorded
-  counterexample in the cleanup evidence). Closing it needs packed-object
-  verification or a contract change; neither is in PR-3b.
+  ignores), but only the exact bytes `.git` are accepted as its gitdir; any
+  other spelling, and two spellings under one root, are `unknown` (amended
+  2026-11-17, "Gitdir name and restorable gitdir" below). So is a root with a
+  path that shares a file or directory with another manifest path (worktree
+  paths included): the same path below the root, or a file named twice, a
+  file named like a directory or one directory spelled two ways on a case-
+  and normalization-insensitive volume (APFS, HFS+). So is a git path that
+  is not UTF-8, and a path below the gitdir that APFS would open as one of
+  the administrative names the classifier reads (`shallow`, `info/grafts`,
+  `config`, `packed-refs`, `commondir`, `objects/info/alternates`, `refs`,
+  ...) under another spelling: Git reads it, a byte comparison would not. A
+  manifest path with an empty, `.` or `..` component, a NUL, a component
+  over 255 bytes or more than 64 separators is not one the capture walk
+  produces (R2 §3.2) and refuses as `artifact_mismatch`. A reachable object
+  is `packed` when a version 2 index lists it and the index passes bounded
+  structural checks against its sibling pack (R2 K7), whether or not the
+  object is also loose (R4.2 amendment 1). That is presence only: packed
+  contents are never inflated or hashed, so a pack and index an agent forged
+  to be self-consistent can list an object the pack does not hold. A
+  reachable object that is neither loose nor listed is `missing_object`.
+  Under R4.2 below, `packed` makes Q5 `NOT_ELIGIBLE`.
+- PR-3b object structure (R2 §2.1: a property that cannot be established is
+  never success). A reachable loose object with the right SHA-1 is verified
+  only when its structure is in the supported subset and every link has the
+  type its referrer requires. Its header size is canonical decimal. A commit
+  has one `tree`, zero or more `parent`, one `author` and one `committer`,
+  in Git's fsck order and ident form (seconds at most 2^63-1, Git's
+  `date_overflows` bound), repeats no mandatory header later, and continues
+  only `gpgsig`, `gpgsig-sha256` and `mergetag` on following lines. A tag has `object`, `type`,
+  `tag` and an optional `tagger`, and its target has the declared type. A
+  tree has the PR-2 observer's modes, valid distinct names other than `.git`,
+  in Git's order. HEAD and branches name commits. Anything else is
+  `corrupt_object`, a defect: Q3 and Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`. This
+  is stricter than Git where Git only tolerates (uppercase hex, zero-padded or
+  legacy modes).
+- PR-3b gitlinks (R4 §5.2, B25: a gitlink entry alone is benign). A `160000`
+  entry is recorded as the benign Q2 feature `gitlink` and not followed: the
+  submodule commit lives in another object store. A checked-out submodule is
+  a nested repository or a gitlink file and is classified as one. Q5 covers
+  the bytes the slot held; it says nothing about submodule content that was
+  never in the slot.
+- PR-3b history views. A commit-graph (`objects/info/commit-graph` or
+  anything under `objects/info/commit-graphs/`) is a rebuildable Git cache
+  that is never trusted: Git takes parents and generation numbers from it
+  instead of the commits, so a forged or stale graph changes Git's history
+  without changing a verified object. Restore copies bytes and never runs
+  Git (R4 §5.4), and PR-3b has no step that drops or rebuilds the graph, so
+  ignoring it cannot be enforced here. Any commit-graph is therefore the
+  unsupported finding `commit_graph`, like grafts and replace refs (F5 G12):
+  Q3 `INCOMPLETE`, Q4 unchanged (its bytes are preserved), Q5
+  `NOT_ELIGIBLE`. Another spelling of either name is `unknown`. Git writes a
+  graph on `gc`, which also packs the objects, so such a slot is already
+  `NOT_ELIGIBLE(packed)` under R4.2. A `refs/replace/*` name is
+  `replace_refs` whether the ref is loose or a `packed-refs` line.
+- Recorded head on a case-insensitive volume (not changed in PR-3b). Git on
+  APFS reads a loose ref under another case (`refs/heads/Main`) for a
+  packed ref (`refs/heads/main`); the classifier compares ref names as
+  bytes and records the packed oid. Git's oid is the loose file's id or,
+  when that file is a symbolic ref, the oid its target resolves to, or no
+  oid at all when that target does not resolve (dangling or looping), and
+  Git then has no HEAD. Any oid Git reaches this way
+  is the value of a captured ref and so a verified tip (a name that folds
+  onto a captured `.lock` file, which the classifier skips, is refused
+  instead; see "packed-refs" below), and its objects are preserved, but the
+  preservation document's `head` names the packed commit, not Git's. With a synthetic final observation that reuses
+  the classifier this reaches P18 and D4. READY refuses it
+  (`NOT_CLEAN(head)`) when `final_observation.head_resolved` is the commit
+  the PR-2 observer resolves through the OS, which is Git's. PR-4 must
+  produce `head_resolved` that way; the observer's CLEAN status alone does
+  not catch this case once the index matches Git's HEAD.
+- PR-4 prerequisite. Every `not_preservable` refusal (R4.2 and the object
+  rules above) is `check_fresult` rejecting after the freeze-start move ran;
+  F stays `MOVE_INTENT` and the resume never repeats an irreversible step.
+  PR-4 needs a pre-effect eligibility check and an owner-authorized recovery
+  path for such a slot. PR-3b provides neither.
+- PR-4 entry criterion (NB-16, owner, mandatory). Before PR-4 restore or
+  release is implemented, PR-4 must show with tests that all three hold for
+  every path of the slot (worktree, gitdirs and linked-worktree pointers):
+  1. Capture distinguishes file types (regular, executable, directory,
+     symbolic link) and records the type with each entry.
+  2. A symbolic link is never silently represented as a regular file:
+     neither its target string nor the bytes of the file it points to are
+     recorded or restored as a regular file's content.
+  3. Restore never follows a symbolic link out of its authorized tree, for
+     any path it creates, writes or replaces.
+  4. Every directory Git needs to accept a gitdir (`refs`, `objects`),
+     empty or not, is recorded by capture and recreated by restore; it is
+     never implied by the files below it.
+  5. Restore never lets Git discovery, run from the slot root or from a
+     nested repository's worktree, open another repository than the
+     captured gitdir (for example a bare repository at the slot root).
+  The PR-3b manifest (`codegraph.o5.manifest/v2`, entries `[path_hex,
+  hex64]`) is untyped and cannot express 1, 2 or 4, so it must change in
+  PR-4. PR-3b does not meet this criterion and claims nothing about it;
+  NB-13 below only refuses symbolic links at administrative directory
+  names, and "Gitdir name and restorable gitdir" below only refuses the
+  slots where 4 and 5 visibly fail for the untyped manifest. Those two
+  refusals may be relaxed only together with tests that show 4 and 5.
+
+## Owner amendment R4.2 to the PR-3b contract (2026-11-16)
+
+A narrow safety amendment to approved R4.1. It supersedes only the
+packed-only ELIGIBLE/READY assumption of R2 K7, R4 §5.2 (row "Packed-only
+objects": `eligible`) and acceptance test P2 ("READY reached"). Historical
+contracts and evidence stay as written.
+
+- **Rule.** When any reachable object of any captured repository is listed
+  by a pack index (feature `packed`; amendment 1 below: also when it is
+  loose), Q5 is
+  `NOT_ELIGIBLE(packed)`. This covers valid packed-only and mixed
+  repositories, deltified objects and forged self-consistent packs alike,
+  because PR-3b never verifies packed contents or their closure. No trusted
+  packed-content verifier exists; adding one needs its own review.
+- **Unchanged.** Q1 (raw capture) and Q4 (R2 §2.1: is preservation complete)
+  keep their meaning: a complete capture of a packed repository is still Q1
+  and Q4 `COMPLETE`. Q3 stays `INCOMPLETE(packed)` and is still never read as
+  a gate; the Q2 feature `packed` feeds Q5 directly. A structurally invalid
+  index, or an index without its pack, stays `unknown` (Q4 `INCOMPLETE`).
+- **Not a blanket refusal.** A pack file alone changes nothing: when every
+  reachable object is a verified loose object and no pack index lists any of
+  them, unrelated packs are ignored and the slot stays eligible. (Amendment 1
+  below supersedes the earlier wording that duplicate packs are ignored.)
+- **Where it refuses.** The EP manifest is the output of the freeze-start
+  move effect, so the first refusal is `check_fresult` rejecting
+  (`freeze-start`, MOVED) with `not_preservable` after the move ran: F stays
+  `MOVE_INTENT`, no attribute is revoked, the barrier stays held and the
+  release refuses, the F resume repeats the idempotent effect and is rejected
+  again. This is the existing path of every other `NOT_ELIGIBLE` reason
+  (shallow, unborn HEAD, alternates). D-QUAR and D-PRES recompute Q5 and
+  refuse on their own; READY needs D-PRES, and D4 needs READY.
+- **P2 as amended.** Packed-only: freeze-start rejected `not_preservable`;
+  recomputed Q1 `COMPLETE`, Q3 `INCOMPLETE`, Q4 `COMPLETE`, Q5
+  `NOT_ELIGIBLE`; no preservation document, no READY, no D4.
+
+### R4.2 amendment 1: a pack listing outranks a loose copy (NB-12, 2026-11-17)
+
+Owner decision on review finding NB-12 of `c49f2636`. It widens the R4.2
+refusal (fewer slots are eligible) and changes nothing else: Q1, Q4, the
+refusal path and the other features keep their meaning.
+
+- **Why a verified loose object is not enough.** Git looks an object up in
+  its packs before its loose objects. When a pack index lists an id that
+  also exists loose, Git's view of that object is the packed entry, which
+  the classifier never reads, and whether a command re-hashes it depends on
+  the command and the Git version. A self-consistent forged pack whose index
+  lists the HEAD commit's id makes `git log` show the forged commit (Git
+  2.38 and 2.54) while the loose HEAD still verifies; one listing the root
+  tree's id makes `git checkout` write files the verified tree does not name
+  (both versions); for a forged blob entry 2.38 checks out the forged bytes
+  and 2.54 the loose ones. Before this amendment both reached
+  D4 with the PR-2 observer `CLEAN`, and a routine `git gc` on the restored
+  byte copy deletes the true loose object through `prune-packed` and keeps
+  the forged one. A D4 recovery claim says Git will see the verified
+  history; with a listed duplicate nothing establishes that.
+- **Rule.** A reachable object is `packed` when any captured pack index
+  lists its id, whatever the loose copy holds. Loose precedence is never
+  assumed and duplicate representations are never assumed harmless. The
+  loose copy is still read and walked, so a corrupt or mistyped loose
+  object, or a missing one below it, stays a defect (Q4 `INCOMPLETE`).
+- **The cases, distinguished.**
+  - *Loose and packed representations of the same object* (an index lists a
+    reachable id that is also loose): `packed`, Q5 `NOT_ELIGIBLE(packed)`,
+    whether the packed entry is genuine (`git repack -a` without `-d`) or
+    forged. Git writes the genuine case; it is now unsupported for recovery,
+    and its bytes are preserved as for any other `NOT_ELIGIBLE` slot.
+  - *Duplicate packed representations* (two or more indexes list the same
+    reachable id, with or without a loose copy): `packed`. Which entry Git
+    reads depends on its pack order and differs between Git versions (2.38
+    and 2.54 pick different packs for the same bytes), so no copy is
+    preferred.
+  - *Multi-pack-index* (`objects/pack/multi-pack-index`, or anything under
+    `objects/pack/multi-pack-index.d/`): Git looks objects up through it
+    before any pack index and reads the entry it names even when no `.idx`
+    lists that id. It is never parsed here, so any multi-pack-index is the
+    unverified finding `multi_pack_index`: Q3 `INCOMPLETE`, Q4 unchanged, Q5
+    `NOT_ELIGIBLE`. Another spelling of either name is `unknown`.
+  - *Unsupported pack content and index inconsistencies* are unchanged: an
+    index that fails the structural checks, one without its pack, or a
+    version 1 index is `unknown` (Q4 `INCOMPLETE`); packed contents are
+    never inflated, so deltified, forged and genuine packed objects are the
+    same `packed` finding.
+  - *Unrelated packs* (no index lists a reachable id) are ignored, as before.
+- **Acceptance.** Loose-only repositories, signed and merged ones included,
+  and those with an unrelated pack still reach D4. Every case above stops at
+  freeze-start with `not_preservable` and never reaches READY or D4.
+
+### Administrative directory captured as an entry (NB-13, 2026-11-17)
+
+A manifest entry is `(path, digest)` with no file type, so the classifier
+cannot tell a regular file from a symbolic link whose capture recorded some
+bytes. Git opens `objects`, `objects/pack`, `objects/info`,
+`objects/info/commit-graphs`, `objects/pack/multi-pack-index.d`, `info`,
+`refs`, `refs/heads`, `refs/replace`, `modules` and `reftable` as
+directories. Git does not read a regular file at one of these names as a
+directory; what it does instead depends on the name and, at `objects` and
+`refs`, on the file's execute bit. Measured with Git 2.38.0 and Apple Git
+2.54.0 on APFS; this is observed behavior, not a guarantee Git makes. At
+`objects` or `refs` a file without an execute bit makes Git refuse the
+repository (`not a git repository`). With mode 0755 Git accepts the
+repository and the reads fail instead: at `objects` the object reads fail
+(`bad object HEAD` or `failed to read object ... Not a directory`), at
+`refs` the current branch has no commits. At `refs/heads` with a symbolic
+HEAD it reports that the current branch has no commits, with or without an
+execute bit and also when the branch exists only in `packed-refs`; with a
+detached HEAD it carries on. At `objects/pack` it prints `unable to open
+object pack directory` and carries on. At the other names it ignores the
+file. No safety claim depends on which of these happens. As a
+symbolic link to a directory outside the slot, Git 2.38 and 2.54 follow it
+(measured for `objects/pack`, `objects/info`, `info` and `refs`; the rule
+below does not depend on the other names being followed): a forged pack there
+replaces HEAD in `git log`, `alternates` there adds outside objects, `grafts`
+there rewrites history, and with a detached HEAD a linked `refs` supplies
+replace refs. The classifier saw only the loose objects, so these slots were
+eligible.
+
+- **Rule.** Any captured entry exactly at one of those gitdir-relative names
+  is `unknown` (Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`). Another spelling of the
+  name was already `unknown` through the administrative-name rule. Entries
+  below those directories are unchanged.
+- **Not covered here.** A symbolic link elsewhere under a gitdir (for example
+  `config`, `HEAD`, a ref, a loose object, a `.pack`, `hooks`, `logs`).
+  When the capture records the link target as the entry's bytes, a typical
+  target such as `/path` does not parse and is refused. That is not a
+  guarantee, because some target strings are also valid config or ref text.
+  When the capture records the bytes of the linked file instead, the
+  classifier cannot detect the link at all. The classifier cannot enforce
+  this without a typed manifest; the PR-4 entry criterion (NB-16, under
+  "PR-4 prerequisite" above) is what closes it.
+
+### packed-refs: the subset whose Git reading was measured (B-1, N-1, N-2, 2026-11-17)
+
+Git resolves a packed ref by binary search, trusts a `^` line as the ref's
+peeled value and, under some headers, trusts its absence. The classifier
+used to keep the first of two lines for one name and accept any `^` line,
+so Git 2.38 and 2.54 could resolve HEAD to an unverified commit on the
+second line while the slot reached D4. Measured with both versions in
+disposable repositories:
+
+- **Repeated name.** Git resolves the second line in both orders without a
+  header, and either line depending on layout under `sorted`. `git fsck` on
+  2.38 is silent. Any repeated name, also with identical values, is
+  `malformed_packed` (Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`). A loose ref still
+  takes precedence over a packed line of the same name.
+- **Peel lines.** `git show-ref -d`, `describe` and, on 2.54,
+  `for-each-ref %(*objectname)` report a forged `^` value, including one
+  that names an absent object or follows a commit ref. A `^` line is
+  accepted only directly after a ref line and only when it equals Git's
+  peel of the verified value (the final target of its tag chain). Under a
+  `fully-peeled` header, or `peeled` for `refs/tags/`, Git 2.38 treats a
+  missing `^` line as "not a tag" (2.54 peels anyway), so a tag without one
+  is refused there; without such a header Git peels the tag itself and a
+  missing line is accepted. A line a loose ref shadows is never read by Git
+  and is not checked.
+- **Header and order.** The header is accepted only as the first line, only
+  with Git's prefix `# pack-refs with: ` (Git 2.54 refuses the file
+  otherwise) and only when its traits are printable ASCII and spaces. Git
+  reads the traits as a C string, so with `sorted\0` or `fully-peeled\0`
+  Git still sees the trait while a byte-wise split does not; the review of
+  498983ad reached D4 that way. Under a `sorted` trait the names must be in increasing byte
+  order: with an unsorted file Git 2.38 no longer found HEAD's branch, and
+  `for-each-ref` listed the packed value of a name a loose ref shadows,
+  whose object the classifier never verified.
+- **Ref names** in `packed-refs`, a loose symbolic ref and HEAD follow Git's
+  check-ref-format: no `..`, `@{`, empty or `.`-leading component, trailing
+  `.` or `/`, component ending in `.lock`, control character, space or any
+  of ``~^:?*[\``. Git refuses such names (`bad ref`, `packed refname is
+  dangerous`, `your current branch appears to be broken`). Stricter by
+  CodeGraph policy: names are printable ASCII, the PR-2 observer's packed-ref
+  subset, so a non-ASCII name Git accepts (`refs/heads/fünf`) is still
+  `malformed_packed` or `malformed_ref`; and HEAD must name
+  `refs/heads/[A-Za-z0-9._/-]` as the observer requires, otherwise
+  `git_head`. Both only over-refuse. Loose ref file names are not checked
+  here: Git ignores a broken one, and HEAD and symbolic refs cannot point at
+  it because their targets are checked.
+- **Case alias of a `.lock` file.** `refs/heads/x.LOCK` is a valid name for
+  Git, which compares `.lock` byte-wise. On APFS Git opens it as a captured
+  `refs/heads/x.lock`, which the classifier skips as residue: Git 2.38 and
+  2.54 then resolved the ref, or HEAD, to that file's unverified commit
+  while the slot reached D4 (review of ce630f01). Any packed name,
+  symbolic-ref target or HEAD target that folds (APFS/HFS+ rules) onto a
+  captured `refs/**.lock` path is `unknown`.
+
+### Scope of the D4 recovery claim (NB-15, 2026-11-17)
+
+D4 states that Git, reading the restored slot, sees for HEAD and every
+captured ref exactly the objects the classifier verified as loose objects.
+Two preconditions apply. Git must discover the restored slot's own `.git`
+(the B-1 and B-2 rules below refuse what PR-3b can see; PR-4 must hold
+NB-16 items 4 and 5). On a case-insensitive volume a ref Git reads under
+another case is the exception above ("Recorded head on a case-insensitive
+volume"). It states nothing else. In particular:
+
+- **Unrelated packs.** A pack whose index lists no reachable id is ignored
+  (R4.2), even when its contents are forged. `git fsck` on such a restored
+  slot fails (exit 4 for a forged unrelated entry) while D4 holds. Neither
+  that nor `git gc`, `repack` or `prune` succeeding is part of the claim.
+  Changing this needs a separate owner decision.
+- **Unreachable objects** (loose or packed), reflogs, the index, hooks and
+  other administrative files are preserved as raw bytes only. They are not
+  verified.
+- **Names other than HEAD and captured refs.** Pseudorefs (`MERGE_HEAD`,
+  `ORIG_HEAD`, `FETCH_HEAD`), `worktrees/*/HEAD`, sequencer state and Git's
+  short-name lookup are outside the claim. A top-level `$GIT_DIR/main` file
+  makes `git rev-parse main` warn that the name is ambiguous and resolve to
+  that file's commit (measured, Git 2.38 and 2.54), while `refs/heads/main`
+  is still the verified one. By Git's documented behavior (not measured
+  here) a `MERGE_HEAD` becomes a parent of the next `git commit`.
+- **Evidence limits.** The measurements in this section: Git 2.38.0 and
+  Apple Git 2.54.0 on APFS, macOS only. Linux ran only the gitdir discovery
+  tests of the next section (hosted CI, Git 2.56.1). Windows runtime, other
+  Git versions and HFS+ were not exercised.
+
+### Gitdir name and restorable gitdir (B-1, B-2, 2026-11-17)
+
+Git accepts a directory as a gitdir only when it has a valid `HEAD`, an
+`objects` directory and a `refs` directory (`is_git_directory`). When it
+rejects the slot's `.git`, discovery goes on to check the slot root itself
+as a bare repository. The review of 5cfd2721 reached D4 twice with Git
+2.38.0 and Apple Git 2.54.0 resolving HEAD to a forged commit of a bare
+repository at the slot root, while the classifier had verified the gitdir.
+
+- **B-1: `refs` must be restorable.** The manifest records files, not
+  directories, and a restore creates a directory only above a captured
+  file. After `git pack-refs --all` no file remains under `.git/refs/`, the
+  restored `.git` has no `refs` and Git rejects it. A repository (top level
+  or nested) with no captured path below `refs/` is the unsupported
+  finding `refs_dir`: Q3 `INCOMPLETE`, Q4 unchanged (every byte is
+  preserved), Q5 `NOT_ELIGIBLE`. A gitlink file has no gitdir here and is
+  not checked. `objects` needs no rule of its own: Q5 `ELIGIBLE` requires
+  HEAD's commit as a captured loose object below `objects/`. Any captured
+  file below `refs/` is enough, a loose ref or `.lock` residue: Git does
+  not need `refs/heads` or `refs/tags` (measured: the empty `refs/tags` of
+  an ordinary repository is not captured and Git still opens the restore).
+  The rule therefore holds only if restore recreates every captured file
+  below `refs/`, residue included, or records `refs` as a directory
+  (NB-16 item 4).
+- **B-2: exact `.git` only (amends R2 K3).** R2 K3 locates a gitdir by
+  every spelling a case-insensitive volume or Git's `is_hfs_dotgit` may
+  treat as `.git`. That stays the detection rule: such a path is never
+  worktree content or a tree entry. Acceptance is now narrower. Only the
+  exact bytes `.git` are a repository's gitdir; a root whose gitdir is any
+  other spelling (`.GIT`, `.Git`, `.g<U+200C>it` and the other HFS+-ignorable
+  code points) is `unknown`: Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`, and its
+  other findings are still reported. Measured: Git 2.38.0 and 2.54.0 on
+  case-insensitive APFS do not open the seven measured
+  ignorable-code-point spellings (U+200C, U+200D, U+200E, U+200F, U+202A,
+  U+206F, U+FEFF) as `.git`, and open the forged root instead; they do
+  open `.GIT` and `.Git`. On a case-sensitive Linux volume (hosted CI, Git
+  2.56.1) Git opens none of the nine. The other ignorable code points were
+  not measured; they are refused all the same. `.git` is ASCII, so Unicode
+  normalization yields no other spelling of it.
+- **Accepted over-refusals** until PR-4 meets NB-16 items 4 and 5:
+  - a valid repository whose refs are all in `packed-refs` (after `git
+    pack-refs --all` or `git gc`; the latter is already
+    `NOT_ELIGIBLE(packed)` under R4.2), top level or nested;
+  - a valid repository whose gitdir is spelled `.GIT` or `.Git` on a
+    case-insensitive volume, where Git does open it.
+- **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on case-insensitive
+  APFS (macOS), and Git 2.56.1 on the hosted Linux runner for the real-Git
+  tests. HFS+, case-sensitive APFS and Windows were not exercised
+  and no equivalent behavior is claimed for them.
 
 ## Not in PR-1
 
