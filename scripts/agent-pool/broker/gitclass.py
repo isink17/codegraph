@@ -49,10 +49,12 @@ EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
                          "submodule_gitdir", "git_head", "unborn_head", "commit_graph"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE, Q4 unchanged (owner amendment R4.2 to
-# R2 K7 / R4 §5.2 / P2). `packed`: a reachable object is not loose but a
-# consistent pack index lists it; its packed content is never inflated or
-# hashed, so nothing proves the pack holds it.
-UNVERIFIED = frozenset({"packed"})
+# R2 K7 / R4 §5.2 / P2). `packed`: a consistent pack index lists a reachable
+# object, even one with a verified loose copy, because Git reads a pack before
+# a loose object; packed content is never inflated or hashed, so nothing proves
+# what the pack holds. `multi_pack_index`: Git looks objects up through it
+# before any pack index and it is never parsed here.
+UNVERIFIED = frozenset({"packed", "multi_pack_index"})
 # Recorded, benign.
 BENIGN = frozenset({"dangling_symref", "residue", "symref", "packed_refs", "nested", "gitlink"})
 
@@ -416,7 +418,9 @@ def _pack_index(r, files):
 def _closure(r, files, tips, commits):
     """Walks every object reachable from `tips`; `commits` must be commits
     (HEAD and branches, as Git's fsck requires). A link to an object of
-    another type than its referrer requires is `corrupt_object`."""
+    another type than its referrer requires is `corrupt_object`. A listed
+    object is `packed` even when its loose copy verifies (owner amendment
+    R4.2, NB-12); the loose copy is still checked and walked."""
     packed = _pack_index(r, files)
     kinds, todo = {}, [(oid, b"commit" if oid in commits else None) for oid in sorted(tips)]
     while todo:
@@ -427,6 +431,8 @@ def _closure(r, files, tips, commits):
                 return
             got = _read_object(files, oid)
             kinds[oid] = None
+            if oid in packed:
+                r.features.add("packed")
             if got == "missing":
                 r.features.add("packed" if oid in packed else "missing_object")
             elif got == "corrupt":
@@ -448,7 +454,8 @@ def _closure(r, files, tips, commits):
 _ADMIN = frozenset({b"HEAD", b"config", b"shallow", b"packed-refs", b"commondir", b"reftable", b"modules",
                     b"info", b"info/grafts", b"objects", b"objects/info", b"objects/info/alternates",
                     b"objects/info/http-alternates", b"objects/info/commit-graph",
-                    b"objects/info/commit-graphs", b"objects/pack", b"refs", b"refs/heads",
+                    b"objects/info/commit-graphs", b"objects/pack", b"objects/pack/multi-pack-index",
+                    b"objects/pack/multi-pack-index.d", b"refs", b"refs/heads",
                     b"refs/replace"})
 _ADMIN_FOLDED = frozenset(_fold(a) for a in _ADMIN)
 
@@ -466,7 +473,9 @@ def classify(root, files):
                        (b"objects/info/http-alternates", "alternates"), (b"info/grafts", "grafts"),
                        (b"commondir", "commondir"), (b"reftable", "reftable"),
                        (b"objects/info/commit-graph", "commit_graph"),
-                       (b"objects/info/commit-graphs", "commit_graph")):
+                       (b"objects/info/commit-graphs", "commit_graph"),
+                       (b"objects/pack/multi-pack-index", "multi_pack_index"),
+                       (b"objects/pack/multi-pack-index.d", "multi_pack_index")):
         if name in files or any(p.startswith(name + b"/") for p in files):
             r.features.add(feat)
     if any(p.startswith(b"modules/") for p in files):

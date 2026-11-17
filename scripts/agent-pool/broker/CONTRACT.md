@@ -273,11 +273,13 @@ Rules worth repeating:
   manifest path with an empty, `.` or `..` component, a NUL, a component
   over 255 bytes or more than 64 separators is not one the capture walk
   produces (R2 §3.2) and refuses as `artifact_mismatch`. A reachable object
-  that is not loose is `packed` only when a version 2 index lists it and the
-  index passes bounded structural checks against its sibling pack (R2 K7).
-  That is presence only: packed contents are never inflated or hashed, so a
-  pack and index an agent forged to be self-consistent can list an object the
-  pack does not hold. Under R4.2 below, `packed` makes Q5 `NOT_ELIGIBLE`.
+  is `packed` when a version 2 index lists it and the index passes bounded
+  structural checks against its sibling pack (R2 K7), whether or not the
+  object is also loose (R4.2 amendment 1). That is presence only: packed
+  contents are never inflated or hashed, so a pack and index an agent forged
+  to be self-consistent can list an object the pack does not hold. A
+  reachable object that is neither loose nor listed is `missing_object`.
+  Under R4.2 below, `packed` makes Q5 `NOT_ELIGIBLE`.
 - PR-3b object structure (R2 §2.1: a property that cannot be established is
   never success). A reachable loose object with the right SHA-1 is verified
   only when its structure is in the supported subset and every link has the
@@ -347,8 +349,9 @@ contracts and evidence stay as written.
   a gate; the Q2 feature `packed` feeds Q5 directly. A structurally invalid
   index, or an index without its pack, stays `unknown` (Q4 `INCOMPLETE`).
 - **Not a blanket refusal.** A pack file alone changes nothing: when every
-  reachable object is a verified loose object, unrelated or duplicate packs
-  are ignored and the slot stays eligible.
+  reachable object is a verified loose object and no pack index lists any of
+  them, unrelated packs are ignored and the slot stays eligible. (Amendment 1
+  below supersedes the earlier wording that duplicate packs are ignored.)
 - **Where it refuses.** The EP manifest is the output of the freeze-start
   move effect, so the first refusal is `check_fresult` rejecting
   (`freeze-start`, MOVED) with `not_preservable` after the move ran: F stays
@@ -360,6 +363,56 @@ contracts and evidence stay as written.
 - **P2 as amended.** Packed-only: freeze-start rejected `not_preservable`;
   recomputed Q1 `COMPLETE`, Q3 `INCOMPLETE`, Q4 `COMPLETE`, Q5
   `NOT_ELIGIBLE`; no preservation document, no READY, no D4.
+
+### R4.2 amendment 1: a pack listing outranks a loose copy (NB-12, 2026-11-17)
+
+Owner decision on review finding NB-12 of `c49f2636`. It narrows R4.2 and
+changes nothing else: Q1, Q4, the refusal path and the other features keep
+their meaning.
+
+- **Why a verified loose object is not enough.** Git looks an object up in
+  its packs before its loose objects, and does not re-hash a packed commit or
+  tree on `log` or `checkout`. When a pack index lists an id that also exists
+  loose, Git's view of that object is the packed entry, which the classifier
+  never reads. A self-consistent forged pack whose index lists the HEAD
+  commit's id makes `git log` show the forged commit while the loose HEAD
+  still verifies; one listing the root tree's id makes `git checkout` write
+  files the verified tree does not name. Before this amendment both reached
+  D4 with the PR-2 observer `CLEAN`, and a routine `git gc` on the restored
+  byte copy deletes the true loose object through `prune-packed` and keeps
+  the forged one. A D4 recovery claim says Git will see the verified
+  history; with a listed duplicate nothing establishes that.
+- **Rule.** A reachable object is `packed` when any captured pack index
+  lists its id, whatever the loose copy holds. Loose precedence is never
+  assumed and duplicate representations are never assumed harmless. The
+  loose copy is still read and walked, so a corrupt or mistyped loose
+  object, or a missing one below it, stays a defect (Q4 `INCOMPLETE`).
+- **The cases, distinguished.**
+  - *Loose and packed representations of the same object* (an index lists a
+    reachable id that is also loose): `packed`, Q5 `NOT_ELIGIBLE(packed)`,
+    whether the packed entry is genuine (`git repack -a` without `-d`) or
+    forged. Git writes the genuine case; it is now unsupported for recovery,
+    and its bytes are preserved as for any other `NOT_ELIGIBLE` slot.
+  - *Duplicate packed representations* (two or more indexes list the same
+    reachable id, with or without a loose copy): `packed`. Which entry Git
+    reads depends on its pack order and differs between Git versions (2.38
+    and 2.54 pick different packs for the same bytes), so no copy is
+    preferred.
+  - *Multi-pack-index* (`objects/pack/multi-pack-index`, or anything under
+    `objects/pack/multi-pack-index.d/`): Git looks objects up through it
+    before any pack index and reads the entry it names even when no `.idx`
+    lists that id. It is never parsed here, so any multi-pack-index is the
+    unverified finding `multi_pack_index`: Q3 `INCOMPLETE`, Q4 unchanged, Q5
+    `NOT_ELIGIBLE`. Another spelling of either name is `unknown`.
+  - *Unsupported pack content and index inconsistencies* are unchanged: an
+    index that fails the structural checks, one without its pack, or a
+    version 1 index is `unknown` (Q4 `INCOMPLETE`); packed contents are
+    never inflated, so deltified, forged and genuine packed objects are the
+    same `packed` finding.
+  - *Unrelated packs* (no index lists a reachable id) are ignored, as before.
+- **Acceptance.** Loose-only repositories, signed and merged ones included,
+  and those with an unrelated pack still reach D4. Every case above stops at
+  freeze-start with `not_preservable` and never reaches READY or D4.
 
 ## Not in PR-1
 

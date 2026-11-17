@@ -1195,10 +1195,11 @@ class PackIndex(unittest.TestCase):
 
 
 def packed_rows():
-    """{case: (files, q1, (q1, q3, q4, q5), reasons)} for owner amendment R4.2.
-    A reachable object known only through a pack index is never content
-    verified, so Q5 is NOT_ELIGIBLE whatever the pack holds; Q1 and Q4 keep
-    their R2 meaning; loose objects decide whenever they are present."""
+    """{case: (files, q1, (q1, q3, q4, q5), reasons)} for owner amendment R4.2
+    and its amendment 1. A reachable object that any pack index lists is never
+    content verified, so Q5 is NOT_ELIGIBLE whatever the pack holds, also when
+    a verified loose copy exists (Git reads the pack first); Q1 and Q4 keep
+    their R2 meaning; only packs that list no reachable object are ignored."""
     loose, coid = pw.git_repo()
     toid, traw = pw.head_tree(loose, coid)
     no_tree = {p: d for p, d in loose.items() if p != pw.loose_key(toid)}
@@ -1211,6 +1212,10 @@ def packed_rows():
     ip = next(p for p in packed if p.endswith(b".idx"))
     nested = pw.git_repo(variant=("packed_only",), prefix=b"vendor/lib/")[0]
     unrelated = pw.with_pack(loose, {pw.gobj(b"blob", b"unrelated\n")[0]: b"blob 10\0unrelated\n"}, b"u")
+    craw = pw.zlib.decompress(loose[pw.loose_key(coid)])
+    fbody = b"tree " + toid.encode() + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+    objects = {p: d for p, d in loose.items() if not p.startswith(b".git/objects/")}
+    bad_tree = {**loose, pw.loose_key(toid): pw.zlib.compress(wrong_tree)}
     ok, pk = ("COMPLETE", "VERIFIED", "COMPLETE", "ELIGIBLE"), ("COMPLETE", "INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE")
     gone = ("COMPLETE", "INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE")
     return {
@@ -1232,9 +1237,25 @@ def packed_rows():
             pw.with_pack(no_tree, {toid: traw}), "COMPLETE", pk, ["packed"]),
         "09b nested repository with packed objects": ({**loose, **nested}, "COMPLETE", pk, ["packed"]),
         "10a unrelated pack, every reachable object loose": (unrelated, "COMPLETE", ok, []),
-        "10b every reachable object loose and in a genuine pack": (pw.with_pack(loose, raws), "COMPLETE", ok, []),
-        "10c loose object beside a forged pack entry for its id": (
-            pw.with_pack(loose, {toid: readme}), "COMPLETE", ok, []),
+        "10b every reachable object loose and in a genuine pack (repack without -d)": (
+            pw.with_pack(loose, raws), "COMPLETE", pk, ["packed"]),
+        "10c verified loose tree, a forged pack entry for its id": (
+            pw.with_pack(loose, {toid: readme}), "COMPLETE", pk, ["packed"]),
+        "10d verified loose HEAD commit, a forged pack entry for its id": (
+            pw.with_pack(loose, {coid: b"commit %d\0" % len(fbody) + fbody}), "COMPLETE", pk, ["packed"]),
+        "10e two genuine indexes list every object, every object loose": (
+            pw.with_pack(pw.with_pack(loose, raws, b"a"), raws, b"b"), "COMPLETE", pk, ["packed"]),
+        "10f two genuine indexes list every object, none loose": (
+            pw.with_pack(pw.with_pack(objects, raws, b"a"), raws, b"b"), "COMPLETE", pk, ["packed"]),
+        "10g genuine and forged indexes list the HEAD commit, loose copy verified": (
+            pw.with_pack(pw.with_pack(loose, {coid: craw}, b"a"), {coid: b"commit %d\0" % len(fbody) + fbody}, b"b"),
+            "COMPLETE", pk, ["packed"]),
+        "10h a listed object's loose copy is corrupt: still a defect": (
+            pw.with_pack(bad_tree, {toid: traw}), "COMPLETE", gone, ["corrupt_object", "packed"]),
+        "10j an index lists every object, another one an unrelated blob": (
+            pw.with_pack(unrelated, raws, b"a"), "COMPLETE", pk, ["packed"]),
+        "10i multi-pack-index, every reachable object loose": (
+            {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"}, "COMPLETE", pk, ["multi_pack_index"]),
         "11 complete raw capture, unverified packed objects": (packed, "COMPLETE", pk, ["packed"]),
         "12a incomplete raw capture, loose": (loose, "INCOMPLETE", ("INCOMPLETE", "VERIFIED", "INCOMPLETE",
                                                                     "NOT_ELIGIBLE"), []),
@@ -1253,7 +1274,7 @@ class PackedEligibility(unittest.TestCase):
     def test_forged_entries_really_differ_from_the_listed_object(self):
         """The forged rows list an id whose packed bytes do not hash to it."""
         for case, (files, *_rest) in packed_rows().items():
-            if case[:2] in ("03", "04", "05"):
+            if case[:2] in ("03", "04", "05") or case[:3] in ("10c", "10d"):
                 pack = next(d for p, d in files.items() if p.endswith(b".pack"))
                 idx = next(d for p, d in files.items() if p.endswith(b".idx"))
                 (listed,) = gitclass._idx_names(idx, pack)
@@ -1264,6 +1285,87 @@ class PackedEligibility(unittest.TestCase):
                 typ = {1: b"commit", 2: b"tree", 3: b"blob"}[pack[12] >> 4 & 7]
                 raw = typ + b" " + str(len(body)).encode() + b"\0" + body
                 self.assertNotEqual(pw.hashlib.sha1(raw).hexdigest(), listed, case)  # noqa: S324
+
+
+class PackListingOutranksLoose(unittest.TestCase):
+    """R4.2 amendment 1 (NB-12) against real Git: Git reads a listed packed
+    entry before a verified loose copy, so the classifier must refuse."""
+
+    def git_out(self, lab, r, *args):
+        return lab.git(r, *args).stdout
+
+    def test_git_reads_a_forged_pack_entry_over_the_verified_loose_head(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        self.assertEqual(classify(captured(r))[1:5], ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+        coid = self.git_out(lab, r, "rev-parse", "HEAD").decode().strip()
+        true_body = self.git_out(lab, r, "cat-file", "commit", "HEAD")
+        tree = true_body.split(b"\n", 1)[0]
+        forged = tree + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        files = pw.with_pack(captured(r), {coid: b"commit %d\0" % len(forged) + forged})
+        for p, d in files.items():
+            lab.write(r, p.decode(), d)
+        loose = pw.zlib.decompress(files[pw.loose_key(coid)])
+        self.assertEqual(pw.hashlib.sha1(loose).hexdigest(), coid)  # noqa: S324
+        self.assertEqual(self.git_out(lab, r, "cat-file", "commit", coid), forged)
+        self.assertEqual(self.git_out(lab, r, "log", "--format=%s").strip(), b"forged")
+        self.assertEqual(classify(captured(r))[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"]))
+
+    def test_repack_without_d_is_not_eligible(self):
+        """`git repack -a` without `-d` keeps every loose object and packs it
+        too: Git's legitimate loose-and-packed layout, now unsupported."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        before = captured(r)
+        lab.git(r, "repack", "-a", "-q")
+        files = captured(r)
+        loose = {p for p in before if p.startswith(b".git/objects/") and len(p) == 54}
+        self.assertTrue(loose)
+        self.assertTrue(loose <= set(files))
+        idx = next(p for p in files if p.endswith(b".idx"))
+        listed = gitclass._idx_names(files[idx], files[idx[:-4] + b".pack"])
+        self.assertEqual({(p[13:15] + p[16:]).decode() for p in loose}, listed)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["packed"]))
+        lab.git(r, "multi-pack-index", "write")
+        self.assertIn(b".git/objects/pack/multi-pack-index", captured(r))
+        self.assertEqual(classify(captured(r))[1:5],
+                         ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["multi_pack_index", "packed"]))
+
+    def test_version_1_index_is_unknown(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        lab.git(r, "repack", "-a", "-d", "-q")
+        pack = next(p for p in captured(r) if p.endswith(b".pack"))
+        lab.git(r, "index-pack", "--index-version=1", "-o", "v1.idx", pack.decode())
+        files = captured(r)
+        idx = next(p for p in files if p.endswith(b".idx") and p.startswith(b".git/"))
+        files[idx] = files.pop(b"v1.idx")
+        self.assertNotEqual(files[idx][:4], b"\xfftOc")
+        _, _, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+
+    def test_multi_pack_index_is_never_trusted(self):
+        files, _ = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        d = b".git/objects/pack/multi-pack-index.d/"
+        for name, extra in (("single file", {b".git/objects/pack/multi-pack-index": b"MIDX"}),
+                            ("incremental chain", {d + b"multi-pack-index-chain": b"0" * 40 + b"\n",
+                                                   d + b"multi-pack-index-" + b"0" * 40 + b".midx": b"MIDX"}),
+                            ("empty", {b".git/objects/pack/multi-pack-index": b""}),
+                            ("nested repository",
+                             {**nested, b"vendor/lib/.git/objects/pack/multi-pack-index": b"MIDX"})):
+            with self.subTest(name):
+                _, q3, q4, q5, reasons, _ = classify({**files, **extra})
+                self.assertEqual((q3, q4, q5, reasons),
+                                 ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["multi_pack_index"]))
+        for name in (b".git/objects/pack/Multi-Pack-Index", b".git/objects/pack/MULTI-PACK-INDEX.D/x"):
+            with self.subTest(name):
+                _, _, q4, q5, reasons, _ = classify({**files, name: b"MIDX"})
+                self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("unknown", reasons)
+        self.assertEqual(classify({**files, b".git/objects/pack/multi-pack-index.lock": b"MIDX"})[2:5],
+                         ("COMPLETE", "ELIGIBLE", []))
 
 
 class TypedNeutralization(unittest.TestCase):

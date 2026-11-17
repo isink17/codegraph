@@ -527,8 +527,9 @@ def _old_policy(real=gitclass.questions):
 
 
 class PackedObjects(Base):
-    """Owner amendment R4.2: a reachable object known only through a pack
-    index is not recovery evidence. The refusal happens in `check_fresult`
+    """Owner amendment R4.2 and its amendment 1: a reachable object that any
+    pack index lists is not recovery evidence, also beside a verified loose
+    copy (Git reads the pack first). The refusal happens in `check_fresult`
     after the freeze-start move effect ran (the EP manifest is that effect's
     output); nothing later can commit, discharge or replay past it."""
 
@@ -548,6 +549,78 @@ class PackedObjects(Base):
         self.w.fx.trees[SLOT] = pw.with_pack({p: d for p, d in loose.items() if p != pw.loose_key(toid)},
                                              {toid: traw})
         self.stuck_at_move()
+
+    def shadowed_head(self):
+        """NB-12: every object loose and verified; a self-consistent pack lists
+        the HEAD commit's id and holds another commit."""
+        loose, coid = pw.git_repo()
+        toid, _ = pw.head_tree(loose, coid)
+        body = b"tree " + toid.encode() + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        return pw.with_pack(loose, {coid: b"commit %d\0" % len(body) + body})
+
+    def test_pack_entry_shadowing_a_verified_loose_head_never_reaches_d4(self):
+        self.w.fx.trees[SLOT] = self.shadowed_head()
+        self.stuck_at_move()
+
+    def test_shadowed_head_refused_by_quarantine_on_its_own(self):
+        self.w.fx.trees[SLOT] = self.shadowed_head()
+        with _old_policy():
+            self.ok("adopt", "request", "freeze-start")
+        self.ok("freeze-continue")
+        self.refused("quarantine", Code.PROVENANCE_INSUFFICIENT, "not_preservable(packed)")
+
+    def test_duplicate_representations_never_reach_d4(self):
+        loose, _ = pw.git_repo()
+        raws = {p[13:].replace(b"/", b"").decode(): pw.zlib.decompress(d)
+                for p, d in loose.items() if p.startswith(b".git/objects/")}
+        for name, files in (("loose and one genuine pack", pw.with_pack(loose, raws)),
+                            ("loose and two genuine packs", pw.with_pack(pw.with_pack(loose, raws, b"a"), raws, b"b")),
+                            ("multi-pack-index", {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"})):
+            with self.subTest(name):
+                self.w.close()
+                self.w = pw.World()
+                self.w.fx.trees[SLOT] = files
+                self.stuck_at_move()
+
+    def test_signed_merged_repository_written_by_git_reaches_d4(self):
+        """Loose-only history Git wrote with SSH-signed commits, a signed tag
+        merged with `mergetag` and a merge commit, plus an unrelated pack."""
+        import shutil
+        import subprocess
+        from gitfixture import GIT, Lab
+        if GIT is None or shutil.which("ssh-keygen") is None:
+            self.skipTest("git or ssh-keygen not installed")
+        lab = Lab()
+        self.addCleanup(lab.cleanup)
+        r, key = lab.path("repo"), lab.path("key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True, capture_output=True,
+                       env=lab.env, timeout=60)
+        sign = ("-c", "gpg.format=ssh", "-c", "user.signingkey=" + key + ".pub")
+        lab.git(lab.root, "init", "-q", r)
+        for branch, name in (("main", "a"), ("side", "s"), ("main", "m")):
+            if branch == "side":
+                lab.git(r, "checkout", "-q", "-b", "side")
+            elif name == "m":
+                lab.git(r, *sign, "tag", "-s", "-m", "signed", "v1")
+                lab.git(r, "checkout", "-q", "main")
+            lab.write(r, name, name.encode() + b"\n")
+            lab.git(r, "add", name)
+            lab.git(r, *sign, "commit", "-q", "-S", "-m", name)
+        lab.git(r, *sign, "merge", "-q", "-S", "--no-ff", "-m", "merge v1", "v1")
+        files = {}
+        for d, _, names in os.walk(r):
+            for n in names:
+                with open(os.path.join(d, n), "rb") as f:
+                    files[os.path.relpath(os.path.join(d, n), r).encode()] = f.read()
+        merge = pw.zlib.decompress(files[pw.loose_key(lab.git(r, "rev-parse", "HEAD").stdout.decode().strip())])
+        self.assertIn(b"\nmergetag object ", merge)
+        self.assertIn(b"\ngpgsig -----BEGIN SSH SIGNATURE-----", merge)
+        self.assertEqual(lab.git(r, "fsck", "--full", "--strict", "--no-dangling").returncode, 0)
+        oid = pw.gobj(b"blob", b"unrelated\n")[0]
+        self.assertNotIn(pw.loose_key(oid), files)
+        self.w.fx.trees[SLOT] = pw.with_pack(files, {oid: b"blob 10\0unrelated\n"}, b"u")
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
 
     def test_unrelated_pack_beside_loose_objects_reaches_d4(self):
         oid, z = pw.gobj(b"blob", b"unrelated\n")
