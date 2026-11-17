@@ -72,14 +72,14 @@ read_cwds() {
 	fi
 }
 
-# Every lease change of a slot happens under its lock. mkdir is atomic; a
-# lock left by a crashed run is reported, never broken automatically.
-# migrate and unmigrate hold every slot lock at once. The lock directory
-# holds this run's random id in `owner`: a run removes only a lock whose id
-# is its own, and a failed removal is reported without changing the exit
-# status, so every other held lock is still released. The report is kept in
-# this shell while HOLD_REPORTS is set, so it outlives `try_acquire ...
-# 2>/dev/null` without a descriptor that git's detached children would keep.
+# Every lease change of a slot happens under its lock. A lock left by a
+# crashed run is reported, never broken automatically. migrate and unmigrate
+# hold every slot lock at once. The lock directory holds this run's random id
+# in `owner`: a run removes only a lock whose id is its own, and a failed
+# removal is reported without changing the exit status, so every other held
+# lock is still released. The report is kept in this shell while HOLD_REPORTS
+# is set, so it outlives `try_acquire ... 2>/dev/null` without a descriptor
+# that git's detached children would keep.
 LOCKS=()
 LOCK_ID=""
 LOCK_REPORTS=()
@@ -89,7 +89,13 @@ lock_slot() {
 	local l="$LEASES/.$1.lock"
 	[[ -n $LOCK_ID ]] || LOCK_ID=$(random_token)
 	mkdir "$l" 2>/dev/null || return 1
-	echo "$LOCK_ID" >"$l/owner" || { rmdir "$l"; return 1; }
+	# The lock is taken by creating owner with O_EXCL (noclobber), not by
+	# mkdir: uutils mkdir 0.10.0 (Ubuntu 26.04) exits 0 when it lost the race
+	# to create the directory. On any failure the directory may be another
+	# run's, so it is left alone. noclobber opens an existing non-regular
+	# owner without O_EXCL; the check after the write refuses that.
+	(set -C; printf '%s\n' "$LOCK_ID" >"$l/owner") 2>/dev/null || return 1
+	[[ -f $l/owner && ! -L $l/owner ]] && [[ $(cat "$l/owner" 2>/dev/null) == "$LOCK_ID" ]] || return 1
 	LOCKS+=("$l")
 }
 drop_lock() {

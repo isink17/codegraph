@@ -132,6 +132,11 @@ There is no time-based expiry.
 
 Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
 created with `mkdir`, holding the taking run's random id in `owner`). The
+run that creates `owner` exclusively (O_EXCL) holds the lock; `mkdir`'s
+exit status is not trusted, because uutils `mkdir` 0.10.0 (Ubuntu 26.04)
+exits 0 after losing the race to create the directory. A run that cannot
+create `owner` refuses and leaves the directory alone, even one it created
+itself; such a directory blocks the slot like a crashed run's lock. The
 lock is advisory: it serialises `pool.sh` runs and nothing else, so it does
 not fence a process that writes to the slot or the lease directory without
 taking it. A run removes only a lock whose `owner` is its own id; a lock it
@@ -406,7 +411,7 @@ checks again under the lock and refuses. Run the helper only through
 `pool.sh recover`; run directly it takes any existing lock directory as held.
 
 **Locking.** The mutating actions take the slot lock `<pool>/.<slot>.lock`
-in `pool.sh` with the same `mkdir` protocol every other command uses, then
+in `pool.sh` with the same slot-lock protocol every other command uses, then
 read the marker under it. The helper checks that the lock exists and passes
 it to the library as `held_lock`, so no second lock (such as
 `recovery/.<slot>.lock`) is ever taken. The lock is held while the owner
