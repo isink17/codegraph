@@ -10,7 +10,7 @@ import zlib
 HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
 HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
 OBJECT_TYPES = (b"commit", b"tree", b"blob", b"tag")
-HFS_IGNORED = re.compile("[‌-‏‪-‮⁪-⁯﻿]")
+HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 _SIZE = re.compile(rb"(?:0|[1-9][0-9]*)\Z")
 
 
