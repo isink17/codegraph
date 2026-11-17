@@ -10,6 +10,7 @@ proven by construction and no record of another cycle can enter the chain."""
 import re
 
 from . import canonical, o5contract as oc, protocol
+from .canonical import is_hex64
 from .refusal import Code, Refused
 
 J_SCHEMA = "codegraph.o5.journal/v2"
@@ -38,10 +39,6 @@ class Mismatch(Exception):
 def need(cond, code, detail):
     if not cond:
         raise Mismatch(code, detail)
-
-
-def hex64(v):
-    return type(v) is str and bool(canonical.HEX64.match(v))
 
 
 def path_hex(v):
@@ -77,8 +74,8 @@ def check_header(pre, header, cid, sctx):
     need(type(header) is dict, Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
     need(sorted(header) == sorted(HEADER_KEYS), Code.STATE_UNKNOWN, "barrier_binding")
     need(all(header[k] == getattr(pre, k) for k in BOUND_KEYS), Code.STATE_UNKNOWN, "barrier_binding")
-    need(hex64(header["cycle_id"]) and header["cycle_id"] == cid, Code.STATE_UNKNOWN, "cycle_binding")
-    need(hex64(header["start_ctx"]) and header["start_ctx"] == sctx, Code.STATE_UNKNOWN, "cycle_binding")
+    need(is_hex64(header["cycle_id"]) and header["cycle_id"] == cid, Code.STATE_UNKNOWN, "cycle_binding")
+    need(is_hex64(header["start_ctx"]) and header["start_ctx"] == sctx, Code.STATE_UNKNOWN, "cycle_binding")
 
 
 class View:
@@ -107,13 +104,13 @@ def _record_ok(rec, seq, prev, early):
         return False
     if seq == 0:
         return kind == "start"
-    if kind == "start" or not hex64(rec["early"]) or early is not None and rec["early"] != early:
+    if kind == "start" or not is_hex64(rec["early"]) or early is not None and rec["early"] != early:
         return False
     if kind == "move.done":
         return type(rec["linked"]) is list and all(path_hex(x) for x in rec["linked"]) \
             and rec["linked"] == sorted(set(rec["linked"]))
     if kind == "revoke.done":
-        return rec["attr"] in ATTRS and hex64(rec["original"])
+        return rec["attr"] in ATTRS and is_hex64(rec["original"])
     if kind == "thaw.done":
         return rec["attr"] in ATTRS + ("move",)
     return True
@@ -123,7 +120,7 @@ def walk(res, pre, head, cid, sctx):
     """§3.2/§8 lineage. Raises Mismatch(journal_mismatch) on any gap, broken
     `prev`, foreign header, unknown kind, record after `end`, second
     `revoked` or partial (non-canonical) record."""
-    need(hex64(head), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+    need(is_hex64(head), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
     recs, prev, early = [], oc.ZERO64, None
     for seq in range(MAX_RECORDS):
         data = res.journal(cid, seq)

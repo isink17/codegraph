@@ -8,15 +8,16 @@ answers Q2 (features) per (repository, check) with every finding reported, and
 the caller derives Q3 (semantic verification), Q4 (verified preservation) and
 Q5 (recovery eligibility) from those findings only. A stored summary is never
 read. The parsing subset follows the PR-2 observer (`gitraw`), which core
-modules may not import; anything outside it is a finding, never a success."""
+modules may not import; both share the byte primitives in `gitbytes`.
+Anything outside the subset is a finding, never a success."""
 
 import hashlib
 import re
 import unicodedata
-import zlib
 
-HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
-HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
+from . import gitbytes
+from .gitbytes import HEX40, HEX64, HFS_IGNORED, OBJECT_TYPES, is_gitdir_name
+
 # A ref name: printable ASCII (the PR-2 observer's packed-ref subset) that
 # also passes Git's check-ref-format rules, which `_REF_BAD` rejects.
 _REF = re.compile(rb"refs/[!-~]{1,240}\Z")
@@ -30,18 +31,14 @@ _PACKED_HEADER = re.compile(rb"# pack-refs with: ([ -~]*)\Z")
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
-_TYPES = (b"commit", b"tree", b"blob", b"tag")
 # Tree entry mode: the type its object must have; a gitlink is not followed.
 _MODES = {b"100644": b"blob", b"100755": b"blob", b"120000": b"blob", b"40000": b"tree", b"160000": None}
 # Git's fsck_ident: `name <email> seconds +hhmm`, name nonempty, no zero padding.
 _IDENT = re.compile(rb"[^<>\n]+ <[^<>\n]*> (0|[1-9][0-9]{0,19}) [+-][0-9]{4}\Z")
 # Git's date_overflows: the seconds must fit a signed 64-bit time_t.
 _TIME_MAX = (1 << 63) - 1
-# Object header size: canonical decimal, as Git writes it and the PR-2 observer reads it.
-_SIZE = re.compile(rb"(?:0|[1-9][0-9]*)\Z")
 # The only headers Git continues on following lines (leading space).
 _MULTILINE = frozenset({b"gpgsig", b"gpgsig-sha256", b"mergetag"})
-_HFS_IGNORED = re.compile("[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]")
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
@@ -73,19 +70,6 @@ class Repo:
 
     def __init__(self, root):
         self.root, self.features, self.head, self.head_oid, self.tips = root, set(), None, None, set()
-
-
-def is_gitdir_name(c):
-    """R2 K3 detection: a `.git` name compared case-insensitively, also with
-    the code points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and
-    `.g<U+200C>it` count. Only the exact `.git` is accepted as a repository
-    (`repositories`)."""
-    if c.lower() == b".git":
-        return True
-    try:
-        return _HFS_IGNORED.sub("", c.decode("utf-8")).lower() == ".git"
-    except UnicodeDecodeError:
-        return False
 
 
 def git_index(parts):
@@ -148,7 +132,7 @@ def _fold(path):
         except UnicodeDecodeError:
             out.append("\0" + c.decode("latin-1").lower())
             continue
-        out.append(unicodedata.normalize("NFD", _HFS_IGNORED.sub("", s)).casefold())
+        out.append(unicodedata.normalize("NFD", HFS_IGNORED.sub("", s)).casefold())
     return "/".join(out)
 
 
@@ -335,19 +319,9 @@ def _read_object(files, oid):
     if data is None:
         return "missing"
     try:
-        z = zlib.decompressobj()
-        raw = z.decompress(data, MAX_OBJECT_BYTES + 1)
-        if len(raw) > MAX_OBJECT_BYTES or z.unconsumed_tail or z.unused_data or not z.eof:
-            return "corrupt"
-    except zlib.error:
+        return gitbytes.loose_object(oid.encode(), data, MAX_OBJECT_BYTES + 1)
+    except gitbytes.Malformed:
         return "corrupt"
-    if hashlib.sha1(raw).hexdigest() != oid:  # noqa: S324 - Git object ids are SHA-1 (integrity only)
-        return "corrupt"
-    nul = raw.find(b"\0", 0, 32)
-    typ, sep, size = raw[:max(nul, 0)].partition(b" ")
-    if nul < 0 or not sep or typ not in _TYPES or not _SIZE.match(size) or int(size) != len(raw) - nul - 1:
-        return "corrupt"
-    return typ, raw[nul + 1:]
 
 
 def _headers(body):
@@ -401,7 +375,7 @@ def _tag_links(body):
     keys = [k for k, _ in h]
     m = 4 if keys[3:4] == [b"tagger"] else 3
     if keys[:3] != [b"object", b"type", b"tag"] or set(keys[m:]) & {b"object", b"type", b"tag", b"tagger"} \
-            or not HEX40.match(h[0][1]) or h[1][1] not in _TYPES or not h[2][1] \
+            or not HEX40.match(h[0][1]) or h[1][1] not in OBJECT_TYPES or not h[2][1] \
             or (m == 4 and not _ident(h[3][1])):
         return None
     return [(h[0][1].decode(), h[1][1])]

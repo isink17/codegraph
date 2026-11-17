@@ -1689,10 +1689,14 @@ class Boundaries(Base):
         d = self.w.prov.decide(ctx, sel.public(), None)
         self.assertEqual((d.result, d.code, d.detail),
                          ("REFUSE", Code.QUIESCENCE_NOT_ESTABLISHED, "barrier_unavailable(protected_mode_unsupported)"))
-        self.assertFalse(self.w.prov.handoff_establish(prot, sel.public(), None).passed)
-        self.assertFalse(self.w.prov.handoff_validate(prot, sel.public(), None).passed)
+        protected = ["barrier_unavailable(protected_mode_unsupported)"]
+        for verdict in (self.w.prov.handoff_establish(prot, sel.public(), None),
+                        self.w.prov.handoff_validate(prot, sel.public(), None)):
+            self.assertEqual((verdict.passed, verdict.reasons), (False, protected))
         view = types.SimpleNamespace(slot=SLOT, row="P13", f="REVOKED", current=cyc)
-        self.assertIsNone(self.w.prov.discharge(view, o5.chain(self.w.env, cyc.barrier_id), prot, sel.public()))
+        with mock.patch.object(oc, "require_synthetic", wraps=oc.require_synthetic) as guard:
+            self.assertIsNone(self.w.prov.discharge(view, o5.chain(self.w.env, cyc.barrier_id), prot, sel.public()))
+        self.assertEqual(guard.call_args_list[0], mock.call(oc.PROTECTED))
         with self.assertRaisesRegex(ValueError, "protected_mode_unsupported"):
             self.w.prov.check_fresult(ctx, "snapshot", oc.FResult("SNAPSHOT_FAILED", "io", {}), cyc.cycle_id)
 

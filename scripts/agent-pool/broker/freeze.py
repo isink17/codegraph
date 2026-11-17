@@ -8,6 +8,7 @@ from collections import namedtuple
 import recovery_state as rs
 
 from . import barrier, canonical, cutover, evidence, o5contract as oc, protocol
+from .canonical import is_hex64
 from .refusal import Code, Refused
 from .stores import EvidenceStore, RecordStore
 
@@ -39,16 +40,13 @@ RELATION = {
 INTENT_VERB = {spec[1]: v for v, spec in RELATION.items()}
 
 
-def _hex(v):
-    return type(v) is str and bool(canonical.HEX64.match(v))
-
-
 def check_result(verb, res):
     """C1′: an effect result outside the relation raises in W (the invocation
     ends UNFINISHED with the intent pending)."""
     spec = RELATION[verb][2].get(getattr(res, "value", None))
     if spec is None or res.reason not in spec[0] or type(res.bindings) is not dict \
-            or any(not _hex(res.bindings.get(b)) for b in spec[1]) or any(not _hex(v) for v in res.bindings.values()):
+            or any(not is_hex64(res.bindings.get(b)) for b in spec[1]) \
+            or any(not is_hex64(v) for v in res.bindings.values()):
         raise ValueError("effect result outside the F relation")
 
 
@@ -77,7 +75,7 @@ def fold(log, doc_of):
             spec = RELATION[verb][2].get(e.get("value"))
             b = e.get("bindings")
             if spec is None or e.get("reason") not in spec[0] or type(b) is not dict \
-                    or any(not _hex(b.get(k)) for k in spec[1]) or e.get("op_id") != pending["op_id"]:
+                    or any(not is_hex64(b.get(k)) for k in spec[1]) or e.get("op_id") != pending["op_id"]:
                 return "UNKNOWN", None
             if e.get("auth_digest") != pending["auth_digest"]:
                 rdoc = doc_of(e.get("auth_digest"))
@@ -138,7 +136,7 @@ def chains_of(world, docs, cycle_facts):
     out = {}
     for bid, keys in ids.items():
         raw = [st.get(f"barrier/{bid}/{i:010d}") for i in range(len(keys))]
-        if None in raw or not _hex(bid):
+        if None in raw or not is_hex64(bid):
             out[bid or "?"] = barrier._invalid(bid, "gap")
             continue
         out[bid] = barrier.verify_chain(bid, raw, lambda d: (docs.get(d) or {}).get("verb"), cycle_facts,
@@ -288,8 +286,8 @@ def _burn_bound(world, slot, doc, entry):
         return False
     g = lifecycle.g_pre(view.rec)
     o5 = doc.get("o5")
-    return (doc.get("slot_generation") == g and type(o5) is dict and _hex(o5.get("barrier_id"))
-            and _hex(o5.get("cutover_head"))
+    return (doc.get("slot_generation") == g and type(o5) is dict and is_hex64(o5.get("barrier_id"))
+            and is_hex64(o5.get("cutover_head"))
             and entry["binding_digest"] == authz.binding_digest({"verb": "freeze-start", "slot": slot,
                                                                  "op_id": op_id, "slot_generation": g}))
 

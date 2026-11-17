@@ -15,7 +15,8 @@ import re
 import recovery_state as rs
 
 from . import barrier, canonical, evidence, freeze, gitclass, journal, libview, o5contract as oc, protocol
-from .journal import Mismatch, hex64, need, path_hex, valid_component
+from .canonical import is_hex64
+from .journal import Mismatch, need, path_hex, valid_component
 from .refusal import Code, Refused
 
 M_SCHEMA = "codegraph.o5.manifest/v2"
@@ -27,7 +28,6 @@ MAX_CHUNKS = 128
 INV_DOMAIN = "codegraph.o5.inventory/v1"
 TCB_UIDS = (0,)
 _CHANNEL = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
-_PROTECTED = "barrier_unavailable(protected_mode_unsupported)"
 _RESUME_INTENT = {"D-THAW-R": ("THAW_INTENT", ("D-THAW", "D-THAW-R")),
                   "D-SNAP-R": ("SNAPSHOT_INTENT", ("D-SNAP", "D-SNAP-R")),
                   "D-VERIFY-R": ("VERIFY_INTENT", ("D-VERIFY", "D-VERIFY-R"))}
@@ -54,29 +54,29 @@ class WorldResolver:
         return self._w.o5.stores[name]
 
     def journal(self, cid, seq):
-        if not hex64(cid) or type(seq) is not int or seq < 0:
+        if not is_hex64(cid) or type(seq) is not int or seq < 0:
             return None
         return self._store("journals").get(f"journal/{cid}/{seq:08d}")
 
     def artifact(self, cid, d):
-        if not hex64(cid) or not hex64(d):
+        if not is_hex64(cid) or not is_hex64(d):
             return None
         return self._store("artifacts").get(f"artifact/{cid}/{d}")
 
     def blob(self, d):
-        return self._store("artifacts").get(f"blob/{d}") if hex64(d) else None
+        return self._store("artifacts").get(f"blob/{d}") if is_hex64(d) else None
 
     def barrier(self, bid, seq):
-        if not hex64(bid) or type(seq) is not int or seq < 0:
+        if not is_hex64(bid) or type(seq) is not int or seq < 0:
             return None
         return self._store("barriers").get(f"barrier/{bid}/{seq:010d}")
 
     def evidence(self, d):
-        return evidence.load(self._store("evidence"), d) if hex64(d) else None
+        return evidence.load(self._store("evidence"), d) if is_hex64(d) else None
 
     def burned_doc(self, d):
         oc.require_synthetic(oc.mode(self._w))
-        if not hex64(d) or d not in {e["auth_digest"] for e in self._w.ledger.entries()}:
+        if not is_hex64(d) or d not in {e["auth_digest"] for e in self._w.ledger.entries()}:
             return None
         data = self._w.authz.get(d)
         if data is None or canonical.sha256(data) != d:
@@ -101,12 +101,6 @@ class WorldResolver:
 
 # ------------------------------------------------------------------ helpers
 
-def _cell(doc):
-    o5 = doc.get("o5") if type(doc) is dict else None
-    dec = o5.get("decision") if type(o5) is dict else None
-    return dec.get("cell") if type(dec) is dict else None
-
-
 def _digest_of(selection, kind):
     for k, d in selection.get("evidence", []) + selection.get("provider_inputs", []):
         if k == kind:
@@ -116,10 +110,6 @@ def _digest_of(selection, kind):
 
 def _inputs(selection, kinds):
     return {k: _digest_of(selection, k) for k in kinds}
-
-
-def _mode(pre):
-    need(type(pre.mode) is str and pre.mode == oc.SYNTHETIC, Code.QUIESCENCE_NOT_ESTABLISHED, _PROTECTED)
 
 
 def _bb(detail):
@@ -211,7 +201,7 @@ class _Cycle:
         self.r, self.pre, self.cid, self.sctx = r, pre, cid, sctx
 
     def obj(self, d, keys=None, code=Code.PROVENANCE_INSUFFICIENT, detail="evidence_unavailable"):
-        need(hex64(d), code, detail)
+        need(is_hex64(d), code, detail)
         data = self.r.artifact(self.cid, d)
         need(data is not None, code, detail)
         o, h = journal.parse(data, code, detail)
@@ -242,7 +232,7 @@ class _Cycle:
                 need(co["kind"] == "entries" and co["n"] == n and type(es) is list and 1 <= len(es) <= MAX_ENTRIES,
                      Code.STATE_UNKNOWN, "artifact_mismatch")
                 for e in es:
-                    need(type(e) is list and len(e) == 2 and path_hex(e[0]) and hex64(e[1])
+                    need(type(e) is list and len(e) == 2 and path_hex(e[0]) and is_hex64(e[1])
                          and (not out or e[0] > out[-1][0]), Code.STATE_UNKNOWN, "artifact_mismatch")
                     p = bytes.fromhex(e[0])
                     need(p.count(b"/") <= journal.MAX_PATH_DEPTH and all(valid_component(c) for c in p.split(b"/"))
@@ -263,7 +253,7 @@ class _Cycle:
              Code.STATE_UNKNOWN, "artifact_mismatch")
         if phase == "early":
             o = m["originals"]
-            need(type(o) is dict and all(k in journal.ATTRS and hex64(v) for k, v in o.items()), Code.STATE_UNKNOWN,
+            need(type(o) is dict and all(k in journal.ATTRS and is_hex64(v) for k, v in o.items()), Code.STATE_UNKNOWN,
                  "artifact_mismatch")
         return m
 
@@ -344,7 +334,7 @@ def _isolated(d, required):
     the bound artifacts among them."""
     objs = d.get("objects") if type(d) is dict else None
     return type(objs) is list and bool(objs) and all(
-        type(o) is list and len(o) == 6 and hex64(o[0]) and o[5] is True and _protected_entry(o[:5]) for o in objs) \
+        type(o) is list and len(o) == 6 and is_hex64(o[0]) and o[5] is True and _protected_entry(o[:5]) for o in objs) \
         and set(required) <= {o[0] for o in objs}
 
 
@@ -369,13 +359,13 @@ class Preservation:
     def _ids(self, pre):
         """(cycle_id, start_ctx): the cycle identity re-derived from the burned
         freeze-start document PR-3a named, and that document's `o5.ctx`."""
-        need(hex64(pre.cycle_id) and hex64(pre.freeze_start_auth)
+        need(is_hex64(pre.cycle_id) and is_hex64(pre.freeze_start_auth)
              and pre.cycle_id == oc.cycle_id(pre.slot, pre.g_pre, pre.op_id, pre.freeze_start_auth),
              Code.STATE_UNKNOWN, "barrier_binding")
         doc = self._r.burned_doc(pre.freeze_start_auth)
         need(doc is not None and doc.get("verb") == "freeze-start" and doc.get("slot") == pre.slot
              and doc.get("op_id") == pre.op_id and doc.get("slot_generation") == pre.g_pre
-             and type(doc.get("o5")) is dict and hex64(doc["o5"].get("ctx")), Code.STATE_UNKNOWN, "barrier_binding")
+             and type(doc.get("o5")) is dict and is_hex64(doc["o5"].get("ctx")), Code.STATE_UNKNOWN, "barrier_binding")
         return pre.cycle_id, doc["o5"]["ctx"]
 
     def _cycle(self, pre):
@@ -394,7 +384,7 @@ class Preservation:
             view = self._r.library(pre.slot, pre.op_id)
         except Refused:
             view = None
-        need(view is not None and hex64(d) and canonical.digest(view.rec) == d, Code.PROVENANCE_INSUFFICIENT,
+        need(view is not None and is_hex64(d) and canonical.digest(view.rec) == d, Code.PROVENANCE_INSUFFICIENT,
              "evidence_unavailable")
         need(view.rec.get("state") in states and view.rec.get("slot_generation") == pre.g_pre + 1,
              Code.VERB_NOT_ALLOWED_IN_STATE, "library_state")
@@ -406,7 +396,7 @@ class Preservation:
         except Refused:
             view = None
         p = view.pending if view is not None else None
-        need(p is not None and hex64(d) and canonical.digest({k: p[k] for k in rs.ENTRY_KEYS if k in p}) == d,
+        need(p is not None and is_hex64(d) and canonical.digest({k: p[k] for k in rs.ENTRY_KEYS if k in p}) == d,
              Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         return view
 
@@ -414,7 +404,7 @@ class Preservation:
         """R4.1 §4: `d` is the digest the current selection names (callers pass
         `_inputs(selection, ...)`), and only a record of the holder chain, read
         by exact key, matches it."""
-        need(hex64(d), Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_record_unselected")
+        need(is_hex64(d), Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_record_unselected")
         for seq in range(4096):
             data = self._r.barrier(pre.holder_chain, seq)
             if data is None:
@@ -433,12 +423,12 @@ class Preservation:
         cell = decision_cell(pre)
         inputs = _inputs(selection, oc.DECISION_CELLS[cell][2]) if cell in oc.DECISION_CELLS else {}
         try:
-            _mode(pre)
+            oc.require_synthetic(pre.mode)
             need(cell in oc.DECISION_CELLS, Code.PROVENANCE_INSUFFICIENT, "no_decision_cell")
             basis = oc.DECISION_CELLS[cell][1]
             need(ctx.basis == basis or basis == "barrier_or_handoff" and ctx.basis in ("barrier", "handoff"),
                  Code.STATE_UNKNOWN, "barrier_binding")
-            need(all(hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+            need(all(is_hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
             if ctx.basis == "handoff":
                 v = ctx.verdict
                 need(v is not None and v.cell == "H-VAL" and v.phase == "validate" and v.passed is True,
@@ -456,7 +446,8 @@ class Preservation:
         need(e is not None and e.get("kind") == "intent" and e.get("value") == intent and e.get("op_id") == pre.op_id,
              Code.STATE_UNKNOWN, "barrier_binding")
         doc = self._r.burned_doc(e.get("auth_digest"))
-        need(doc is not None and _cell(doc) in cells and doc.get("slot") == pre.slot and doc.get("op_id") == pre.op_id
+        need(doc is not None and freeze._cell(doc) in cells and doc.get("slot") == pre.slot
+             and doc.get("op_id") == pre.op_id
              and (doc.get("o5") or {}).get("cycle_id") == pre.cycle_id, Code.STATE_UNKNOWN, "original_mismatch")
 
     def _D_THAW(self, pre, inputs, selection):
@@ -552,7 +543,7 @@ class Preservation:
         view = self._pending(pre, inputs["library_pending"])
         need(view.pending.get("evidence") == inputs["original_doc"], Code.STATE_UNKNOWN, "original_mismatch")
         doc = self._r.burned_doc(inputs["original_doc"])
-        need(doc is not None and doc.get("verb") == verb and _cell(doc) == cell, Code.STATE_UNKNOWN,
+        need(doc is not None and doc.get("verb") == verb and freeze._cell(doc) == cell, Code.STATE_UNKNOWN,
              "original_mismatch")
         need((doc.get("slot"), doc.get("op_id"), doc.get("slot_generation")) == (pre.slot, pre.op_id, pre.g_pre + 1)
              and (doc.get("o5") or {}).get("cycle_id") == pre.cycle_id, Code.STATE_UNKNOWN, "barrier_binding")
@@ -561,7 +552,7 @@ class Preservation:
     def _D_PRES_R(self, pre, inputs, selection):
         doc, _ = self._original(pre, inputs, "preservation", "D-PRES")
         ep = _digest_of(selection, "ep_manifest")
-        need(hex64(ep), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+        need(is_hex64(ep), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         cy = self._cycle(pre)
         now = self._pres_fields(pre, cy, ep, inputs["fs_manifest_verified"])
         need(all(doc.get(k) == v for k, v in now.items()), Code.STATE_UNKNOWN, "original_mismatch")
@@ -570,7 +561,7 @@ class Preservation:
     def _ready_check(self, pre, inputs, rec, cy):
         """R1, R3–R7 (§8.2); R2 is the handoff verdict PR-3a and `decide` checked."""
         pdoc = self._r.burned_doc(rec.get("gates", {}).get("preservation"))
-        need(pdoc is not None and pdoc.get("verb") == "preservation" and _cell(pdoc) == "D-PRES",
+        need(pdoc is not None and pdoc.get("verb") == "preservation" and freeze._cell(pdoc) == "D-PRES",
              Code.STATE_UNKNOWN, "preservation_binding")
         try:
             vb, vm, ves, _ = cy.binding(inputs["fs_manifest_verified"], "final", verify=True)
@@ -617,7 +608,7 @@ class Preservation:
         need(view.marker is None, Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         need(view.rec.get("gates", {}).get("ready") == inputs["ready_doc"], Code.STATE_UNKNOWN, "original_mismatch")
         doc = self._r.burned_doc(inputs["ready_doc"])
-        need(doc is not None and doc.get("verb") == "ready" and _cell(doc) == "D-READY", Code.STATE_UNKNOWN,
+        need(doc is not None and doc.get("verb") == "ready" and freeze._cell(doc) == "D-READY", Code.STATE_UNKNOWN,
              "original_mismatch")
         need((doc.get("o5") or {}).get("cycle_id") == pre.cycle_id and doc.get("slot") == pre.slot
              and doc.get("op_id") == pre.op_id, Code.STATE_UNKNOWN, "barrier_binding")
@@ -649,15 +640,15 @@ class Preservation:
              Code.STATE_UNKNOWN, "barrier_binding")
         det = rec.get("detail") if type(rec.get("detail")) is dict else {}
         chans, setuid = det.get("neutralized"), det.get("neutralized_setuid")
-        need(type(chans) is list and all(type(x) is str and _CHANNEL.match(x) and not hex64(x) for x in chans)
-             and type(setuid) is list and all(hex64(x) for x in setuid), Code.QUIESCENCE_NOT_ESTABLISHED,
+        need(type(chans) is list and all(type(x) is str and _CHANNEL.match(x) and not is_hex64(x) for x in chans)
+             and type(setuid) is list and all(is_hex64(x) for x in setuid), Code.QUIESCENCE_NOT_ESTABLISHED,
              "enforcement_record_unavailable")
         need(pre.scope in ("SLOT_ISOLATED", "POOL_MAINTENANCE"), Code.STATE_UNKNOWN, "barrier_binding")
         ch = self._ev(inputs, "agent_channels", pre)["data"].get("channels")
         need(type(ch) is dict and bool(ch) and all(s == "neutralized" and n in chans for n, s in ch.items()),
              Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_incomplete(channel)")
         files = self._ev(inputs, "setuid_writer_scan", pre)["data"].get("files")
-        need(type(files) is list and all(type(f) is list and len(f) == 3 and hex64(f[0]) and type(f[1]) is int
+        need(type(files) is list and all(type(f) is list and len(f) == 3 and is_hex64(f[0]) and type(f[1]) is int
                                          and f[2] is True and f[0] in setuid for f in files),
              Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_incomplete(setuid)")
         eo = self._r.evidence(_digest_of(selection, "enforcement_observation"))
@@ -665,17 +656,17 @@ class Preservation:
              and type(det.get("enforcement")) is str and eo["data"].get("digest") == det["enforcement"],
              Code.QUIESCENCE_NOT_ESTABLISHED, "enforcement_incomplete(observation)")
         mnt = self._ev(inputs, "mounts_external", pre)["data"]
-        need(hex64(det.get("mounts_baseline")) and mnt.get("baseline") == det["mounts_baseline"]
+        need(is_hex64(det.get("mounts_baseline")) and mnt.get("baseline") == det["mounts_baseline"]
              and mnt.get("mounts") == det["mounts_baseline"], Code.QUIESCENCE_NOT_ESTABLISHED,
              "enforcement_incomplete(mounts_baseline)")
 
     def handoff_establish(self, pre, selection, view):
         inputs = _inputs(selection, oc.H_EST_KINDS)
         try:
-            _mode(pre)
+            oc.require_synthetic(pre.mode)
             need(pre.release_target is None and pre.holder_chain == pre.barrier_id and pre.cycle_id is not None,
                  Code.STATE_UNKNOWN, "barrier_binding")
-            need(all(hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+            need(all(is_hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
             cy = self._cycle(pre)
             self._e5(pre, selection, inputs)
             cso = self._ev(inputs, "claimed_set_observation", pre)["data"]
@@ -702,8 +693,8 @@ class Preservation:
         """H-VAL V-1..V-7 (R4 §6.3, R4.1 §5.3): protected evidence only; nothing
         an agent can write after an authorized release is consulted."""
         inputs = _inputs(selection, kinds)
-        _mode(pre)
-        need(all(hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+        oc.require_synthetic(pre.mode)
+        need(all(is_hex64(v) for v in inputs.values()), Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
         cy = self._cycle(pre)
         need(sup_digest is None or inputs["superseded"] == sup_digest, Code.STATE_UNKNOWN, "barrier_binding")
         sup = self._barrier_record(pre, inputs["superseded"])
@@ -753,7 +744,7 @@ class Preservation:
     def discharge(self, view, holder, pre, selection):
         cur = getattr(view, "current", None)
         try:
-            _mode(pre)
+            oc.require_synthetic(pre.mode)
             need(cur is not None and pre.holder_chain == holder.id == cur.barrier_id and pre.cycle_id == cur.cycle_id
                  and pre.g_pre == cur.g_pre and pre.slot == view.slot, Code.STATE_UNKNOWN, "barrier_binding")
             if view.row in ("P13", "P14", "P15", "P16", "P17"):
@@ -774,7 +765,7 @@ class Preservation:
             if kind in ("D4", "D4H"):
                 need(lv.rec.get("state") == rs.READY and lv.marker is not None, Code.STATE_UNKNOWN, "ready")
                 rdoc = self._r.burned_doc(inputs["ready_doc"])
-                need(rdoc is not None and rdoc.get("verb") == "ready" and _cell(rdoc) == "D-READY"
+                need(rdoc is not None and rdoc.get("verb") == "ready" and freeze._cell(rdoc) == "D-READY"
                      and inputs["ready_doc"] == lv.rec["gates"].get("ready")
                      and rdoc.get("preservation") == inputs["preservation_doc"] == lv.rec["gates"].get("preservation"),
                      Code.STATE_UNKNOWN, "preservation_binding")
@@ -795,8 +786,8 @@ class Preservation:
 
     def _check_fresult(self, ctx, verb, res, cycle_id):
         pre = ctx.pre
-        _mode(pre)
-        need(hex64(cycle_id), Code.STATE_UNKNOWN, "cycle_binding")
+        oc.require_synthetic(pre.mode)
+        need(is_hex64(cycle_id), Code.STATE_UNKNOWN, "cycle_binding")
         if pre.cycle_id is not None:
             need(cycle_id == pre.cycle_id, Code.STATE_UNKNOWN, "cycle_binding")
             cy = self._cycle(pre)

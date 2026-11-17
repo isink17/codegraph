@@ -7,6 +7,7 @@ the in-memory store with fault hooks. Real file I/O is PR-4."""
 import json
 
 from . import canonical
+from .canonical import is_hex64
 from .refusal import Code, Refused
 from .stores import Gated, TxnError
 
@@ -69,7 +70,7 @@ def _reject(_):
 
 def _value_ok(v, t, seq, prev):
     if t == "hex":
-        return type(v) is str and bool(canonical.HEX64.match(v))
+        return is_hex64(v)
     if t == "uint":
         return type(v) is int and 0 <= v <= canonical.MAX_INT
     if t == "prev":

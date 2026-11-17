@@ -13,6 +13,10 @@ MAX_INT = 2 ** 53 - 1
 MAX_DEPTH = 16
 
 
+def is_hex64(v):
+    return type(v) is str and bool(HEX64.match(v))
+
+
 class DomainError(ValueError):
     pass
 

@@ -38,6 +38,7 @@ stores must implement the same interfaces with temp file, `F_FULLFSYNC`,
 | `_testsupport/` | test-only capability and evidence producers (LB5) |
 | `fdwalk.py` (PR-2) | descriptor-relative, no-follow, bounded reads |
 | `gitraw.py` (PR-2) | strict-subset config, HEAD, refs, loose commit and tree objects |
+| `gitbytes.py` | pure byte primitives `gitraw` and `gitclass` share: hex ids, `.git` name detection, loose-object decoding; each caller keeps its own size bound and error policy |
 | `indexverify.py` (PR-2) | index parser, worktree comparison, `observe`, result model |
 
 ## Clarifications made in PR-1
