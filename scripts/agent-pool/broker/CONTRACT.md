@@ -424,8 +424,16 @@ cannot tell a regular file from a symbolic link whose capture recorded some
 bytes. Git opens `objects`, `objects/pack`, `objects/info`,
 `objects/info/commit-graphs`, `objects/pack/multi-pack-index.d`, `info`,
 `refs`, `refs/heads`, `refs/replace`, `modules` and `reftable` as
-directories. As a regular file Git skips them. As a symbolic link to a
-directory outside the slot, Git 2.38 and 2.54 follow it: a forged pack there
+directories. Git does not read a regular file at one of these names as a
+directory; what it does instead depends on the name (Git 2.38 and 2.54).
+At `objects` or `refs` it refuses the repository (`not a git repository`).
+At `refs/heads` with a symbolic HEAD it reports that the current branch has
+no commits; with a detached HEAD it carries on. At `objects/pack` it prints
+`unable to open object pack directory` and carries on. At the other names it
+ignores the file. No safety claim depends on which of these happens. As a
+symbolic link to a directory outside the slot, Git 2.38 and 2.54 follow it
+(measured for `objects/pack`, `objects/info`, `info` and `refs`; the rule
+below does not depend on the other names being followed): a forged pack there
 replaces HEAD in `git log`, `alternates` there adds outside objects, `grafts`
 there rewrites history, and with a detached HEAD a linked `refs` supplies
 replace refs. The classifier saw only the loose objects, so these slots were
