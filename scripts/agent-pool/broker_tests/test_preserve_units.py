@@ -662,6 +662,60 @@ class GitClassification(unittest.TestCase):
                  b".git/hooks/pre-commit.sample": b"", b".git/refs/heads/Feature": oid + b"\n"}
         self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
 
+    def test_administrative_directory_captured_as_an_entry_is_unknown(self):
+        """NB-13: an entry at a name Git opens as a directory may be a symbolic
+        link the capture recorded without its type; restored, Git reads packs,
+        alternates, grafts or refs outside the slot. Detached HEAD keeps
+        `refs` from failing as `unborn_head`."""
+        self.assertLessEqual(gitclass._ADMIN_DIRS, gitclass._ADMIN)
+        for variant in ((), ("detached",)):
+            files, _ = pw.git_repo(variant=variant)
+            self.assertEqual(classify(files)[2:5], ("COMPLETE", "ELIGIBLE", []))
+            for name in (b"objects/pack", b"objects/info", b"info", b"refs", b"modules", b"objects",
+                         b"refs/heads", b"refs/replace", b"objects/info/commit-graphs",
+                         b"objects/pack/multi-pack-index.d", b"reftable", b"objects/Pack", b"OBJECTS/pack",
+                         b"Objects/Info", b"INFO", "obj‌ects/pack".encode()):
+                with self.subTest(variant=variant, name=name):
+                    got = {p: d for p, d in files.items()
+                           if p != b".git/" + name and not p.startswith(b".git/" + name + b"/")}
+                    got[b".git/" + name] = b"/elsewhere/dir"
+                    _, _, q4, q5, reasons, _ = classify(got)
+                    self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+                    self.assertIn("unknown", reasons)
+        files, coid = pw.git_repo()
+        nested, _ = pw.git_repo(prefix=b"vendor/lib/")
+        _, _, q4, q5, reasons, _ = classify({**files, **nested, b"vendor/lib/.git/objects/pack": b"/elsewhere"})
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+        legit = {b".git/info/exclude": b"", b".git/objects/info/packs": b"\n", b".git/refs/tags/v1": coid.encode() + b"\n",
+                 b"objects/pack": b"x", b"info": b"x", b"refs": b"x", b"src/objects": b"x"}
+        self.assertEqual(classify({**files, **legit})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_git_follows_a_symlinked_pack_directory_outside_the_repository(self):
+        """NB-13 against real Git: `.git/objects/pack` linked to an outside
+        directory holding a forged pack changes what Git reads for HEAD."""
+        lab = git_lab(self)
+        r = three_commits(lab)
+        coid = lab.git(r, "rev-parse", "HEAD").stdout.decode().strip()
+        tree = lab.git(r, "cat-file", "commit", "HEAD").stdout.split(b"\n", 1)[0]
+        forged = tree + b"\nauthor F <f@x> 0 +0000\ncommitter F <f@x> 0 +0000\n\nforged\n"
+        outside = lab.path("outside")
+        for p, d in pw.with_pack({}, {coid: b"commit %d\0" % len(forged) + forged}).items():
+            lab.write(outside, os.path.basename(p.decode()), d)
+        pack_dir = os.path.join(r, ".git", "objects", "pack")
+        os.rmdir(pack_dir)
+        try:
+            os.symlink(outside, pack_dir)
+        except OSError as e:
+            self.skipTest(f"symbolic links unavailable: {e}")
+        self.assertEqual(lab.git(r, "log", "--format=%s").stdout.strip(), b"forged")
+        files = captured(r)
+        self.assertEqual(classify(files)[2:5], ("COMPLETE", "ELIGIBLE", []))
+        files[b".git/objects/pack"] = os.fsencode(os.readlink(pack_dir))
+        _, _, q4, q5, reasons, _ = classify(files)
+        self.assertEqual((q4, q5), ("INCOMPLETE", "NOT_ELIGIBLE"))
+        self.assertIn("unknown", reasons)
+
     def test_commit_graph_is_never_trusted(self):
         """NB-7: Git takes parents and generation numbers from a commit-graph
         instead of the verified commits, and recovery has no step that drops

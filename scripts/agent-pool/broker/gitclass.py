@@ -458,6 +458,13 @@ _ADMIN = frozenset({b"HEAD", b"config", b"shallow", b"packed-refs", b"commondir"
                     b"objects/pack/multi-pack-index.d", b"refs", b"refs/heads",
                     b"refs/replace"})
 _ADMIN_FOLDED = frozenset(_fold(a) for a in _ADMIN)
+# The `_ADMIN` names Git opens as directories. A manifest entry is untyped, so
+# one at such a name may be a symbolic link that restore recreates, and Git
+# then reads packs, alternates, grafts or refs outside the slot (NB-13).
+# Other spellings are already `unknown` through `_ADMIN_FOLDED`.
+_ADMIN_DIRS = frozenset({b"info", b"modules", b"objects", b"objects/info", b"objects/info/commit-graphs",
+                         b"objects/pack", b"objects/pack/multi-pack-index.d", b"refs", b"refs/heads",
+                         b"refs/replace", b"reftable"})
 
 
 def classify(root, files):
@@ -465,7 +472,8 @@ def classify(root, files):
     r = Repo(root)
     if b"" in files:
         r.features.add("gitlink_file")
-    if any(_fold(q) in _ADMIN_FOLDED and q not in _ADMIN for q in _prefixes(files)):
+    if any(_fold(q) in _ADMIN_FOLDED and q not in _ADMIN for q in _prefixes(files)) \
+            or not _ADMIN_DIRS.isdisjoint(files):
         r.features.add("unknown")
     if b"config" in files:
         _config(r, files[b"config"])

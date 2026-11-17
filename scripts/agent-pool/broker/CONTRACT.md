@@ -417,6 +417,52 @@ refusal path and the other features keep their meaning.
   and those with an unrelated pack still reach D4. Every case above stops at
   freeze-start with `not_preservable` and never reaches READY or D4.
 
+### Administrative directory captured as an entry (NB-13, 2026-11-17)
+
+A manifest entry is `(path, digest)` with no file type, so the classifier
+cannot tell a regular file from a symbolic link whose capture recorded some
+bytes. Git opens `objects`, `objects/pack`, `objects/info`,
+`objects/info/commit-graphs`, `objects/pack/multi-pack-index.d`, `info`,
+`refs`, `refs/heads`, `refs/replace`, `modules` and `reftable` as
+directories. As a regular file Git skips them. As a symbolic link to a
+directory outside the slot, Git 2.38 and 2.54 follow it: a forged pack there
+replaces HEAD in `git log`, `alternates` there adds outside objects, `grafts`
+there rewrites history, and with a detached HEAD a linked `refs` supplies
+replace refs. The classifier saw only the loose objects, so these slots were
+eligible.
+
+- **Rule.** Any captured entry exactly at one of those gitdir-relative names
+  is `unknown` (Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`). Another spelling of the
+  name was already `unknown` through the administrative-name rule. Entries
+  below those directories are unchanged.
+- **Not covered here.** A symbolic link elsewhere under a gitdir (for example
+  `config`, `HEAD`, a ref, a loose object, a `.pack`, `hooks`, `logs`).
+  When the capture records the link target as the entry's bytes, a typical
+  target such as `/path` does not parse and is refused. That is not a
+  guarantee, because some target strings are also valid config or ref text.
+  When the capture records the bytes of the linked file instead, the
+  classifier cannot detect the link at all. PR-4 must therefore either never
+  recreate a symbolic link below a gitdir, or record the type and refuse
+  (`git-symlink`, PR-3b contract r2 G16a). The classifier cannot enforce
+  this without a typed manifest.
+
+### Scope of the D4 recovery claim (NB-15, 2026-11-17)
+
+D4 states that Git, reading the restored slot, sees for HEAD and every
+captured ref exactly the objects the classifier verified as loose objects.
+It states nothing else. In particular:
+
+- **Unrelated packs.** A pack whose index lists no reachable id is ignored
+  (R4.2), even when its contents are forged. `git fsck` on such a restored
+  slot fails (exit 4 for a forged unrelated entry) while D4 holds. Neither
+  that nor `git gc`, `repack` or `prune` succeeding is part of the claim.
+  Changing this needs a separate owner decision.
+- **Unreachable objects** (loose or packed), reflogs, the index, hooks and
+  other administrative files are preserved as raw bytes only. They are not
+  verified.
+- **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on APFS, macOS only.
+  Linux and Windows runtime, other Git versions and HFS+ were not exercised.
+
 ## Not in PR-1
 
 PR-2..PR-5, RS-1, RS-4, NL1–NL6, L1–L8, P1–P24, real file I/O, any account,

@@ -215,6 +215,15 @@ class Positive(Base):
         self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
         self.assertEqual(self.w.release(), DENIED)
 
+    def test_pack_directory_captured_as_an_entry_is_not_preservable(self):
+        """NB-13: the entry may be a symbolic link that restore recreates, and
+        Git then reads packs outside the slot."""
+        files, _ = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**files, b".git/objects/pack": b"/elsewhere/pack"}
+        self.ok("adopt", "request")
+        self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
+        self.assertEqual(self.w.release(), DENIED)
+
     def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
         self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
         self.w.to_ready()
