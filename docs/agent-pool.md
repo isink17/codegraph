@@ -132,7 +132,10 @@ There is no time-based expiry.
 
 Every lease change takes a per-slot lock (`pool/.<slot>.lock`, a directory
 created with `mkdir`, holding the taking run's random id in `owner`). The
-lock is advisory: it serialises `pool.sh` runs and nothing else, so it does
+run that creates `owner` exclusively (O_EXCL) holds the lock; `mkdir`'s
+exit status is not trusted, because uutils `mkdir` 0.10.0 (Ubuntu 26.04)
+exits 0 after losing the race to create the directory. A run that cannot
+create `owner` refuses and leaves the directory alone. The lock is advisory: it serialises `pool.sh` runs and nothing else, so it does
 not fence a process that writes to the slot or the lease directory without
 taking it. A run removes only a lock whose `owner` is its own id; a lock it
 cannot remove (missing, replaced or not empty) is reported on stderr, every
