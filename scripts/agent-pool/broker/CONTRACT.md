@@ -316,7 +316,9 @@ Rules worth repeating:
 - Recorded head on a case-insensitive volume (not changed in PR-3b). Git on
   APFS reads a loose ref under another case (`refs/heads/Main`) for a
   packed ref (`refs/heads/main`); the classifier compares ref names as
-  bytes and records the packed oid. Both oids are verified tips and their
+  bytes and records the packed oid. Both oids are verified tips (a name
+  that folds onto a captured `.lock` file, which the classifier skips, is
+  refused instead; see "packed-refs" below) and their
   objects are preserved, but the preservation document's `head` names the
   packed commit, not Git's. With a synthetic final observation that reuses
   the classifier this reaches P18 and D4. READY refuses it
@@ -519,6 +521,13 @@ disposable repositories:
   `git_head`. Both only over-refuse. Loose ref file names are not checked
   here: Git ignores a broken one, and HEAD and symbolic refs cannot point at
   it because their targets are checked.
+- **Case alias of a `.lock` file.** `refs/heads/x.LOCK` is a valid name for
+  Git, which compares `.lock` byte-wise. On APFS Git opens it as a captured
+  `refs/heads/x.lock`, which the classifier skips as residue: Git 2.38 and
+  2.54 then resolved the ref, or HEAD, to that file's unverified commit
+  while the slot reached D4 (review of ce630f01). Any packed name,
+  symbolic-ref target or HEAD target that folds (APFS/HFS+ rules) onto a
+  captured `refs/**.lock` path is `unknown`.
 
 ### Scope of the D4 recovery claim (NB-15, 2026-11-17)
 
@@ -534,6 +543,13 @@ It states nothing else. In particular:
 - **Unreachable objects** (loose or packed), reflogs, the index, hooks and
   other administrative files are preserved as raw bytes only. They are not
   verified.
+- **Names other than HEAD and captured refs.** Pseudorefs (`MERGE_HEAD`,
+  `ORIG_HEAD`, `FETCH_HEAD`), `worktrees/*/HEAD`, sequencer state and Git's
+  short-name lookup are outside the claim. A top-level `$GIT_DIR/main` file
+  makes `git rev-parse main` warn that the name is ambiguous and resolve to
+  that file's commit (measured, Git 2.38 and 2.54), while `refs/heads/main`
+  is still the verified one. By Git's documented behavior (not measured
+  here) a `MERGE_HEAD` becomes a parent of the next `git commit`.
 - **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on APFS, macOS only.
   Linux and Windows runtime, other Git versions and HFS+ were not exercised.
 

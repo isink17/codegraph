@@ -275,25 +275,34 @@ def _packed(r, data, refs):
     return peels, traits
 
 
-def _peeled(files, oid):
+def _peeled(files, oid, memo):
     """What Git's peel of `oid` gives: the final target of a tag chain, None
-    when `oid` is not a tag, False when a link is not an intact loose tag."""
-    got = _read_object(files, oid)
-    if not isinstance(got, tuple):
-        return False
-    if got[0] != b"tag":
-        return None
-    for _ in range(MAX_OBJECTS):
-        links = _tag_links(got[1])
-        if links is None:
-            return False
-        oid, typ = links[0]
-        if typ != b"tag":
-            return oid
+    when `oid` is not a tag, False when a link is not an intact loose tag.
+    `memo` keeps every tag walked, so each tag is read once per classify."""
+    chain = []
+    while True:
+        if oid in memo:
+            res = memo[oid]
+            res = False if chain and res is None else res
+            break
         got = _read_object(files, oid)
         if not isinstance(got, tuple) or got[0] != b"tag":
-            return False
-    return False
+            res = None if isinstance(got, tuple) and not chain else False
+            if not chain:
+                memo[oid] = res
+            break
+        links = _tag_links(got[1])
+        chain.append(oid)
+        if links is None or len(chain) > MAX_OBJECTS:
+            res = False
+            break
+        oid, typ = links[0]
+        if typ != b"tag":
+            res = oid
+            break
+    for tag in chain:
+        memo[tag] = res
+    return res
 
 
 def _check_peels(r, files, refs, peels, traits):
@@ -302,14 +311,12 @@ def _check_peels(r, files, refs, peels, traits):
     trusts its absence. Either must match the verified objects. A line that
     a loose ref shadows is never read. A broken tag chain is reported by
     `_closure` already."""
-    peeled = {}
+    memo = {}
     for name, peel in peels.items():
         kind, oid = refs[name]
         if kind != "packed":
             continue
-        if oid not in peeled:
-            peeled[oid] = _peeled(files, oid)
-        want = peeled[oid]
+        want = _peeled(files, oid, memo)
         knows = b"fully-peeled" in traits or (b"peeled" in traits and name.startswith(b"refs/tags/"))
         if want is not False and peel != want and (peel is not None or knows):
             r.features.add("malformed_packed")
@@ -596,6 +603,13 @@ def classify(root, files):
             else:
                 r.head_oid = target[1]
             r.head = {"kind": "symbolic"}
+    # Git on a case-insensitive volume opens the loose file of a name it looks
+    # up in any case, also one skipped here as `.lock` residue. HEAD's target
+    # is a ref here or HEAD is already `unborn_head`.
+    locks = {_fold(p) for p in files if p.startswith(b"refs/") and p.endswith(b".lock")}
+    looked_up = set(refs) | {val for kind, val in refs.values() if kind == "sym"}
+    if any(_fold(n) in locks for n in looked_up):
+        r.features.add("unknown")
     r.tips = {val for kind, val in refs.values() if kind != "sym"} | ({r.head_oid} if r.head_oid else set())
     branches = {val for name, (kind, val) in refs.items() if kind != "sym" and name.startswith(b"refs/heads/")}
     _closure(r, files, r.tips, branches | ({r.head_oid} if r.head_oid else set()))

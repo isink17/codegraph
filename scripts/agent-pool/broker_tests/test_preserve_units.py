@@ -1564,6 +1564,40 @@ class PackedRefsAsGitReadsThem(unittest.TestCase):
                 self.eligible(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
         self.eligible(HDR + pw.packed_lines((o.c2, b"refs/heads/a.b")), head=b"ref: refs/heads/a.b\n")
 
+    def test_name_git_opens_as_a_lock_file_in_another_case(self):
+        """On APFS Git opens `refs/heads/x.LOCK` as the loose file `x.lock`,
+        which is skipped here as residue and never verified."""
+        o = self.o
+        forged = {b".git/refs/heads/feature.lock": o.f.encode() + b"\n"}
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/feature.LOCK"), (o.c2, b"refs/heads/main")),
+                     finding="unknown", extra=forged)
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/main.LOCK")), finding="unknown",
+                     head=b"ref: refs/heads/main.LOCK\n", extra={b".git/refs/heads/main.lock": o.f.encode() + b"\n"})
+        self.refused(HDR + pw.packed_lines((o.c2, b"refs/heads/main")), finding="unknown",
+                     extra={b".git/refs/heads/alias": b"ref: refs/heads/x.LOCK\n",
+                            b".git/refs/heads/x.lock": o.f.encode() + b"\n"})
+        _, q3, q4, q5, reasons, _ = self.q(HDR + pw.packed_lines((o.c2, b"refs/heads/main")), extra=forged)
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []))
+
+    def test_peel_walks_each_tag_once(self):
+        """A chain of n tags, each packed with its peel line and the
+        outermost first, reads each tag once rather than once per ref."""
+        o, files = self.o, dict(self.files)
+        prev, typ, chain = o.c1, b"commit", []
+        for i in range(60):
+            prev, z = pw.gobj(b"tag", b"object " + prev.encode() + b"\ntype " + typ + b"\ntag t%d\ntagger a <a> 0 +0000\n\nt\n" % i)
+            files[pw.loose_key(prev)], typ = z, b"tag"
+            chain.append(prev)
+        body = pw.packed_lines((o.c2, b"refs/heads/main"),
+                               *[p for i, t in reversed(list(enumerate(chain)))
+                                 for p in ((t, b"refs/tags/t%03d" % (99 - i)), (o.c1,))])
+        self.files = files
+        real, calls = gitclass._read_object, []
+        with mock.patch.object(gitclass, "_read_object", side_effect=lambda f, oid: calls.append(oid) or real(f, oid)):
+            self.eligible(HDR + body)
+        peel_reads = len(calls) - len(set(calls))
+        self.assertLessEqual(peel_reads, len(chain) + 2)
+
     def test_head_names_outside_the_observer_subset_are_unsupported(self):
         """Git accepts `refs/heads/a+b`; the PR-2 observer resolves HEAD only
         through [A-Za-z0-9._/-], so the bytes stay complete but not eligible."""
@@ -1634,6 +1668,19 @@ class PackedRefsAgainstRealGit(unittest.TestCase):
         self.assertIn("refs/heads/b " + other, listed)
         self.assertIn("refs/heads/b " + main, listed)
         self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["malformed_packed"]))
+
+    def test_lock_file_git_opens_for_another_case(self):
+        tree = self.rev("HEAD^{tree}")
+        forged = self.lab.git(self.r, "commit-tree", "-m", "FORGED", tree).stdout.decode().strip()
+        head = self.rev("HEAD")
+        self.write_packed(b"# pack-refs with: peeled fully-peeled sorted \n" + head.encode() + b" refs/heads/feature.LOCK\n"
+                          + head.encode() + b" refs/heads/main\n")
+        self.lab.write(self.r, ".git/refs/heads/feature.lock", forged.encode() + b"\n")
+        if not os.path.exists(os.path.join(self.r, ".git", "refs", "heads", "feature.LOCK")):
+            self.skipTest("case-sensitive volume")
+        self.files = captured(self.r)
+        self.assertEqual(self.rev("refs/heads/feature.LOCK"), forged)
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
 
     def test_forged_peel_git_reports_is_refused(self):
         v1, peel = self.rev("v1"), self.rev("v1^{}")

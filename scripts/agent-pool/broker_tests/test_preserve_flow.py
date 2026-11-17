@@ -807,6 +807,18 @@ class PackedRefs(Base):
                   extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
         self.stuck_at_move()
 
+    def test_head_name_git_opens_as_a_lock_file(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main.LOCK")), head=b"ref: refs/heads/main.LOCK\n",
+                  extra={b".git/refs/heads/main.lock": o.f.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_branch_name_git_opens_as_a_lock_file(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/feature.LOCK"), (o.c2, b"refs/heads/main")),
+                  extra={b".git/refs/heads/feature.lock": o.f.encode() + b"\n"})
+        self.stuck_at_move()
+
     def test_head_name_git_rejects(self):
         o = pw.packed_world()[1]
         self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/../x")), head=b"ref: refs/heads/../x\n")
