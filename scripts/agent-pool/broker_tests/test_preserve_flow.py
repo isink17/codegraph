@@ -18,6 +18,7 @@ from broker.stores import Crash
 from preserve_world import OTHER, SLOT, outcome, rel
 
 PRES_KEYS = {"head", "complete", "inventory", "preserved", "artifact"}
+HDR = b"# pack-refs with: peeled fully-peeled sorted \n"
 
 
 class Base(unittest.TestCase):
@@ -756,6 +757,52 @@ def _with_head(files, raw_objects, head):
 
 def _commit(body):
     return b"commit %d\0" % len(body) + body
+
+
+class PackedRefs(Base):
+    """packed-refs that Git reads differently from the classifier is refused
+    after the move, never READY or D4; a valid one still reaches D4."""
+
+    def slot(self, packed, head=b"ref: refs/heads/main\n", extra=None):
+        files, o = pw.packed_world()
+        self.w.fx.trees[SLOT] = {**files, b".git/packed-refs": packed, b".git/HEAD": head, **(extra or {})}
+        return o
+
+    def test_valid_packed_refs_with_tags_reach_d4(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                        (o.t2, b"refs/tags/v2"), (o.c1,)))
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        self.assertEqual(self.w.last_doc("preservation")["head"], o.c2)
+
+    def test_repeated_branch_line_git_reads_second(self):
+        """Git 2.38 and 2.54 resolve HEAD to the forged second line; this
+        slot used to reach D4 with the first line's commit as its head."""
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/main")))
+        self.stuck_at_move()
+
+    def test_repeated_branch_line_forged_first(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.f, b"refs/heads/main"), (o.c2, b"refs/heads/main")))
+        self.stuck_at_move()
+
+    def test_forged_peel_line(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.f,)))
+        self.stuck_at_move()
+
+    def test_unsorted_names_under_a_sorted_header(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b")),
+                  extra={b".git/refs/heads/b": o.c2.encode() + b"\n"})
+        self.stuck_at_move()
+
+    def test_head_name_git_rejects(self):
+        o = pw.packed_world()[1]
+        self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/../x")), head=b"ref: refs/heads/../x\n")
+        self.stuck_at_move()
 
 
 class MalformedObjects(Base):

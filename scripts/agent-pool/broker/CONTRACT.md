@@ -329,6 +329,20 @@ Rules worth repeating:
   F stays `MOVE_INTENT` and the resume never repeats an irreversible step.
   PR-4 needs a pre-effect eligibility check and an owner-authorized recovery
   path for such a slot. PR-3b provides neither.
+- PR-4 entry criterion (NB-16, owner, mandatory). Before PR-4 restore or
+  release is implemented, PR-4 must show with tests that all three hold for
+  every path of the slot (worktree, gitdirs and linked-worktree pointers):
+  1. Capture distinguishes file types (regular, executable, directory,
+     symbolic link) and records the type with each entry.
+  2. A symbolic link is never silently represented as a regular file:
+     neither its target string nor the bytes of the file it points to are
+     recorded or restored as a regular file's content.
+  3. Restore never follows a symbolic link out of its authorized tree, for
+     any path it creates, writes or replaces.
+  The PR-3b manifest (`codegraph.o5.manifest/v2`, entries `[path_hex,
+  hex64]`) is untyped and cannot express 1 or 2, so it must change in PR-4.
+  PR-3b does not meet this criterion and claims nothing about it; NB-13
+  below only refuses symbolic links at administrative directory names.
 
 ## Owner amendment R4.2 to the PR-3b contract (2026-11-16)
 
@@ -425,12 +439,19 @@ bytes. Git opens `objects`, `objects/pack`, `objects/info`,
 `objects/info/commit-graphs`, `objects/pack/multi-pack-index.d`, `info`,
 `refs`, `refs/heads`, `refs/replace`, `modules` and `reftable` as
 directories. Git does not read a regular file at one of these names as a
-directory; what it does instead depends on the name (Git 2.38 and 2.54).
-At `objects` or `refs` it refuses the repository (`not a git repository`).
-At `refs/heads` with a symbolic HEAD it reports that the current branch has
-no commits; with a detached HEAD it carries on. At `objects/pack` it prints
-`unable to open object pack directory` and carries on. At the other names it
-ignores the file. No safety claim depends on which of these happens. As a
+directory; what it does instead depends on the name and, at `objects` and
+`refs`, on the file's execute bit. Measured with Git 2.38.0 and Apple Git
+2.54.0 on APFS; this is observed behavior, not a guarantee Git makes. At
+`objects` or `refs` a file without an execute bit makes Git refuse the
+repository (`not a git repository`). With mode 0755 Git accepts the
+repository and the reads fail instead: at `objects` the object reads fail
+(`bad object HEAD` or `failed to read object ... Not a directory`), at
+`refs` the current branch has no commits. At `refs/heads` with a symbolic
+HEAD it reports that the current branch has no commits, with or without an
+execute bit and also when the branch exists only in `packed-refs`; with a
+detached HEAD it carries on. At `objects/pack` it prints `unable to open
+object pack directory` and carries on. At the other names it ignores the
+file. No safety claim depends on which of these happens. As a
 symbolic link to a directory outside the slot, Git 2.38 and 2.54 follow it
 (measured for `objects/pack`, `objects/info`, `info` and `refs`; the rule
 below does not depend on the other names being followed): a forged pack there
@@ -449,10 +470,52 @@ eligible.
   target such as `/path` does not parse and is refused. That is not a
   guarantee, because some target strings are also valid config or ref text.
   When the capture records the bytes of the linked file instead, the
-  classifier cannot detect the link at all. PR-4 must therefore either never
-  recreate a symbolic link below a gitdir, or record the type and refuse
-  (`git-symlink`, PR-3b contract r2 G16a). The classifier cannot enforce
-  this without a typed manifest.
+  classifier cannot detect the link at all. The classifier cannot enforce
+  this without a typed manifest; the PR-4 entry criterion (NB-16, under
+  "PR-4 prerequisite" above) is what closes it.
+
+### packed-refs as Git reads it (B-1, N-1, N-2, 2026-11-17)
+
+Git resolves a packed ref by binary search, trusts a `^` line as the ref's
+peeled value and, under some headers, trusts its absence. The classifier
+used to keep the first of two lines for one name and accept any `^` line,
+so Git 2.38 and 2.54 could resolve HEAD to an unverified commit on the
+second line while the slot reached D4. Measured with both versions in
+disposable repositories:
+
+- **Repeated name.** Git resolves the second line in both orders without a
+  header, and either line depending on layout under `sorted`. `git fsck` on
+  2.38 is silent. Any repeated name, also with identical values, is
+  `malformed_packed` (Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`). A loose ref still
+  takes precedence over a packed line of the same name.
+- **Peel lines.** `git show-ref -d`, `describe` and, on 2.54,
+  `for-each-ref %(*objectname)` report a forged `^` value, including one
+  that names an absent object or follows a commit ref. A `^` line is
+  accepted only directly after a ref line and only when it equals Git's
+  peel of the verified value (the final target of its tag chain). Under a
+  `fully-peeled` header, or `peeled` for `refs/tags/`, Git 2.38 treats a
+  missing `^` line as "not a tag" (2.54 peels anyway), so a tag without one
+  is refused there; without such a header Git peels the tag itself and a
+  missing line is accepted. A line a loose ref shadows is never read by Git
+  and is not checked.
+- **Header and order.** The header is accepted only as the first line and
+  only with Git's prefix `# pack-refs with: ` (Git 2.54 refuses the file
+  otherwise). Under a `sorted` trait the names must be in increasing byte
+  order: with an unsorted file Git 2.38 no longer found HEAD's branch, and
+  `for-each-ref` listed the packed value of a name a loose ref shadows,
+  whose object the classifier never verified.
+- **Ref names** in `packed-refs`, a loose symbolic ref and HEAD follow Git's
+  check-ref-format: no `..`, `@{`, empty or `.`-leading component, trailing
+  `.` or `/`, component ending in `.lock`, control character, space or any
+  of ``~^:?*[\``. Git refuses such names (`bad ref`, `packed refname is
+  dangerous`, `your current branch appears to be broken`). Stricter by
+  CodeGraph policy: names are printable ASCII, the PR-2 observer's packed-ref
+  subset, so a non-ASCII name Git accepts (`refs/heads/fünf`) is still
+  `malformed_packed` or `malformed_ref`; and HEAD must name
+  `refs/heads/[A-Za-z0-9._/-]` as the observer requires, otherwise
+  `git_head`. Both only over-refuse. Loose ref file names are not checked
+  here: Git ignores a broken one, and HEAD and symbolic refs cannot point at
+  it because their targets are checked.
 
 ### Scope of the D4 recovery claim (NB-15, 2026-11-17)
 

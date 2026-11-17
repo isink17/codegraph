@@ -1424,6 +1424,196 @@ class PackListingOutranksLoose(unittest.TestCase):
                          ("COMPLETE", "ELIGIBLE", []))
 
 
+HDR = b"# pack-refs with: peeled fully-peeled sorted \n"
+UNSORTED = b"# pack-refs with: peeled fully-peeled \n"
+
+
+class PackedRefsAsGitReadsThem(unittest.TestCase):
+    """packed-refs must mean one thing to Git and to the classifier: what
+    Git could read differently (a repeated name, a forged or missing peel, a
+    name Git rejects, a header or order Git does not accept) is
+    `malformed_packed`, never a verified ref."""
+
+    def setUp(self):
+        self.files, self.o = pw.packed_world()
+
+    def q(self, packed, head=b"ref: refs/heads/main\n", extra=None):
+        files = {**self.files, b".git/packed-refs": packed, b".git/HEAD": head, **(extra or {})}
+        return classify(files)
+
+    def refused(self, packed, finding="malformed_packed", **kw):
+        _, q3, q4, q5, reasons, _ = self.q(packed, **kw)
+        self.assertEqual((q3, q4, q5), ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"), packed)
+        self.assertIn(finding, reasons, packed)
+
+    def eligible(self, packed, **kw):
+        _, q3, q4, q5, reasons, head = self.q(packed, **kw)
+        self.assertEqual((q3, q4, q5, reasons), ("VERIFIED", "COMPLETE", "ELIGIBLE", []), packed)
+        return head
+
+    def test_unique_refs_with_peeled_tags_stay_eligible(self):
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, b"refs/heads/side"), (o.t1, b"refs/tags/v1"), (o.c1,),
+                     (o.t2, b"refs/tags/v2"), (o.c1,), (o.c1, b"refs/tags/v3"))
+        self.assertEqual(self.eligible(HDR + body), o.c2)
+        self.assertEqual(self.eligible(b"# pack-refs with: peeled sorted \n" + body), o.c2)
+        self.eligible(body)
+
+    def test_repeated_name_is_malformed_in_every_layout(self):
+        o = self.o
+        main = b"refs/heads/main"
+        for case, body in (
+                ("verified first", pw.packed_lines((o.c2, main), (o.f, main))),
+                ("forged first", pw.packed_lines((o.f, main), (o.c2, main))),
+                ("identical", pw.packed_lines((o.c2, main), (o.c2, main))),
+                ("separated", pw.packed_lines((o.c2, main), (o.c1, b"refs/heads/x"), (o.f, main))),
+                ("tag repeated with peel lines", pw.packed_lines((o.c2, main), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                                       (o.t1, b"refs/tags/v1"), (o.c1,))),
+                ("tag repeated with another peel", pw.packed_lines((o.c2, main), (o.t1, b"refs/tags/v1"), (o.c1,),
+                                                         (o.c2, b"refs/tags/v1")))):
+            for header in (HDR, b""):
+                with self.subTest(case, header=header):
+                    self.refused(header + body)
+
+    def test_a_loose_ref_still_shadows_its_packed_line(self):
+        o = self.o
+        loose = {b".git/refs/heads/main": o.c2.encode() + b"\n"}
+        self.assertEqual(self.eligible(HDR + pw.packed_lines((o.f, b"refs/heads/main")), extra=loose), o.c2)
+
+    def test_peel_lines_must_match_the_verified_tag_chain(self):
+        o = self.o
+        main = (o.c2, b"refs/heads/main")
+        for case, body in (
+                ("peel to another commit", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c2,))),
+                ("peel to an absent object", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), ("1" * 40,))),
+                ("peel of a tag of a tag stops early", pw.packed_lines(main, (o.t2, b"refs/tags/v2"), (o.t1,))),
+                ("peel on a commit ref", pw.packed_lines(main, (o.c1,))),
+                ("two peel lines", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c1,), (o.c1,))),
+                ("peel before any ref", pw.packed_lines((o.c1,), main)),
+                ("peel that is not 40 hex", pw.packed_lines(main, (o.t1, b"refs/tags/v1"), (o.c1.upper(),))),
+                ("missing peel under fully-peeled", pw.packed_lines(main, (o.t1, b"refs/tags/v1")))):
+            with self.subTest(case):
+                self.refused(HDR + body)
+        self.refused(b"# pack-refs with: peeled \n" + pw.packed_lines(main, (o.t1, b"refs/tags/v1")))
+
+    def test_peel_absence_is_trusted_only_where_git_trusts_it(self):
+        """Without a header, or under `peeled` outside `refs/tags/`, Git peels
+        a tag itself."""
+        o = self.o
+        self.eligible(pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1")))
+        self.eligible(b"# pack-refs with: peeled sorted \n" + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/x/t")))
+
+    def test_shadowed_line_peel_is_not_read(self):
+        o = self.o
+        loose = {b".git/refs/tags/v1": o.t1.encode() + b"\n"}
+        self.eligible(HDR + pw.packed_lines((o.c2, b"refs/heads/main"), (o.t1, b"refs/tags/v1"), (o.c2,)), extra=loose)
+
+    def test_header_must_be_the_first_line_git_accepts(self):
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"))
+        self.refused(body + HDR)
+        self.refused(b"# pack-refs with:peeled fully-peeled sorted \n" + body)
+        self.refused(b"# other\n" + body)
+        self.refused(HDR + HDR + body)
+
+    def test_sorted_header_requires_sorted_names(self):
+        """Git binary-searches a file that claims `sorted`: an unsorted one
+        hides HEAD's branch and lists a packed value a loose ref shadows."""
+        o = self.o
+        body = pw.packed_lines((o.c2, b"refs/heads/main"), (o.f, b"refs/heads/b"), (o.c1, b"refs/heads/a"))
+        loose = {b".git/refs/heads/b": o.c2.encode() + b"\n"}
+        self.refused(HDR + body, extra=loose)
+        self.refused(b"# pack-refs with: sorted\n" + body, extra=loose)
+        self.eligible(b"# pack-refs with: peeled fully-peeled \n" + body, extra=loose)
+        self.eligible(body, extra=loose)
+
+    def test_ref_names_follow_git_check_ref_format(self):
+        o = self.o
+        bad = (b"refs/heads/a..b", b"refs/heads/x.lock", b"refs/heads/x.lock/y", b"refs/heads/x.", b"refs/heads/.x",
+               b"refs/heads/a/.b", b"refs/heads/.", b"refs/heads//x", b"refs/heads/x/", b"refs/heads/a b",
+               b"refs/heads/a\tb", b"refs/heads/a\x7fb", b"refs/heads/a~b", b"refs/heads/a^b", b"refs/heads/a:b",
+               b"refs/heads/a?b", b"refs/heads/a*b", b"refs/heads/a[b", b"refs/heads/a\\b", b"refs/heads/a@{b",
+               b"refs/", b"refs/heads/" + b"x" * 240)
+        for name in bad:
+            with self.subTest(name):
+                self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+                self.refused(UNSORTED + pw.packed_lines((o.c2, name)), head=b"ref: " + name + b"\n", finding="malformed_head")
+                self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main")), finding="malformed_ref",
+                             extra={b".git/refs/heads/alias": b"ref: " + name + b"\n"})
+        for name in (b"refs/heads/a.b", b"refs/heads/v1.2/x", b"refs/heads/x.lockx", b"refs/heads/a.lock.b",
+                     b"refs/heads/@", b"refs/heads/a@b", b"refs/heads/a+b", b"refs/heads/a-b_c", b"refs/heads/A,b=c"):
+            with self.subTest(name):
+                self.eligible(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+        self.eligible(HDR + pw.packed_lines((o.c2, b"refs/heads/a.b")), head=b"ref: refs/heads/a.b\n")
+
+    def test_head_names_outside_the_observer_subset_are_unsupported(self):
+        """Git accepts `refs/heads/a+b`; the PR-2 observer resolves HEAD only
+        through [A-Za-z0-9._/-], so the bytes stay complete but not eligible."""
+        o = self.o
+        _, q3, q4, q5, reasons, _ = self.q(HDR + pw.packed_lines((o.c2, b"refs/heads/a+b")), head=b"ref: refs/heads/a+b\n")
+        self.assertEqual((q3, q4, q5, reasons), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["git_head"]))
+
+    def test_non_ascii_names_stay_outside_the_supported_subset(self):
+        """Git accepts `refs/heads/fünf`; the supported subset is the PR-2
+        observer's printable ASCII, so such a name refuses rather than verifies."""
+        o = self.o
+        name = "refs/heads/fünf".encode()
+        self.refused(UNSORTED + pw.packed_lines((o.c2, b"refs/heads/main"), (o.c1, name)))
+        self.refused(UNSORTED + pw.packed_lines((o.c2, name)), head=b"ref: " + name + b"\n", finding="malformed_head")
+
+
+class PackedRefsAgainstRealGit(unittest.TestCase):
+    """The classifier against what the installed Git reads from the same
+    packed-refs bytes."""
+
+    def setUp(self):
+        self.lab = git_lab(self)
+        self.r = three_commits(self.lab)
+        self.git("tag", "-a", "-m", "t", "v1", "HEAD~2")
+        self.git("tag", "-a", "-m", "t", "v2", "v1")
+        self.git("tag", "light", "HEAD~1")
+        self.git("pack-refs", "--all")
+        self.files = captured(self.r)
+
+    def git(self, *args):
+        return self.lab.git(self.r, *args).stdout.decode().strip()
+
+    def rev(self, ref):
+        return self.git("rev-parse", ref)
+
+    def write_packed(self, data):
+        with open(os.path.join(self.r, ".git", "packed-refs"), "wb") as f:
+            f.write(data)
+        self.files = captured(self.r)
+
+    def test_git_written_annotated_and_nested_tags_are_eligible(self):
+        self.assertEqual(sum(p.startswith(b".git/refs/") for p in self.files), 0)
+        self.assertIn(b"\n^", self.files[b".git/packed-refs"])
+        self.assertEqual(classify(self.files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.rev("HEAD")))
+
+    def test_repeated_branch_line_git_reads_is_refused(self):
+        """Git resolves HEAD to the second line; before the fix the classifier
+        verified only the first and called the slot eligible."""
+        head, packed = self.rev("HEAD"), self.files[b".git/packed-refs"]
+        tree = self.rev("HEAD^{tree}")
+        forged = self.lab.git(self.r, "commit-tree", "-m", "FORGED", tree).stdout.decode().strip()
+        line = head.encode() + b" refs/heads/main\n"
+        self.assertIn(line, packed)
+        self.write_packed(packed.replace(line, line + forged.encode() + b" refs/heads/main\n"))
+        self.assertEqual(self.rev("HEAD"), forged)
+        self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+    def test_forged_peel_git_reports_is_refused(self):
+        v1, peel = self.rev("v1"), self.rev("v1^{}")
+        packed = self.files[b".git/packed-refs"]
+        line = v1.encode() + b" refs/tags/v1\n^" + peel.encode() + b"\n"
+        self.assertIn(line, packed)
+        other = self.rev("HEAD")
+        self.write_packed(packed.replace(line, line.replace(peel.encode(), other.encode())))
+        self.assertIn(other + " refs/tags/v1^{}", self.git("show-ref", "-d", "v1"))
+        self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+
 class TypedNeutralization(unittest.TestCase):
     """N-R41-9 through the real H-EST, in a full world."""
 

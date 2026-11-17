@@ -7,6 +7,7 @@ real effect writer is PR-4 (P-B1 option (b))."""
 
 import hashlib
 import json
+import types
 import zlib
 
 import harness
@@ -142,6 +143,28 @@ def git_repo(worktree=None, variant=(), prefix=b""):
     out = {prefix + p: d for p, d in worktree.items()}
     out.update({prefix + b".git/" + p: d for p, d in g.items()})
     return out, coid
+
+
+def packed_world():
+    """(files, ids) with a second commit, an annotated tag `v1` on the first
+    and an annotated tag `v2` that tags `v1`; every ref lives in packed-refs
+    and the caller writes that file."""
+    files, c1 = git_repo()
+    toid, _ = head_tree(files, c1)
+    c2, z2 = gobj(b"commit", b"tree " + toid.encode() + b"\nparent " + c1.encode()
+                  + b"\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nsecond\n")
+    t1, zt1 = gobj(b"tag", b"object " + c1.encode() + b"\ntype commit\ntag v1\ntagger a <a> 0 +0000\n\nt\n")
+    t2, zt2 = gobj(b"tag", b"object " + t1.encode() + b"\ntype tag\ntag v2\ntagger a <a> 0 +0000\n\nt\n")
+    f, zf = gobj(b"commit", b"tree " + toid.encode() + b"\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\nFORGED\n")
+    for oid, z in ((c2, z2), (t1, zt1), (t2, zt2), (f, zf)):
+        files[loose_key(oid)] = z
+    del files[b".git/refs/heads/main"]
+    return files, types.SimpleNamespace(c1=c1, c2=c2, t1=t1, t2=t2, f=f)
+
+
+def packed_lines(*pairs):
+    """packed-refs lines: (oid, name) for a ref, (oid,) for a `^` line."""
+    return b"".join((b"^" + p[0].encode() if len(p) == 1 else p[0].encode() + b" " + p[1]) + b"\n" for p in pairs)
 
 
 # ------------------------------------------------------------------ synthetic PR-4 effects (test-owned stores)

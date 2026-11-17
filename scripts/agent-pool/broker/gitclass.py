@@ -17,10 +17,14 @@ import zlib
 
 HEX40 = re.compile(rb"[0-9a-f]{40}\Z")
 HEX64 = re.compile(rb"[0-9a-f]{64}\Z")
-_REF = re.compile(rb"refs/[A-Za-z0-9._/-]{1,240}\Z")
+# A ref name: printable ASCII (the PR-2 observer's packed-ref subset) that
+# also passes Git's check-ref-format rules, which `_REF_BAD` rejects.
+_REF = re.compile(rb"refs/[!-~]{1,240}\Z")
+_REF_BAD = re.compile(rb"[~^:?*\[\\]|\.\.|@\{|//|/\.|\.lock(?:/|\Z)|[/.]\Z")
 _HEAD_REF = re.compile(rb"refs/heads/[A-Za-z0-9._/-]{1,200}\Z")
 _SECTION = re.compile(rb'\[([A-Za-z0-9.-]+)(?: "([^"\\\n]*)")?\]\Z')
 _KEY_VALUE = re.compile(rb"([A-Za-z][A-Za-z0-9-]*)[ \t]*(?:=[ \t]*(.*))?\Z")
+_PACKED_HEADER = b"# pack-refs with: "
 MAX_REF = 4096
 MAX_OBJECTS = 100000
 MAX_OBJECT_BYTES = 16 << 20
@@ -213,33 +217,91 @@ def _oid_file(r, data, what):
     if HEX64.match(body):
         r.features.add("unsupported_object_format")
         return None, None
-    if body.startswith(b"ref: ") and _REF.match(body[5:]):
+    if body.startswith(b"ref: ") and _valid_ref(body[5:]):
         return None, body[5:]
     r.features.add(what)
     return None, None
 
 
+def _valid_ref(name):
+    return _REF.match(name) is not None and _REF_BAD.search(name) is None
+
+
 def _packed(r, data, refs):
+    """Parses `packed-refs` as Git reads it and returns ({name: peel id or
+    None}, header traits). Anything Git would read differently is
+    `malformed_packed`: a repeated name (Git may resolve either line), a
+    header that is not the first line, a `^` line not directly after a ref,
+    and names out of order under a `sorted` header (Git then binary-searches
+    and can miss a ref or expose a packed value a loose ref shadows)."""
     lines = data.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
     else:
         r.features.add("malformed_packed")
-    last = None
+    traits = set()
+    if lines and lines[0].startswith(_PACKED_HEADER):
+        traits = set(lines.pop(0)[len(_PACKED_HEADER):].split(b" "))
+    peels, last, prev = {}, None, None
     for line in lines:
-        if line.startswith(b"# pack-refs with:"):
+        if line.startswith(b"^"):
+            if last is None or not HEX40.match(line[1:]):
+                r.features.add("malformed_packed")
+            else:
+                peels[last] = line[1:].decode()
+            last = None
             continue
-        if line.startswith(b"^") and HEX40.match(line[1:]) and last is not None:
-            continue
+        last = None
         oid, _, name = line.partition(b" ")
-        if HEX40.match(oid) and _REF.match(name):
+        if HEX40.match(oid) and _valid_ref(name):
+            if name in peels or (b"sorted" in traits and prev is not None and name < prev):
+                r.features.add("malformed_packed")
+            peels[name] = None
             refs.setdefault(name, ("packed", oid.decode()))
-            last = name
+            last = prev = name
             if name.startswith(b"refs/replace/"):
                 r.features.add("replace_refs")
         elif HEX64.match(oid):
             r.features.add("unsupported_object_format")
         else:
+            r.features.add("malformed_packed")
+    return peels, traits
+
+
+def _peeled(files, oid):
+    """What Git's peel of `oid` gives: the final target of a tag chain, None
+    when `oid` is not a tag, False when a link is not an intact loose tag."""
+    got = _read_object(files, oid)
+    if not isinstance(got, tuple):
+        return False
+    if got[0] != b"tag":
+        return None
+    for _ in range(MAX_OBJECTS):
+        links = _tag_links(got[1])
+        if links is None:
+            return False
+        oid, typ = links[0]
+        if typ != b"tag":
+            return oid
+        got = _read_object(files, oid)
+        if not isinstance(got, tuple) or got[0] != b"tag":
+            return False
+    return False
+
+
+def _check_peels(r, files, refs, peels, traits):
+    """Git trusts a `^` line as the ref's peeled value, and under a
+    `fully-peeled` (or, for `refs/tags/`, `peeled`) header Git 2.38 also
+    trusts its absence. Either must match the verified objects. A line that
+    a loose ref shadows is never read. A broken tag chain is reported by
+    `_closure` already."""
+    for name, peel in peels.items():
+        kind, oid = refs[name]
+        if kind != "packed":
+            continue
+        want = _peeled(files, oid)
+        knows = b"fully-peeled" in traits or (b"peeled" in traits and name.startswith(b"refs/tags/"))
+        if want is not False and peel != want and (peel is not None or knows):
             r.features.add("malformed_packed")
 
 
@@ -498,9 +560,10 @@ def classify(root, files):
             oid, sym = _oid_file(r, files[p], "malformed_ref")
             if oid is not None or sym is not None:
                 refs[p] = ("loose", oid) if oid is not None else ("sym", sym)
+    peels, traits = {}, set()
     if b"packed-refs" in files:
         r.features.add("packed_refs")
-        _packed(r, files[b"packed-refs"], refs)
+        peels, traits = _packed(r, files[b"packed-refs"], refs)
     for name, (kind, val) in refs.items():
         if kind == "sym":
             r.features.add("symref")
@@ -526,6 +589,7 @@ def classify(root, files):
     r.tips = {val for kind, val in refs.values() if kind != "sym"} | ({r.head_oid} if r.head_oid else set())
     branches = {val for name, (kind, val) in refs.items() if kind != "sym" and name.startswith(b"refs/heads/")}
     _closure(r, files, r.tips, branches | ({r.head_oid} if r.head_oid else set()))
+    _check_peels(r, files, refs, peels, traits)
     return r
 
 
