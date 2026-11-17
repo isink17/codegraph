@@ -52,8 +52,11 @@ EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include
 # `commit_graph`: Git reads parents and generations from a commit-graph
 # instead of the verified commits, and recovery has no step that drops or
 # rebuilds it, so the Git view after a restore is not the verified one.
+# `refs_dir`: no captured path lies under `refs/`, so a restore of the
+# untyped manifest (files only) has no `refs` directory, Git rejects the
+# gitdir and may discover another repository instead (CONTRACT.md, B-1).
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
-                         "submodule_gitdir", "git_head", "unborn_head", "commit_graph"})
+                         "submodule_gitdir", "git_head", "unborn_head", "commit_graph", "refs_dir"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE, Q4 unchanged (owner amendment R4.2 to
 # R2 K7 / R4 §5.2 / P2). `packed`: a consistent pack index lists a reachable
 # object, even one with a verified loose copy, because Git reads a pack before
@@ -73,8 +76,10 @@ class Repo:
 
 
 def is_gitdir_name(c):
-    """R2 K3: a `.git` name compared case-insensitively, also with the code
-    points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and `.Git` count."""
+    """R2 K3 detection: a `.git` name compared case-insensitively, also with
+    the code points HFS+ ignores (Git's `is_hfs_dotgit`), so `.GIT` and
+    `.g<U+200C>it` count. Only the exact `.git` is accepted as a repository
+    (`repositories`)."""
     if c.lower() == b".git":
         return True
     try:
@@ -97,7 +102,9 @@ def repositories(files, captured=None):
     (bytes) to its bytes. A repository is the prefix before the first `.git`
     component; a `.git` regular file is a gitlink (linked worktree or submodule
     checkout) whose objects are elsewhere. A root whose administrative
-    directory is spelled more than one way is ambiguous: `unknown`. So is a
+    directory is spelled other than the exact `.git`, or more than one way,
+    is ambiguous: `unknown`, since whether Git opens that spelling depends
+    on the volume and Git may discover another repository instead. So is a
     root with a path that shares a file or directory with another captured
     path (`captured`: every manifest path, default `files`), either as the
     same path below the administrative directory or on a case- and
@@ -124,7 +131,7 @@ def repositories(files, captured=None):
     repos = {}
     for root, fs in split.items():
         repos[root] = classify(root, fs)
-        if len(names[root]) > 1 or root in ambiguous:
+        if names[root] != {b".git"} or root in ambiguous:
             repos[root].features.add("unknown")
     return repos
 
@@ -551,6 +558,8 @@ def classify(root, files):
     r = Repo(root)
     if b"" in files:
         r.features.add("gitlink_file")
+    elif not any(p.startswith(b"refs/") for p in files):
+        r.features.add("refs_dir")
     if any(_fold(q) in _ADMIN_FOLDED and q not in _ADMIN for q in _prefixes(files)) \
             or not _ADMIN_DIRS.isdisjoint(files):
         r.features.add("unknown")

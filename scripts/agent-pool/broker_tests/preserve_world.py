@@ -103,9 +103,11 @@ def git_repo(worktree=None, variant=(), prefix=b""):
     for oid, z in objs.items():
         g[b"objects/" + oid[:2].encode() + b"/" + oid[2:].encode()] = z
     v = set(variant)
-    if "packed_refs" in v or "packed_only" in v:
+    if "packed_refs" in v:
         del g[b"refs/heads/main"]
         g[b"packed-refs"] = b"# pack-refs with: peeled fully-peeled sorted \n" + coid.encode() + b" refs/heads/main\n"
+    if "loose_tag" in v:
+        g[b"refs/tags/v0"] = coid.encode() + b"\n"
     if "packed_only" in v:
         for oid in objs:
             del g[b"objects/" + oid[:2].encode() + b"/" + oid[2:].encode()]
@@ -147,7 +149,8 @@ def git_repo(worktree=None, variant=(), prefix=b""):
 
 def packed_world():
     """(files, ids) with a second commit, an annotated tag `v1` on the first
-    and an annotated tag `v2` that tags `v1`; every ref lives in packed-refs
+    and an annotated tag `v2` that tags `v1`; every ref but the loose tag
+    `refs/tags/loose` (which keeps `refs/` restorable) lives in packed-refs
     and the caller writes that file."""
     files, c1 = git_repo()
     toid, _ = head_tree(files, c1)
@@ -159,7 +162,24 @@ def packed_world():
     for oid, z in ((c2, z2), (t1, zt1), (t2, zt2), (f, zf)):
         files[loose_key(oid)] = z
     del files[b".git/refs/heads/main"]
+    files[b".git/refs/tags/loose"] = c1.encode() + b"\n"
     return files, types.SimpleNamespace(c1=c1, c2=c2, t1=t1, t2=t2, f=f)
+
+
+def forge_bare(files, head):
+    """`files` plus a bare repository at the slot root whose HEAD is a forged
+    commit over `head`'s tree; the slot's loose objects are copied there."""
+    toid, _ = head_tree(files, head)
+    fc, fz = gobj(b"commit", b"tree " + toid.encode() + b"\nauthor e <e> 0 +0000\ncommitter e <e> 0 +0000\n\nFORGED\n")
+    out = {**files, b"HEAD": b"ref: refs/heads/main\n", b"refs/heads/main": fc.encode() + b"\n",
+           b"objects/" + fc[:2].encode() + b"/" + fc[2:].encode(): fz}
+    out.update({p[5:]: d for p, d in files.items() if p.startswith(b".git/objects/")})
+    return out, fc
+
+
+def respell(files, name):
+    """`files` with the slot's `.git` component spelled `name`."""
+    return {(name + p[4:] if p.startswith(b".git/") else p): d for p, d in files.items()}
 
 
 def packed_lines(*pairs):

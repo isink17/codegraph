@@ -5,7 +5,9 @@ neutralization (N-R41-9). Inputs are built in memory; nothing reads a live
 path."""
 
 import os
+import subprocess
 import types
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -499,6 +501,30 @@ def three_commits(lab):
     return r
 
 
+def restore(lab, files, name):
+    """A file-only restore of `files` into a new directory: a directory exists
+    only above a captured file, which is all the untyped manifest can say."""
+    root = lab.path(name)
+    os.mkdir(root)
+    for p, d in files.items():
+        lab.write(root, os.fsdecode(p), d)
+    return root
+
+
+def discover(lab, cwd):
+    """(git dir, HEAD) as the installed Git discovers them from `cwd`, never
+    above the lab, or the error Git prints."""
+    from gitfixture import GIT, SAFE
+    p = subprocess.run([GIT, *SAFE, "rev-parse", "--git-dir", "HEAD"], cwd=cwd, capture_output=True, timeout=120,
+                       env={**lab.env, "GIT_CEILING_DIRECTORIES": str(lab.root)})
+    return tuple(p.stdout.decode().split()) if p.returncode == 0 else p.stderr.decode()
+
+
+# Spellings Git's `is_hfs_dotgit` or a case-insensitive volume may treat as `.git`.
+ALIASES = (b".GIT", b".Git", ".g\u200cit".encode(), ".g\u200dit".encode(), "\u200e.git".encode(),
+           ".git\u200f".encode(), ".g\u202ait".encode(), ".gi\u206ft".encode(), "\ufeff.git".encode())
+
+
 class GitClassification(unittest.TestCase):
     def q(self, *variant, extra=None):
         files, _ = pw.git_repo(variant=variant)
@@ -512,7 +538,8 @@ class GitClassification(unittest.TestCase):
 
     def test_feature_matrix(self):
         rows = {
-            ("packed_refs",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
+            ("packed_refs",): ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"),
+            ("packed_refs", "loose_tag"): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("packed_only",): ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"),
             ("symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
             ("dangling_symref",): ("VERIFIED", "COMPLETE", "ELIGIBLE"),
@@ -537,6 +564,7 @@ class GitClassification(unittest.TestCase):
         self.assertIn("alternates", self.q("alternates")[4])
         self.assertIn("unborn_head", self.q("unborn")[4])
         self.assertIn("packed", self.q("packed_only")[4])
+        self.assertEqual(self.q("packed_refs")[4], ["refs_dir"])
         self.assertIn("residue", self.q("lock")[0])
         self.assertIn("dangling_symref", self.q("dangling_symref")[0])
 
@@ -567,14 +595,16 @@ class GitClassification(unittest.TestCase):
 
     def test_nested_repository_under_any_spelling_is_classified(self):
         """B-2: `sub/.GIT` is `sub/.git` on a case-insensitive volume, so its
-        alternates, shallow file, gitlink file and defects are findings."""
+        alternates, shallow file, gitlink file and defects are findings. Only
+        the exact `.git` is accepted, so the alias itself is `unknown`."""
         for name in (b".GIT", b".Git", ".g\u200dit".encode()):
             def nested(*variant, extra=None):
                 files, _ = pw.git_repo(worktree={b"w": b"x\n"}, variant=variant, prefix=b"sub/")
                 files.update(extra or {})
                 return {p.replace(b"sub/.git", b"sub/" + name, 1): d for p, d in files.items()}
             feats, _, q4, q5, reasons, _ = self.q(extra=nested())
-            self.assertEqual((q4, q5, "nested" in feats), ("COMPLETE", "ELIGIBLE", True), name)
+            self.assertEqual((q4, q5, "nested" in feats, reasons), ("INCOMPLETE", "NOT_ELIGIBLE", True, ["unknown"]),
+                             name)
             _, _, q4, _, reasons, _ = self.q(extra=nested("alternates"))
             self.assertEqual(q4, "INCOMPLETE", name)
             self.assertIn("alternates", reasons)
@@ -775,7 +805,7 @@ class GitClassification(unittest.TestCase):
         files = captured(r)
         self.assertFalse([p for p in files if p.startswith(b".git/refs/replace/")], "the replace ref is still loose")
         self.assertIn(b"refs/replace/", files[b".git/packed-refs"])
-        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["replace_refs"]))
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir", "replace_refs"]))
 
     def test_one_directory_spelled_two_ways_is_ambiguous(self):
         """APFS keeps the first spelling of a directory, so `refs/heads/Feat/a`
@@ -1639,8 +1669,13 @@ class PackedRefsAgainstRealGit(unittest.TestCase):
         self.files = captured(self.r)
 
     def test_git_written_annotated_and_nested_tags_are_eligible(self):
+        """Eligible once one loose ref keeps `refs/` in the manifest; with
+        every ref packed it is `refs_dir` (GitdirReconstruction)."""
         self.assertEqual(sum(p.startswith(b".git/refs/") for p in self.files), 0)
         self.assertIn(b"\n^", self.files[b".git/packed-refs"])
+        self.assertEqual(classify(self.files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.git("update-ref", "refs/heads/side", "HEAD~1")
+        self.files = captured(self.r)
         self.assertEqual(classify(self.files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.rev("HEAD")))
 
     def test_repeated_branch_line_git_reads_is_refused(self):
@@ -1691,6 +1726,171 @@ class PackedRefsAgainstRealGit(unittest.TestCase):
         self.write_packed(packed.replace(line, line.replace(peel.encode(), other.encode())))
         self.assertIn(other + " refs/tags/v1^{}", self.git("show-ref", "-d", "v1"))
         self.assertEqual(classify(self.files)[1:4], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE"))
+
+
+class GitdirReconstruction(unittest.TestCase):
+    """B-1: Git accepts a gitdir only with HEAD, `objects` and `refs`
+    (`is_git_directory`). The untyped manifest records files, so a restore
+    creates `refs` only above a captured ref file. Without one Git rejects
+    the restored `.git` and may open a forged bare repository at the slot
+    root instead (CONTRACT.md, "Restorable gitdir")."""
+
+    def setUp(self):
+        self.lab = git_lab(self)
+        self.r = three_commits(self.lab)
+        self.head = self.git("rev-parse", "HEAD")
+
+    def git(self, *args):
+        return self.lab.git(self.r, *args).stdout.decode().strip()
+
+    def test_pack_refs_all_leaves_no_ref_file_and_is_refused(self):
+        self.git("pack-refs", "--all")
+        refs = os.path.join(self.r, ".git", "refs")
+        self.assertTrue(os.path.isdir(os.path.join(refs, "heads")))
+        self.assertEqual([n for _, _, names in os.walk(refs) for n in names], [])
+        files = captured(self.r)
+        self.assertFalse([p for p in files if p.startswith(b".git/refs")])
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.assertEqual(discover(self.lab, self.r), (".git", self.head))
+        self.assertIn("not a git repository", discover(self.lab, restore(self.lab, files, "restored")))
+
+    def test_empty_refs_directories_are_not_captured_and_not_needed(self):
+        """`refs/tags` stays empty and out of the manifest; one captured ref
+        file is enough for Git to accept the restored gitdir."""
+        self.assertEqual(os.listdir(os.path.join(self.r, ".git", "refs", "tags")), [])
+        files = captured(self.r)
+        self.assertEqual([p for p in files if p.startswith(b".git/refs")], [b".git/refs/heads/main"])
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.head))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "restored")), (".git", self.head))
+
+    def test_forged_bare_repository_at_the_slot_root(self):
+        """Every ref packed: Git opens the forged root, the classifier refuses.
+        One loose ref: Git keeps the slot's `.git` and the slot is eligible."""
+        self.git("pack-refs", "--all")
+        files, forged = pw.forge_bare(captured(self.r), self.head)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "packed")), (".", forged))
+        self.git("update-ref", "refs/heads/side", "HEAD~1")
+        files, forged = pw.forge_bare(captured(self.r), self.head)
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], self.head))
+        self.assertEqual(discover(self.lab, restore(self.lab, files, "loose")), (".git", self.head))
+
+    def test_nested_repository_without_a_ref_file(self):
+        """Git in a nested repository whose `refs` did not restore opens the
+        enclosing repository instead; the slot is refused."""
+        sub = os.path.join(self.r, "vendor", "lib")
+        os.makedirs(sub)
+        self.lab.git(sub, "init", "-q")
+        self.lab.write(sub, "x.txt", b"nested\n")
+        self.lab.git(sub, "add", "x.txt")
+        self.lab.git(sub, "commit", "-q", "-m", "n")
+        nested = self.lab.git(sub, "rev-parse", "HEAD").stdout.decode().strip()
+        self.assertEqual(classify(captured(self.r))[2:5], ("COMPLETE", "ELIGIBLE", []))
+        self.lab.git(sub, "pack-refs", "--all")
+        files = captured(self.r)
+        self.assertEqual(classify(files)[1:5], ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE", ["refs_dir"]))
+        got = discover(self.lab, os.path.join(restore(self.lab, files, "restored"), "vendor", "lib"))
+        self.assertEqual(got[1:], (self.head,))
+        self.assertNotEqual(self.head, nested)
+
+    def test_synthetic_nested_and_top_level(self):
+        top, _ = pw.git_repo()
+        for where, files in (("top", pw.git_repo(variant=("packed_refs",))[0]),
+                             ("nested", {**top, **pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]})):
+            with self.subTest(where):
+                _, q3, q4, q5, reasons, _ = classify(files)
+                self.assertEqual((q3, q4, q5), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
+                self.assertIn("refs_dir", reasons)
+        nested = pw.git_repo(variant=("packed_refs", "loose_tag"), prefix=b"vendor/lib/")[0]
+        self.assertEqual(classify({**top, **nested})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+    def test_a_gitlink_file_has_no_refs_of_its_own(self):
+        _, _, q4, _, reasons, _ = classify({**pw.git_repo()[0], b"sub/.git": b"gitdir: /elsewhere\n"})
+        self.assertEqual((q4, "gitlink_file" in reasons, "refs_dir" in reasons), ("INCOMPLETE", True, False))
+
+
+class GitdirSpelling(unittest.TestCase):
+    """B-2: Git on APFS does not open `.g\\u200cit` as `.git`, and on a
+    case-sensitive volume not `.GIT` either. Another spelling is detected as
+    an administrative directory (R2 K3) but accepted as a repository only as
+    the exact bytes `.git`; any other spelling is `unknown`."""
+
+    def test_exact_name_is_the_control(self):
+        files, coid = pw.git_repo()
+        self.assertEqual(classify(files)[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], coid))
+        self.assertEqual(classify(pw.forge_bare(files, coid)[0])[1:6], ("VERIFIED", "COMPLETE", "ELIGIBLE", [], coid))
+
+    def test_every_alias_is_detected_and_unknown(self):
+        files, coid = pw.git_repo()
+        forged, _ = pw.forge_bare(files, coid)
+        for name in ALIASES:
+            with self.subTest(name):
+                self.assertTrue(gitclass.is_git_path(name + b"/HEAD"))
+                for tree in (pw.respell(files, name), pw.respell(forged, name)):
+                    self.assertEqual(set(gitclass.repositories(tree)), {b""})
+                    self.assertEqual(classify(tree)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_competing_spellings(self):
+        files, coid = pw.git_repo()
+        forged, _ = pw.forge_bare(files, coid)
+        ign = ".g\u200cit".encode()
+        for names in ((b".git", ign), (b".git", b".GIT"), (b".GIT", ign), (b".GIT", b".Git", ign)):
+            with self.subTest(names):
+                tree = {**forged}
+                for n in names:
+                    tree.update(pw.respell(files, n))
+                self.assertEqual(classify(tree)[2:5], ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_nested_alias_beside_an_exact_top_level_gitdir(self):
+        top, _ = pw.git_repo()
+        for name in ALIASES:
+            nested = pw.git_repo(prefix=b"sub/")[0]
+            nested = {p.replace(b"sub/.git/", b"sub/" + name + b"/", 1): d for p, d in nested.items()}
+            with self.subTest(name):
+                repos = gitclass.repositories({**top, **nested})
+                self.assertEqual(("unknown" in repos[b""].features, "unknown" in repos[b"sub"].features), (False, True))
+                self.assertEqual(classify({**top, **nested})[2:5], ("INCOMPLETE", "NOT_ELIGIBLE", ["unknown"]))
+
+    def test_unicode_normalization(self):
+        """`.git` is ASCII: every normalization form leaves it unchanged, and
+        a look-alike that no volume folds to `.git` is worktree content, so
+        the slot has no repository and is refused. A root spelled NFD alone
+        is an exact `.git` repository; NFC and NFD of one root are `unknown`
+        (test_two_paths_that_name_one_file_are_ambiguous)."""
+        for form in ("NFC", "NFD", "NFKC", "NFKD"):
+            self.assertEqual(unicodedata.normalize(form, ".git"), ".git")
+        files, coid = pw.git_repo()
+        for name in (".gi\u0307t", "\uff0egit", ".g\u0131t", ".gi\u0301t"):
+            with self.subTest(name):
+                tree = pw.respell(files, name.encode())
+                self.assertFalse(gitclass.is_git_path(name.encode() + b"/HEAD"))
+                self.assertEqual(gitclass.repositories(tree), {})
+                self.assertEqual(classify(tree)[1:5], ("INCOMPLETE", "INCOMPLETE", "NOT_ELIGIBLE", []))
+        nfd = "cafe\u0301/".encode()
+        self.assertEqual(classify({**files, **pw.git_repo(prefix=nfd)[0]})[2:5], ("COMPLETE", "ELIGIBLE", []))
+
+
+class GitdirSpellingAgainstRealGit(unittest.TestCase):
+    """What the installed Git discovers for each spelling, on this host's
+    volume, with a forged bare repository at the slot root."""
+
+    def test_git_discovery_of_each_spelling(self):
+        lab = git_lab(self)
+        r = three_commits(lab)
+        head = lab.git(r, "rev-parse", "HEAD").stdout.decode().strip()
+        forged_files, forged = pw.forge_bare(captured(r), head)
+        lab.write(lab.root, "CaseProbe", b"")
+        folds_case = os.path.exists(os.path.join(lab.root, "caseprobe"))
+        self.assertEqual(discover(lab, restore(lab, forged_files, "exact")), (".git", head))
+        for i, name in enumerate(ALIASES):
+            with self.subTest(name):
+                tree = pw.respell(forged_files, name)
+                self.assertEqual(classify(tree)[3], "NOT_ELIGIBLE")
+                got = discover(lab, restore(lab, tree, "alias%d" % i))
+                if folds_case and name.lower() == b".git":
+                    self.assertEqual(got, (".git", head))  # APFS opens `.GIT`: a documented over-refusal
+                else:
+                    self.assertEqual(got, (".", forged))
 
 
 class TypedNeutralization(unittest.TestCase):

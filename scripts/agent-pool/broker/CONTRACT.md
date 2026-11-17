@@ -261,7 +261,9 @@ Rules worth repeating:
   `artifact/<cycle_id>/<digest>`, `blob/<sha256>`); their writer is PR-4.
 - PR-3b Git classification: a repository is located by any spelling of its
   `.git` component (R2 K3: case-insensitive, plus the code points HFS+
-  ignores); two spellings under one root are `unknown`. So is a root with a
+  ignores), but only the exact bytes `.git` are accepted as its gitdir; any
+  other spelling, and two spellings under one root, are `unknown` (amended
+  2026-11-17, "Gitdir name and restorable gitdir" below). So is a root with a
   path that shares a file or directory with another manifest path (worktree
   paths included): the same path below the root, or a file named twice, a
   file named like a directory or one directory spelled two ways on a case-
@@ -316,11 +318,12 @@ Rules worth repeating:
 - Recorded head on a case-insensitive volume (not changed in PR-3b). Git on
   APFS reads a loose ref under another case (`refs/heads/Main`) for a
   packed ref (`refs/heads/main`); the classifier compares ref names as
-  bytes and records the packed oid. Both oids are verified tips (a name
-  that folds onto a captured `.lock` file, which the classifier skips, is
-  refused instead; see "packed-refs" below) and their
-  objects are preserved, but the preservation document's `head` names the
-  packed commit, not Git's. With a synthetic final observation that reuses
+  bytes and records the packed oid. Git's oid is the loose file's id or,
+  when that file is a symbolic ref, the oid its target resolves to. Either
+  is the value of a captured ref and so a verified tip (a name that folds
+  onto a captured `.lock` file, which the classifier skips, is refused
+  instead; see "packed-refs" below), and its objects are preserved, but the
+  preservation document's `head` names the packed commit, not Git's. With a synthetic final observation that reuses
   the classifier this reaches P18 and D4. READY refuses it
   (`NOT_CLEAN(head)`) when `final_observation.head_resolved` is the commit
   the PR-2 observer resolves through the OS, which is Git's. PR-4 must
@@ -341,10 +344,19 @@ Rules worth repeating:
      recorded or restored as a regular file's content.
   3. Restore never follows a symbolic link out of its authorized tree, for
      any path it creates, writes or replaces.
+  4. Every directory Git needs to accept a gitdir (`refs`, `objects`),
+     empty or not, is recorded by capture and recreated by restore; it is
+     never implied by the files below it.
+  5. Restore never lets Git discovery, run from the slot root or from a
+     nested repository's worktree, open another repository than the
+     captured gitdir (for example a bare repository at the slot root).
   The PR-3b manifest (`codegraph.o5.manifest/v2`, entries `[path_hex,
-  hex64]`) is untyped and cannot express 1 or 2, so it must change in PR-4.
-  PR-3b does not meet this criterion and claims nothing about it; NB-13
-  below only refuses symbolic links at administrative directory names.
+  hex64]`) is untyped and cannot express 1, 2 or 4, so it must change in
+  PR-4. PR-3b does not meet this criterion and claims nothing about it;
+  NB-13 below only refuses symbolic links at administrative directory
+  names, and "Gitdir name and restorable gitdir" below only refuses the
+  slots where 4 and 5 visibly fail for the untyped manifest. Those two
+  refusals may be relaxed only together with tests that show 4 and 5.
 
 ## Owner amendment R4.2 to the PR-3b contract (2026-11-16)
 
@@ -533,7 +545,11 @@ disposable repositories:
 
 D4 states that Git, reading the restored slot, sees for HEAD and every
 captured ref exactly the objects the classifier verified as loose objects.
-It states nothing else. In particular:
+Two preconditions apply. Git must discover the restored slot's own `.git`
+(the B-1 and B-2 rules below refuse what PR-3b can see; PR-4 must hold
+NB-16 items 4 and 5). On a case-insensitive volume a ref Git reads under
+another case is the exception above ("Recorded head on a case-insensitive
+volume"). It states nothing else. In particular:
 
 - **Unrelated packs.** A pack whose index lists no reachable id is ignored
   (R4.2), even when its contents are forged. `git fsck` on such a restored
@@ -552,6 +568,51 @@ It states nothing else. In particular:
   here) a `MERGE_HEAD` becomes a parent of the next `git commit`.
 - **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on APFS, macOS only.
   Linux and Windows runtime, other Git versions and HFS+ were not exercised.
+
+### Gitdir name and restorable gitdir (B-1, B-2, 2026-11-17)
+
+Git accepts a directory as a gitdir only when it has a valid `HEAD`, an
+`objects` directory and a `refs` directory (`is_git_directory`). When it
+rejects the slot's `.git`, discovery goes on to check the slot root itself
+as a bare repository. The review of 5cfd2721 reached D4 twice with Git
+2.38.0 and Apple Git 2.54.0 resolving HEAD to a forged commit of a bare
+repository at the slot root, while the classifier had verified the gitdir.
+
+- **B-1: `refs` must be restorable.** The manifest records files, not
+  directories, and a restore creates a directory only above a captured
+  file. After `git pack-refs --all` no file remains under `.git/refs/`, the
+  restored `.git` has no `refs` and Git rejects it. A repository (top level
+  or nested) with no captured path below `refs/` is the unsupported
+  finding `refs_dir`: Q3 `INCOMPLETE`, Q4 unchanged (every byte is
+  preserved), Q5 `NOT_ELIGIBLE`. A gitlink file has no gitdir here and is
+  not checked. `objects` needs no rule of its own: Q5 `ELIGIBLE` requires
+  HEAD's commit as a captured loose object below `objects/`. One captured
+  ref file, loose branch, tag or other ref, is enough: Git does not need
+  `refs/heads` or `refs/tags` (measured: the empty `refs/tags` of an
+  ordinary repository is not captured and Git still opens the restore).
+- **B-2: exact `.git` only (amends R2 K3).** R2 K3 locates a gitdir by
+  every spelling a case-insensitive volume or Git's `is_hfs_dotgit` may
+  treat as `.git`. That stays the detection rule: such a path is never
+  worktree content or a tree entry. Acceptance is now narrower. Only the
+  exact bytes `.git` are a repository's gitdir; a root whose gitdir is any
+  other spelling (`.GIT`, `.Git`, `.g<U+200C>it` and the other HFS+-ignorable
+  code points) is `unknown`: Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`, and its
+  other findings are still reported. Measured: Git 2.38.0 and 2.54.0 on
+  case-insensitive APFS do not open `.g<U+200C>it` (or the other
+  ignorable-code-point spellings) as `.git`, and open the forged root
+  instead; they do open `.GIT` and `.Git`. On a case-sensitive Linux volume
+  (hosted CI) Git opens none of them. `.git` is ASCII, so Unicode
+  normalization yields no other spelling of it.
+- **Accepted over-refusals** until PR-4 meets NB-16 items 4 and 5:
+  - a valid repository whose refs are all in `packed-refs` (after `git
+    pack-refs --all` or `git gc`; the latter is already
+    `NOT_ELIGIBLE(packed)` under R4.2), top level or nested;
+  - a valid repository whose gitdir is spelled `.GIT` or `.Git` on a
+    case-insensitive volume, where Git does open it.
+- **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on case-insensitive
+  APFS (macOS), and the installed Git of the hosted Linux runner for the
+  real-Git tests. HFS+, case-sensitive APFS and Windows were not exercised
+  and no equivalent behavior is claimed for them.
 
 ## Not in PR-1
 

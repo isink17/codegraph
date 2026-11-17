@@ -225,15 +225,22 @@ class Positive(Base):
         self.rejected("freeze-start", "fresult_rejected:not_preservable", "MOVE_INTENT")
         self.assertEqual(self.w.release(), DENIED)
 
-    def test_plain_nested_upper_case_repository_reaches_d4_outside_the_dirty_inventory(self):
-        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
+    def test_plain_nested_repository_reaches_d4_outside_the_dirty_inventory(self):
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".git")}
         self.w.to_ready()
         self.assertEqual(rel(self.w.release()), "D4")
         s, doc = self.w.st(), self.w.last_doc("preservation")
         dirty = sorted(p.hex() for p in self.w.fx.tree(SLOT) if not gitclass.is_git_path(p))
         self.assertIn(b"sub/work.txt".hex(), dirty)
-        self.assertFalse(any(b"/.GIT/" in bytes.fromhex(p) for p in dirty))
+        self.assertFalse(any(b"/.git/" in bytes.fromhex(p) for p in dirty))
         self.assertEqual(doc["inventory"]["dirty"], [preserve.item_id("dirty", s["fs_m"], 0, dirty)])
+
+    def test_plain_nested_upper_case_repository_is_not_preservable(self):
+        """B-2 (2026-11-17): only the exact `.git` is a repository; `sub/.GIT`
+        stays out of the dirty inventory but refuses (`unknown`)."""
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **self._nested(b".GIT")}
+        self.assertFalse(any(b"/.GIT/" in p for p in self.w.fx.tree(SLOT) if not gitclass.is_git_path(p)))
+        self.stuck_at_move()
 
     def test_owner_thaw_from_p7_then_d2(self):
         self.ok("adopt", "request", "freeze-start", "freeze-continue")
@@ -822,6 +829,48 @@ class PackedRefs(Base):
     def test_head_name_git_rejects(self):
         o = pw.packed_world()[1]
         self.slot(HDR + pw.packed_lines((o.c2, b"refs/heads/../x")), head=b"ref: refs/heads/../x\n")
+        self.stuck_at_move()
+
+
+class RestorableGitdir(Base):
+    """B-1 and B-2 end to end: a slot whose gitdir Git may not open after a
+    file-only restore, beside a forged bare repository at the slot root, is
+    refused after the move and never reaches READY or D4."""
+
+    def test_every_ref_packed(self):
+        self.w.fx.trees[SLOT] = pw.git_repo(variant=("packed_refs",))[0]
+        self.stuck_at_move()
+
+    def test_every_ref_packed_beside_a_forged_bare_root(self):
+        files, coid = pw.git_repo(variant=("packed_refs",))
+        self.w.fx.trees[SLOT] = pw.forge_bare(files, coid)[0]
+        self.stuck_at_move()
+
+    def test_nested_repository_with_every_ref_packed(self):
+        nested = pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]
+        self.w.fx.trees[SLOT] = {**pw.git_repo()[0], **nested}
+        self.stuck_at_move()
+
+    def test_one_loose_ref_beside_a_forged_bare_root_reaches_d4(self):
+        files, coid = pw.git_repo(variant=("packed_refs", "loose_tag"))
+        self.w.fx.trees[SLOT] = pw.forge_bare(files, coid)[0]
+        self.w.to_ready()
+        self.assertEqual(rel(self.w.release()), "D4")
+        self.assertEqual(self.w.last_doc("preservation")["head"], coid)
+
+    def test_gitdir_alias_beside_a_forged_bare_root(self):
+        files, coid = pw.git_repo()
+        forged = pw.forge_bare(files, coid)[0]
+        for name in (".g\u200cit".encode(), b".GIT"):
+            with self.subTest(name):
+                self.w = pw.World(**self.world_kw)
+                self.addCleanup(self.w.close)
+                self.w.fx.trees[SLOT] = pw.respell(forged, name)
+                self.stuck_at_move()
+
+    def test_competing_gitdir_spellings(self):
+        files, coid = pw.git_repo()
+        self.w.fx.trees[SLOT] = {**pw.forge_bare(files, coid)[0], **pw.respell(files, ".g\u200cit".encode())}
         self.stuck_at_move()
 
 
