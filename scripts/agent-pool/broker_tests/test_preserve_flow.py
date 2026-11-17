@@ -575,6 +575,9 @@ class PackedObjects(Base):
                 for p, d in loose.items() if p.startswith(b".git/objects/")}
         for name, files in (("loose and one genuine pack", pw.with_pack(loose, raws)),
                             ("loose and two genuine packs", pw.with_pack(pw.with_pack(loose, raws, b"a"), raws, b"b")),
+                            ("unrelated pack sorts before a forged HEAD entry",
+                             pw.with_pack(self.shadowed_head(), {pw.gobj(b"blob", b"unrelated\n")[0]:
+                                                                 b"blob 10\0unrelated\n"}, b"a")),
                             ("multi-pack-index", {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"})):
             with self.subTest(name):
                 self.w.close()

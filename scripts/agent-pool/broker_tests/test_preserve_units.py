@@ -1254,6 +1254,8 @@ def packed_rows():
             pw.with_pack(bad_tree, {toid: traw}), "COMPLETE", gone, ["corrupt_object", "packed"]),
         "10j an index lists every object, another one an unrelated blob": (
             pw.with_pack(unrelated, raws, b"a"), "COMPLETE", pk, ["packed"]),
+        "10k an unrelated index sorts before a forged index listing the HEAD commit": (
+            pw.with_pack(unrelated, {coid: b"commit %d\0" % len(fbody) + fbody}, b"z"), "COMPLETE", pk, ["packed"]),
         "10i multi-pack-index, every reachable object loose": (
             {**loose, b".git/objects/pack/multi-pack-index": b"MIDX"}, "COMPLETE", pk, ["multi_pack_index"]),
         "11 complete raw capture, unverified packed objects": (packed, "COMPLETE", pk, ["packed"]),

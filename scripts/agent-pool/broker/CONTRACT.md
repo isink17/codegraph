@@ -337,8 +337,9 @@ packed-only ELIGIBLE/READY assumption of R2 K7, R4 §5.2 (row "Packed-only
 objects": `eligible`) and acceptance test P2 ("READY reached"). Historical
 contracts and evidence stay as written.
 
-- **Rule.** When any reachable object of any captured repository is known
-  only through a pack index (feature `packed`), Q5 is
+- **Rule.** When any reachable object of any captured repository is listed
+  by a pack index (feature `packed`; amendment 1 below: also when it is
+  loose), Q5 is
   `NOT_ELIGIBLE(packed)`. This covers valid packed-only and mixed
   repositories, deltified objects and forged self-consistent packs alike,
   because PR-3b never verifies packed contents or their closure. No trusted
@@ -366,18 +367,20 @@ contracts and evidence stay as written.
 
 ### R4.2 amendment 1: a pack listing outranks a loose copy (NB-12, 2026-11-17)
 
-Owner decision on review finding NB-12 of `c49f2636`. It narrows R4.2 and
-changes nothing else: Q1, Q4, the refusal path and the other features keep
-their meaning.
+Owner decision on review finding NB-12 of `c49f2636`. It widens the R4.2
+refusal (fewer slots are eligible) and changes nothing else: Q1, Q4, the
+refusal path and the other features keep their meaning.
 
 - **Why a verified loose object is not enough.** Git looks an object up in
-  its packs before its loose objects, and does not re-hash a packed commit or
-  tree on `log` or `checkout`. When a pack index lists an id that also exists
-  loose, Git's view of that object is the packed entry, which the classifier
-  never reads. A self-consistent forged pack whose index lists the HEAD
-  commit's id makes `git log` show the forged commit while the loose HEAD
-  still verifies; one listing the root tree's id makes `git checkout` write
-  files the verified tree does not name. Before this amendment both reached
+  its packs before its loose objects. When a pack index lists an id that
+  also exists loose, Git's view of that object is the packed entry, which
+  the classifier never reads, and whether a command re-hashes it depends on
+  the command and the Git version. A self-consistent forged pack whose index
+  lists the HEAD commit's id makes `git log` show the forged commit (Git
+  2.38 and 2.54) while the loose HEAD still verifies; one listing the root
+  tree's id makes `git checkout` write files the verified tree does not name
+  (both versions); for a forged blob entry 2.38 checks out the forged bytes
+  and 2.54 the loose ones. Before this amendment both reached
   D4 with the PR-2 observer `CLEAN`, and a routine `git gc` on the restored
   byte copy deletes the true loose object through `prune-packed` and keeps
   the forged one. A D4 recovery claim says Git will see the verified
