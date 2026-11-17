@@ -9,6 +9,9 @@ trap 'kill $(cat "$T/linger/all" 2>/dev/null) 2>/dev/null || :; chmod -R u+rwx "
 export CG_POOL_ROOT=$T/slots CG_POOL_LEASES=$T/leases CG_POOL_CWD_FILE=$T/cwds CG_POOL_REPO=$T/seed
 : >"$T/cwds"
 fails=0
+# The slot lock must hold with whichever mkdir and bash run here.
+echo "mkdir: $(command -v mkdir): $({ mkdir --version 2>/dev/null || echo 'no --version'; } | sed -n 1p)"
+echo "bash: $BASH_VERSION"
 
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
 expect() { # expect <exit code> <command...>
@@ -1016,6 +1019,23 @@ done
 hold_foreign
 expect 3 env PATH="$T/eexist:$PATH" "$POOL" acquire --slot auto --task f --agent y
 [[ $(cat "$T/out") == BLOCKED_POOL_BUSY ]] || fail "auto acquire beside held locks was not quiet: $(cat "$T/out")"
+# migrate and unmigrate take worker A's lock and then find B's held: only
+# A's lock is let go, and B's stays as it was.
+for op in migrate unmigrate; do
+	rm -rf "$LA" "$LB"
+	mkdir "$LB"
+	echo foreign-b >"$LB/owner"
+	before=$(held_snap)
+	expect 1 "$POOL" $op
+	mv "$T/out" "$T/honest.out"
+	expect 1 env PATH="$T/eexist:$PATH" "$POOL" $op
+	cmp -s "$T/honest.out" "$T/out" || fail "$op with mkdir exiting 0 and B held reported differently: $(cat "$T/out")"
+	[[ $(cat "$T/out") == "$B lock held: $LB; nothing changed" ]] || fail "$op with B held: $(cat "$T/out")"
+	[[ $(held_snap) == "$before" ]] || fail "$op with B held changed a lock or lease:
+$before
+---
+$(held_snap)"
+done
 rm -rf "$LA" "$LB"
 expect 0 "$POOL" release --slot $A --token "$TA"
 # A failure above may have left a lease; later cases start without one.
@@ -1023,7 +1043,8 @@ rm -f "$CG_POOL_LEASES/$A.lease" "$CG_POOL_LEASES/$B.lease"
 
 # An owner entry that is empty, a dangling link, a link to /dev/null or a
 # directory, or a lock directory owner cannot be created in: refused, and the
-# entry is neither followed, written through nor removed.
+# entry is neither followed, written through nor removed. A FIFO is left out:
+# opening it blocks until a reader comes, though nothing is claimed or removed.
 expect 0 "$POOL" prepare --slot $B
 for kind in empty dangling devnull dir unwritable; do
 	[[ $kind != unwritable || $(id -u) != 0 ]] || continue
