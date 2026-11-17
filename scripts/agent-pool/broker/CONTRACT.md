@@ -319,7 +319,9 @@ Rules worth repeating:
   APFS reads a loose ref under another case (`refs/heads/Main`) for a
   packed ref (`refs/heads/main`); the classifier compares ref names as
   bytes and records the packed oid. Git's oid is the loose file's id or,
-  when that file is a symbolic ref, the oid its target resolves to. Either
+  when that file is a symbolic ref, the oid its target resolves to, or no
+  oid at all when that target does not resolve (dangling or looping), and
+  Git then has no HEAD. Any oid Git reaches this way
   is the value of a captured ref and so a verified tip (a name that folds
   onto a captured `.lock` file, which the classifier skips, is refused
   instead; see "packed-refs" below), and its objects are preserved, but the
@@ -566,8 +568,10 @@ volume"). It states nothing else. In particular:
   that file's commit (measured, Git 2.38 and 2.54), while `refs/heads/main`
   is still the verified one. By Git's documented behavior (not measured
   here) a `MERGE_HEAD` becomes a parent of the next `git commit`.
-- **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on APFS, macOS only.
-  Linux and Windows runtime, other Git versions and HFS+ were not exercised.
+- **Evidence limits.** The measurements in this section: Git 2.38.0 and
+  Apple Git 2.54.0 on APFS, macOS only. Linux ran only the gitdir discovery
+  tests of the next section (hosted CI, Git 2.56.1). Windows runtime, other
+  Git versions and HFS+ were not exercised.
 
 ### Gitdir name and restorable gitdir (B-1, B-2, 2026-11-17)
 
@@ -586,10 +590,13 @@ repository at the slot root, while the classifier had verified the gitdir.
   finding `refs_dir`: Q3 `INCOMPLETE`, Q4 unchanged (every byte is
   preserved), Q5 `NOT_ELIGIBLE`. A gitlink file has no gitdir here and is
   not checked. `objects` needs no rule of its own: Q5 `ELIGIBLE` requires
-  HEAD's commit as a captured loose object below `objects/`. One captured
-  ref file, loose branch, tag or other ref, is enough: Git does not need
-  `refs/heads` or `refs/tags` (measured: the empty `refs/tags` of an
-  ordinary repository is not captured and Git still opens the restore).
+  HEAD's commit as a captured loose object below `objects/`. Any captured
+  file below `refs/` is enough, a loose ref or `.lock` residue: Git does
+  not need `refs/heads` or `refs/tags` (measured: the empty `refs/tags` of
+  an ordinary repository is not captured and Git still opens the restore).
+  The rule therefore holds only if restore recreates every captured file
+  below `refs/`, residue included, or records `refs` as a directory
+  (NB-16 item 4).
 - **B-2: exact `.git` only (amends R2 K3).** R2 K3 locates a gitdir by
   every spelling a case-insensitive volume or Git's `is_hfs_dotgit` may
   treat as `.git`. That stays the detection rule: such a path is never
@@ -598,10 +605,12 @@ repository at the slot root, while the classifier had verified the gitdir.
   other spelling (`.GIT`, `.Git`, `.g<U+200C>it` and the other HFS+-ignorable
   code points) is `unknown`: Q4 `INCOMPLETE`, Q5 `NOT_ELIGIBLE`, and its
   other findings are still reported. Measured: Git 2.38.0 and 2.54.0 on
-  case-insensitive APFS do not open `.g<U+200C>it` (or the other
-  ignorable-code-point spellings) as `.git`, and open the forged root
-  instead; they do open `.GIT` and `.Git`. On a case-sensitive Linux volume
-  (hosted CI) Git opens none of them. `.git` is ASCII, so Unicode
+  case-insensitive APFS do not open the seven measured
+  ignorable-code-point spellings (U+200C, U+200D, U+200E, U+200F, U+202A,
+  U+206F, U+FEFF) as `.git`, and open the forged root instead; they do
+  open `.GIT` and `.Git`. On a case-sensitive Linux volume (hosted CI, Git
+  2.56.1) Git opens none of the nine. The other ignorable code points were
+  not measured; they are refused all the same. `.git` is ASCII, so Unicode
   normalization yields no other spelling of it.
 - **Accepted over-refusals** until PR-4 meets NB-16 items 4 and 5:
   - a valid repository whose refs are all in `packed-refs` (after `git
@@ -610,8 +619,8 @@ repository at the slot root, while the classifier had verified the gitdir.
   - a valid repository whose gitdir is spelled `.GIT` or `.Git` on a
     case-insensitive volume, where Git does open it.
 - **Evidence limits.** Git 2.38.0 and Apple Git 2.54.0 on case-insensitive
-  APFS (macOS), and the installed Git of the hosted Linux runner for the
-  real-Git tests. HFS+, case-sensitive APFS and Windows were not exercised
+  APFS (macOS), and Git 2.56.1 on the hosted Linux runner for the real-Git
+  tests. HFS+, case-sensitive APFS and Windows were not exercised
   and no equivalent behavior is claimed for them.
 
 ## Not in PR-1

@@ -1795,8 +1795,10 @@ class GitdirReconstruction(unittest.TestCase):
 
     def test_synthetic_nested_and_top_level(self):
         top, _ = pw.git_repo()
-        for where, files in (("top", pw.git_repo(variant=("packed_refs",))[0]),
-                             ("nested", {**top, **pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]})):
+        packed = pw.git_repo(variant=("packed_refs",))[0]
+        for where, files in (("top", packed),
+                             ("nested", {**top, **pw.git_repo(variant=("packed_refs",), prefix=b"vendor/lib/")[0]}),
+                             ("a sibling of refs", {**packed, b".git/refs.bak": b"x\n", b".git/refsx/y": b"x\n"})):
             with self.subTest(where):
                 _, q3, q4, q5, reasons, _ = classify(files)
                 self.assertEqual((q3, q4, q5), ("INCOMPLETE", "COMPLETE", "NOT_ELIGIBLE"))
