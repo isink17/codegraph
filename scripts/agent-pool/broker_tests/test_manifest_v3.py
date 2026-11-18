@@ -881,6 +881,104 @@ class ClosedValues(Case):
                         self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
 
 
+class AcrossObjects(Case):
+    """Order, ancestry, components and shapes hold across every chunk and
+    index object, for every entry type, phase and result."""
+
+    def test_one_misordered_pair_refuses(self):
+        for es in ([f("b"), f("aa")], [d("b"), d("aa")], [f("ab"), f("a")], [d("a"), f("c"), f("bb")]):
+            with self.subTest(es):
+                self.bad_manifest(es)
+
+    @mock.patch.object(preserve, "MAX_ENTRIES", 1)
+    def test_order_is_global_across_chunks(self):
+        for es in ([d("b"), d("a")], [f("a", b"1"), f("a", b"2")]):
+            with self.subTest(es):
+                self.assertEqual(len(preserve.manifest_chunks(self.lab.hdr, es)), 2)
+                self.bad_manifest(es)
+
+    def test_order_is_strict_across_full_chunks(self):
+        es = [f("%05d" % i, b"%d" % i) for i in range(1200)]
+        k = len(preserve.manifest_chunks(self.lab.hdr, es)[0])
+        prev = bytes.fromhex(es[k - 1][0])
+        for first in (prev, prev[:-1] + b"!"):
+            with self.subTest(first):
+                bad = es[:k] + [f(first, b"other")] + es[k + 1:]
+                self.assertEqual(len(preserve.manifest_chunks(self.lab.hdr, bad)[0]), k)
+                self.bad_manifest(bad)
+
+    @mock.patch.object(preserve, "MAX_ENTRIES", 1)
+    @mock.patch.object(preserve, "MAX_INDEX_CHUNKS", 2)
+    def test_order_and_ancestors_across_index_objects(self):
+        self.assertEqual(len(self.ok([d("a"), f("a/x"), f("a/y")], per_index=2)[0]["entry_index"]), 2)
+        self.assertEqual(len(self.ok([d("a"), d("a/b"), d("a/b/c"), f("a/b/c/f")], per_index=2)[0]["entry_index"]), 2)
+        self.ok([d("a"), d("b"), d("c")], per_index=2)
+        for es in ([d("a"), d("a")], [d("b"), d("a")], [d("0"), d("1"), d("1")], [d("0"), d("2"), d("1")]):
+            with self.subTest(es):
+                self.bad_manifest(es, per_index=2)
+
+    def test_malformed_entry_after_a_valid_one_refuses(self):
+        for bad in (7, True, "62", ["62"], {"a": "62"}, ["62", "d", "-"], ["62", "d", "-", 0],
+                    [["62"], "d", "-", "-"]):
+            with self.subTest(bad):
+                self.bad_manifest([d("a"), bad])
+
+    def test_every_component_is_checked_below_a_directory(self):
+        """The parent is a `d` entry, so only the component rule can refuse."""
+        for p in (b"a/", b"a/.", b"a/..", b"a/x\0y", b"a/" + b"n" * 256):
+            with self.subTest(p):
+                self.bad_manifest([d("a"), d(p)])
+        self.bad_manifest([d("a"), d("a/.."), d("a/../.."), f("a/../../x")])
+        self.ok([d("a"), f(b"a/" + b"n" * 255)])
+
+    def test_symlink_target_nul_anywhere(self):
+        for target in ("0061", "610062", "006100"):
+            with self.subTest(target):
+                self.bad_manifest([[hx("a"), "l", "-", target]])
+
+    def test_reason_inner_characters(self):
+        for r in (["aB"], ["a-b"], ["a.b"], ["a b"], ["a,b"]):
+            with self.subTest(r):
+                self.bad_manifest(SAMPLE, result="INCOMPLETE", reasons=r)
+
+    def test_unsupported_count_is_recomputed(self):
+        es = [d("a"), u("a/p", "fifo")]
+        self.bad_manifest(es, result="COMPLETE", reasons=[], totals=dict(totals(es), unsupported=0))
+        self.bad_manifest(es, totals=dict(totals(es), unsupported=2))
+
+    def test_rules_hold_for_every_type_phase_and_result(self):
+        for es in ([u("a/p", "fifo")], [link("a/l", b"t")]):
+            with self.subTest(es):
+                self.bad_manifest(es)
+        self.ok(SAMPLE, "early", classifier_head="a" * 40)
+        for phase, result, reasons in (("final", "INCOMPLETE", ["unstable"]), ("early", "COMPLETE", [])):
+            with self.subTest((phase, result)):
+                self.bad_manifest(SAMPLE, phase, result=result, reasons=reasons,
+                                  walk={"pass1": WALK, "pass2": "0" * 64})
+        self.bad_manifest([d("a"), u("a/p", "fifo")], "early", result="COMPLETE", reasons=[])
+        m, got = self.ok([d("a")], result="INCOMPLETE", reasons=["x"], totals=dict(totals([d("a")]), bytes=1))
+        self.bad(lambda: self.lab.cy.content_v3(m, got))
+        self.bad_manifest([[hx("a"), "d", "", ""]])
+
+    def test_object_key_sets_are_exact(self):
+        """An index, chunk, binding or blob-set object with an extra or a missing key refuses."""
+        es = [f("a", b"x")]
+        for obj, change in (("chunk", {"x": 1}), ("chunk", {"n": DROP}), ("index", {"x": 1}), ("index", {"n": DROP}),
+                            ("binding", {"x": 1}), ("binding", {"cycle_id": DROP}), ("set", {"x": 1})):
+            with self.subTest((obj, change)):
+                def put(o, kind):
+                    o = dict(o, **change) if kind == obj else o
+                    return self.lab.put({k: v for k, v in o.items() if v is not DROP})
+                cd = put({"header": self.lab.hdr, "kind": "entries", "n": 0, "entries": es}, "chunk")
+                idx = put({"header": self.lab.hdr, "kind": "entry_index", "n": 0, "chunks": [cd]}, "index")
+                md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final", "entry_index": [idx],
+                                   "totals": totals(es), "walk": {"pass1": WALK, "pass2": WALK},
+                                   "result": "COMPLETE", "reasons": []})
+                bs = put({"header": self.lab.hdr, "set": [es[0][3]]}, "set")
+                b = put({"header": self.lab.hdr, "cycle_id": self.lab.cid, "manifest": md, "blobs": bs}, "binding")
+                self.bad(lambda: self.lab.cy.binding_v3(b, "final"))
+
+
 class Eligibility(unittest.TestCase):
     def test_clean_tree_has_no_refusal(self):
         self.assertEqual(preserve.refusals_v3([tuple(e) for e in SAMPLE]), [])
@@ -917,6 +1015,12 @@ class Eligibility(unittest.TestCase):
             with self.subTest((a, b)):
                 self.assertEqual(preserve.refusals_v3([tuple(e) for e in typed({a: b"1", b: b"2"})]),
                                  ["name_alias"])
+
+    def test_alias_of_every_kind_and_encoding(self):
+        for es in ([f(b"\xc0"), f(b"\xe0")], [u("A", "fifo"), u("a", "sock")],
+                   [d(".git"), f(".git/HEAD"), f(".git/head")]):
+            with self.subTest(es):
+                self.assertEqual(preserve.refusals_v3([tuple(e) for e in sorted(es)]), ["name_alias"])
 
     def test_file_that_is_a_directory_elsewhere(self):
         es = [tuple(e) for e in sorted([f("A"), d("a"), d("a/x")])]
