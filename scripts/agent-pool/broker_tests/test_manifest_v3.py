@@ -168,13 +168,6 @@ class ValidTrees(Case):
         self.assertEqual(self.lab.cy.binding_v3(early, "early")[3],
                          sorted({e[3] for e in SAMPLE if e[1] == "f"} | set(ORIGINALS.values())))
 
-    def test_verify_binding(self):
-        md = self.lab.manifest(SAMPLE)
-        bs = self.lab.put({"header": self.lab.hdr, "set": sorted({e[3] for e in SAMPLE if e[1] == "f"})})
-        vb = self.lab.put({"header": self.lab.hdr, "cycle_id": CID, "manifest": md, "blobs": bs, "reverified": True,
-                           "sealed_at": 1})
-        self.assertEqual(self.lab.cy.binding_v3(vb, "final", verify=True)[2], [tuple(e) for e in SAMPLE])
-
     def test_classifier_head_is_optional_and_exact(self):
         self.ok(SAMPLE, classifier_head="a" * 40)
         for bad in ("A" * 40, "a" * 39, "a" * 64, 7):
@@ -233,6 +226,11 @@ class Entries(Case):
                 self.bad_manifest([parent, f("a/b")])
                 self.bad_manifest([parent, d("a/b")])
 
+    def test_file_digest_encoding(self):
+        for v in ("-", "A" * 64, "0" * 63, "0" * 65, "g" * 64, ""):
+            with self.subTest(v):
+                self.bad_manifest([[hx("a"), "f", "0", v]])
+
     def test_file_modes(self):
         self.ok([f("a", attr="x"), f("b", attr="0")])
         for attr in ("1", "X", "755", "0755", "0644", "-", "", "x "):
@@ -280,6 +278,21 @@ class ManifestFields(Case):
         self.bad_manifest(SAMPLE, "early", originals={"xattr": "0" * 64})
         md = self.lab.manifest(SAMPLE, "early")
         self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
+
+    def test_phase_must_match(self):
+        """An early manifest never reads as final, nor a final one as early."""
+        for built, stored, read in (("final", "early", "final"), ("early", "final", "early"),
+                                    ("final", "EARLY", "final"), ("final", "verify", "final")):
+            with self.subTest((built, stored)):
+                lab = Lab()
+                m, _ = journal.parse(lab.mem.a[(CID, lab.manifest(SAMPLE, built))])
+                md = lab.put(dict(m, phase=stored))
+                self.bad(lambda: lab.cy.manifest_v3(md, read))
+
+    def test_bounds_are_pinned(self):
+        self.assertEqual((preserve.V3_MAX_HEADER, preserve.V3_MAX_BYTES, preserve.V3_MAX_ENTRIES,
+                          preserve.V3_MAX_REASONS, journal.MAX_PATH_BYTES, journal.MAX_PATH_DEPTH),
+                         (2048, 1 << 31, 200_000, 32, 4096, 64))
 
     def test_walk(self):
         for walk in ({"pass1": WALK, "pass2": "0" * 64}, {"pass1": WALK}, {"pass1": "x", "pass2": "x"},
@@ -362,6 +375,58 @@ class Chunking(Case):
                                                         "entries": more})), preserve.CHUNK_BYTES)
         self.assertEqual(len(self.ok(es)[1]), 1200)
 
+    def test_exact_fit(self):
+        """A chunk of exactly CHUNK_BYTES is one chunk; one more entry splits it."""
+        def size(es):
+            return len(canonical.canon({"header": self.lab.hdr, "kind": "entries", "n": 0, "entries": es}))
+        es, i = [], 0
+        while size(es + [f("%05d" % i)]) <= preserve.CHUNK_BYTES - 1500:
+            es.append(f("%05d" % i))
+            i += 1
+        tail = [d("}")] if (preserve.CHUNK_BYTES - size(es + [link("~", b"p")])) % 2 else []
+        rest = preserve.CHUNK_BYTES - size(es + tail + [link("~", b"p")])
+        es += tail + [link("~", b"p" * (1 + rest // 2))]
+        self.assertEqual(size(es), preserve.CHUNK_BYTES)
+        self.assertEqual(len(preserve.manifest_chunks(self.lab.hdr, es)), 1)
+        self.ok(es)
+        more = es + [f("~~")]
+        self.assertEqual([len(c) for c in preserve.manifest_chunks(self.lab.hdr, more)], [len(es), 1])
+        self.ok(more)
+
+    def numbered(self, chunk_ns, index_ns):
+        """Three one-entry chunks, two per index object, with the given ordinals."""
+        es = [d("%d" % i) for i in range(3)]
+        cds = [self.lab.put({"header": self.lab.hdr, "kind": "entries", "n": n, "entries": [e]})
+               for n, e in zip(chunk_ns, es)]
+        index = [self.lab.put({"header": self.lab.hdr, "kind": "entry_index", "n": n, "chunks": cds[2 * k:2 * k + 2]})
+                 for k, n in enumerate(index_ns)]
+        md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final", "entry_index": index,
+                           "totals": totals(es), "walk": {"pass1": WALK, "pass2": WALK}, "result": "COMPLETE",
+                           "reasons": []})
+        return lambda: self.lab.cy.manifest_v3(md, "final")
+
+    def test_misnumbered_objects(self):
+        """Ordinals are exact integers: renumbered, repeated or boolean ones refuse."""
+        with mock.patch.object(preserve, "MAX_ENTRIES", 1), mock.patch.object(preserve, "MAX_INDEX_CHUNKS", 2):
+            self.assertEqual(len(self.numbered([0, 1, 2], [0, 1])()[1]), 3)
+            for chunk_ns, index_ns in (([0, 2, 2], [0, 1]), ([1, 1, 2], [0, 1]), ([0, 1, 2], [1, 1]),
+                                       ([0, 1, 2], [0, 0]), ([False, 1, 2], [0, 1]), ([0, True, 2], [0, 1]),
+                                       ([0, 1, 2], [False, 1]), ([0, 1, 2], [0, True])):
+                with self.subTest((chunk_ns, index_ns)):
+                    self.bad(self.numbered(chunk_ns, index_ns))
+
+    @mock.patch.object(preserve, "MAX_INDEX_CHUNKS", 1)
+    def test_empty_trailing_index_refuses(self):
+        """A full index object followed by an index object with no chunks."""
+        es = [d("a")]
+        cd = self.lab.put({"header": self.lab.hdr, "kind": "entries", "n": 0, "entries": es})
+        index = [self.lab.put({"header": self.lab.hdr, "kind": "entry_index", "n": 0, "chunks": [cd]}),
+                 self.lab.put({"header": self.lab.hdr, "kind": "entry_index", "n": 1, "chunks": []})]
+        md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final", "entry_index": index,
+                           "totals": totals(es), "walk": {"pass1": WALK, "pass2": WALK}, "result": "COMPLETE",
+                           "reasons": []})
+        self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
+
     def test_entry_limit_splits(self):
         with mock.patch.object(preserve, "MAX_ENTRIES", 3):
             es = [d("%d" % i) for i in range(7)]
@@ -401,9 +466,6 @@ class Chunking(Case):
         es = [f("%05d" % i) for i in range(1200)]
         self.bad_manifest(es, chunks=[es], detail=None)
 
-    def test_inventory_chunker_is_separate(self):
-        self.assertIsNot(preserve.manifest_chunks, preserve.chunks_of)
-
 
 class Bindings(Case):
     def test_incorrect_content(self):
@@ -418,6 +480,33 @@ class Bindings(Case):
         self.lab.blobs([b"alpha"])
         m2, es2 = self.ok(SAMPLE, totals=totals(SAMPLE, nbytes + 1))
         self.bad(lambda: self.lab.cy.content_v3(m2, es2))
+
+    def test_bytes_count_every_file_entry(self):
+        """Two files with one content count its length twice."""
+        self.lab.blobs([b"same"])
+        es = [f("a", b"same"), f("b", b"same")]
+        m, got = self.ok(es, totals=totals(es, 8))
+        self.assertTrue(self.lab.cy.content_v3(m, got))
+        m, got = self.ok(es, totals=totals(es, 4))
+        self.bad(lambda: self.lab.cy.content_v3(m, got))
+
+    def test_boolean_header_value_refuses(self):
+        """`g_pre` spelled `true` binds `pre.g_pre == 1` under ==, so v3 checks its type."""
+        lab = Lab()
+        lab.hdr = header(g_pre=True)
+        md = lab.manifest(SAMPLE)
+        self.bad(lambda: lab.cy.manifest_v3(md, "final"))
+        lab = Lab()
+        md = lab.manifest(SAMPLE)
+        m = lab.cy.manifest_v3(md, "final")[0]
+        bad_hdr = header(g_pre=True)
+        chunks = preserve.manifest_chunks(lab.hdr, SAMPLE)
+        for chunk_hdr, index_hdr in ((bad_hdr, lab.hdr), (lab.hdr, bad_hdr)):
+            cds = [lab.put({"header": chunk_hdr, "kind": "entries", "n": n, "entries": c})
+                   for n, c in enumerate(chunks)]
+            idx = lab.put({"header": index_hdr, "kind": "entry_index", "n": 0, "chunks": cds})
+            md2 = lab.put(dict(m, entry_index=[idx]))
+            self.bad(lambda: lab.cy.manifest_v3(md2, "final"))
 
     def test_altered_object_refuses(self):
         md = self.lab.manifest(SAMPLE)
@@ -531,32 +620,51 @@ class Eligibility(unittest.TestCase):
                                  ["name_alias"])
 
 
+def v3_effect_manifest(fx, s, phase, files):
+    """The synthetic effect's manifest step, writing a valid v3 graph instead of v2."""
+    for v in files.values():
+        fx.blob(v)
+    es = typed(files)
+    hdr = fx.header(s)
+    md = build(lambda o: fx.obj(s, o), hdr, es, phase, originals=s["originals"] if phase == "early" else DROP,
+               totals=totals(es, sum(len(v) for v in files.values())))
+    want = {e[3] for e in es if e[1] == "f"} | (set(s["originals"].values()) if phase == "early" else set())
+    bs = fx.obj(s, {"header": hdr, "set": sorted(want)})
+    return fx.obj(s, {"header": hdr, "cycle_id": s["cid"], "manifest": md, "blobs": bs}), md, bs
+
+
 class V2ConsumerEndToEnd(Base):
-    """A v3 EP manifest that reaches the merged consumers refuses with
+    """A v3 manifest that reaches the merged consumers refuses with
     `artifact_mismatch`: never a bare exception, never eligible."""
 
-    def test_freeze_start_with_a_v3_manifest_is_rejected(self):
-        def v3_manifest(fx, s, phase, files):
-            for v in files.values():
-                fx.blob(v)
-            es = typed(files)
-            hdr = fx.header(s)
-            originals = s["originals"] if phase == "early" else DROP
-            md = build(lambda o: fx.obj(s, o), hdr, es, phase, originals=originals,
-                       totals=totals(es, sum(len(v) for v in set(files.values()))))
-            want = {e[3] for e in es if e[1] == "f"} | (set(s["originals"].values()) if phase == "early" else set())
-            bs = fx.obj(s, {"header": hdr, "set": sorted(want)})
-            return fx.obj(s, {"header": hdr, "cycle_id": s["cid"], "manifest": md, "blobs": bs}), md, bs
-
-        with mock.patch.object(pw.Effects, "manifest", v3_manifest):
-            self.ok("adopt", "request")
-            self.rejected("freeze-start", "fresult_rejected:artifact_mismatch", "MOVE_INTENT")
+    def cycle(self):
         s = self.w.st()
         pre = types.SimpleNamespace(**{k: s[k] for k in ("slot", "op_id", "g_pre", "cutover_head", "barrier_id",
                                                          "root_id", "mode")})
-        cy = preserve._Cycle(self.w.prov._r, pre, s["cid"], s["start_ctx"])
+        return s, preserve._Cycle(self.w.prov._r, pre, s["cid"], s["start_ctx"])
+
+    def test_freeze_start_with_a_v3_manifest_is_rejected(self):
+        with mock.patch.object(pw.Effects, "manifest", v3_effect_manifest):
+            self.ok("adopt", "request")
+            self.rejected("freeze-start", "fresult_rejected:artifact_mismatch", "MOVE_INTENT")
+        s, cy = self.cycle()
         _, m, es, _ = cy.binding_v3(s["early"], "early")
         self.assertTrue(cy.content_v3(m, es))
+
+    def test_schemas_mixed_within_one_cycle_are_rejected(self):
+        """A v2 EP manifest and a v3 final manifest in one cycle: the snapshot
+        result is rejected, although each manifest is valid for its schema."""
+        real = pw.Effects.manifest
+
+        def mixed(fx, s, phase, files):
+            return (v3_effect_manifest if phase == "final" else real)(fx, s, phase, files)
+        self.w.to_p13()
+        self.w.handoff()
+        with mock.patch.object(pw.Effects, "manifest", mixed):
+            self.rejected("snapshot", "fresult_rejected:artifact_mismatch", "SNAPSHOT_INTENT")
+        s, cy = self.cycle()
+        cy.binding(s["early"], "early")
+        cy.binding_v3(s["fs"], "final")
 
 
 if __name__ == "__main__":

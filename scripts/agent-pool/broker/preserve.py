@@ -35,7 +35,7 @@ _RESUME_INTENT = {"D-THAW-R": ("THAW_INTENT", ("D-THAW", "D-THAW-R")),
 _FAILURE_ROWS = (("freeze-start", "NONE"), ("freeze-start", "FREEZE_BLOCKED"), ("freeze-continue", "FREEZE_INCOMPLETE"),
                  ("freeze-continue", "FREEZE_BLOCKED"), ("thaw", "FREEZE_BLOCKED"), ("snapshot", "SNAPSHOT_FAILED"),
                  ("verify-preservation", "VERIFY_FAILED"))
-# manifest/v3 bounds (F1 §3.8, U-1).
+# manifest/v3 bounds: the capture walk's entry and byte caps and the canonical header size.
 V3_MAX_ENTRIES = 200_000
 V3_MAX_BYTES = 1 << 31
 V3_MAX_HEADER = 2048
@@ -44,7 +44,6 @@ V3_TOTALS = ("entries", "files", "dirs", "links", "unsupported", "bytes")
 V3_COUNTED = {"f": "files", "d": "dirs", "l": "links", "u": "unsupported"}
 V3_UNSUPPORTED = frozenset({"fifo", "sock", "chr", "blk", "whiteout", "hardlink", "foreign_uid", "cross_device",
                             "unreadable", "unstable", "oversize", "other"})
-_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _LINK_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,1024}\Z")
 _OID = re.compile(r"^[0-9a-f]{40}\Z")
 
@@ -189,7 +188,8 @@ def manifest_chunks(header, entries):
     """The v3 entry chunks in order: each chunk holds as many entries as fit
     under MAX_ENTRIES and CHUNK_BYTES (canonical encoding with `header` and
     its ordinal), every chunk but the last full. None past MAX_INDEX x
-    MAX_INDEX_CHUNKS chunks or when one entry cannot fit."""
+    MAX_INDEX_CHUNKS chunks, or when one entry cannot fit an empty chunk
+    (the header and path bounds exclude that for a valid manifest)."""
     out, cur, size = [], [], 0
     for e in entries:
         add = len(canonical.canon(e))
@@ -333,23 +333,26 @@ class _Cycle:
                  "artifact_mismatch")
         return m
 
-    def entries_v3(self, m):
-        """The typed v3 entries `(path_hex, type, attr, value)`, reconstructed
-        like `entries` and also requiring: every proper prefix of a path is a
-        `d` entry, the chunk and index split is the `manifest_chunks` one, and
-        at most V3_MAX_ENTRIES entries."""
-        out, chunks, seen = [], [], {}
+    def _entries_v3(self, m):
+        """The typed v3 entries `(path_hex, type, attr, value)` of a manifest
+        `manifest_v3` checked, reconstructed like `entries` and also requiring:
+        every object's header encodes exactly as the manifest's, every proper
+        prefix of a path is a `d` entry, the chunk and index split is the
+        `manifest_chunks` one, and at most V3_MAX_ENTRIES entries."""
+        out, chunks, dirs, hdr = [], [], set(), canonical.canon(m["header"])
         for i, d in enumerate(m["entry_index"]):
             io = self.obj(d, ("header", "kind", "n", "chunks"))
             ch = io["chunks"]
             last = i == len(m["entry_index"]) - 1
-            need(io["kind"] == "entry_index" and io["n"] == i and type(ch) is list
+            need(canonical.canon(io["header"]) == hdr and io["kind"] == "entry_index" and type(io["n"]) is int
+                 and io["n"] == i and type(ch) is list
                  and 1 <= len(ch) <= MAX_INDEX_CHUNKS and (len(ch) == MAX_INDEX_CHUNKS or last),
                  Code.STATE_UNKNOWN, "artifact_mismatch")
             for cd in ch:
                 co = self.obj(cd, ("header", "kind", "n", "entries"))
                 es = co["entries"]
-                need(co["kind"] == "entries" and co["n"] == len(chunks) and type(es) is list
+                need(canonical.canon(co["header"]) == hdr and co["kind"] == "entries" and type(co["n"]) is int
+                     and co["n"] == len(chunks) and type(es) is list
                      and 1 <= len(es) <= MAX_ENTRIES and len(out) + len(es) <= V3_MAX_ENTRIES,
                      Code.STATE_UNKNOWN, "artifact_mismatch")
                 for e in es:
@@ -357,8 +360,9 @@ class _Cycle:
                     p = bytes.fromhex(e[0])
                     parent, _, _ = p.rpartition(b"/")
                     need(p.count(b"/") <= journal.MAX_PATH_DEPTH and all(valid_component(c) for c in p.split(b"/"))
-                         and (b"/" not in p or seen.get(parent) == "d"), Code.STATE_UNKNOWN, "artifact_mismatch")
-                    seen[p] = e[1]
+                         and (b"/" not in p or parent in dirs), Code.STATE_UNKNOWN, "artifact_mismatch")
+                    if e[1] == "d":
+                        dirs.add(p)
                     out.append(tuple(e))
                 chunks.append(es)
         need(chunks == manifest_chunks(m["header"], [list(e) for e in out]), Code.STATE_UNKNOWN, "artifact_mismatch")
@@ -373,13 +377,13 @@ class _Cycle:
         m = self.obj(d)
         need(keys <= set(m) <= keys | {"classifier_head"} and m["schema"] == M_SCHEMA_V3
              and M_SCHEMA_V3 in accepted_schemas(self.pre.mode) and m["phase"] == phase
-             and len(canonical.canon(m["header"])) <= V3_MAX_HEADER
+             and len(canonical.canon(m["header"])) <= V3_MAX_HEADER and type(m["header"]["g_pre"]) is int
              and type(m["entry_index"]) is list and len(m["entry_index"]) <= MAX_INDEX
              and type(m["walk"]) is dict and set(m["walk"]) == {"pass1", "pass2"} and is_hex64(m["walk"]["pass1"])
              and m["walk"]["pass1"] == m["walk"]["pass2"]
              and m["result"] in ("COMPLETE", "INCOMPLETE") and type(m["reasons"]) is list
              and len(m["reasons"]) <= V3_MAX_REASONS
-             and all(type(x) is str and _REASON.match(x) for x in m["reasons"])
+             and all(type(x) is str and _CHANNEL.match(x) for x in m["reasons"])
              and m["reasons"] == sorted(set(m["reasons"])) and (m["result"] == "INCOMPLETE") == bool(m["reasons"])
              and ("classifier_head" not in m or type(m["classifier_head"]) is str and _OID.match(m["classifier_head"])),
              Code.STATE_UNKNOWN, "artifact_mismatch")
@@ -391,7 +395,7 @@ class _Cycle:
             o = m["originals"]
             need(type(o) is dict and all(k in journal.ATTRS and is_hex64(v) for k, v in o.items()), Code.STATE_UNKNOWN,
                  "artifact_mismatch")
-        es = self.entries_v3(m)
+        es = self._entries_v3(m)
         counts = {k: 0 for k in V3_COUNTED.values()}
         for e in es:
             counts[V3_COUNTED[e[1]]] += 1
@@ -437,11 +441,11 @@ class _Cycle:
         `verify` binding object of this cycle (§3.2). v2 only."""
         return self._binding(d, phase, verify, self._v2)
 
-    def binding_v3(self, d, phase, verify=False):
-        """`binding` over a v3 manifest; the blob set is the `f` values and
-        the originals, never a symlink target. Validation only: no decision
-        reads it yet."""
-        return self._binding(d, phase, verify, self._v3)
+    def binding_v3(self, d, phase):
+        """`binding` over a v3 `early` or `final` manifest; the blob set is the
+        `f` values and the originals, never a symlink target. Validation only:
+        no decision reads it yet, and the v3 verify binding is not defined."""
+        return self._binding(d, phase, False, self._v3)
 
     def blobs(self, digests):
         """Every digest resolves and re-hashes; returns {digest: bytes} or None."""

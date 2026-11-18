@@ -20,6 +20,8 @@ ALLOWED_TOP = {"re", "hashlib", "unicodedata", "zlib", "recovery_state"}
 FORBIDDEN_NAMES = {"CommitTxn", "_issue", "_new_ingest", "_ISEAL", "_CSEAL", "_new_capability", "_SEAL", "_produce",
                    "OwnerCapability", "IngestCapability", "EffectCap", "FsCap", "BodyCap", "RecordStore", "BlobStore",
                    "fsprim", "fsstore", "fscap"}
+FORBIDDEN_CALLS = {"put", "ingest", "revalidate", "finish", "confirm", "release", "kill", "unlink", "rename",
+                   "write", "chmod", "chown", "chflags", "system", "popen"}
 # The exact (module, names) each pure module imports: a new import is a reviewed change to this table.
 PINNED_IMPORTS = {
     "journal.py": {("re", None), (".", "canonical"), (".", "o5contract"), (".", "protocol"), (".canonical", "is_hex64"),
@@ -42,8 +44,6 @@ def imports(name):
         elif isinstance(node, ast.ImportFrom):
             out |= {("." * node.level + (node.module or ""), a.name) for a in node.names}
     return out
-FORBIDDEN_CALLS = {"put", "ingest", "revalidate", "finish", "confirm", "release", "kill", "unlink", "rename",
-                   "write", "chmod", "chown", "chflags", "system", "popen"}
 
 
 def trees():
