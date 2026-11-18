@@ -376,7 +376,7 @@ class _Cycle:
             {"originals"} if phase == "early" else set())
         m = self.obj(d)
         need(keys <= set(m) <= keys | {"classifier_head"} and m["schema"] == M_SCHEMA_V3
-             and M_SCHEMA_V3 in accepted_schemas(self.pre.mode) and m["phase"] == phase
+             and M_SCHEMA_V3 in accepted_schemas(self.pre.mode) and phase in ("early", "final") and m["phase"] == phase
              and len(canonical.canon(m["header"])) <= V3_MAX_HEADER and type(m["header"]["g_pre"]) is int
              and type(m["entry_index"]) is list and len(m["entry_index"]) <= MAX_INDEX
              and type(m["walk"]) is dict and set(m["walk"]) == {"pass1", "pass2"} and is_hex64(m["walk"]["pass1"])
@@ -423,7 +423,7 @@ class _Cycle:
         m, es = self.manifest_v3(md, phase)
         return m, es, {e[3] for e in es if e[1] == "f"}
 
-    def _binding(self, d, phase, verify, read):
+    def _binding(self, d, phase, verify, read, exact=False):
         keys = ("header", "cycle_id", "manifest", "blobs") + (("reverified", "sealed_at") if verify else ())
         b = self.obj(d, keys)
         need(b["cycle_id"] == self.cid, Code.STATE_UNKNOWN, "cycle_binding")
@@ -434,6 +434,9 @@ class _Cycle:
         bs = self.obj(b["blobs"], ("header", "set"))
         want = contents | (set(m["originals"].values()) if phase == "early" else set())
         need(bs["set"] == sorted(want), Code.STATE_UNKNOWN, "artifact_mismatch")
+        if exact:
+            need(canonical.canon(b["header"]) == canonical.canon(bs["header"]) == canonical.canon(m["header"]),
+                 Code.STATE_UNKNOWN, "artifact_mismatch")
         return b, m, es, bs["set"]
 
     def binding(self, d, phase, verify=False):
@@ -443,9 +446,10 @@ class _Cycle:
 
     def binding_v3(self, d, phase):
         """`binding` over a v3 `early` or `final` manifest; the blob set is the
-        `f` values and the originals, never a symlink target. Validation only:
+        `f` values and the originals, never a symlink target, and every
+        header encodes exactly as the manifest's. Validation only:
         no decision reads it yet, and the v3 verify binding is not defined."""
-        return self._binding(d, phase, False, self._v3)
+        return self._binding(d, phase, False, self._v3, exact=True)
 
     def blobs(self, digests):
         """Every digest resolves and re-hashes; returns {digest: bytes} or None."""
