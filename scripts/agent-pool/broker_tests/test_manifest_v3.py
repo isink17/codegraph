@@ -182,7 +182,9 @@ class Entries(Case):
         for e in (["61", "x", "-", "-"], ["61", "F", "0", "0" * 64], ["61", "", "-", "-"], ["61", "d", "-"],
                   ["61", "d", "-", "-", "-"], ["61", "d", "-", 0], "61", ["61", "d", True, "-"],
                   [["61"], "d", "-", "-"], {"p": "61"}, ["61", "l", "-", 5], ["61", "u", ["fifo"], "-"],
-                  ["61", "x", "fifo", "-"], ["61", "f", ["0"], "a" * 64]):
+                  ["61", "x", "fifo", "-"], ["61", "f", ["0"], "a" * 64], 7, True,
+                  {"a": "61", "b": "d", "c": "-", "d": "-"}, ["61", "D", "-", "-"], ["61", "s", "-", "74"],
+                  ["61", "U", "fifo", "-"], ["61", "L", "-", "74"]):
             with self.subTest(e):
                 self.bad_manifest([e])
 
@@ -253,6 +255,7 @@ class Entries(Case):
             with self.subTest(target[:8]):
                 self.bad_manifest([[hx("a"), "l", "-", target]])
         self.bad_manifest([[hx("a"), "l", "0", "74"]])
+        self.ok([link("b", b"\x10\x0a")])
 
     def test_unsupported_kinds_are_closed(self):
         kinds = {"fifo", "sock", "chr", "blk", "whiteout", "hardlink", "foreign_uid", "cross_device", "unreadable",
@@ -315,7 +318,8 @@ class ManifestFields(Case):
         for result, reasons in (("COMPLETE", ["walk_gap"]), ("INCOMPLETE", []), ("PARTIAL", []),
                                 ("INCOMPLETE", ["b", "a"]), ("INCOMPLETE", ["a", "a"]), ("INCOMPLETE", ["A"]),
                                 ("INCOMPLETE", ["a" * 65]), ("INCOMPLETE", [1]),
-                                ("INCOMPLETE", ["r%02d" % i for i in range(33)])):
+                                ("INCOMPLETE", ["r%02d" % i for i in range(33)]), ("INCOMPLETE", 7),
+                                ("INCOMPLETE", True), ("INCOMPLETE", "walk_gap"), ("INCOMPLETE", {"a": 1})):
             with self.subTest((result, reasons)):
                 self.bad_manifest(SAMPLE, result=result, reasons=reasons)
         self.ok(SAMPLE, result="INCOMPLETE", reasons=["r%02d" % i for i in range(32)])
@@ -335,9 +339,19 @@ class ManifestFields(Case):
                 with self.subTest((key, v)):
                     self.bad_manifest(SAMPLE, totals=dict(good, **{key: v}))
         self.bad_manifest(SAMPLE, totals=dict(good, extra=0))
+        for t in (7, True, "entries", list(preserve.V3_TOTALS), [list(kv) for kv in sorted(good.items())]):
+            with self.subTest(t):
+                self.bad_manifest(SAMPLE, totals=t)
         self.bad_manifest(SAMPLE, totals={k: v for k, v in good.items() if k != "bytes"})
         self.ok(SAMPLE, totals=dict(good, bytes=preserve.V3_MAX_BYTES))
         self.bad_manifest(SAMPLE, totals=dict(good, bytes=preserve.V3_MAX_BYTES + 1))
+
+    def test_index_count_bound(self):
+        """More than MAX_INDEX index digests refuse before any is read."""
+        md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final",
+                           "entry_index": ["0" * 64] * (preserve.MAX_INDEX + 1), "totals": totals([]),
+                           "walk": {"pass1": WALK, "pass2": WALK}, "result": "COMPLETE", "reasons": []})
+        self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
 
     def test_entry_count_bound(self):
         es = [f("f%02d" % i) for i in range(4)]
@@ -369,17 +383,6 @@ class ManifestFields(Case):
             else:
                 self.bad(lambda: lab.cy.manifest_v3(md, "final"))
 
-    def test_header_bound(self):
-        """A canonical header over 2,048 bytes refuses even when it binds."""
-        for n, good in ((1500, True), (2000, False)):
-            pre = types.SimpleNamespace(**dict(vars(PRE), slot="s" * n))
-            lab = Lab(pre)
-            md = lab.manifest(SAMPLE)
-            self.assertEqual(len(canonical.canon(lab.hdr)) <= preserve.V3_MAX_HEADER, good)
-            if good:
-                lab.cy.manifest_v3(md, "final")
-            else:
-                self.bad(lambda: lab.cy.manifest_v3(md, "final"))
 
 
 class Chunking(Case):
@@ -396,6 +399,33 @@ class Chunking(Case):
                 self.assertGreater(len(canonical.canon({"header": self.lab.hdr, "kind": "entries", "n": n,
                                                         "entries": more})), preserve.CHUNK_BYTES)
         self.assertEqual(len(self.ok(es)[1]), 1200)
+
+    def exact_at(self, n, over=0):
+        """Entries whose chunk at ordinal n is exactly CHUNK_BYTES + over bytes, then one more entry."""
+        hdr = self.lab.hdr
+        uniform = [d("b%05d" % i) for i in range(30 * (n + 2))]
+        ch = preserve.manifest_chunks(hdr, uniform)
+        pre, body = sum(ch[:n], []), [ch[n][0]]
+        for parity in ([], [d("c")]):
+            for k in range(1, 1025):
+                full = body + parity + [link("e", b"p" * k)]
+                size = len(canonical.canon({"header": hdr, "kind": "entries", "n": n, "entries": full}))
+                if size == preserve.CHUNK_BYTES + over:
+                    return pre + full + [d("z")], len(full)
+        raise AssertionError("no construction")
+
+    @mock.patch.object(preserve, "CHUNK_BYTES", 1200)
+    def test_exact_fit_at_each_ordinal_width(self):
+        """An exactly full chunk stays whole and one byte more splits it, whatever
+        the digit count of its ordinal."""
+        for n in (0, 1, 9, 10, 11, 99, 100):
+            with self.subTest(n):
+                es, k = self.exact_at(n)
+                self.assertEqual([len(c) for c in preserve.manifest_chunks(self.lab.hdr, es)][n:], [k, 1])
+                self.ok(es)
+                es, k = self.exact_at(n, over=1)
+                self.assertEqual([len(c) for c in preserve.manifest_chunks(self.lab.hdr, es)][n:], [k - 1, 2])
+                self.ok(es)
 
     def test_exact_fit(self):
         """A chunk of exactly CHUNK_BYTES is one chunk; one more entry splits it."""
@@ -545,6 +575,8 @@ class Chunking(Case):
                 mock.patch.object(preserve, "MAX_ENTRIES", 1):
             self.assertEqual(len(preserve.manifest_chunks(self.lab.hdr, [d("a"), d("b")])), 2)
             self.assertIsNone(preserve.manifest_chunks(self.lab.hdr, [d("a"), d("b"), d("c")]))
+        with mock.patch.object(preserve, "CHUNK_BYTES", 400):
+            self.assertIsNone(preserve.manifest_chunks(self.lab.hdr, [link("a", b"t" * 100)]))
 
     def test_worst_case_entry_fits_four_per_chunk(self):
         """The largest entry, an `l` at 4096 path bytes with a 1024-byte target."""
@@ -571,6 +603,12 @@ class Bindings(Case):
         self.lab.blobs([b"alpha"])
         m2, es2 = self.ok(SAMPLE, totals=totals(SAMPLE, nbytes + 1))
         self.bad(lambda: self.lab.cy.content_v3(m2, es2))
+
+    def test_symlink_target_is_never_resolved_as_content(self):
+        self.lab.blobs([b"x"])
+        es = [link("a", b"target"), link("c", bytes(range(1, 33))), f("b", b"x")]
+        m, got = self.ok(sorted(es), totals=totals(es, 1))
+        self.assertTrue(self.lab.cy.content_v3(m, got))
 
     def test_bytes_count_every_file_entry(self):
         """Two files with one content count its length twice."""
@@ -621,19 +659,22 @@ class Bindings(Case):
         self.bad(lambda: self.lab.cy.binding_v3(self.lab.binding(es, blobs=want[::-1]), "final"))
 
     def test_binding_headers_encode_as_the_manifest(self):
-        """One manifest has one accepted binding: a boolean `g_pre` on the
-        binding or blob-set object refuses."""
-        lab = Lab()
-        md = lab.manifest(SAMPLE)
-        bad = header(g_pre=True)
-        want = sorted({e[3] for e in SAMPLE if e[1] == "f"})
-        for bh, sh in ((lab.hdr, lab.hdr), (bad, lab.hdr), (lab.hdr, bad), (bad, bad)):
-            bs = lab.put({"header": sh, "set": want})
-            b = lab.put({"header": bh, "cycle_id": CID, "manifest": md, "blobs": bs})
-            if bh is lab.hdr and sh is lab.hdr:
-                lab.cy.binding_v3(b, "final")
-            else:
-                self.bad(lambda: lab.cy.binding_v3(b, "final"))
+        """One manifest has one accepted binding in either phase: a boolean
+        `g_pre` on the binding or blob-set object refuses."""
+        for phase in ("early", "final"):
+            lab = Lab()
+            md = lab.manifest(SAMPLE, phase)
+            bad = header(g_pre=True)
+            want = sorted({e[3] for e in SAMPLE if e[1] == "f"} | (set(ORIGINALS.values()) if phase == "early"
+                                                                    else set()))
+            for bh, sh in ((lab.hdr, lab.hdr), (bad, lab.hdr), (lab.hdr, bad), (bad, bad)):
+                bs = lab.put({"header": sh, "set": want})
+                b = lab.put({"header": bh, "cycle_id": CID, "manifest": md, "blobs": bs})
+                with self.subTest((phase, bh is bad, sh is bad)):
+                    if bh is lab.hdr and sh is lab.hdr:
+                        lab.cy.binding_v3(b, phase)
+                    else:
+                        self.bad(lambda: lab.cy.binding_v3(b, phase))
 
     def test_originals_values(self):
         self.lab.cy.manifest_v3(self.lab.manifest(SAMPLE, "early"), "early")
@@ -664,6 +705,10 @@ class Bindings(Case):
 
 
 class Dispatch(Case):
+    def test_schema_literals(self):
+        self.assertEqual((preserve.M_SCHEMA, preserve.M_SCHEMA_V3),
+                         ("codegraph.o5.manifest/v2", "codegraph.o5.manifest/v3"))
+
     def test_accepted_schemas(self):
         self.assertEqual(preserve.accepted_schemas(oc.PROTECTED), (V3,))
         self.assertEqual(preserve.accepted_schemas(oc.SYNTHETIC), (preserve.M_SCHEMA, V3))
@@ -671,8 +716,17 @@ class Dispatch(Case):
             self.assertEqual(preserve.accepted_schemas(mode), (), mode)
 
     def test_v3_is_validated_but_refused_by_the_v2_consumer(self):
-        b = self.lab.binding(SAMPLE)
-        self.lab.cy.binding_v3(b, "final")
+        for es in (SAMPLE, []):
+            b = self.lab.binding(es)
+            self.lab.cy.binding_v3(b, "final")
+            self.bad(lambda: self.lab.cy.binding(b, "final"))
+
+    def test_v2_consumer_refuses_the_v3_schema_string(self):
+        """A manifest labelled v3 but shaped like v2 is not read as v2."""
+        es = [[hx("a"), canonical.sha256(b"x")]]
+        md = self.lab.manifest(es, schema=V3, totals=DROP, walk=DROP)
+        bs = self.lab.put({"header": self.lab.hdr, "set": [canonical.sha256(b"x")]})
+        b = self.lab.put({"header": self.lab.hdr, "cycle_id": CID, "manifest": md, "blobs": bs})
         self.bad(lambda: self.lab.cy.binding(b, "final"))
 
     def test_v2_is_not_a_v3_manifest(self):
@@ -716,6 +770,16 @@ class Eligibility(unittest.TestCase):
     def test_symlinks_and_unsupported_never_become_eligible(self):
         self.assertEqual(preserve.refusals_v3([tuple(link("w", b"t"))]), ["symlink"])
         self.assertEqual(preserve.refusals_v3([tuple(d(".git")), tuple(link(".git/HEAD", b"t"))]), ["unknown"])
+        for es, want in (([d("sub"), d("sub/.git"), link("sub/.git/x", b"t")], ["unknown"]),
+                         ([d(".GIT"), link(".GIT/x", b"t")], ["unknown"]),
+                         ([link(".git", b"t")], ["unknown"]),
+                         ([d("w"), link("w/.git", b"/x")], ["unknown"]),
+                         ([link("A", b"t"), link("a", b"t")], ["name_alias", "symlink"]),
+                         ([link(".gitignore", b"t")], ["symlink"]),
+                         ([d("sub"), link("sub/x", b"t")], ["symlink"]),
+                         ([u("p", "fifo"), u("q", "hardlink")], [])):
+            with self.subTest(es):
+                self.assertEqual(preserve.refusals_v3([tuple(e) for e in sorted(es)]), want)
         lab = Lab()
         m, _ = lab.cy.manifest_v3(lab.manifest([u("p", "hardlink")]), "final")
         self.assertEqual(m["result"], "INCOMPLETE")

@@ -35,7 +35,7 @@ _RESUME_INTENT = {"D-THAW-R": ("THAW_INTENT", ("D-THAW", "D-THAW-R")),
 _FAILURE_ROWS = (("freeze-start", "NONE"), ("freeze-start", "FREEZE_BLOCKED"), ("freeze-continue", "FREEZE_INCOMPLETE"),
                  ("freeze-continue", "FREEZE_BLOCKED"), ("thaw", "FREEZE_BLOCKED"), ("snapshot", "SNAPSHOT_FAILED"),
                  ("verify-preservation", "VERIFY_FAILED"))
-# manifest/v3 bounds: the capture walk's entry and byte caps and the canonical header size.
+# manifest/v3 bounds: the capture walk's entry and byte caps, the canonical header size and the reason count.
 V3_MAX_ENTRIES = 200_000
 V3_MAX_BYTES = 1 << 31
 V3_MAX_HEADER = 2048
