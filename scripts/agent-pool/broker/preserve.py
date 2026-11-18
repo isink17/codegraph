@@ -227,7 +227,7 @@ def _entry_v3(e):
 
 def refusals_v3(es):
     """Eligibility refusals of a typed tree, whatever its Git content: a
-    worktree symlink (`symlink`), a symlink below a gitdir (`unknown`), and
+    worktree symlink (`symlink`), a symlink at or below a gitdir (`unknown`), and
     two paths APFS folds together (`name_alias`). Refusal only: an empty list
     makes nothing eligible."""
     out = {"unknown" if gitclass.is_git_path(bytes.fromhex(p)) else "symlink" for p, t, _, _ in es if t == "l"}

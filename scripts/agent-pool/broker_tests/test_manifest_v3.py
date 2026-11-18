@@ -4,6 +4,7 @@ schema dispatch and the eligibility refusals. Validation only: no decision
 reads a v3 manifest yet, so every v2 consumer refuses one. Inputs are built in
 memory; nothing reads a live path."""
 
+import itertools
 import types
 import unittest
 import unicodedata
@@ -305,16 +306,24 @@ class ManifestFields(Case):
         self.assertEqual((preserve.V3_MAX_HEADER, preserve.V3_MAX_BYTES, preserve.V3_MAX_ENTRIES,
                           preserve.V3_MAX_REASONS, journal.MAX_PATH_BYTES, journal.MAX_PATH_DEPTH),
                          (2048, 1 << 31, 200_000, 32, 4096, 64))
+        self.assertEqual((preserve.MAX_INDEX, preserve.MAX_INDEX_CHUNKS, preserve.MAX_ENTRIES, preserve.CHUNK_BYTES,
+                          journal.MAX_OBJECT), (512, 512, 4096, 49152, 49152))
 
     def test_walk(self):
         for walk in (["pass1", "pass2"], {"pass1": WALK, "pass2": "0" * 64}, {"pass1": WALK},
                      {"pass1": "x", "pass2": "x"},
-                     {"pass1": WALK, "pass2": WALK, "pass3": WALK}, [WALK, WALK]):
+                     {"pass1": WALK, "pass2": WALK, "pass3": WALK}, [WALK, WALK],
+                     {"pass1": WALK, "pass2": WALK + "0"}, {"pass1": WALK, "pass2": [WALK]}, 7,
+                     {"pass1": WALK, "pass3": WALK}):
             with self.subTest(walk):
                 self.bad_manifest(SAMPLE, walk=walk)
 
     def test_result_and_reasons(self):
         self.ok(SAMPLE, result="INCOMPLETE", reasons=["path_bound", "walk_gap"])
+        self.ok(SAMPLE, result="INCOMPLETE", reasons=["a" * 64])
+        for r in (["0abc"], ["_x"]):
+            with self.subTest(r):
+                self.bad_manifest(SAMPLE, result="INCOMPLETE", reasons=r)
         for result, reasons in (("COMPLETE", ["walk_gap"]), ("INCOMPLETE", []), ("PARTIAL", []),
                                 ("INCOMPLETE", ["b", "a"]), ("INCOMPLETE", ["a", "a"]), ("INCOMPLETE", ["A"]),
                                 ("INCOMPLETE", ["a" * 65]), ("INCOMPLETE", [1]),
@@ -382,7 +391,6 @@ class ManifestFields(Case):
                 lab.cy.manifest_v3(md, "final")
             else:
                 self.bad(lambda: lab.cy.manifest_v3(md, "final"))
-
 
 
 class Chunking(Case):
@@ -597,12 +605,27 @@ class Bindings(Case):
         m, es = self.lab.cy.manifest_v3(md, "final")
         self.assertTrue(self.lab.cy.content_v3(m, es))
         self.lab.mem.b[canonical.sha256(b"alpha")] = b"alphA"
-        self.assertFalse(self.lab.cy.content_v3(m, es))
+        self.assertIs(self.lab.cy.content_v3(m, es), False)
         del self.lab.mem.b[canonical.sha256(b"alpha")]
-        self.assertFalse(self.lab.cy.content_v3(m, es))
+        self.assertIs(self.lab.cy.content_v3(m, es), False)
         self.lab.blobs([b"alpha"])
         m2, es2 = self.ok(SAMPLE, totals=totals(SAMPLE, nbytes + 1))
         self.bad(lambda: self.lab.cy.content_v3(m2, es2))
+
+    def test_content_without_files(self):
+        """No `f` entry needs no blob: the content is complete when `bytes` is 0."""
+        for es in ([], [d("a"), link("a/l", b"t")]):
+            with self.subTest(len(es)):
+                m, got = self.ok(sorted(es))
+                self.assertIs(self.lab.cy.content_v3(m, got), True)
+        m, got = self.ok([d("a")], totals=dict(totals([d("a")]), bytes=1))
+        self.bad(lambda: self.lab.cy.content_v3(m, got))
+
+    def test_originals_are_not_content(self):
+        self.lab.blobs([b"x"])
+        es = [f("a", b"x")]
+        m, got = self.ok(es, "early", totals=totals(es, 1))
+        self.assertIs(self.lab.cy.content_v3(m, got), True)
 
     def test_symlink_target_is_never_resolved_as_content(self):
         self.lab.blobs([b"x"])
@@ -678,6 +701,9 @@ class Bindings(Case):
 
     def test_originals_values(self):
         self.lab.cy.manifest_v3(self.lab.manifest(SAMPLE, "early"), "early")
+        for o in ({}, {"owner": "0" * 64}):
+            with self.subTest(o):
+                self.lab.cy.manifest_v3(self.lab.manifest(SAMPLE, "early", originals=o), "early")
         for o in ({"owner": "zz"}, {"owner": "A" * 64}, {"owner": 1}, []):
             with self.subTest(o):
                 self.bad_manifest(SAMPLE, "early", originals=o)
@@ -714,6 +740,22 @@ class Dispatch(Case):
         self.assertEqual(preserve.accepted_schemas(oc.SYNTHETIC), (preserve.M_SCHEMA, V3))
         for mode in (None, "", "synthetic", "PROTECTED ", ["SYNTHETIC"], 1):
             self.assertEqual(preserve.accepted_schemas(mode), (), mode)
+
+        class Forged(str):
+            def __eq__(self, other):
+                return True
+            __hash__ = str.__hash__
+        for mode in (Forged(oc.PROTECTED), Forged(oc.SYNTHETIC)):
+            self.assertEqual(preserve.accepted_schemas(mode), ())
+
+    def test_v2_consumer_refuses_other_schema_strings(self):
+        for schema in ("", "codegraph.o5.manifest/", "codegraph.o5.manifest/v"):
+            with self.subTest(schema):
+                es = [[hx("a"), canonical.sha256(b"x")]]
+                md = self.lab.manifest(es, schema=schema, totals=DROP, walk=DROP)
+                bs = self.lab.put({"header": self.lab.hdr, "set": [canonical.sha256(b"x")]})
+                b = self.lab.put({"header": self.lab.hdr, "cycle_id": CID, "manifest": md, "blobs": bs})
+                self.bad(lambda: self.lab.cy.binding(b, "final"))
 
     def test_v3_is_validated_but_refused_by_the_v2_consumer(self):
         for es in (SAMPLE, []):
@@ -763,6 +805,82 @@ class Dispatch(Case):
                     self.bad(fn)
 
 
+class ClosedValues(Case):
+    """Every closed value is checked against the empty string, a proper
+    prefix, another case or length and a non-string, and every index split
+    but the greedy one refuses."""
+
+    def test_entry_fields_have_one_spelling(self):
+        good = {"f": ("0", "0" * 64), "d": ("-", "-"), "l": ("-", "74"), "u": ("fifo", "-")}
+        for t, (a, v) in good.items():
+            self.ok([[hx("a"), t, a, v]])
+            for e in ([[hx("a"), x, a, v] for x in ("", t.upper(), t + t)]
+                      + [[hx("a"), t, x, v] for x in ("", a + a, a[:-1] or "--")]
+                      + [[hx("a"), t, a, x] for x in ("", v[:-1] or "--", v + v if t != "l" else "7")]):
+                with self.subTest(e):
+                    self.bad_manifest([e])
+
+    def test_digests_are_exactly_64_hex(self):
+        for v in ("00", "0" * 62, "0" * 66, "0" * 128):
+            with self.subTest(len(v)):
+                self.bad_manifest([[hx("a"), "f", "0", v]])
+                self.bad_manifest(SAMPLE, walk={"pass1": v, "pass2": v})
+                self.bad_manifest(SAMPLE, "early", originals=dict(ORIGINALS, owner=v))
+
+    def test_manifest_and_object_strings_have_one_spelling(self):
+        for kw in ({"schema": ""}, {"schema": V3[:-3]}, {"schema": "codegraph.o5.manifest/"}, {"schema": 7},
+                   {"result": ""}, {"result": "INCOMPLET"}, {"result": 7}):
+            with self.subTest(kw):
+                self.bad_manifest(SAMPLE, **kw)
+        for read, stored in (("final", ""), ("final", "fin"), ("final", 7), ("early", "ear"), ("early", 7)):
+            with self.subTest((read, stored)):
+                m, _ = journal.parse(self.lab.mem.a[(CID, self.lab.manifest(SAMPLE, read))])
+                md = self.lab.put(dict(m, phase=stored))
+                self.bad(lambda: self.lab.cy.manifest_v3(md, read))
+        for chunk_kind, index_kind in (("", "entry_index"), ("entr", "entry_index"), (7, "entry_index"),
+                                       ("entries", ""), ("entries", "entry"), ("entries", 7)):
+            with self.subTest((chunk_kind, index_kind)):
+                cd = self.lab.put({"header": self.lab.hdr, "kind": chunk_kind, "n": 0, "entries": [d("a")]})
+                idx = self.lab.put({"header": self.lab.hdr, "kind": index_kind, "n": 0, "chunks": [cd]})
+                md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final", "entry_index": [idx],
+                                   "totals": totals([d("a")]), "walk": {"pass1": WALK, "pass2": WALK},
+                                   "result": "COMPLETE", "reasons": []})
+                self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
+
+    def test_originals_keys_and_totals_types(self):
+        for k in ("move", "own", "acls", "owner_"):
+            with self.subTest(k):
+                self.bad_manifest(SAMPLE, "early", originals={k: "0" * 64})
+        good = totals(SAMPLE)
+        for key in preserve.V3_TOTALS:
+            for v in (False, "", [], {}):
+                with self.subTest((key, v)):
+                    self.bad_manifest(SAMPLE, totals=dict(good, **{key: v}))
+            renamed = {(k + "s" if k == key else k): v for k, v in good.items()}
+            with self.subTest(("renamed", key)):
+                self.bad_manifest(SAMPLE, totals=renamed)
+
+    def test_only_the_greedy_index_split_is_accepted(self):
+        with mock.patch.object(preserve, "MAX_INDEX_CHUNKS", 2), mock.patch.object(preserve, "MAX_ENTRIES", 1):
+            es = [d("%d" % i) for i in range(5)]
+            cds = [self.lab.put({"header": self.lab.hdr, "kind": "entries", "n": n, "entries": [e]})
+                   for n, e in enumerate(es)]
+            for sizes in (s for k in range(1, 6) for s in itertools.product((1, 2), repeat=k) if sum(s) == 5):
+                idx, at = [], 0
+                for n, s in enumerate(sizes):
+                    idx.append(self.lab.put({"header": self.lab.hdr, "kind": "entry_index", "n": n,
+                                             "chunks": cds[at:at + s]}))
+                    at += s
+                md = self.lab.put({"schema": V3, "header": self.lab.hdr, "phase": "final", "entry_index": idx,
+                                   "totals": totals(es), "walk": {"pass1": WALK, "pass2": WALK},
+                                   "result": "COMPLETE", "reasons": []})
+                with self.subTest(sizes):
+                    if sizes == (2, 2, 1):
+                        self.lab.cy.manifest_v3(md, "final")
+                    else:
+                        self.bad(lambda: self.lab.cy.manifest_v3(md, "final"))
+
+
 class Eligibility(unittest.TestCase):
     def test_clean_tree_has_no_refusal(self):
         self.assertEqual(preserve.refusals_v3([tuple(e) for e in SAMPLE]), [])
@@ -791,6 +909,14 @@ class Eligibility(unittest.TestCase):
                 lab = Lab()
                 _, got = lab.cy.manifest_v3(lab.manifest(es), "final")
                 self.assertIn("name_alias", preserve.refusals_v3(got))
+
+    def test_nested_fold_collision(self):
+        nfc = unicodedata.normalize("NFC", "caf\u00e9").encode()
+        nfd = unicodedata.normalize("NFD", "caf\u00e9").encode()
+        for a, b in ((b"a/X", b"a/x"), (b"t/" + nfc, b"t/" + nfd), (b"p/q/R", b"p/q/r")):
+            with self.subTest((a, b)):
+                self.assertEqual(preserve.refusals_v3([tuple(e) for e in typed({a: b"1", b: b"2"})]),
+                                 ["name_alias"])
 
     def test_file_that_is_a_directory_elsewhere(self):
         es = [tuple(e) for e in sorted([f("A"), d("a"), d("a/x")])]
