@@ -20,7 +20,9 @@ MAX_OBJECT = 49152
 MAX_RECORDS = 4096
 MAX_ESCAPED = 4096
 ATTRS = ("owner", "mode", "acl", "flags")
-_PATH_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,2048}\Z")
+# One bound for every O5 path (U-1), equal to `fdwalk.Limits.max_path`.
+MAX_PATH_BYTES = 4096
+_PATH_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,%d}\Z" % MAX_PATH_BYTES)
 
 # kind -> keys beyond the common {schema, header, seq, prev, kind} (+ `early` from seq 1 on).
 KINDS = {"start": (), "move.done": ("linked",), "revoke.done": ("attr", "original"), "revoked": ("escaped",),

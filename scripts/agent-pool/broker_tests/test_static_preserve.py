@@ -18,7 +18,30 @@ ALLOWED_BROKER = {"barrier", "canonical", "evidence", "freeze", "gitbytes", "git
                   "o5contract", "protocol", "refusal"}
 ALLOWED_TOP = {"re", "hashlib", "unicodedata", "zlib", "recovery_state"}
 FORBIDDEN_NAMES = {"CommitTxn", "_issue", "_new_ingest", "_ISEAL", "_CSEAL", "_new_capability", "_SEAL", "_produce",
-                   "OwnerCapability", "IngestCapability"}
+                   "OwnerCapability", "IngestCapability", "EffectCap", "FsCap", "BodyCap", "RecordStore", "BlobStore",
+                   "fsprim", "fsstore", "fscap"}
+# The exact (module, names) each pure module imports: a new import is a reviewed change to this table.
+PINNED_IMPORTS = {
+    "journal.py": {("re", None), (".", "canonical"), (".", "o5contract"), (".", "protocol"), (".canonical", "is_hex64"),
+                   (".refusal", "Code"), (".refusal", "Refused")},
+    "preserve.py": {("re", None), ("recovery_state", None), *((".", m) for m in (
+        "barrier", "canonical", "evidence", "freeze", "gitclass", "journal", "libview", "o5contract", "protocol")),
+        (".canonical", "is_hex64"), *((".journal", n) for n in ("Mismatch", "need", "path_hex", "valid_component")),
+        (".refusal", "Code"), (".refusal", "Refused")},
+    "gitclass.py": {("hashlib", None), ("re", None), ("unicodedata", None), (".", "gitbytes"),
+                    *((".gitbytes", n) for n in ("HEX40", "HEX64", "HFS_IGNORED", "OBJECT_TYPES", "is_gitdir_name"))},
+    "gitbytes.py": {("hashlib", None), ("re", None), ("zlib", None)},
+}
+
+
+def imports(name):
+    out = set()
+    for node in ast.walk(ast.parse((BROKER / name).read_text(), name)):
+        if isinstance(node, ast.Import):
+            out |= {(a.name, None) for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            out |= {("." * node.level + (node.module or ""), a.name) for a in node.names}
+    return out
 FORBIDDEN_CALLS = {"put", "ingest", "revalidate", "finish", "confirm", "release", "kill", "unlink", "rename",
                    "write", "chmod", "chown", "chflags", "system", "popen"}
 
@@ -60,6 +83,12 @@ class Boundaries(unittest.TestCase):
                         t = t.value
                     if isinstance(t, ast.Attribute):
                         self.assertNotIn(t.attr, {"items", "docs", "data", "entries", "records"}, name)
+
+    def test_imports_are_pinned(self):
+        """No pure module, and not the shared `gitbytes` primitives, gains an
+        import without a reviewed change here."""
+        for name, want in PINNED_IMPORTS.items():
+            self.assertEqual(imports(name), want, name)
 
     def test_only_the_provider_constructs_sealed_results(self):
         for name, tree in trees():
