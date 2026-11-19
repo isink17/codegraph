@@ -183,6 +183,15 @@ attributes files anywhere (`.gitattributes`, `info/attributes`),
 skip-worktree, intent-to-add, split index, untracked cache, fsmonitor, sparse
 index, index version 4, conflicts and submodules.
 
+**`.git` names.** An index path or a tree entry name with a component that
+`gitbytes.is_gitdir_name` reads as `.git` is UNKNOWN (`malformed-index`,
+`malformed-object`). That is every case spelling (`.GIT`, `.Git`) and every
+spelling with the code points HFS+ ignores, as Git's `is_hfs_dotgit` does
+(U+200C..U+200F, U+202A..U+202E, U+206A..U+206F, U+FEFF), for example
+`.g<U+200C>it` and `<U+FEFF>.git`. The refusal holds on every volume,
+case-sensitive ones included (amended by #548; PR-3b uses the same predicate,
+see "Gitdir name and restorable gitdir").
+
 **Results.** CLEAN means only: HEAD's tree equals the index, every index entry
 exists with the same type, executable bit and content hash (computed from the
 bytes, never from stat data), and nothing else exists in the worktree except
@@ -338,7 +347,7 @@ Rules worth repeating:
   PR-4 needs a pre-effect eligibility check and an owner-authorized recovery
   path for such a slot. PR-3b provides neither.
 - PR-4 entry criterion (NB-16, owner, mandatory). Before PR-4 restore or
-  release is implemented, PR-4 must show with tests that all three hold for
+  release is implemented, PR-4 must show with tests that all five hold for
   every path of the slot (worktree, gitdirs and linked-worktree pointers):
   1. Capture distinguishes file types (regular, executable, directory,
      symbolic link) and records the type with each entry.
