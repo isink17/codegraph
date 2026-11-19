@@ -32,9 +32,23 @@ _CHANNEL = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _RESUME_INTENT = {"D-THAW-R": ("THAW_INTENT", ("D-THAW", "D-THAW-R")),
                   "D-SNAP-R": ("SNAPSHOT_INTENT", ("D-SNAP", "D-SNAP-R")),
                   "D-VERIFY-R": ("VERIFY_INTENT", ("D-VERIFY", "D-VERIFY-R"))}
-_FAILURE_ROWS = (("freeze-start", "NONE"), ("freeze-start", "FREEZE_BLOCKED"), ("freeze-continue", "FREEZE_INCOMPLETE"),
+# (freeze-start, NONE) is never one of them: `_check_none` accepts it only by its exact journal shape.
+_FAILURE_ROWS = (("freeze-start", "FREEZE_BLOCKED"), ("freeze-continue", "FREEZE_INCOMPLETE"),
                  ("freeze-continue", "FREEZE_BLOCKED"), ("thaw", "FREEZE_BLOCKED"), ("snapshot", "SNAPSHOT_FAILED"),
                  ("verify-preservation", "VERIFY_FAILED"))
+# D2.2 §17.3.4: the `journal/v3` record kinds each `freeze-start` NONE reason may be bound to, in order.
+_PRE_EP = ("start", "end")
+_AFTER_EP = ("start", "ep.done", "end")
+_ABORTED = ("start", "ep.done", "move.intent", "move.abort", "end")
+NONE_SHAPES = {"identity": (_PRE_EP, _AFTER_EP), "early_cap": (_PRE_EP, _AFTER_EP), "mount": (_PRE_EP, _AFTER_EP),
+               "early_unstable": (_AFTER_EP, _ABORTED), "not_preservable": (_AFTER_EP,),
+               "rename_failed": (_ABORTED,), "target_exists": (_ABORTED,)}
+# `codegraph.o5.originals/v1` (D2.2 §17.2, §17.3.5): one blob per attribute, at most the capture's per-file bound.
+O_SCHEMA = "codegraph.o5.originals/v1"
+MAX_ORIGINALS = 64 << 20
+MAX_ACL = 128
+_U32 = (1 << 32) - 1
+_GUID = re.compile(r"^[0-9a-f]{32}\Z")
 # manifest/v3 bounds: the capture walk's entry and byte caps, the canonical header size and the reason count.
 V3_MAX_ENTRIES = 200_000
 V3_MAX_BYTES = 1 << 31
@@ -225,17 +239,52 @@ def _entry_v3(e):
     return t == "u" and a in V3_UNSUPPORTED and v == "-"
 
 
+def _paths(es):
+    """`path_hex` of every entry, v2 or v3."""
+    return [e[0] for e in es]
+
+
+def _file_blobs(es):
+    """(path_hex, blob digest) of every regular file: each v2 entry, the `f`
+    entries of v3. Never a directory, symlink target or `u` entry."""
+    return [(e[0], e[-1]) for e in es if len(e) == 2 or e[1] == "f"]
+
+
 def refusals_v3(es):
     """Eligibility refusals of a typed tree, whatever its Git content: a
     worktree symlink (`symlink`), a symlink at or below a gitdir (`unknown`), and
     two paths APFS folds together (`name_alias`). Refusal only: an empty list
     makes nothing eligible."""
-    out = {"unknown" if gitclass.is_git_path(bytes.fromhex(p)) else "symlink" for p, t, _, _ in es if t == "l"}
+    out = {"unknown" if gitclass.is_git_path(bytes.fromhex(e[0])) else "symlink" for e in es if e[1] == "l"}
     # Every directory is an entry, so any alias (a name twice, a file that is a directory, a directory spelled two
     # ways) is two entries with one folded path.
-    if len({gitclass._fold(bytes.fromhex(p)) for p, _, _, _ in es}) < len(es):
+    if len({gitclass._fold(bytes.fromhex(p)) for p in _paths(es)}) < len(es):
         out.add("name_alias")
     return sorted(out)
+
+
+def _value_ok(attr, v):
+    """One attribute value in its §17.2 domain."""
+    if attr == "owner":
+        return type(v) is list and len(v) == 2 and all(type(x) is int and 0 <= x <= _U32 for x in v)
+    if attr == "mode":
+        return type(v) is int and 0 <= v <= 0o7777
+    if attr == "flags":
+        return type(v) is int and 0 <= v <= _U32
+    return type(v) is list and len(v) <= MAX_ACL and all(
+        type(a) is list and len(a) == 4 and type(a[1]) is str and bool(_GUID.match(a[1]))
+        and all(type(x) is int and 0 <= x <= _U32 for x in (a[0], a[2], a[3])) for a in v)
+
+
+def originals_ok(o, attr, n):
+    """A parsed `originals/v1` object for `attr` over an EP of `n` entries:
+    the closed key set, `n + 1` values (ordinal 0 the slot root), distinct
+    hex64 object keys and every value in its domain."""
+    vs = o.get("values") if type(o) is dict else None
+    return type(o) is dict and set(o) == {"schema", "attr", "n", "values"} and o["schema"] == O_SCHEMA \
+        and o["attr"] == attr and type(o["n"]) is int and o["n"] == n and type(vs) is list and len(vs) == n + 1 \
+        and all(type(x) is list and len(x) == 2 and is_hex64(x[0]) and _value_ok(attr, x[1]) for x in vs) \
+        and len({x[0] for x in vs}) == n + 1
 
 
 def item_id(category, manifest, n, members):
@@ -274,19 +323,36 @@ class _Cycle:
     def __init__(self, r, pre, cid, sctx):
         self.r, self.pre, self.cid, self.sctx = r, pre, cid, sctx
 
-    def obj(self, d, keys=None, code=Code.PROVENANCE_INSUFFICIENT, detail="evidence_unavailable"):
-        need(is_hex64(d), code, detail)
+    def obj(self, d, keys=None, code=Code.PROVENANCE_INSUFFICIENT, detail="evidence_unavailable", v3=False):
+        """With `v3` (manifest/v3 objects, D2.2 §16.2): only an absent object
+        is `evidence_unavailable`; a malformed digest, an oversize,
+        non-canonical or headerless object is `artifact_mismatch`."""
+        bad = (Code.STATE_UNKNOWN, "artifact_mismatch") if v3 else (code, detail)
+        need(is_hex64(d), *bad)
         data = self.r.artifact(self.cid, d)
         need(data is not None, code, detail)
-        o, h = journal.parse(data, code, detail)
+        o, h = journal.parse(data, *bad)
         need(h == d, Code.STATE_UNKNOWN, "artifact_mismatch")
+        need(type(o.get("header")) is dict or not v3, *bad)
         journal.check_header(self.pre, o.get("header"), self.cid, self.sctx)
         if keys is not None:
             need(set(o) == set(keys), Code.STATE_UNKNOWN, "artifact_mismatch")
         return o
 
     def journal(self, head):
-        return journal.walk(self.r, self.pre, head, self.cid, self.sctx)
+        """The verified journal prefix at `head`. A v3 journal past `ep.done`
+        is also checked against its EP: ordinals, range coverage and the
+        `originals` its revoke intents name (D2.2 §17.3.2)."""
+        j = journal.walk(self.r, self.pre, head, self.cid, self.sctx)
+        if j.v3 and j.ep is not None:
+            _, m, _, _ = self.binding_v3(j.ep, "early")
+            journal.check_v3(j, m["totals"]["entries"], m["originals"])
+        return j
+
+    def final_head(self, j):
+        """D2.2 §17.3.2 final-head probe: no record exists after the head, by
+        exact key."""
+        need(self.r.journal(self.cid, len(j.recs)) is None, Code.STATE_UNKNOWN, "journal_mismatch")
 
     def entries(self, m):
         """R4.1 §3.4 reconstruction: ordered index objects, ordered chunks,
@@ -341,7 +407,7 @@ class _Cycle:
         `manifest_chunks` one, and at most V3_MAX_ENTRIES entries."""
         out, chunks, dirs, hdr = [], [], set(), canonical.canon(m["header"])
         for i, d in enumerate(m["entry_index"]):
-            io = self.obj(d, ("header", "kind", "n", "chunks"))
+            io = self.obj(d, ("header", "kind", "n", "chunks"), v3=True)
             ch = io["chunks"]
             last = i == len(m["entry_index"]) - 1
             need(canonical.canon(io["header"]) == hdr and io["kind"] == "entry_index" and type(io["n"]) is int
@@ -349,7 +415,7 @@ class _Cycle:
                  and 1 <= len(ch) <= MAX_INDEX_CHUNKS and (len(ch) == MAX_INDEX_CHUNKS or last),
                  Code.STATE_UNKNOWN, "artifact_mismatch")
             for cd in ch:
-                co = self.obj(cd, ("header", "kind", "n", "entries"))
+                co = self.obj(cd, ("header", "kind", "n", "entries"), v3=True)
                 es = co["entries"]
                 need(canonical.canon(co["header"]) == hdr and co["kind"] == "entries" and type(co["n"]) is int
                      and co["n"] == len(chunks) and type(es) is list
@@ -374,7 +440,7 @@ class _Cycle:
         to the recomputed counts. `bytes` is only bound-checked here."""
         keys = {"schema", "header", "phase", "entry_index", "totals", "walk", "result", "reasons"} | (
             {"originals"} if phase == "early" else set())
-        m = self.obj(d)
+        m = self.obj(d, v3=True)
         need(keys <= set(m) <= keys | {"classifier_head"} and m["schema"] == M_SCHEMA_V3
              and M_SCHEMA_V3 in accepted_schemas(self.pre.mode) and phase in ("early", "final") and m["phase"] == phase
              and len(canonical.canon(m["header"])) <= V3_MAX_HEADER and type(m["header"]["g_pre"]) is int
@@ -417,7 +483,7 @@ class _Cycle:
     def _v2(self, md, phase):
         m = self.manifest(md, phase)
         es = self.entries(m)
-        return m, es, {x for _, x in es}
+        return m, es, {b for _, b in _file_blobs(es)}
 
     def _v3(self, md, phase):
         m, es = self.manifest_v3(md, phase)
@@ -425,13 +491,13 @@ class _Cycle:
 
     def _binding(self, d, phase, verify, read, exact=False):
         keys = ("header", "cycle_id", "manifest", "blobs") + (("reverified", "sealed_at") if verify else ())
-        b = self.obj(d, keys)
+        b = self.obj(d, keys, v3=exact)
         need(b["cycle_id"] == self.cid, Code.STATE_UNKNOWN, "cycle_binding")
         if verify:
             need(b["reverified"] is True and type(b["sealed_at"]) is int, Code.PROVENANCE_INSUFFICIENT,
                  "evidence_unavailable")
         m, es, contents = read(b["manifest"], phase)
-        bs = self.obj(b["blobs"], ("header", "set"))
+        bs = self.obj(b["blobs"], ("header", "set"), v3=exact)
         want = contents | (set(m["originals"].values()) if phase == "early" else set())
         need(bs["set"] == sorted(want), Code.STATE_UNKNOWN, "artifact_mismatch")
         if exact:
@@ -447,9 +513,41 @@ class _Cycle:
     def binding_v3(self, d, phase):
         """`binding` over a v3 `early` or `final` manifest; the blob set is the
         `f` values and the originals, never a symlink target, and every
-        header encodes exactly as the manifest's. Validation only:
-        no decision reads it yet, and the v3 verify binding is not defined."""
-        return self._binding(d, phase, False, self._v3, exact=True)
+        header encodes exactly as the manifest's. An `early` binding also
+        re-reads and checks every `originals` blob it names
+        (`originals_v3`). The v3 verify binding is not defined before PR-4e."""
+        out = self._binding(d, phase, False, self._v3, exact=True)
+        if phase == "early":
+            self.originals_v3(out[1])
+        return out
+
+    def bound(self, j, d, phase):
+        """`binding` or `binding_v3` by the schema of the cycle's journal: one
+        cycle has one schema, so the other manifest schema refuses."""
+        return (self.binding_v3 if j.v3 else self.binding)(d, phase)
+
+    def originals_v3(self, m):
+        """Every `originals` blob a v3 EP manifest names, re-read and re-hashed
+        from its bytes, parsed within MAX_ORIGINALS and checked by
+        `originals_ok`; ordinal 0 is the slot root (`header.root_id`) and
+        every attribute lists the same object keys. An absent blob is
+        `evidence_unavailable`; altered, oversize or invalid bytes are
+        `artifact_mismatch`. A partial attribute set is valid evidence of
+        irreversibility (`reversible`)."""
+        keys = None
+        for a in sorted(m["originals"]):
+            d = m["originals"][a]
+            data = self.r.blob(d)
+            need(data is not None, Code.PROVENANCE_INSUFFICIENT, "evidence_unavailable")
+            need(type(data) is bytes and len(data) <= MAX_ORIGINALS and canonical.sha256(data) == d,
+                 Code.STATE_UNKNOWN, "artifact_mismatch")
+            try:
+                o = protocol.parse_doc(data, MAX_ORIGINALS)
+            except Refused:
+                raise Mismatch(Code.STATE_UNKNOWN, "artifact_mismatch") from None
+            need(originals_ok(o, a, m["totals"]["entries"]) and o["values"][0][0] == self.pre.root_id
+                 and (keys is None or [x[0] for x in o["values"]] == keys), Code.STATE_UNKNOWN, "artifact_mismatch")
+            keys = [x[0] for x in o["values"]]
 
     def blobs(self, digests):
         """Every digest resolves and re-hashes; returns {digest: bytes} or None."""
@@ -463,17 +561,27 @@ class _Cycle:
 
     def assess(self, m, es, full):
         """Q1 from the raw capture (stored INCOMPLETE is trusted only to refuse;
-        COMPLETE needs every needed blob); Q2–Q5 from the captured Git bytes."""
-        a = Assessment()
-        git = [(bytes.fromhex(p), b) for p, b in es if gitclass.is_git_path(bytes.fromhex(p))]
-        got = self.blobs(sorted({b for _, b in es}) if full else sorted({b for _, b in git}))
+        COMPLETE needs every needed blob); Q2–Q5 from the captured Git bytes.
+        A v3 manifest gives the classifier every typed entry, adds the tree
+        refusals of `refusals_v3`, and its resolved `bytes` must equal the
+        files' lengths."""
+        a, v3 = Assessment(), m.get("schema") == M_SCHEMA_V3
+        fs = [(bytes.fromhex(p), b) for p, b in _file_blobs(es)]
+        git = [x for x in fs if gitclass.is_git_path(x[0])]
+        got = self.blobs(sorted({x[1] for x in (fs if full else git)}))
         a.q1 = "COMPLETE" if m["result"] == "COMPLETE" and got is not None else "INCOMPLETE"
-        files = {p: got[b] for p, b in git} if got is not None else {}
-        repos = gitclass.repositories(files, [bytes.fromhex(p) for p, _ in es])
-        a.q2, a.q3, a.q4, a.q5, a.reasons, a.head = gitclass.questions(repos, a.q1)
+        if v3 and full and got is not None:
+            need(sum(len(got[x[1]]) for x in fs) == m["totals"]["bytes"], Code.STATE_UNKNOWN, "artifact_mismatch")
+        files = {x[0]: got[x[1]] for x in git} if got is not None else {}
+        if v3:
+            repos = gitclass.repositories_typed(files, [(bytes.fromhex(e[0]), e[1]) for e in es])
+            tree, hk = refusals_v3(es), "classifier_head"
+        else:
+            repos, tree, hk = gitclass.repositories(files, [bytes.fromhex(p) for p in _paths(es)]), (), "head_resolved"
+        a.q2, a.q3, a.q4, a.q5, a.reasons, a.head = gitclass.questions(repos, a.q1, *((tree,) if v3 else ()))
         a.top = repos.get(b"")
-        if "head_resolved" in m:
-            need(m["head_resolved"] == a.head, Code.STATE_UNKNOWN, "artifact_mismatch")
+        if hk in m:
+            need(m[hk] == a.head, Code.STATE_UNKNOWN, "artifact_mismatch")
         return a
 
     def reversible(self, m, blobset):
@@ -554,7 +662,7 @@ class Preservation:
         """The EP binding of this cycle, consistent with the journal's `early`;
         assessed (Git bytes only, or every blob) when `full` is not None."""
         need(j.early == ep_d, Code.STATE_UNKNOWN, "barrier_binding")
-        b, m, es, bs = cy.binding(ep_d, "early")
+        b, m, es, bs = cy.bound(j, ep_d, "early")
         return m, es, bs, cy.assess(m, es, full) if full is not None else None
 
     def _library(self, pre, d, states):
@@ -638,7 +746,7 @@ class Preservation:
                 raise Mismatch(Code.PROVENANCE_INSUFFICIENT, "thaw_not_safe(journal_mismatch)") from None
             raise
         need(j.early == inputs["ep_manifest"] == inputs["original_blobs"], Code.STATE_UNKNOWN, "barrier_binding")
-        _, m, es, bs = cy.binding(inputs["ep_manifest"], "early")
+        _, m, es, bs = cy.bound(j, inputs["ep_manifest"], "early")
         originals = m["originals"]
         need(all(originals.get(a) == o for a, o in j.revoked_attrs.items()), Code.PROVENANCE_INSUFFICIENT,
              "thaw_not_safe(journal_mismatch)")
@@ -655,7 +763,7 @@ class Preservation:
         j = cy.journal(inputs["journal_head"])
         journal.require_revoked(j)
         m, es, bs, a = self._ep(cy, j, inputs["ep_manifest"], True)
-        journal.require_no_escaped(j, {p for p, _ in es})
+        journal.require_no_escaped(j, set(_paths(es)))
         rev = cy.reversible(m, bs)
         if not (rev and a.q4 == "COMPLETE" and a.q5 == "ELIGIBLE"):
             why = sorted(set(a.reasons) | ({"irreversible"} if not rev else set()) | (
@@ -674,7 +782,7 @@ class Preservation:
         j = cy.journal(inputs["journal_head"])
         journal.require_revoked(j)
         _, es, bs, _ = self._ep(cy, j, inputs["ep_manifest"])
-        journal.require_no_escaped(j, {p for p, _ in es})
+        journal.require_no_escaped(j, set(_paths(es)))
         need(cy.blobs(bs) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
         return cy, j, es
 
@@ -689,8 +797,8 @@ class Preservation:
         return self._D_SNAP(pre, inputs, selection)
 
     def _D_VERIFY(self, pre, inputs, selection):
-        cy, _, _ = self._snap_common(pre, inputs)
-        cy.binding(inputs["fs_manifest"], "final")
+        cy, j, _ = self._snap_common(pre, inputs)
+        cy.bound(j, inputs["fs_manifest"], "final")
         return {}
 
     def _D_VERIFY_R(self, pre, inputs, selection):
@@ -705,7 +813,7 @@ class Preservation:
         need(a.q4 == "COMPLETE", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(raw)")
         need(a.q5 == "ELIGIBLE", Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(recovery)")
         need(a.head is not None and a.head == ep_head, Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(head)")
-        members = {"dirty": [p for p, _ in ves if not gitclass.is_git_path(bytes.fromhex(p))],
+        members = {"dirty": [p for p, _ in _file_blobs(ves) if not gitclass.is_git_path(bytes.fromhex(p))],
                    "untracked": [], "ignored": [], "unpublished_commits": gitclass.unpublished_commit_items(a.top)}
         inv, preserved = inventory_items(vb["manifest"], vm["header"], members)
         need(inv is not None, Code.PROVENANCE_INSUFFICIENT, "preservation_incomplete(inventory_size)")
@@ -747,7 +855,7 @@ class Preservation:
             if e.detail in ("cycle_binding", "barrier_binding"):
                 raise
             raise Mismatch(Code.STATE_UNKNOWN, "artifact_mismatch") from None
-        need(cy.blobs(sorted({b for _, b in ves})) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
+        need(cy.blobs(sorted({b for _, b in _file_blobs(ves)})) is not None, Code.STATE_UNKNOWN, "artifact_mismatch")
         need(pdoc.get("artifact") == {"manifest": vb["manifest"], "blobs": vb["blobs"]}, Code.STATE_UNKNOWN,
              "preservation_binding")
         obs = self._ev(inputs, "final_observation", pre)
@@ -856,7 +964,7 @@ class Preservation:
             j = cy.journal(inputs["journal_head"])
             journal.require_revoked(j)
             _, es, _, _ = self._ep(cy, j, inputs["ep_manifest"])
-            journal.require_no_escaped(j, {p for p, _ in es})
+            journal.require_no_escaped(j, set(_paths(es)))
             need(type(cso["linked"]) is list and len(cso["linked"]) == 2 and cso["linked"][0] == 0o700
                  and j.linked is not None and cso["linked"][1] == j.linked, Code.QUIESCENCE_NOT_ESTABLISHED, "linked")
             iso = self._ev(inputs, "artifact_isolation", pre)["data"]
@@ -896,7 +1004,7 @@ class Preservation:
         protected = set(self._ep(cy, j, inputs["ep_manifest"])[2])
         bound = [inputs["ep_manifest"], inputs["journal_head"]]
         if "fs_manifest" in kinds:
-            protected |= set(cy.binding(inputs["fs_manifest"], "final")[3])
+            protected |= set(cy.bound(j, inputs["fs_manifest"], "final")[3])
             bound.append(inputs["fs_manifest"])
         if "fs_manifest_verified" in kinds:
             protected |= set(cy.binding(inputs["fs_manifest_verified"], "final", verify=True)[3])
@@ -978,10 +1086,13 @@ class Preservation:
             rc = cy.obj(b["reconcile"], ("header", "reconcile"), Code.STATE_UNKNOWN, "artifact_mismatch")
             need(type(rc["reconcile"]) is list, Code.STATE_UNKNOWN, "artifact_mismatch")
         row = (verb, res.value)
-        if row == ("freeze-start", "MOVED"):
+        if row == ("freeze-start", "NONE"):
+            self._check_none(pre, cy, res.reason, b)
+        elif row == ("freeze-start", "MOVED"):
             need("early" in b and "journal" in b, Code.STATE_UNKNOWN, "journal_required")
             j = cy.journal(b["journal"])
-            need(j.moved and not j.revoked, Code.STATE_UNKNOWN, "journal_mismatch")
+            need(j.moved and not j.revoked and (not j.v3 or j.recs[-1]["kind"] == "move.done"), Code.STATE_UNKNOWN,
+                 "journal_mismatch")
             m, es, bs, a = self._ep(cy, j, b["early"], True)
             need(cy.reversible(m, bs) and a.q4 == "COMPLETE" and a.q5 == "ELIGIBLE", Code.STATE_UNKNOWN,
                  "not_preservable")
@@ -993,12 +1104,14 @@ class Preservation:
         elif row == ("thaw", "NONE"):
             j = cy.journal(b["journal"])
             need(journal.thaw_complete(j), Code.STATE_UNKNOWN, "journal_mismatch")
+            if j.v3:
+                cy.final_head(j)
         elif row == ("snapshot", "SNAPSHOTTED"):
             need("journal" in b, Code.STATE_UNKNOWN, "journal_required")
             j = cy.journal(b["journal"])
             journal.require_revoked(j)
             _, ees, _, _ = self._ep(cy, j, b["early"])
-            _, fm, fes, _ = cy.binding(b["final"], "final")
+            _, fm, fes, _ = cy.bound(j, b["final"], "final")
             a = cy.assess(fm, fes, True)
             need(fm["result"] == "COMPLETE" and a.q4 == "COMPLETE", Code.STATE_UNKNOWN, "raw_incomplete")
             need(fes == ees, Code.STATE_UNKNOWN, "mutated")
@@ -1007,7 +1120,7 @@ class Preservation:
             j = cy.journal(b["journal"])
             journal.require_revoked(j)
             _, ees, ebs, _ = self._ep(cy, j, b["early"])
-            fb, fm, fes, fbs = cy.binding(b["final"], "final")
+            fb, fm, fes, fbs = cy.bound(j, b["final"], "final")
             vb, vm, ves, vbs = cy.binding(b["verify"], "final", verify=True)
             need(vb["manifest"] == fb["manifest"] and vb["blobs"] == fb["blobs"], Code.STATE_UNKNOWN,
                  "artifact_mismatch")
@@ -1020,3 +1133,25 @@ class Preservation:
                     journal.require_revoked(j)
         else:
             raise Mismatch(Code.STATE_UNKNOWN, "fresult_unlisted")
+
+    def _check_none(self, pre, cy, reason, b):
+        """D2.2 §17.3.4: a `freeze-start` NONE is accepted only bound to a
+        `journal/v3` of exactly its reason's shape with a final head, so no
+        `move.intent` without its `move.abort`, and no `move.done`, revoke or
+        thaw record, can stand behind it (Theorem N-7). A binding-free
+        store failure is accepted only while `seq 0` is absent."""
+        need(set(b) <= {"early", "journal"}, Code.STATE_UNKNOWN, "fresult_unlisted")
+        if reason in ("store_space", "store_error"):
+            need(not b and cy.r.journal(cy.cid, 0) is None, Code.STATE_UNKNOWN, "journal_mismatch")
+            return
+        need(reason in NONE_SHAPES and "journal" in b, Code.STATE_UNKNOWN, "journal_required")
+        j = cy.journal(b["journal"])
+        need(j.v3, Code.STATE_UNKNOWN, "journal_mismatch")
+        cy.final_head(j)
+        shape = tuple(r["kind"] for r in j.recs)
+        need(shape in NONE_SHAPES[reason] and j.end_rec["outcome"] == "none" and j.end_rec["reason"] == reason
+             and b.get("early") == (None if shape == _PRE_EP else j.early), Code.STATE_UNKNOWN, "journal_mismatch")
+        if reason == "not_preservable":
+            m, _, bs, a = self._ep(cy, j, b["early"], True)
+            need(not (cy.reversible(m, bs) and a.q4 == "COMPLETE" and a.q5 == "ELIGIBLE"), Code.STATE_UNKNOWN,
+                 "preservable")

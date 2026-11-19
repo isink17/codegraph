@@ -164,12 +164,13 @@ def parse_request(raw, entry, owner=None):
     return op, fields
 
 
-def parse_doc(raw):
+def parse_doc(raw, limit=MAX_DOC):
     """Strict parser for stored and displayed documents: the bytes must be
-    exactly CANON of an object in D, so CANON(parse_doc(b)) == b."""
+    exactly CANON of an object in D, so CANON(parse_doc(b)) == b. `limit`
+    raises the size bound for one caller's own larger objects."""
     if type(raw) is not bytes:
         raise Refused(Code.ENCODING)
-    if len(raw) > MAX_DOC:
+    if len(raw) > limit:
         raise Refused(Code.OVERSIZE)
     if any(not 0x20 <= c <= 0x7E for c in raw):
         raise Refused(Code.ENCODING)
