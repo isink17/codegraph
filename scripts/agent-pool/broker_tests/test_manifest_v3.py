@@ -22,6 +22,8 @@ V3 = preserve.M_SCHEMA_V3
 WALK = canonical.sha256(b"walk")
 ORIGINALS = {a: canonical.sha256(a.encode()) for a in journal.ATTRS}
 DROP = object()
+# The 16 code points HFS+ and APFS ignore in names, as CONTRACT.md lists them.
+HFS_IGNORABLE = [chr(c) for c in (*range(0x200C, 0x2010), *range(0x202A, 0x202F), *range(0x206A, 0x2070), 0xFEFF)]
 
 
 def hx(path):
@@ -338,6 +340,12 @@ class ManifestFields(Case):
         m, _ = self.ok(es)
         self.assertEqual(m["result"], "INCOMPLETE")
         self.bad_manifest(es, result="COMPLETE", reasons=[])
+
+    def test_unsupported_entry_named_like_git_is_valid(self):
+        for es in ([u(".gitkeep", "fifo")], [d(".git"), u(".git/p", "fifo")], [u(".github", "sock")]):
+            with self.subTest(es):
+                m, _ = self.ok(es)
+                self.assertEqual(m["result"], "INCOMPLETE")
 
     def test_totals(self):
         good = totals(SAMPLE)
@@ -708,6 +716,13 @@ class Bindings(Case):
             with self.subTest(o):
                 self.bad_manifest(SAMPLE, "early", originals=o)
 
+    def test_undefined_phase_refuses(self):
+        b = self.lab.binding(SAMPLE)
+        self.lab.cy.binding_v3(b, "final")
+        for phase in ("verify", "", "Final", "EARLY", None):
+            with self.subTest(phase):
+                self.bad(lambda: self.lab.cy.binding_v3(b, phase))
+
     def test_foreign_cycle(self):
         b = self.lab.binding(SAMPLE, cycle_id=CID2)
         self.bad(lambda: self.lab.cy.binding_v3(b, "final"), "cycle_binding")
@@ -1022,6 +1037,15 @@ class Eligibility(unittest.TestCase):
             with self.subTest(es):
                 self.assertEqual(preserve.refusals_v3([tuple(e) for e in sorted(es)]), ["name_alias"])
 
+    def test_symlink_below_every_gitdir_spelling_is_unknown(self):
+        for cp in HFS_IGNORABLE:
+            for name in (".g" + cp + "it", cp + ".git", ".GIT" + cp):
+                with self.subTest((hex(ord(cp)), name.index(cp))):
+                    es = [tuple(e) for e in sorted([d(name), link(name + "/x", b"t")])]
+                    self.assertEqual(preserve.refusals_v3(es), ["unknown"])
+                    es = [tuple(e) for e in sorted([d("w"), d("w/" + name), link("w/" + name + "/x", b"t")])]
+                    self.assertEqual(preserve.refusals_v3(es), ["unknown"])
+
     def test_file_that_is_a_directory_elsewhere(self):
         es = [tuple(e) for e in sorted([f("A"), d("a"), d("a/x")])]
         self.assertEqual(preserve.refusals_v3(es), ["name_alias"])
@@ -1038,6 +1062,11 @@ class Eligibility(unittest.TestCase):
             with self.subTest((a, b)):
                 self.assertEqual(preserve.refusals_v3([tuple(e) for e in typed({a: b"1", b: b"2"})]),
                                  ["name_alias"])
+
+    def test_distinct_accents_are_no_alias(self):
+        for a, b in (("cafe", "caf\u00e9"), ("resume", "r\u00e9sum\u00e9"), ("a", "\u00e1"), ("e", "e\u0301")):
+            with self.subTest((a, b)):
+                self.assertEqual(preserve.refusals_v3([tuple(e) for e in sorted([d(a), d(b)])]), [])
 
 
 def v3_effect_manifest(fx, s, phase, files):
