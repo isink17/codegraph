@@ -20,6 +20,7 @@ from .journal import Mismatch, need, path_hex, valid_component
 from .refusal import Code, Refused
 
 M_SCHEMA = "codegraph.o5.manifest/v2"
+M_SCHEMA_V3 = "codegraph.o5.manifest/v3"
 MAX_INDEX = 512
 MAX_INDEX_CHUNKS = 512
 MAX_ENTRIES = 4096
@@ -34,6 +35,25 @@ _RESUME_INTENT = {"D-THAW-R": ("THAW_INTENT", ("D-THAW", "D-THAW-R")),
 _FAILURE_ROWS = (("freeze-start", "NONE"), ("freeze-start", "FREEZE_BLOCKED"), ("freeze-continue", "FREEZE_INCOMPLETE"),
                  ("freeze-continue", "FREEZE_BLOCKED"), ("thaw", "FREEZE_BLOCKED"), ("snapshot", "SNAPSHOT_FAILED"),
                  ("verify-preservation", "VERIFY_FAILED"))
+# manifest/v3 bounds: the capture walk's entry and byte caps, the canonical header size and the reason count.
+V3_MAX_ENTRIES = 200_000
+V3_MAX_BYTES = 1 << 31
+V3_MAX_HEADER = 2048
+V3_MAX_REASONS = 32
+V3_TOTALS = ("entries", "files", "dirs", "links", "unsupported", "bytes")
+V3_COUNTED = {"f": "files", "d": "dirs", "l": "links", "u": "unsupported"}
+V3_UNSUPPORTED = frozenset({"fifo", "sock", "chr", "blk", "whiteout", "hardlink", "foreign_uid", "cross_device",
+                            "unreadable", "unstable", "oversize", "other"})
+_LINK_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,1024}\Z")
+_OID = re.compile(r"^[0-9a-f]{40}\Z")
+
+
+def accepted_schemas(mode):
+    """Manifest schemas a mode accepts: protected v3 only, synthetic v2 and v3
+    (until the v2 consumer is removed); any other mode none."""
+    if type(mode) is not str:
+        return ()
+    return {oc.SYNTHETIC: (M_SCHEMA, M_SCHEMA_V3), oc.PROTECTED: (M_SCHEMA_V3,)}.get(mode, ())
 
 
 # ------------------------------------------------------------------ resolver (R4 §3.2, R4.1 §4)
@@ -164,6 +184,60 @@ def chunks_of(header, category, manifest, members, limit):
     return out
 
 
+def manifest_chunks(header, entries):
+    """The v3 entry chunks in order: each chunk holds as many entries as fit
+    under MAX_ENTRIES and CHUNK_BYTES (canonical encoding with `header` and
+    its ordinal), every chunk but the last full. None past MAX_INDEX x
+    MAX_INDEX_CHUNKS chunks, or when one entry cannot fit an empty chunk
+    (the header and path bounds exclude that for a valid manifest)."""
+    out, cur, size = [], [], 0
+    for e in entries:
+        add = len(canonical.canon(e))
+        if cur and (len(cur) == MAX_ENTRIES or size + 1 + add > CHUNK_BYTES):
+            out.append(cur)
+            cur = []
+        if cur:
+            cur.append(e)
+            size += 1 + add
+            continue
+        if len(out) >= MAX_INDEX * MAX_INDEX_CHUNKS:
+            return None
+        size = len(canonical.canon({"header": header, "kind": "entries", "n": len(out), "entries": []})) + add
+        if size > CHUNK_BYTES:
+            return None
+        cur = [e]
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _entry_v3(e):
+    """One `[path_hex, type, attr, value]` entry of the closed v3 set."""
+    if type(e) is not list or len(e) != 4 or any(type(x) is not str for x in e) or not path_hex(e[0]):
+        return False
+    _, t, a, v = e
+    if t == "f":
+        return a in ("0", "x") and is_hex64(v)
+    if t == "d":
+        return a == "-" and v == "-"
+    if t == "l":
+        return a == "-" and bool(_LINK_HEX.match(v)) and b"\0" not in bytes.fromhex(v)
+    return t == "u" and a in V3_UNSUPPORTED and v == "-"
+
+
+def refusals_v3(es):
+    """Eligibility refusals of a typed tree, whatever its Git content: a
+    worktree symlink (`symlink`), a symlink at or below a gitdir (`unknown`), and
+    two paths APFS folds together (`name_alias`). Refusal only: an empty list
+    makes nothing eligible."""
+    out = {"unknown" if gitclass.is_git_path(bytes.fromhex(p)) else "symlink" for p, t, _, _ in es if t == "l"}
+    # Every directory is an entry, so any alias (a name twice, a file that is a directory, a directory spelled two
+    # ways) is two entries with one folded path.
+    if len({gitclass._fold(bytes.fromhex(p)) for p, _, _, _ in es}) < len(es):
+        out.add("name_alias")
+    return sorted(out)
+
+
 def item_id(category, manifest, n, members):
     """The id preimage excludes the header (N-R41-5): anyone can recompute it
     from the verified manifest digest and the member list."""
@@ -247,7 +321,9 @@ class _Cycle:
         keys = {"schema", "header", "phase", "entry_index", "result", "reasons"} | (
             {"originals"} if phase == "early" else set())
         m = self.obj(d)
+        # Every caller decides on v2 only, so a v3 manifest refuses here (v3 is validated, never decided on, yet).
         need(keys <= set(m) <= keys | {"questions", "head_resolved"} and m["schema"] == M_SCHEMA
+             and M_SCHEMA in accepted_schemas(self.pre.mode)
              and m["phase"] == phase and m["result"] in ("COMPLETE", "INCOMPLETE") and type(m["reasons"]) is list
              and all(type(x) is str for x in m["reasons"]) and (m["result"] == "INCOMPLETE") == bool(m["reasons"]),
              Code.STATE_UNKNOWN, "artifact_mismatch")
@@ -257,21 +333,123 @@ class _Cycle:
                  "artifact_mismatch")
         return m
 
-    def binding(self, d, phase, verify=False):
-        """(binding, manifest, entries, blob set) of an `early`, `final` or
-        `verify` binding object of this cycle (§3.2)."""
+    def _entries_v3(self, m):
+        """The typed v3 entries `(path_hex, type, attr, value)` of a manifest
+        `manifest_v3` checked, reconstructed like `entries` and also requiring:
+        every object's header encodes exactly as the manifest's, every proper
+        prefix of a path is a `d` entry, the chunk and index split is the
+        `manifest_chunks` one, and at most V3_MAX_ENTRIES entries."""
+        out, chunks, dirs, hdr = [], [], set(), canonical.canon(m["header"])
+        for i, d in enumerate(m["entry_index"]):
+            io = self.obj(d, ("header", "kind", "n", "chunks"))
+            ch = io["chunks"]
+            last = i == len(m["entry_index"]) - 1
+            need(canonical.canon(io["header"]) == hdr and io["kind"] == "entry_index" and type(io["n"]) is int
+                 and io["n"] == i and type(ch) is list
+                 and 1 <= len(ch) <= MAX_INDEX_CHUNKS and (len(ch) == MAX_INDEX_CHUNKS or last),
+                 Code.STATE_UNKNOWN, "artifact_mismatch")
+            for cd in ch:
+                co = self.obj(cd, ("header", "kind", "n", "entries"))
+                es = co["entries"]
+                need(canonical.canon(co["header"]) == hdr and co["kind"] == "entries" and type(co["n"]) is int
+                     and co["n"] == len(chunks) and type(es) is list
+                     and 1 <= len(es) <= MAX_ENTRIES and len(out) + len(es) <= V3_MAX_ENTRIES,
+                     Code.STATE_UNKNOWN, "artifact_mismatch")
+                for e in es:
+                    need(_entry_v3(e) and (not out or e[0] > out[-1][0]), Code.STATE_UNKNOWN, "artifact_mismatch")
+                    p = bytes.fromhex(e[0])
+                    parent, _, _ = p.rpartition(b"/")
+                    need(p.count(b"/") <= journal.MAX_PATH_DEPTH and all(valid_component(c) for c in p.split(b"/"))
+                         and (b"/" not in p or parent in dirs), Code.STATE_UNKNOWN, "artifact_mismatch")
+                    if e[1] == "d":
+                        dirs.add(p)
+                    out.append(tuple(e))
+                chunks.append(es)
+        need(chunks == manifest_chunks(m["header"], [list(e) for e in out]), Code.STATE_UNKNOWN, "artifact_mismatch")
+        return out
+
+    def manifest_v3(self, d, phase):
+        """(manifest, typed entries) of a v3 manifest of this cycle: the closed
+        key set and field rules, the header bound, the entries, and totals equal
+        to the recomputed counts. `bytes` is only bound-checked here."""
+        keys = {"schema", "header", "phase", "entry_index", "totals", "walk", "result", "reasons"} | (
+            {"originals"} if phase == "early" else set())
+        m = self.obj(d)
+        need(keys <= set(m) <= keys | {"classifier_head"} and m["schema"] == M_SCHEMA_V3
+             and M_SCHEMA_V3 in accepted_schemas(self.pre.mode) and phase in ("early", "final") and m["phase"] == phase
+             and len(canonical.canon(m["header"])) <= V3_MAX_HEADER and type(m["header"]["g_pre"]) is int
+             and type(m["entry_index"]) is list and len(m["entry_index"]) <= MAX_INDEX
+             and type(m["walk"]) is dict and set(m["walk"]) == {"pass1", "pass2"} and is_hex64(m["walk"]["pass1"])
+             and m["walk"]["pass1"] == m["walk"]["pass2"]
+             and m["result"] in ("COMPLETE", "INCOMPLETE") and type(m["reasons"]) is list
+             and len(m["reasons"]) <= V3_MAX_REASONS
+             and all(type(x) is str and _CHANNEL.match(x) for x in m["reasons"])
+             and m["reasons"] == sorted(set(m["reasons"])) and (m["result"] == "INCOMPLETE") == bool(m["reasons"])
+             and ("classifier_head" not in m or type(m["classifier_head"]) is str and _OID.match(m["classifier_head"])),
+             Code.STATE_UNKNOWN, "artifact_mismatch")
+        t = m["totals"]
+        need(type(t) is dict and set(t) == set(V3_TOTALS) and all(type(v) is int and v >= 0 for v in t.values())
+             and t["entries"] <= V3_MAX_ENTRIES and t["bytes"] <= V3_MAX_BYTES
+             and (m["result"] == "INCOMPLETE" or t["unsupported"] == 0), Code.STATE_UNKNOWN, "artifact_mismatch")
+        if phase == "early":
+            o = m["originals"]
+            need(type(o) is dict and all(k in journal.ATTRS and is_hex64(v) for k, v in o.items()), Code.STATE_UNKNOWN,
+                 "artifact_mismatch")
+        es = self._entries_v3(m)
+        counts = {k: 0 for k in V3_COUNTED.values()}
+        for e in es:
+            counts[V3_COUNTED[e[1]]] += 1
+        need(all(t[k] == n for k, n in counts.items()) and t["entries"] == len(es), Code.STATE_UNKNOWN,
+             "artifact_mismatch")
+        return m, es
+
+    def content_v3(self, m, es):
+        """Q1 content of a v3 tree: every `f` blob resolves and re-hashes and
+        their lengths sum to `totals.bytes`. False when a blob is missing or
+        corrupt; a resolved set with another sum is a mismatch."""
+        got = self.blobs(sorted({e[3] for e in es if e[1] == "f"}))
+        if got is None:
+            return False
+        need(sum(len(got[e[3]]) for e in es if e[1] == "f") == m["totals"]["bytes"], Code.STATE_UNKNOWN,
+             "artifact_mismatch")
+        return True
+
+    def _v2(self, md, phase):
+        m = self.manifest(md, phase)
+        es = self.entries(m)
+        return m, es, {x for _, x in es}
+
+    def _v3(self, md, phase):
+        m, es = self.manifest_v3(md, phase)
+        return m, es, {e[3] for e in es if e[1] == "f"}
+
+    def _binding(self, d, phase, verify, read, exact=False):
         keys = ("header", "cycle_id", "manifest", "blobs") + (("reverified", "sealed_at") if verify else ())
         b = self.obj(d, keys)
         need(b["cycle_id"] == self.cid, Code.STATE_UNKNOWN, "cycle_binding")
         if verify:
             need(b["reverified"] is True and type(b["sealed_at"]) is int, Code.PROVENANCE_INSUFFICIENT,
                  "evidence_unavailable")
-        m = self.manifest(b["manifest"], phase)
-        es = self.entries(m)
+        m, es, contents = read(b["manifest"], phase)
         bs = self.obj(b["blobs"], ("header", "set"))
-        want = {x for _, x in es} | (set(m["originals"].values()) if phase == "early" else set())
+        want = contents | (set(m["originals"].values()) if phase == "early" else set())
         need(bs["set"] == sorted(want), Code.STATE_UNKNOWN, "artifact_mismatch")
+        if exact:
+            need(canonical.canon(b["header"]) == canonical.canon(bs["header"]) == canonical.canon(m["header"]),
+                 Code.STATE_UNKNOWN, "artifact_mismatch")
         return b, m, es, bs["set"]
+
+    def binding(self, d, phase, verify=False):
+        """(binding, manifest, entries, blob set) of an `early`, `final` or
+        `verify` binding object of this cycle (§3.2). v2 only."""
+        return self._binding(d, phase, verify, self._v2)
+
+    def binding_v3(self, d, phase):
+        """`binding` over a v3 `early` or `final` manifest; the blob set is the
+        `f` values and the originals, never a symlink target, and every
+        header encodes exactly as the manifest's. Validation only:
+        no decision reads it yet, and the v3 verify binding is not defined."""
+        return self._binding(d, phase, False, self._v3, exact=True)
 
     def blobs(self, digests):
         """Every digest resolves and re-hashes; returns {digest: bytes} or None."""
