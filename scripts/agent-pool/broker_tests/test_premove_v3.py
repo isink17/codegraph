@@ -473,6 +473,16 @@ class SchemaIsolation(Base):
         self.rejected("freeze-start", "NONE", "not_preservable", "artifact_mismatch", early=b,
                       journal=self.j.prev)
 
+    def test_protected_mode_walks_v3_only(self):
+        rec = {"schema": journal.J_SCHEMA, "header": header(CID, root_id=ROOT, mode=oc.PROTECTED), "seq": 0,
+               "prev": oc.ZERO64, "kind": "start"}
+        self.mem.j[(CID, 0)] = canonical.canon(rec)
+        pre = types.SimpleNamespace(**dict(vars(PRE3), mode=oc.PROTECTED))
+        self.bad(lambda: journal.walk(self.mem, pre, H(self.mem.j[(CID, 0)]), CID, SCTX), "journal_mismatch")
+        rec["schema"] = V3
+        self.mem.j[(CID, 0)] = canonical.canon(rec)
+        self.assertTrue(journal.walk(self.mem, pre, H(self.mem.j[(CID, 0)]), CID, SCTX).v3)
+
     def test_v2_journal_never_carries_a_none(self):
         """A merged v2 cycle has no shape for any freeze-start NONE."""
         mem = self.mem
@@ -483,6 +493,12 @@ class SchemaIsolation(Base):
         for reason in preserve.NONE_SHAPES:
             with self.subTest(reason):
                 self.rejected("freeze-start", "NONE", reason, journal=head)
+        # A v2 `start`, `end` has the kinds of the v3 pre-EP shape.
+        end = dict(rec, seq=1, prev=head, kind="end", early=H(b"early"))
+        mem.j[(CID, 1)] = canonical.canon(end)
+        for reason in ("identity", "mount"):
+            with self.subTest(("v2 end", reason)):
+                self.rejected("freeze-start", "NONE", reason, journal=H(mem.j[(CID, 1)]))
 
 
 # ------------------------------------------------------------------ freeze-start NONE (T-J2, T-J3, T-J5, T-E*)
@@ -681,6 +697,18 @@ class AfterTheMove(Base):
         self.mem.j[(CID, self.j.seq + 1)] = b"{}"
         self.rejected("thaw", "NONE", journal=head)
 
+    def test_thaw_complete_needs_every_range(self):
+        """`thaw_complete` itself, over a view whose head is `end{thawed}` but
+        whose thaw ranges do not match the revoke ranges."""
+        view = types.SimpleNamespace(v3=True, end=True, end_rec={"outcome": "thawed"}, moved=True, thaw_moved=True,
+                                     ranges={a: [(0, 5, True)] for a in journal.ATTRS},
+                                     thaw_ranges={a: [(0, 5, True)] for a in journal.ATTRS})
+        self.assertTrue(journal.thaw_complete(view))
+        for bad in ({"owner": []}, {"mode": [(0, 4, True)]}, {"acl": [(0, 5, False)]}):
+            with self.subTest(bad):
+                v = types.SimpleNamespace(**dict(vars(view), thaw_ranges=dict(view.thaw_ranges, **bad)))
+                self.assertFalse(journal.thaw_complete(v))
+
     def test_thaw_none_without_revoke(self):
         """MOVED then thaw: no revoke range, only the move is reversed."""
         self.moved()
@@ -740,6 +768,19 @@ class Originals(Base):
                  Code.STATE_UNKNOWN)
         self.mem.b[o["flags"]] = b"not bytes".decode()
         self.bad(lambda: self.cy.binding_v3(self.ep(originals=o)[0], "early"), "artifact_mismatch")
+
+    def test_valid_bytes_under_another_digest(self):
+        """Canonical, `originals_ok` bytes stored under a digest they do not
+        hash to: only the re-hash refuses them (P1)."""
+        es = typed(REPO)
+        o = self.lab.originals(es)
+        other = canonical.canon({"schema": preserve.O_SCHEMA, "attr": "mode", "n": len(es),
+                                 "values": [[ROOT, 0o600]] + [[H(b"object|%d" % i), 0o600]
+                                                              for i in range(1, len(es) + 1)]})
+        self.assertTrue(preserve.originals_ok(protocol.parse_doc(other), "mode", len(es)))
+        self.mem.b[o["mode"]] = other
+        self.bad(lambda: self.cy.binding_v3(self.ep(originals=o)[0], "early"), "artifact_mismatch",
+                 Code.STATE_UNKNOWN)
 
     def test_substituted_blob_of_another_attribute(self):
         es = typed(REPO)
