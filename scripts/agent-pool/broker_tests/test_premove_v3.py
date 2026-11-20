@@ -914,6 +914,58 @@ class Originals(Base):
         self.bad(lambda: self.cy.binding_v3(self.ep(originals=o)[0], "early"), "artifact_mismatch",
                  Code.STATE_UNKNOWN)
 
+    def complete_cycle(self, o):
+        """A complete EP with originals `o`, moved, revoked over all four
+        attributes and thawed; returns (ep, revoked head, thawed head)."""
+        ep, es = self.ep(originals=o)
+        self.j.start()
+        self.j.ep(ep)
+        self.j.move()
+        self.j.moved()
+        n = len(es)
+        self.j.revoke(n, o)
+        revoked = self.j.add("revoked", escaped=[])
+        thawed = self.j.thaw([(a, 0, n) for a in journal.THAW_ORDER])
+        return ep, revoked, thawed
+
+    def test_every_attribute_is_checked(self):
+        """An absent blob, or a hash-valid one that fails `originals_ok`, for
+        each attribute in turn: the EP read refuses, and so do REVOKED,
+        thaw NONE and MOVED over it."""
+        es = typed(REPO)
+        esc = canonical.digest({"escaped": []})
+        eligible = (["symref"], "VERIFIED", "COMPLETE", "ELIGIBLE", [], "a" * 40)
+        for attr in journal.ATTRS:
+            for how, detail in (("absent", "evidence_unavailable"), ("invalid", "artifact_mismatch")):
+                with self.subTest((attr, how)):
+                    self.setUp()
+                    o = self.lab.originals(es)
+                    if how == "absent":
+                        o[attr] = H(b"never written|" + attr.encode())
+                    else:
+                        bad = originals_blobs(self.lab.blob, len(es), root=H(b"another root"), attrs=(attr,))
+                        o[attr] = bad[attr]
+                    ep, revoked, thawed = self.complete_cycle(o)
+                    self.bad(lambda: self.cy.binding_v3(ep, "early"), detail)
+                    self.rejected("freeze-continue", "REVOKED", detail=detail, early=ep, journal=revoked,
+                                  escaped=esc)
+                    self.rejected("thaw", "NONE", detail=detail, journal=thawed)
+                    with mock.patch.object(gitclass, "questions", lambda *a: eligible):
+                        self.rejected("freeze-start", "MOVED", detail=detail, early=ep, journal=self.j.prev)
+
+    def test_thaw_none_needs_a_completed_thaw(self):
+        """thaw NONE bound to a final head that is not `end{thawed}`."""
+        es = typed(REPO)
+        ep, es2 = self.ep()
+        self.j.start()
+        self.j.ep(ep)
+        self.j.move()
+        self.j.moved()
+        self.j.revoke(len(es2), self.lab.originals(es2))
+        head = self.j.add("revoked", escaped=[])
+        self.rejected("thaw", "NONE", journal=head)
+        self.assertEqual(len(es), len(es2))
+
     def test_substituted_blob_of_another_attribute(self):
         es = typed(REPO)
         o = self.lab.originals(es)
