@@ -22,6 +22,8 @@ V3 = preserve.M_SCHEMA_V3
 WALK = canonical.sha256(b"walk")
 ORIGINALS = {a: canonical.sha256(a.encode()) for a in journal.ATTRS}
 DROP = object()
+ROOT = canonical.sha256(b"root|s")
+PRE3 = types.SimpleNamespace(**dict(vars(PRE), root_id=ROOT))
 # The 16 code points HFS+ and APFS ignore in names, as CONTRACT.md lists them.
 HFS_IGNORABLE = [chr(c) for c in (*range(0x200C, 0x2010), *range(0x202A, 0x202F), *range(0x206A, 0x2070), 0xFEFF)]
 
@@ -52,6 +54,15 @@ def typed(files):
     return sorted([d(x) for x in dirs] + [f(p, v) for p, v in files.items()])
 
 
+def originals_blobs(put, n, root=ROOT, attrs=journal.ATTRS):
+    """Valid `originals/v1` blobs for an EP of `n` entries, stored through
+    `put` (bytes -> digest); ordinal 0 is the slot root."""
+    keys = [root] + [canonical.sha256(b"object|%d" % i) for i in range(1, n + 1)]
+    value = {"owner": [501, 20], "mode": 0o644, "flags": 0, "acl": []}
+    return {a: put(canonical.canon({"schema": preserve.O_SCHEMA, "attr": a, "n": n,
+                                    "values": [[k, value[a]] for k in keys]})) for a in attrs}
+
+
 def kind(e):
     return e[1] if type(e) is list and len(e) > 1 else None
 
@@ -80,9 +91,9 @@ def build(put, hdr, entries, phase="final", chunks=None, per_index=512, **fields
 class Lab:
     """One cycle's in-memory artifacts and blobs, and the `_Cycle` reading them."""
 
-    def __init__(self, pre=PRE, cid=CID):
+    def __init__(self, pre=PRE3, cid=CID):
         self.mem, self.cid = Mem(), cid
-        self.hdr = header(cid, slot=pre.slot)
+        self.hdr = header(cid, slot=pre.slot, root_id=pre.root_id)
         self.cy = preserve._Cycle(self.mem, pre, cid, SCTX)
 
     def put(self, o, cid=None):
@@ -90,6 +101,13 @@ class Lab:
         h = canonical.sha256(data)
         self.mem.a[(cid or self.cid, h)] = data
         return h
+
+    def blob(self, data):
+        self.mem.b[canonical.sha256(data)] = data
+        return canonical.sha256(data)
+
+    def originals(self, entries):
+        return originals_blobs(self.blob, len(entries), self.hdr["root_id"])
 
     def blobs(self, contents):
         for c in contents:
@@ -100,8 +118,10 @@ class Lab:
         return build(self.put, self.hdr, entries, phase, **kw)
 
     def binding(self, entries, phase="final", blobs=None, cycle_id=None, **kw):
+        if phase == "early" and "originals" not in kw:
+            kw["originals"] = self.originals(entries)
         md = self.manifest(entries, phase, **kw)
-        want = {e[3] for e in entries if e[1] == "f"} | (set(ORIGINALS.values()) if phase == "early" else set())
+        want = {e[3] for e in entries if e[1] == "f"} | (set(kw["originals"].values()) if phase == "early" else set())
         bs = self.put({"header": self.hdr, "set": sorted(want) if blobs is None else blobs})
         return self.put({"header": self.hdr, "cycle_id": cycle_id or self.cid, "manifest": md, "blobs": bs})
 
@@ -120,11 +140,12 @@ class Case(unittest.TestCase):
         return self.lab.cy.manifest_v3(self.lab.manifest(entries, phase, **kw), phase)
 
     def bad(self, fn, detail="artifact_mismatch"):
-        """`detail=None`: an over-bound or headerless object, which the merged
-        reader refuses before any v3 rule (`evidence_unavailable`)."""
+        """An over-bound, non-canonical or headerless v3 object is malformed,
+        so `artifact_mismatch` like every other §16.2 violation; only an
+        absent object is `evidence_unavailable`."""
         with self.assertRaises(Mismatch) as e:
             fn()
-        self.assertEqual(e.exception.detail, detail or "evidence_unavailable")
+        self.assertEqual(e.exception.detail, detail)
         if e.exception.detail == "artifact_mismatch":
             self.assertIs(e.exception.code, Code.STATE_UNKNOWN)
 
@@ -172,7 +193,7 @@ class ValidTrees(Case):
         self.assertTrue(self.lab.cy.content_v3(m, es))
         early = self.lab.binding(SAMPLE, "early", totals=totals(SAMPLE, nbytes))
         self.assertEqual(self.lab.cy.binding_v3(early, "early")[3],
-                         sorted({e[3] for e in SAMPLE if e[1] == "f"} | set(ORIGINALS.values())))
+                         sorted({e[3] for e in SAMPLE if e[1] == "f"} | set(self.lab.originals(SAMPLE).values())))
 
     def test_classifier_head_is_optional_and_exact(self):
         self.ok(SAMPLE, classifier_head="a" * 40)
@@ -286,7 +307,7 @@ class ManifestFields(Case):
     def test_closed_keys(self):
         for key in ("schema", "header", "phase", "entry_index", "totals", "walk", "result", "reasons"):
             with self.subTest(key):
-                self.bad_manifest(SAMPLE, detail=None if key == "header" else "artifact_mismatch", **{key: DROP})
+                self.bad_manifest(SAMPLE, **{key: DROP})
         self.bad_manifest(SAMPLE, originals=ORIGINALS)
         self.bad_manifest(SAMPLE, "early", originals=DROP)
         self.bad_manifest(SAMPLE, "early", originals={"xattr": "0" * 64})
@@ -603,7 +624,7 @@ class Chunking(Case):
 
     def test_oversized_chunk_refuses(self):
         es = [f("%05d" % i) for i in range(1200)]
-        self.bad_manifest(es, chunks=[es], detail=None)
+        self.bad_manifest(es, chunks=[es])
 
 
 class Bindings(Case):
@@ -653,13 +674,13 @@ class Bindings(Case):
     def test_boolean_header_value_refuses(self):
         """`g_pre` spelled `true` binds `pre.g_pre == 1` under ==, so v3 checks its type."""
         lab = Lab()
-        lab.hdr = header(g_pre=True)
+        lab.hdr = header(g_pre=True, root_id=ROOT)
         md = lab.manifest(SAMPLE)
         self.bad(lambda: lab.cy.manifest_v3(md, "final"))
         lab = Lab()
         md = lab.manifest(SAMPLE)
         m = lab.cy.manifest_v3(md, "final")[0]
-        bad_hdr = header(g_pre=True)
+        bad_hdr = header(g_pre=True, root_id=ROOT)
         chunks = preserve.manifest_chunks(lab.hdr, SAMPLE)
         for chunk_hdr, index_hdr in ((bad_hdr, lab.hdr), (lab.hdr, bad_hdr)):
             cds = [lab.put({"header": chunk_hdr, "kind": "entries", "n": n, "entries": c})
@@ -694,10 +715,10 @@ class Bindings(Case):
         `g_pre` on the binding or blob-set object refuses."""
         for phase in ("early", "final"):
             lab = Lab()
-            md = lab.manifest(SAMPLE, phase)
-            bad = header(g_pre=True)
-            want = sorted({e[3] for e in SAMPLE if e[1] == "f"} | (set(ORIGINALS.values()) if phase == "early"
-                                                                    else set()))
+            o = lab.originals(SAMPLE) if phase == "early" else {}
+            md = lab.manifest(SAMPLE, phase, **({"originals": o} if o else {}))
+            bad = header(g_pre=True, root_id=ROOT)
+            want = sorted({e[3] for e in SAMPLE if e[1] == "f"} | set(o.values()))
             for bh, sh in ((lab.hdr, lab.hdr), (bad, lab.hdr), (lab.hdr, bad), (bad, bad)):
                 bs = lab.put({"header": sh, "set": want})
                 b = lab.put({"header": bh, "cycle_id": CID, "manifest": md, "blobs": bs})
@@ -1075,9 +1096,10 @@ def v3_effect_manifest(fx, s, phase, files):
         fx.blob(v)
     es = typed(files)
     hdr = fx.header(s)
-    md = build(lambda o: fx.obj(s, o), hdr, es, phase, originals=s["originals"] if phase == "early" else DROP,
+    o = originals_blobs(fx.blob, len(es), s["root_id"]) if phase == "early" else {}
+    md = build(lambda x: fx.obj(s, x), hdr, es, phase, originals=o if phase == "early" else DROP,
                totals=totals(es, sum(len(v) for v in files.values())))
-    want = {e[3] for e in es if e[1] == "f"} | (set(s["originals"].values()) if phase == "early" else set())
+    want = {e[3] for e in es if e[1] == "f"} | set(o.values())
     bs = fx.obj(s, {"header": hdr, "set": sorted(want)})
     return fx.obj(s, {"header": hdr, "cycle_id": s["cid"], "manifest": md, "blobs": bs}), md, bs
 

@@ -20,7 +20,7 @@ RELATION = {
     "freeze-start": (("NONE",), "MOVE_INTENT", {
         "MOVED": (("",), ("early",)),
         "NONE": (("early_unstable", "early_cap", "unsupported_layout", "mount", "store_space", "store_error",
-                  "identity", "rename_failed", "target_exists"), ()),
+                  "identity", "rename_failed", "target_exists", "not_preservable"), ()),
         "FREEZE_BLOCKED": (("identity_swap", "identity"), ())}),
     "freeze-continue": (("MOVED", "FREEZE_INCOMPLETE", "FREEZE_BLOCKED"), "REVOKE_INTENT", {
         "REVOKED": (("",), ("early", "journal")),

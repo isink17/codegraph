@@ -127,10 +127,13 @@ class Tables(unittest.TestCase):
                     self.assertEqual(preserve.decision_cell(pre), spec.decision if spec else None)
 
     def test_failure_rows_are_the_relation_failures(self):
+        """(freeze-start, NONE) has its own exact check and is never a failure
+        row: a failure row only walks a bound journal."""
         rel = {(v, val) for v, spec in freeze.RELATION.items() for val in spec[2]}
         success = {("freeze-start", "MOVED"), ("freeze-continue", "REVOKED"), ("thaw", "NONE"),
                    ("snapshot", "SNAPSHOTTED"), ("verify-preservation", "VERIFIED")}
-        self.assertEqual(set(preserve._FAILURE_ROWS) | success, rel)
+        self.assertNotIn(("freeze-start", "NONE"), preserve._FAILURE_ROWS)
+        self.assertEqual(set(preserve._FAILURE_ROWS) | success | {("freeze-start", "NONE")}, rel)
 
 
 if __name__ == "__main__":

@@ -41,8 +41,10 @@ _TIME_MAX = (1 << 63) - 1
 _MULTILINE = frozenset({b"gpgsig", b"gpgsig-sha256", b"mergetag"})
 
 # Q4 INCOMPLETE: the bytes do not form a repository PR-3b can vouch for.
+# `name_alias`: two typed entries one case- and normalization-insensitive volume opens as one.
 DEFECTS = frozenset({"malformed_config", "missing_head", "malformed_head", "malformed_ref", "malformed_packed",
-                     "oversize_ref", "unsupported_object_format", "missing_object", "corrupt_object", "unknown"})
+                     "oversize_ref", "unsupported_object_format", "missing_object", "corrupt_object", "unknown",
+                     "name_alias"})
 # Q4 INCOMPLETE(git_external): objects or administration live outside the captured tree.
 EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE: preserved as bytes, never claimed recoverable through Git.
@@ -52,8 +54,9 @@ EXTERNAL = frozenset({"alternates", "gitlink_file", "commondir", "config_include
 # `refs_dir`: no captured path lies under `refs/`, so a restore of the
 # untyped manifest (files only) has no `refs` directory, Git rejects the
 # gitdir and may discover another repository instead (CONTRACT.md, B-1).
+# `symlink`: a worktree symbolic link, recorded but never restored (OD-P4-1).
 UNSUPPORTED = frozenset({"reftable", "sha256", "extensions", "shallow", "grafts", "replace_refs", "promisor",
-                         "submodule_gitdir", "git_head", "unborn_head", "commit_graph", "refs_dir"})
+                         "submodule_gitdir", "git_head", "unborn_head", "commit_graph", "refs_dir", "symlink"})
 # Q3 INCOMPLETE and Q5 NOT_ELIGIBLE, Q4 unchanged (owner amendment R4.2 to
 # R2 K7 / R4 §5.2 / P2). `packed`: a consistent pack index lists a reachable
 # object, even one with a verified loose copy, because Git reads a pack before
@@ -525,6 +528,58 @@ _ADMIN_FOLDED = frozenset(_fold(a) for a in _ADMIN)
 _ADMIN_DIRS = frozenset({b"info", b"modules", b"objects", b"objects/info", b"objects/info/commit-graphs",
                          b"objects/pack", b"objects/pack/multi-pack-index.d", b"refs", b"refs/heads",
                          b"refs/replace", b"reftable"})
+_GITDIR_SHAPE = ((b"HEAD", "f"), (b"objects", "d"), (b"refs", "d"))
+_BARE_HEAD, _BARE_COMMONDIR, _BARE_OBJECTS, _BARE_REFS = (_fold(n) for n in (b"HEAD", b"commondir", b"objects",
+                                                                             b"refs"))
+
+
+def gitdir_shape(kinds, gitdir):
+    """Git's `is_git_directory` as typed entries show it (D2.2 §5.3, §14.5):
+    `gitdir` is a `d` with `HEAD` an `f` and `objects` and `refs` `d`s below
+    it. `kinds` maps every entry path to its type."""
+    return kinds.get(gitdir) == "d" and all(kinds.get(gitdir + b"/" + n) == t for n, t in _GITDIR_SHAPE)
+
+
+def bare_shape(typed):
+    """Worktree directories (the slot root `b""` and every `d` with no gitdir
+    component) Git could open as a bare repository (D2.2 §16.7): a direct
+    child of any type folding to `HEAD` or `commondir`, or children folding to
+    both `objects` and `refs`. Directories inside a gitdir are not origins."""
+    origins = {b""} | {p for p, t in typed if t == "d" and git_index(p.split(b"/")) is None}
+    kids = {}
+    for p, _ in typed:
+        parent, _, name = p.rpartition(b"/")
+        if parent in origins:
+            kids.setdefault(parent, set()).add(_fold(name))
+    return sorted(d for d, ns in kids.items()
+                  if _BARE_HEAD in ns or _BARE_COMMONDIR in ns or {_BARE_OBJECTS, _BARE_REFS} <= ns)
+
+
+def repositories_typed(files, typed):
+    """`repositories` over a typed tree (D2.2 §14.5). `typed` lists `(path,
+    type)` for every entry; `files` holds the bytes of its `f` entries below
+    a gitdir. On top of the merged rules (NB-13 and B-1 unrelaxed: an entry
+    of any type at an `_ADMIN_DIRS` name is `unknown`): an entry of any type
+    with a gitdir component defines a root; that root is `unknown` unless its
+    gitdir is the exact `.git` with `gitdir_shape`, and so is a root with a
+    `l` or `u` entry anywhere below its gitdir; a worktree directory with
+    `bare_shape` is `unknown`. Refusal only."""
+    kinds = dict(typed)
+    # `repositories` folds file paths; a directory is a prefix of them, and an empty one is in `refusals_v3`.
+    repos = repositories(files, [p for p, t in typed if t != "d"])
+    for p, t in typed:
+        parts = p.split(b"/")
+        i = git_index(parts)
+        if i is None:
+            continue
+        root, sub = b"/".join(parts[:i]), b"/".join(parts[i + 1:])
+        r = repos.setdefault(root, Repo(root))
+        if not gitdir_shape(kinds, b"/".join(parts[:i] + [b".git"])) or t in ("l", "u") or sub in _ADMIN_DIRS \
+                or _fold(sub) in _ADMIN_FOLDED and sub not in _ADMIN:
+            r.features.add("unknown")
+    for d in bare_shape(typed):
+        repos.setdefault(d, Repo(d)).features.add("unknown")
+    return repos
 
 
 def classify(root, files):
@@ -600,11 +655,13 @@ def classify(root, files):
     return r
 
 
-def questions(repos, q1):
+def questions(repos, q1, tree=()):
     """(q2 features, q3, q4, q5, reasons, head) for the captured tree. `repos`
     maps a repository root to its Repo; the slot's own repository is the root
-    `b""`. Unknown never succeeds; one finding never hides another."""
-    feats = set()
+    `b""`; `tree` adds findings of the whole tree (a typed manifest's
+    `symlink`, `unknown` and `name_alias`). Unknown never succeeds; one
+    finding never hides another."""
+    feats = set(tree)
     for root, r in repos.items():
         feats |= r.features | ({"nested"} if root else set())
     top = repos.get(b"")
