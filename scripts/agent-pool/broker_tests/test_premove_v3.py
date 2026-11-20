@@ -136,7 +136,7 @@ class Base(unittest.TestCase):
         return self.cy.journal(head)
 
 
-# ------------------------------------------------------------------ journal/v3 grammar (T-J1, T-J4, T-J9)
+# ------------------------------------------------------------------ journal/v3 grammar
 
 class Grammar(Base):
     def full(self, files=None):
@@ -214,7 +214,7 @@ class Grammar(Base):
         self.j.start()
         self.j.ep(ep)
         self.j.move()
-        self.negative(self.j.move)  # T-J4: a second intent
+        self.negative(self.j.move)  # a second intent
         for bad in ({"src_name": "2f".join(["61", "62"])}, {"dst_name": ""}, {"src_parent": "X" * 64},
                     {"dst_name": b"..".hex()}, {"root": 7}):
             with self.subTest(bad):
@@ -404,7 +404,7 @@ class Grammar(Base):
         self.negative(lambda: self.j.revoke(n, o, ("acl",)))
 
     def test_thaw_of_an_open_revoke_range(self):
-        """Thaw after FREEZE_INCOMPLETE: the open range is thawed too (T-J7)."""
+        """Thaw after FREEZE_INCOMPLETE: the open range is thawed too."""
         n, o = self.revoke_prefix()
         self.j.revoke(n, o, ("flags",))
         self.j.add("revoke.intent", attr="acl", lo=0, hi=n, originals=o["acl"])
@@ -433,6 +433,63 @@ class Grammar(Base):
                 self.setUp()
                 ep, _ = self.ep()
                 self.negative(build)
+
+    def test_layout_prev_seq_and_schema(self):
+        """The chain, the `seq` value and the schema of every record."""
+        for build in (lambda: (self.j.start(), self._raw(1, prev=H(b"not the start")))[1],
+                      lambda: self._raw(0, kind="start", prev=H(b"x"), early=None),
+                      lambda: (self.j.start(), self._raw(1, seq=2))[1],
+                      lambda: (self.j.start(), self._raw(1, schema=journal.J_SCHEMA))[1]):
+            with self.subTest(build):
+                self.setUp()
+                self.negative(build)
+
+    def _raw(self, key, kind="end", prev=None, seq=None, schema=V3, early=oc.ZERO64):
+        """Writes one record at `key` with chosen layout fields."""
+        rec = {"schema": schema, "header": header(CID, root_id=ROOT), "seq": key if seq is None else seq,
+               "prev": self.j.prev if prev is None else prev, "kind": kind}
+        if kind == "end":
+            rec.update(outcome="none", reason="identity")
+        if early is not None and key:
+            rec["early"] = early
+        data = canonical.canon(rec)
+        self.mem.j[(CID, key)] = data
+        return H(data)
+
+    def test_attribute_outside_the_closed_set(self):
+        n, o = self.revoke_prefix()
+        self.negative(lambda: self.j.add("revoke.intent", attr="xattr", lo=0, hi=n, originals=o["flags"]))
+
+    def test_thaw_pairing(self):
+        """Each `thaw.intent` is followed by its own `thaw.done` before the next."""
+        cases = [
+            lambda n: (self.j.add("thaw.intent", attr="owner", lo=0, hi=n),
+                       self.j.add("thaw.intent", attr="owner", lo=0, hi=n))[1],
+            lambda n: (self.j.add("thaw.intent", attr="owner", lo=0, hi=n),
+                       self.j.add("thaw.done", attr="owner", lo=0, hi=n - 1))[1],
+            lambda n: (self.j.add("thaw.intent", attr="owner", lo=0, hi=n),
+                       self.j.add("thaw.done", attr="mode", lo=0, hi=n))[1],
+            lambda n: self.j.add("thaw.done", attr="owner", lo=0, hi=n),
+        ]
+        for i, build in enumerate(cases):
+            with self.subTest(i):
+                self.setUp()
+                n, o = self.revoke_prefix()
+                self.j.revoke(n, o)
+                self.j.add("revoked", escaped=[])
+                self.negative(lambda: build(n))
+
+    def test_move_back_once(self):
+        for extra in ("intent", "done"):
+            with self.subTest(extra):
+                self.setUp()
+                self.revoke_prefix()
+                back = self.j.add("thaw.move.intent", **BACK)
+                if extra == "intent":
+                    self.negative(lambda: self.j.add("thaw.move.intent", **BACK))
+                else:
+                    self.j.add("thaw.move.done", intent=back)
+                    self.negative(lambda: self.j.add("thaw.move.done", intent=back))
 
     def test_boolean_seq_is_not_an_integer(self):
         self.j.start()
@@ -501,7 +558,7 @@ class SchemaIsolation(Base):
                 self.rejected("freeze-start", "NONE", reason, journal=H(mem.j[(CID, 1)]))
 
 
-# ------------------------------------------------------------------ freeze-start NONE (T-J2, T-J3, T-J5, T-E*)
+# ------------------------------------------------------------------ freeze-start NONE
 
 class NoneShapes(Base):
     def shape(self, kinds, reason, binding=None):
@@ -541,6 +598,31 @@ class NoneShapes(Base):
                 self.rejected("freeze-start", "NONE", reason)
                 self.rejected("freeze-start", "NONE", reason, journal=self.j.prev)
 
+    def test_none_without_its_end_is_rejected(self):
+        """Every shape with its `end` removed, at a final head: nothing moved
+        is never inferred from a journal that does not say so."""
+        cases = [("identity", lambda ep: self.j.start()),
+                 ("mount", lambda ep: self.j.start())]
+        for reason in ("not_preservable", "identity", "early_unstable"):
+            cases.append((reason, lambda ep: (self.j.start(), self.j.ep(ep))[1]))
+        for reason in ("rename_failed", "target_exists", "early_unstable"):
+            cases.append((reason, lambda ep, r=reason: (self.j.start(), self.j.ep(ep), self.j.move(),
+                                                         self.j.abort(r))[3]))
+        for reason, build in cases:
+            with self.subTest(reason):
+                self.setUp()
+                ep, _ = self.ep()
+                head = build(ep)
+                b = {"journal": head} if self.j.seq < 1 else {"journal": head, "early": ep}
+                self.bad(lambda: self.check("freeze-start", "NONE", reason, **b), "journal_mismatch")
+
+    def test_store_failure_never_with_bindings(self):
+        for reason in ("store_space", "store_error"):
+            for b in ({"journal": H(b"x")}, {"early": H(b"x")}, {"journal": H(b"x"), "early": H(b"y")}):
+                with self.subTest((reason, b)):
+                    self.setUp()
+                    self.rejected("freeze-start", "NONE", reason, **b)
+
     def test_unsupported_layout_is_never_accepted(self):
         b = self.shape(preserve._AFTER_EP, "not_preservable")
         self.rejected("freeze-start", "NONE", "unsupported_layout", "journal_required", **b)
@@ -571,7 +653,7 @@ class NoneShapes(Base):
         self.rejected("freeze-start", "NONE", "not_preservable", "fresult_unlisted", final=H(b"f"), **b)
 
     def test_head_must_be_final(self):
-        """T-J2: a NONE bound to an earlier head while a later record exists."""
+        """A NONE bound to an earlier head while a later record exists."""
         self.j.start()
         early_head = self.j.end(reason="identity")
         self.mem.j[(CID, 2)] = canonical.canon({"x": 1})
@@ -584,7 +666,7 @@ class NoneShapes(Base):
         self.rejected("freeze-start", "NONE", "not_preservable", early=ep, journal=at_ep)
 
     def test_none_at_move_intent_or_after_the_move_is_rejected(self):
-        """T-J5, T-E4, T-E8: nothing moved needs an abort and an end."""
+        """Nothing moved needs an abort and an end."""
         ep, es = self.ep()
         self.j.start()
         self.j.ep(ep)
@@ -596,8 +678,8 @@ class NoneShapes(Base):
             self.rejected("freeze-start", "NONE", reason, early=ep, journal=moved)
 
     def test_not_preservable_reassesses_the_ep(self):
-        """T-E7: the re-assessment must not be eligible; in PR-4b no v3 EP is
-        (NB-13 and B-1 stay unrelaxed), so it is forced here."""
+        """The re-assessment must not be eligible. While NB-13 and B-1 stay
+        unrelaxed no v3 EP is, so it is forced here."""
         b = self.shape(preserve._AFTER_EP, "not_preservable")
         self.ok("freeze-start", "NONE", "not_preservable", **b)
         eligible = (["symref"], "VERIFIED", "COMPLETE", "ELIGIBLE", [], "a" * 40)
@@ -614,7 +696,7 @@ class NoneShapes(Base):
             self.ok("freeze-start", "NONE", "not_preservable", **b)
 
     def test_resume_after_end_is_idempotent(self):
-        """T-E14 (consumer side): every reason re-validates to the same
+        """Every reason re-validates to the same
         acceptance and the check writes nothing."""
         for reason, shapes in preserve.NONE_SHAPES.items():
             with self.subTest(reason):
@@ -626,7 +708,7 @@ class NoneShapes(Base):
                 self.assertEqual((self.mem.j, self.mem.a, self.mem.b), before)
 
     def test_none_is_never_a_failure_row(self):
-        """T-E12: routed through `_FAILURE_ROWS` (the mutant), a NONE bound to a
+        """Routed through `_FAILURE_ROWS` (the mutant), a NONE bound to a
         journal that shows `move.done` would be accepted; the real check rejects it."""
         ep, _ = self.ep()
         self.j.start()
@@ -648,7 +730,7 @@ class NoneShapes(Base):
         self.assertNotIn("unsupported_layout", preserve.NONE_SHAPES)
 
 
-# ------------------------------------------------------------------ MOVED, REVOKED and thaw over v3 (T-J6, T-J7)
+# ------------------------------------------------------------------ MOVED, REVOKED and thaw over v3
 
 class AfterTheMove(Base):
     def moved(self, files=None, **kw):
@@ -709,6 +791,56 @@ class AfterTheMove(Base):
                 v = types.SimpleNamespace(**dict(vars(view), thaw_ranges=dict(view.thaw_ranges, **bad)))
                 self.assertFalse(journal.thaw_complete(v))
 
+    def test_split_ranges_revoke_and_thaw(self):
+        """N above one range: two ranges per attribute are revoked and thawed
+        in ascending order; descending is refused."""
+        files = {b"f%04d" % i: b"same" for i in range(4100)}
+        ep, es, _ = self.moved(files)
+        n = len(es)
+        self.assertEqual(n, 4100)
+        self.j.revoke(n, self.lab.originals(es))
+        self.assertEqual(self.j.seq, 3 + 2 * 2 * 4)
+        head = self.j.add("revoked", escaped=[])
+        self.ok("freeze-continue", "REVOKED", early=ep, journal=head, escaped=canonical.digest({"escaped": []}))
+        split = [(0, 4095), (4096, n)]
+        mark = (self.j.seq, self.j.prev)
+        done = self.j.thaw([(a, lo, hi) for a in journal.THAW_ORDER for lo, hi in split])
+        self.ok("thaw", "NONE", journal=done)
+        for k in [k for k in self.mem.j if k[1] > mark[0]]:
+            del self.mem.j[k]
+        self.j.seq, self.j.prev = mark
+        self.j.add("thaw.intent", attr="owner", lo=4096, hi=n)
+        self.bad(lambda: self.walk(self.j.prev), "journal_mismatch")
+
+    def hest(self, escaped, linked):
+        ep, es, _ = self.moved()
+        self.j.revoke(len(es), self.lab.originals(es))
+        head = self.j.add("revoked", escaped=escaped)
+        pre = types.SimpleNamespace(**dict(vars(ctx(cycle_id=CID).pre), release_target=None,
+                                           holder_chain=PRE3.barrier_id, digest=H(b"pre")))
+        sel = {"evidence": [[k, H(k.encode())] for k in oc.H_EST_KINDS if k not in ("journal_head", "ep_manifest")]
+               + [["journal_head", head], ["ep_manifest", ep]], "provider_inputs": []}
+        data = {"claimed_set_observation": {"parent": [0, 0o700, 0], "ancestors_root_owned": True, "entries": [],
+                                            "linked": linked},
+                "writer_capabilities": {"grants": []}, "source_identity": {"root_id": ROOT},
+                "artifact_isolation": {"objects": [[ep, 0, 0o400, 0, 1, True], [head, 0, 0o400, 0, 1, True]]}}
+        with mock.patch.object(preserve.Preservation, "_e5", lambda *a: None), \
+                mock.patch.object(preserve.Preservation, "_ev",
+                                  lambda self, i, k, p, decisive=True: {"data": data[k]}), \
+                mock.patch.object(preserve.Preservation, "_library", lambda *a: None):
+            v = self.prov.handoff_establish(pre, sel, None)
+        return v.passed, v.reasons, es
+
+    def test_handoff_establish_over_v3(self):
+        """H-EST reads `linked` and `escaped` of a v3 journal (the barrier,
+        library and evidence inputs are stubbed to pass)."""
+        self.assertEqual(self.hest([], [0o700, []])[:2], (True, []))
+        self.setUp()
+        es = typed(REPO)
+        self.assertEqual(self.hest([es[-1][0]], [0o700, []])[:2], (False, ["escaped_present"]))
+        self.setUp()
+        self.assertEqual(self.hest([], [0o700, [b"a".hex()]])[:2], (False, ["linked"]))
+
     def test_thaw_none_without_revoke(self):
         """MOVED then thaw: no revoke range, only the move is reversed."""
         self.moved()
@@ -716,7 +848,7 @@ class AfterTheMove(Base):
         self.ok("thaw", "NONE", journal=head)
 
     def test_merged_readers_over_v3(self):
-        """T-J9: D-THAW, D-QUIES and the snapshot inputs read a v3 journal
+        """D-THAW, D-QUIES and the snapshot inputs read a v3 journal
         through the merged fields; D-QUAR refuses as `not_preservable`."""
         ep, es, _ = self.moved()
         self.j.revoke(len(es), self.lab.originals(es))
@@ -733,7 +865,7 @@ class AfterTheMove(Base):
         self.assertIn("unknown", e.exception.detail)
 
 
-# ------------------------------------------------------------------ originals/v1 (P1, P5, T-J8)
+# ------------------------------------------------------------------ originals/v1
 
 class Originals(Base):
     def blob(self, o):
@@ -771,7 +903,7 @@ class Originals(Base):
 
     def test_valid_bytes_under_another_digest(self):
         """Canonical, `originals_ok` bytes stored under a digest they do not
-        hash to: only the re-hash refuses them (P1)."""
+        hash to: only the re-hash refuses them."""
         es = typed(REPO)
         o = self.lab.originals(es)
         other = canonical.canon({"schema": preserve.O_SCHEMA, "attr": "mode", "n": len(es),
@@ -791,7 +923,7 @@ class Originals(Base):
         return [[root, value]] + [[H(b"object|%d" % i), value] for i in range(1, n + 1)]
 
     def test_originals_ok_negatives(self):
-        """T-J8: missing root, `n` mismatch, duplicate key, out-of-domain
+        """Missing root, `n` mismatch, duplicate key, out-of-domain
         value, closed keys and types."""
         n = 3
         good = {"schema": preserve.O_SCHEMA, "attr": "mode", "n": n, "values": self.values("mode", n, 0o644)}
@@ -843,7 +975,7 @@ class Originals(Base):
         self.bad(self.early(lambda: self.ep(originals=o)[0]), "artifact_mismatch")
 
     def test_large_valid_originals_parse(self):
-        """Above the 64 KiB document bound, inside MAX_ORIGINALS (E-5)."""
+        """Above the 64 KiB document bound, inside MAX_ORIGINALS."""
         n = 3000
         files = {b"f%04d" % i: b"x" for i in range(n)}
         es = typed(files)
@@ -893,7 +1025,7 @@ class Originals(Base):
                 self.bad(self.early(lambda: self.ep(originals=o)[0]), "artifact_mismatch")
 
 
-# ------------------------------------------------------------------ refusal codes (P3)
+# ------------------------------------------------------------------ refusal codes
 
 class RefusalCodes(Base):
     def test_absent_v3_object_is_evidence_unavailable(self):
@@ -941,7 +1073,7 @@ class RefusalCodes(Base):
         self.ok("freeze-start", "NONE", "not_preservable", early=ep, journal=self.j.prev)
 
 
-# ------------------------------------------------------------------ eligibility and the typed classifier (P2, T-G*)
+# ------------------------------------------------------------------ eligibility and the typed classifier
 
 def kinds_of(entries):
     return [(bytes.fromhex(e[0]), e[1]) for e in entries]
@@ -965,7 +1097,7 @@ class Eligibility(Base):
         return self.cy.assess(m, es, True)
 
     def test_empty_complete_manifest_is_never_eligible(self):
-        """P2: a valid empty COMPLETE manifest establishes nothing."""
+        """A valid empty COMPLETE manifest establishes nothing."""
         b, es = self.ep(files={})
         _, m, es, bs = self.cy.binding_v3(b, "early")
         self.assertEqual((m["result"], es), ("COMPLETE", []))
@@ -980,7 +1112,7 @@ class Eligibility(Base):
     def test_valid_nonempty_complete_manifest_reaches_the_classifier(self):
         """A complete capture of an honest repository: Q1 COMPLETE, every blob
         and original re-hashed, and NOT_ELIGIBLE only by NB-13 (`objects` and
-        `refs` are `d` entries at administrative names; relaxed in PR-4e)."""
+        `refs` are `d` entries at administrative names; that rule is relaxed only with the real restorer)."""
         a = self.assess()
         self.assertEqual(a.q1, "COMPLETE")
         self.assertEqual(a.q5, "NOT_ELIGIBLE")
@@ -1041,7 +1173,7 @@ class Eligibility(Base):
 
 
 class TypedClassifier(unittest.TestCase):
-    """T-G1/T-G2/T-G9..T-G19 (classifier side)."""
+    """The typed classifier input: roots, `gitdir_shape`, `bare_shape` and the unrelaxed merged rules."""
 
     def repo(self, prefix=b"", extra=(), drop=()):
         files = {prefix + p: v for p, v in REPO.items() if p not in drop}
@@ -1059,7 +1191,7 @@ class TypedClassifier(unittest.TestCase):
 
     def test_merged_rules_stay_unrelaxed(self):
         """NB-13 over every entry type and B-1 over files: an honest v3
-        repository is `unknown` until PR-4e."""
+        repository is `unknown` until the relaxation."""
         _, es = self.repo()
         self.assertTrue(unknown(es))
         with mock.patch.object(gitclass, "_ADMIN_DIRS", frozenset()):
@@ -1091,14 +1223,14 @@ class TypedClassifier(unittest.TestCase):
                     self.assertTrue(unknown(es, files=files))
 
     def test_gitfile_is_refused(self):
-        """T-G9: a `.git` file, even pointing inside the tree."""
+        """A `.git` file, even pointing inside the tree."""
         files = {b"sub/.git": b"gitdir: ../.git/modules/sub\n"}
         es = typed(files)
         r = gitclass.repositories_typed(files, kinds_of(es))
         self.assertTrue({"gitlink_file", "unknown"} <= r[b"sub"].features)
 
     def test_bare_shape_positive_cases(self):
-        """FC-1 narrowed scope: administrative names inside the gitdir are not
+        """Narrowed scope: administrative names inside the gitdir are not
         discovery origins."""
         extra = [d(".git/logs"), f(".git/logs/HEAD", b"x"), d(".git/logs/refs"), d(".git/logs/refs/heads"),
                  f(".git/logs/refs/heads/main", b"x"), d(".git/refs/remotes"), d(".git/refs/remotes/origin"),
@@ -1109,7 +1241,7 @@ class TypedClassifier(unittest.TestCase):
             self.assertFalse(unknown(es))
 
     def test_bare_shape_negative_cases(self):
-        """T-G10..T-G13, T-G15..T-G17 at the slot root and in worktree directories."""
+        """Forged bare shapes at the slot root and in worktree directories."""
         cases = {
             "sub/.git + sub/commondir": ([d("sub"), d("sub/.git"), f("sub/commondir", b"../x\n")], b"sub"),
             "file objects and refs at root": ([f("objects", b"", "x"), f("refs", b"", "x")], b""),
@@ -1126,15 +1258,30 @@ class TypedClassifier(unittest.TestCase):
                 self.assertIn(where, gitclass.bare_shape(kinds_of(es)))
                 self.assertTrue(unknown(es, where))
 
+    def test_bare_shape_folds_ignorable_and_unicode_spellings(self):
+        for name in ("HE\u200dAD", "\ufeffcommondir"):
+            with self.subTest(name):
+                _, es = self.repo(extra=[f(name, b"x")])
+                self.assertIn(b"", gitclass.bare_shape(kinds_of(es)))
+
+    def test_administrative_alias_of_a_directory(self):
+        """An empty directory spelled like an administrative name below the
+        gitdir is `unknown` even with NB-13 out of the way."""
+        _, es = self.repo(extra=[d(".git/objects/Pack")])
+        with mock.patch.object(gitclass, "_ADMIN_DIRS", frozenset()):
+            self.assertTrue(unknown(es))
+            _, clean = self.repo()
+            self.assertFalse(unknown(clean))
+
     def test_empty_gitdir_and_nested_gitdir_without_refs(self):
-        """T-G13 and T-G18."""
+        """An empty gitdir and a nested gitdir without `refs`."""
         _, es = self.repo(extra=[d("N"), d("N/.git"), f("N/.git/HEAD", b"ref: refs/heads/main\n"),
                                  d("N/.git/objects")])
         self.assertTrue(unknown(es, b"N", files={**REPO, b"N/.git/HEAD": b"ref: refs/heads/main\n"}))
         self.assertTrue(unknown([d(".git")]))
 
     def test_every_kind_at_every_administrative_directory(self):
-        """T-G14: never eligible unless `d`; PR-4b keeps NB-13, so not even then."""
+        """Never eligible unless `d`; NB-13 is unrelaxed, so not even then."""
         for name in sorted(gitclass._ADMIN_DIRS):
             for e in (f(".git/" + name.decode(), b"x"), link(".git/" + name.decode(), b"/x"),
                       u(".git/" + name.decode(), "fifo"), d(".git/" + name.decode())):
@@ -1153,8 +1300,8 @@ class TypedClassifier(unittest.TestCase):
                     self.assertTrue(unknown(entries, files=files))
 
     def test_scope_mutants_fail(self):
-        """T-G19: a scope without the slot root or the worktree directories
-        misses T-G10/T-G15; a scope that enters gitdirs refuses the positives."""
+        """A scope without the slot root or the worktree directories
+        misses the forged shapes; a scope that enters gitdirs refuses the positives."""
         real = gitclass.bare_shape
         root_case = [f("objects", b"", "x"), f("refs", b"", "x")]
         nested_case = [d("a"), d("a/b"), f("a/b/HEAD", b"x"), d("a/b/objects"), d("a/b/refs")]
@@ -1183,7 +1330,7 @@ class TypedClassifier(unittest.TestCase):
                 self.assertIn("name_alias", preserve.refusals_v3(sorted(extra, key=lambda e: e[0])))
 
 
-# ------------------------------------------------------------------ T-SX1: every HFS+-ignorable code point
+# ------------------------------------------------------------------ every HFS+-ignorable code point
 
 class HfsIgnorable(unittest.TestCase):
     def test_sixteen_code_points(self):
@@ -1220,22 +1367,29 @@ class HfsIgnorable(unittest.TestCase):
                              {name})
 
 
-# ------------------------------------------------------------------ static (T-J10, T-M20, no write authority)
+# ------------------------------------------------------------------ static
 
 class Static(unittest.TestCase):
     SRC = Path(test_static.BROKER) / "preserve.py"
 
     def test_no_tuple_unpacking_of_manifest_entries(self):
-        """T-J10: a loop or comprehension that unpacks its item iterates a call
+        """A loop or comprehension that unpacks its item iterates a call
         (the typed accessors, `enumerate`, `.items()`), never a bare entry list."""
+        def allowed(it):
+            if isinstance(it, ast.BinOp):
+                return allowed(it.left) and allowed(it.right)
+            if not isinstance(it, ast.Call):
+                return False
+            f = it.func
+            return isinstance(f, ast.Name) and f.id in ("_file_blobs", "enumerate") \
+                or isinstance(f, ast.Attribute) and f.attr in ("items", "get")
         tree = ast.parse(self.SRC.read_text())
         for node in ast.walk(tree):
             if isinstance(node, (ast.For, ast.comprehension)) and isinstance(node.target, (ast.Tuple, ast.List)):
-                self.assertNotIsInstance(node.iter, (ast.Name, ast.Attribute, ast.Subscript),
-                                         f"line {getattr(node, 'lineno', node.iter.lineno)}")
+                self.assertTrue(allowed(node.iter), f"line {node.iter.lineno}: {ast.unparse(node.iter)}")
 
     def test_inventory_chunker_unchanged_and_separate(self):
-        """T-M20: `chunks_of` is byte-identical to the merged one and neither
+        """`chunks_of` is byte-identical to the merged one and neither
         chunker calls the other."""
         src = inspect.getsource(preserve.chunks_of) + inspect.getsource(preserve._chunk_obj)
         self.assertEqual(hashlib.sha256(src.encode()).hexdigest(), CHUNKS_OF_SHA256)

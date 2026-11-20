@@ -515,7 +515,7 @@ class _Cycle:
         `f` values and the originals, never a symlink target, and every
         header encodes exactly as the manifest's. An `early` binding also
         re-reads and checks every `originals` blob it names
-        (`originals_v3`). The v3 verify binding is not defined before PR-4e."""
+        (`originals_v3`). No v3 verify binding is defined yet."""
         out = self._binding(d, phase, False, self._v3, exact=True)
         if phase == "early":
             self.originals_v3(out[1])
