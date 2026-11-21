@@ -9,8 +9,8 @@ import json
 
 import recovery_state as rs
 
-from . import (anchor, authz, barrier, canonical, custody, ledger, libview, lifecycle, o5contract, opclass,
-               protocol, provenance)
+from . import (anchor, authz, authz_txn, barrier, canonical, custody, fscap, journal, ledger, libview, lifecycle,
+               o5contract, opclass, protocol, provenance)
 from . import freeze as o5freeze
 from .refusal import Code, Outcome, Refused, Result
 from .stores import AuthzStore, Crash, FaultPlan, FWal, GateRecords, TierC
@@ -27,7 +27,7 @@ F_INTENT_VERB = {"MOVE_INTENT": "freeze-start", "REVOKE_INTENT": "freeze-continu
 class World:
     """Every store one invocation reads or writes, plus injected producers:
     observer (PR-2/PR-3 evidence), freeze (PR-3 effects, called as
-    freeze(verb, slot, op_id, ctx, cycle_id)), backups (OD-6), and the id,
+    freeze(verb, slot, op_id, ctx, cycle_id, cap, fscap)), backups (OD-6), and the id,
     token and nonce sources."""
 
     def __init__(self, library, ctx, *, clock, observer, freeze, backups, ids, tokens, nonces, faults=None,
@@ -733,11 +733,27 @@ def _f_complete(world, plan, facts, txn, verb, digest, cid):
     """C1′: the effect returns an FResult inside the F relation and accepted by
     PR-3b check_fresult; then the completion, then (barrier basis only, R4
     §2.4) the `refreshed` record in the same CommitTxn. The effect, the check
-    and the record all receive the one canonical cycle identity `cid`."""
+    and the record all receive the one canonical cycle identity `cid`.
+
+    P-B1(b): the only call site that mints the effect's store and filesystem
+    capabilities. After the effect returns or raises it seals their authority
+    and completes only the result the sealed record and the journal determine
+    (LP-RESULT); every other case is UNFINISHED with the intent pending."""
     if type(cid) is not str or not canonical.HEX64.match(cid):
         raise Refused(Code.STATE_UNKNOWN, "cycle_inconsistent")
     gate = plan.o5
-    res = world.freeze(verb, facts.slot, facts.op_id, gate.ctx, cid)
+    binding = _effect_binding(world, facts, verb, digest, cid)
+    cap, fs, authority = authz_txn._issue_effect(txn, binding, _cycle_header(world, gate.ctx, cid),
+                                                 o5contract.mode(world), world.o5.stores, world.faults)
+    try:
+        res, err = world.freeze(verb, facts.slot, facts.op_id, gate.ctx, cid, cap, fs), None
+    except Exception as e:  # the sealed record decides (R2)
+        res, err = None, e
+    rec = authority.seal()
+    out = fscap.reconcile(verb, rec, fscap.journal_kinds(world.o5.stores["journals"], cid), res, err)
+    if out is None:
+        raise fscap.Unfinished(f"no result determined by the sealed record (effect: {res!r}, {err!r})")
+    res = o5contract.FResult(*out)
     o5freeze.check_result(verb, res)
     world.o5.preservation.check_fresult(gate.ctx, verb, res, cid)
     utc = world.clock()
@@ -749,6 +765,58 @@ def _f_complete(world, plan, facts, txn, verb, digest, cid):
         key, data = o5freeze.refreshed_record(chain, digest, facts.slot, cid, done, gate.picked, utc,
                                             o5contract.mode(world))
         world.o5.stores["barriers"].put(txn, key, data)
+
+
+def _effect_binding(world, facts, verb, digest, cid):
+    """The pair's binding (P-B1(b) Common rules). The pending intent comes from
+    the operation's F WAL log of the slot, re-read and folded here over
+    burned, stored documents, and from the original authorization document it
+    names, re-read, re-hashed and burned; for a resume the `resume-step`
+    document (this invocation's burn) only selects. Refuses any conflict."""
+    order = [e["auth_digest"] for e in world.ledger.entries()]
+
+    def doc_of(d):
+        return _doc(world, d) if d in order else None
+    log = [e for e in world.fwal.log(facts.slot) if e.get("op_id") == facts.op_id]
+    f, last = o5freeze.fold(log, doc_of)
+    if f == "UNKNOWN" or last is None or last.get("kind") != "intent" or not order or order[-1] != digest:
+        raise Refused(Code.STATE_UNKNOWN, "effect_binding")
+    auth, doc = last["auth_digest"], doc_of(last["auth_digest"])
+    if o5freeze.INTENT_VERB.get(last.get("value")) != verb or doc is None or doc.get("verb") != verb \
+            or doc.get("slot") != facts.slot or doc.get("op_id") != last["op_id"] \
+            or verb == "freeze-start" and cid != o5contract.cycle_id(facts.slot, doc.get("slot_generation"),
+                                                                     last["op_id"], auth):
+        raise Refused(Code.STATE_UNKNOWN, "effect_binding")
+    if auth != digest:
+        rdoc = doc_of(digest)
+        if rdoc is None or rdoc.get("verb") != "resume-step" or order.index(auth) >= order.index(digest) \
+                or rdoc.get("slot") != facts.slot or rdoc.get("op_id") != last["op_id"] \
+                or rdoc.get("transition") != verb or rdoc.get("target_digest") != canonical.digest(last):
+            raise Refused(Code.STATE_UNKNOWN, "effect_binding")
+    return {"slot": facts.slot, "op_id": last["op_id"], "verb": verb, "cycle_id": cid, "auth_digest": auth}
+
+
+def _cycle_header(world, ctx, cid):
+    """This cycle's header as the PR-3b reader derives it: the bound fields of
+    the containment context, `cid`, and the freeze-start context (this
+    invocation's for a freeze-start, else the burned freeze-start document's
+    `o5.ctx`). None when it cannot be derived; the capabilities then refuse."""
+    pre = getattr(ctx, "pre", None)
+    try:
+        if pre.cycle_id is None:
+            start = ctx.digest
+        else:
+            auth = pre.freeze_start_auth
+            doc = _doc(world, auth) if auth in {e["auth_digest"] for e in world.ledger.entries()} else None
+            if pre.cycle_id != cid or cid != o5contract.cycle_id(pre.slot, pre.g_pre, pre.op_id, auth) \
+                    or doc is None or doc.get("verb") != "freeze-start" or doc.get("slot") != pre.slot \
+                    or doc.get("op_id") != pre.op_id or doc.get("slot_generation") != pre.g_pre \
+                    or type(doc.get("o5")) is not dict or not canonical.is_hex64(doc["o5"].get("ctx")):
+                return None
+            start = doc["o5"]["ctx"]
+        return dict({k: getattr(pre, k) for k in journal.BOUND_KEYS}, cycle_id=cid, start_ctx=start)
+    except AttributeError:
+        return None
 
 
 def _quarantine_hook(world, txn, slot, expected_post):

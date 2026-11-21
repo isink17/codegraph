@@ -3,8 +3,9 @@ in-memory fakes PR-1 tests drive. A fake proves ordering and the write barrier,
 never filesystem durability: real stores are PR-4 and must satisfy the same
 interface with temp, F_FULLFSYNC, renameatx_np(RENAME_EXCL) and directory sync."""
 
-from . import canonical
-from .authz_txn import CommitTxn, TxnError
+from . import canonical, fscap
+from .authz_txn import CommitTxn, StoreCap, TxnError
+from .refusal import Code, Refused
 
 
 class Crash(BaseException):
@@ -164,6 +165,60 @@ class RecordStore(Gated):
         return self.items.get(key)
 
     def keys(self):
+        return sorted(self.items)
+
+    def snapshot(self):
+        return canonical.serialize({k: v.decode("ascii", "replace") for k, v in sorted(self.items.items())})
+
+
+class CapStore:
+    """A capability-gated O5 store: the journal, artifact and blob namespaces
+    (P-B1(b) A). It refuses the CommitTxn and accepts only the store
+    capability, inside that capability's own hold of the authority lock. A put
+    is an exclusive create, or a content-addressed one that accepts identical
+    existing bytes; nothing is overwritten or deleted. In-memory model: a key
+    whose put raised after the write stays in `pending` until `make_durable`,
+    so existence is never durability. Tests seed `items` directly (test setup,
+    not a write API)."""
+
+    def __init__(self, name, faults=None):
+        self.name = name
+        self.faults = faults if faults is not None else FaultPlan()
+        self.items, self.pending, self.writes = {}, set(), []
+
+    def put(self, cap, key, data, exclusive):
+        if not isinstance(cap, StoreCap) or not cap._holds():
+            raise TxnError(f"{self.name} accepts only the store capability")
+        self.faults.hit(f"{self.name}:put:before")
+        old = self.items.get(key)
+        if old is not None:
+            if exclusive or old != data:
+                raise fscap.Refused(f"{self.name}: {key} exists")
+            return
+        self.items[key] = bytes(data)
+        self.pending.add(key)
+        self.writes.append((cap._txn_id, "put"))
+        self.faults.hit(f"{self.name}:put:after")
+        self.pending.discard(key)
+
+    def get(self, key):
+        self.faults.hit(f"{self.name}:get:before")
+        return self.items.get(key)
+
+    def durable(self, key):
+        return key in self.items and key not in self.pending
+
+    def make_durable(self, key):
+        self.faults.hit(f"{self.name}:sync:before")
+        self.pending.discard(key)
+        return key in self.items
+
+    def keys(self):
+        """The complete key listing, or Refused(STATE_UNKNOWN, artifact_inventory); never a partial list."""
+        try:
+            self.faults.hit(f"{self.name}:keys:before")
+        except Exception:
+            raise Refused(Code.STATE_UNKNOWN, "artifact_inventory") from None
         return sorted(self.items)
 
     def snapshot(self):

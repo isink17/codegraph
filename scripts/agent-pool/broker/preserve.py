@@ -98,7 +98,7 @@ class WorldResolver:
         return self._store("artifacts").get(f"artifact/{cid}/{d}")
 
     def blob(self, d):
-        return self._store("artifacts").get(f"blob/{d}") if is_hex64(d) else None
+        return self._store("blobs").get(f"blob/{d}") if is_hex64(d) else None
 
     def barrier(self, bid, seq):
         if not is_hex64(bid) or type(seq) is not int or seq < 0:

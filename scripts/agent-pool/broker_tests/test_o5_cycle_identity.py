@@ -37,9 +37,9 @@ class Base(unittest.TestCase):
         self.effects, self.checks = [], []
         inner = self.env.world.freeze
 
-        def effect(verb, slot, op, ctx, cid):
+        def effect(verb, slot, op, ctx, cid, cap, fscap):
             self.effects.append((verb, cid))
-            return inner(verb, slot, op, ctx, cid)
+            return inner(verb, slot, op, ctx, cid, cap, fscap)
         self.env.world.freeze = effect
         prov = self.env.world.o5.preservation
         if prov is not None:
@@ -410,8 +410,8 @@ class Crashes(Base):
         self.ok("adopt", "request")
         inner = self.env.world.freeze
 
-        def boom(verb, slot, op, ctx, cid):
-            inner(verb, slot, op, ctx, cid)
+        def boom(verb, slot, op, ctx, cid, cap, fscap):
+            inner(verb, slot, op, ctx, cid, cap, fscap)
             raise Crash("effect:after_header")
         self.env.world.freeze = boom
         with self.assertRaises(Crash):
@@ -552,8 +552,8 @@ class CarryForward(Base):
         self.ok("adopt", "request", "freeze-start")
         ctx = types.SimpleNamespace(pre=types.SimpleNamespace(cycle_id=self.expected()))
         with self.assertRaises(ValueError):
-            self.env.world.freeze("freeze-continue", SLOT, OP, ctx, "c" * 64)
-        res = self.env.world.freeze("freeze-continue", SLOT, OP, ctx, self.expected())
+            self.env.world.freeze("freeze-continue", SLOT, OP, ctx, "c" * 64, None, None)
+        res = self.env.world.freeze("freeze-continue", SLOT, OP, ctx, self.expected(), None, None)
         self.assertEqual(res.bindings, o5.stamp(res.bindings, SLOT, OP, self.expected()))
 
     def test_synthetic_check_compares_the_context_cycle(self):
@@ -574,8 +574,8 @@ class CarryForward(Base):
         self.ok("adopt", "request")
         inner = self.env.world.freeze
 
-        def boom(verb, slot, op, ctx, cid):
-            inner(verb, slot, op, ctx, cid)
+        def boom(verb, slot, op, ctx, cid, cap, fscap):
+            inner(verb, slot, op, ctx, cid, cap, fscap)
             raise Crash("effect:after_header")
         self.env.world.freeze = boom
         with self.assertRaises(Crash):
