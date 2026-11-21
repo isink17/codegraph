@@ -190,7 +190,7 @@ def packed_lines(*pairs):
 # ------------------------------------------------------------------ synthetic PR-4 effects (test-owned stores)
 
 class Effects:
-    """World.freeze(verb, slot, op_id, ctx, cycle_id). The first write of a
+    """World.freeze(verb, slot, op_id, ctx, cycle_id, cap, fscap). The first write of a
     cycle is its seq-0 journal record (R4.1 §3.3); every object carries the
     §3.1 header and lives under the cycle's keys; irreversible steps are keyed
     by (cycle_id, step) from the cycle's own journal (§6.3)."""
@@ -233,7 +233,7 @@ class Effects:
 
     def blob(self, data):
         d = canonical.sha256(data)
-        self._put("artifacts", f"blob/{d}", data)
+        self._put("blobs", f"blob/{d}", data)
         return d
 
     def journal(self, s, kind, **extra):
@@ -280,7 +280,7 @@ class Effects:
         doc = protocol.parse_doc(self.env.world.authz.docs[ctx.pre.freeze_start_auth])
         return doc["o5"]["ctx"]
 
-    def __call__(self, verb, slot, op, ctx, cid):
+    def __call__(self, verb, slot, op, ctx, cid, cap, fscap):
         self.calls.append((verb, cid))
         pre = ctx.pre
         s = self.state.get(cid)
