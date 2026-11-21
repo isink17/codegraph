@@ -2,21 +2,27 @@
 (thaw_target_occupied with later walk I/O), N2 (the content gate is bound to
 the current intent's digest), the capability-gated stores, the store
 capability's artifact and blob namespaces, the reader, the mint and its
-binding, key-only `_traces`, and the constant protected-mode refusal."""
+binding, key-only `_traces`, and the constant protected-mode refusal; then
+the post-review hardening: the seal on every exit of the effect (N1), the
+cycle identity recomputed at every mint (N2), the deliberate refusal
+boundaries of the unimplemented operations (N3) and the pair's store scope
+(N4)."""
 
 import json
+import operator
+import threading
 import unittest
 from unittest import mock
 
 import fsharness as M
-from test_fscap_fsmodel import RAW, XOBJ, attempt
+from test_fscap_fsmodel import RAW, XOBJ, attempt, named, spawn
 from test_fscap_repair import GATE, Repair
 from test_fscap_repair2 import ENTRYPOINTS
 
 from broker import authz_txn, canonical, freeze, fscap, invocation, journal, o5contract as oc
 from broker.authz_txn import StoreCap, TxnError
 from broker.refusal import Refused as BrokerRefused
-from broker.stores import CapStore, RecordStore
+from broker.stores import CapStore, Crash, EvidenceStore, RecordStore
 
 POISONED = ("Refused", "authority FSCAP_POISONED")
 
@@ -392,6 +398,331 @@ class ResultAndTraces(unittest.TestCase):
         self.assertFalse(freeze._traces(world, cid, auth))
         stores["artifacts"].items[f"artifact/{cid}/x"] = b"{}"
         self.assertTrue(freeze._traces(world, cid, auth))
+
+
+
+# ---------------------------------------------------------------- N1: the seal on every exit of the effect
+
+SEALED = ("Refused", "authority FSCAP_SEALED")
+WAIT = 10
+
+
+class N1SealOnEveryExit(Repair):
+    def raising(self, exc):
+        """A freeze-start effect that writes through move.intent, keeps both capabilities and raises `exc`."""
+        disk = self.world()
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        kept = {}
+
+        def eff(s, f):
+            M.journal_through_move_intent(s)
+            kept.update(s=s, f=f)
+            raise exc
+        with self.assertRaises(type(exc)) as cm:
+            M.invoke(inv, eff)
+        self.assertIs(cm.exception, exc)                                # propagated unchanged, never replaced
+        return disk, inv, kept
+
+    def after_exit(self, disk, inv, kept, renames=0):
+        """Sealed, no post-seal effect through any alias, and no F completion was attempted or written."""
+        a, s, f = inv.authority, kept["s"], kept["f"]
+        self.assertIs(a.state, M.FSCAP_SEALED)
+        self.assertIsNotNone(a.record)
+        before, journal = disk.fs(), disk.journal()
+        tried = [attempt(f.move), attempt(f.view().move), attempt(M.FsCap(a, inv).move_back),
+                 attempt(f.observe, "slot"), attempt(f.read_content, "attrs"),
+                 attempt(s.put, "move.done", intent=M.h(journal[-1]), linked=[]),
+                 attempt(s.put_blob, b"late"), attempt(f._c.reader.journal, 0)]
+        self.assertEqual(tried, [SEALED] * 7 + [("Refused", "reader closed (FSCAP_SEALED)")])
+        self.assertEqual((a.renames, disk.fs(), disk.journal()), (renames, before, journal))
+        self.assertEqual((M.fstate(disk)[0], self.completions(disk), inv.prepared), ("MOVE_INTENT", 0, None))
+        self.assertEqual(M.inspect_durable(inv)["fwal"], "intent_pending")
+
+    def test_system_exit_keyboard_interrupt_and_crash_seal_and_propagate(self):
+        for exc in (SystemExit(3), KeyboardInterrupt(), Crash("effect stopped")):
+            with self.subTest(exc=type(exc).__name__):
+                self.fresh()
+                disk, inv, kept = self.raising(exc)
+                self.after_exit(disk, inv, kept)
+                self.unmoved(disk)
+
+    def test_an_ordinary_exception_still_seals_and_ends_unfinished(self):
+        disk = self.world()
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        kept = {}
+
+        def eff(s, f):
+            M.journal_through_move_intent(s)
+            kept.update(s=s, f=f)
+            raise RuntimeError("effect failed")
+        self.assertEqual(M.invoke(inv, eff)[0], "UNFINISHED")
+        self.after_exit(disk, inv, kept)
+
+    def test_a_worker_in_flight_linearizes_before_the_seal_and_nothing_runs_after_it(self):
+        for exc in (SystemExit(3), KeyboardInterrupt(), Crash("effect stopped")):
+            with self.subTest(exc=type(exc).__name__):
+                self.fresh()
+                disk = self.world()
+                inv = M.start_invocation(disk, "freeze-start", M.A_START)
+                out, kept = {}, {}
+                paused, release = threading.Event(), threading.Event()
+                M.HOOKS["before_rename"] = named("worker", lambda: (paused.set(), release.wait(WAIT)))
+                M.HOOKS["seal_enter"] = release.set                     # the seal starts only after the effect left
+
+                def eff(s, f, exc=exc):
+                    M.journal_through_move_intent(s)
+                    kept.update(s=s, f=f, t=spawn(out, "worker", f.move))
+                    paused.wait(WAIT)                                   # the worker holds the lock mid-call
+                    raise exc
+                with self.assertRaises(type(exc)):
+                    M.invoke(inv, eff)
+                kept["t"].join(WAIT)
+                self.assertEqual(out["worker"], ("ok", "completed"))   # the in-flight call finished first
+                rec = inv.authority.record
+                self.assertEqual((rec.claimed, rec.rename_issued, rec.renames, rec.outcome),
+                                 (True, True, 1, ("completed",)))      # and the sealed record holds it
+                late = {}
+                spawn(late, "late", kept["f"].view().move).join(WAIT)
+                self.assertEqual(late["late"], SEALED)
+                self.after_exit(disk, inv, kept, renames=1)
+                self.assertEqual((disk.fs()["slot"], disk.fs()["dst"]), (None, RAW))
+                self.assertNotIn("move.done", self.kinds(disk))
+
+    def test_a_failed_completion_append_follows_the_seal(self):
+        for how in ("fwal append fails", "crash before the append"):
+            with self.subTest(how):
+                self.fresh()
+                disk = self.world()
+                inv = M.start_invocation(disk, "freeze-start", M.A_START)
+                kept = {}
+
+                def eff(s, f):
+                    kept.update(s=s, f=f)
+                    return M.effect_freeze_start(s, f)
+                if how == "fwal append fails":
+                    M.FAULTS.add("fwal:append:before")
+                    result = M.invoke(inv, eff)
+                    self.assertEqual(result, ("UNFINISHED", "OSError: [Errno 5] fwal append failed before the write"))
+                else:
+                    M.CRASH["at"] = "completion_prepared"
+                    with self.assertRaises(Crash):
+                        M.invoke(inv, eff)
+                    M.CRASH["at"] = None
+                M.FAULTS.clear()
+                self.assertEqual(inv.prepared["value"], "MOVED")       # prepared, never appended
+                self.assertEqual(attempt(kept["f"].move_back), SEALED)
+                self.assertEqual(attempt(kept["s"].put, "end", outcome="none", reason=""), SEALED)
+                self.assertEqual((M.fstate(disk)[0], self.completions(disk), inv.authority.renames),
+                                 ("MOVE_INTENT", 0, 1))
+                self.assertEqual(M.inspect_durable(inv)["fwal"], "intent_pending")
+
+
+# ---------------------------------------------------------------- N2: the cycle identity is recomputed at every mint
+
+A_START2, A_CONT2, A_OTHER = "c5" * 32, "c6" * 32, "c7" * 32
+BINDING_REFUSED = ("UNFINISHED", "Refused: STATE_UNKNOWN: effect_binding")
+
+
+def moved(disk, token=M.A_START):
+    """Test setup: F WAL MOVE_INTENT and MOVED for the freeze-start document of `token`; returns its digest."""
+    a = disk.burn(M._doc("freeze-start", "NONE", token))
+    disk.fwal_append(M._intent("MOVE_INTENT", a))
+    disk.fwal_append({"op_id": M.OP, "kind": "complete", "value": "MOVED", "reason": "",
+                      "bindings": {"early": M.EARLY}, "auth_digest": a, "utc": 1})
+    return a
+
+
+class N2FreshCycleIdentity(Repair):
+    def mints(self, inv, effect):
+        """Runs `inv`; returns (result, the bindings and headers the mint received, effect calls)."""
+        minted, calls, real = [], [], authz_txn._issue_effect
+
+        def spy(txn, binding, header, *a):
+            minted.append((binding, header))
+            return real(txn, binding, header, *a)
+
+        def eff(s, f):
+            calls.append(1)
+            return effect(s, f)
+        with mock.patch.object(authz_txn, "_issue_effect", spy):
+            return M.invoke(inv, eff), minted, calls
+
+    def refused_before_the_mint(self, disk, inv, f):
+        result, minted, calls = self.mints(inv, lambda s, fs: ("NONE", "store_error", {}))
+        self.assertEqual((result, minted, calls, inv.authority), (BINDING_REFUSED, [], [], None))
+        self.assertFalse(inv.txn._effect)
+        self.assertEqual((M.fstate(disk)[0], self.completions(disk)), (f, 0))
+
+    def test_a_wrong_cycle_id_refuses_before_the_mint(self):
+        for name, cid in (("wrong", "f" * 64), ("another slot", oc.cycle_id("codegraph-worker-y", M.GEN, M.OP,
+                                                                              M.START_AUTH)),
+                          ("another operation", oc.cycle_id(M.SLOT, M.GEN, "op2", M.START_AUTH)),
+                          ("another generation", oc.cycle_id(M.SLOT, M.GEN + 1, M.OP, M.START_AUTH))):
+            for ctx in ("the gate's context", "a context that agrees"):
+                with self.subTest(name, ctx=ctx):
+                    self.fresh()
+                    disk, inv = self.thaw()
+                    inv.cid = cid
+                    if ctx == "a context that agrees":
+                        inv.ctx = M._ctx(M._pre("thaw", cid, M.START_AUTH))
+                    self.refused_before_the_mint(disk, inv, "THAW_INTENT")
+
+    def test_a_moved_library_generation_refuses_before_the_mint(self):
+        disk, inv = self.thaw()
+        with mock.patch.object(invocation.o5freeze, "gen_of", lambda facts: M.GEN + 1):
+            self.refused_before_the_mint(disk, inv, "THAW_INTENT")
+
+    def test_a_freeze_start_with_another_cycle_id_refuses_before_the_mint(self):
+        disk = self.world()
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        inv.cid = oc.cycle_id(M.SLOT, M.GEN, "op2", M.START_AUTH)
+        self.refused_before_the_mint(disk, inv, "MOVE_INTENT")
+
+    def test_a_stale_cycle_view_refuses_and_the_current_cycle_mints(self):
+        disk, inv = self.thaw()
+        self.assertEqual(M.invoke(inv, M.effect_thaw), ("COMMITTED", "NONE", ""))   # cycle 1 is thawed
+        a2 = moved(disk, A_START2)                                      # cycle 2 of the same operation
+        cid2 = oc.cycle_id(M.SLOT, M.GEN, M.OP, a2)
+        stale = M.start_invocation(disk, "freeze-continue", A_CONT2)    # cid and context still name cycle 1
+        self.refused_before_the_mint(disk, stale, "REVOKE_INTENT")
+        current = M.Invocation(disk, "freeze-continue", stale.auth)
+        current.cid, current.ctx = cid2, M._ctx(M._pre("freeze-continue", cid2, a2))
+        result, minted, calls = self.mints(current, lambda s, f: ("FREEZE_INCOMPLETE", "store_error",
+                                                                  {"journal": "d" * 64}))
+        self.assertEqual((result, calls), (("COMMITTED", "FREEZE_INCOMPLETE", "store_error"), [1]))
+        (binding, header), = minted
+        self.assertEqual((binding["cycle_id"], binding["auth_digest"], header["cycle_id"]), (cid2, stale.auth, cid2))
+        mixed = M.start_invocation(disk, "thaw", M.A_THAW2)             # cycle 2's cid with cycle 1's context
+        mixed.cid = cid2
+        self.refused_before_the_mint(disk, mixed, "THAW_INTENT")
+
+    def test_a_changed_original_authorization_refuses_before_the_mint(self):
+        for name in ("another burned freeze-start", "the stored document changed"):
+            with self.subTest(name):
+                self.fresh()
+                disk = self.world()
+                M.seed_thaw(disk)
+                other = disk.burn(M._doc("freeze-start", "NONE", A_OTHER))
+                inv = M.start_invocation(disk, "thaw", M.A_THAW)
+                if name == "another burned freeze-start":               # a fully consistent forged context
+                    inv.cid = oc.cycle_id(M.SLOT, M.GEN, M.OP, other)
+                    inv.ctx = M._ctx(M._pre("thaw", inv.cid, other))
+                else:                                                   # re-hash fails: no original document
+                    disk.world.authz.docs[M.START_AUTH] += b" "
+                self.refused_before_the_mint(disk, inv, "THAW_INTENT")
+
+    def test_every_verb_mints_with_the_recomputed_identity(self):
+        cases = {}
+        disk = self.world()
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        cases["freeze-start"] = (disk, inv, M.effect_freeze_start, ("COMMITTED", "MOVED", ""), M.START_AUTH)
+        disk = self.world()
+        a = moved(disk)
+        inv = M.start_invocation(disk, "freeze-continue", M.A_CONT)
+        incomplete = lambda s, f: ("FREEZE_INCOMPLETE", "store_error", {"journal": "d" * 64})  # noqa: E731
+        cases["freeze-continue"] = (disk, inv, incomplete, ("COMMITTED", "FREEZE_INCOMPLETE", "store_error"), inv.auth)
+        self.assertEqual(a, M.START_AUTH)
+        disk, inv = self.thaw()
+        cases["thaw"] = (disk, inv, M.effect_thaw, ("COMMITTED", "NONE", ""), inv.auth)
+        disk = self.world()
+        first = M.start_invocation(disk, "freeze-start", M.A_START)
+        M.invoke(first, lambda s, f: (M.journal_through_move_intent(s), 1 / 0))
+        inv = M.start_invocation(disk, "resume-step")
+        cases["resume-step"] = (disk, inv, M.effect_resume_move, ("COMMITTED", "MOVED", ""), M.START_AUTH)
+        for verb, (disk, inv, effect, want, auth) in cases.items():
+            with self.subTest(verb):
+                result, minted, calls = self.mints(inv, effect)
+                self.assertEqual((result, calls), (want, [1]))
+                (binding, header), = minted
+                self.assertEqual(binding, {"slot": M.SLOT, "op_id": M.OP, "verb": inv.verb, "cycle_id": M.CID,
+                                           "auth_digest": auth})
+                self.assertEqual(header, M.HEADER)
+
+
+# ---------------------------------------------------------------- N3: the deliberate refusal boundaries
+
+class N3RefusalBoundaries(Repair):
+    def test_the_pair_exposes_no_unimplemented_privileged_operation(self):
+        """prepare_quarantine, attribute changes, staging and flushes (PR-4e/PR-4f) do not exist on the pair."""
+        public = {cls.__name__: sorted(n for n in dir(cls) if not n.startswith("_"))
+                  for cls in (fscap.FsCap, StoreCap, fscap.Reader)}
+        self.assertEqual(public, {"FsCap": ["move", "move_back", "observe", "read_content", "view"],
+                                  "StoreCap": ["put", "put_artifact", "put_blob"],
+                                  "Reader": ["artifact", "blob", "journal"]})
+
+    def test_attribute_change_completions_refuse_without_an_effect(self):
+        for verb, kind in (("freeze-continue", "revoke.done"), ("thaw", "thaw.done"), ("thaw", "revoke.done")):
+            with self.subTest(verb=verb, kind=kind):
+                self.fresh()
+                if verb == "thaw":
+                    disk, inv = self.thaw()
+                else:
+                    disk = self.world(slot=None, dst=RAW)
+                    moved(disk)
+                    disk.journal_seed("start")
+                    disk.journal_seed("ep.done", binding=M.EARLY)
+                    mi = disk.journal_seed("move.intent", src_parent=M.SP, src_name=M.SN, dst_parent=M.QD,
+                                           dst_name=M.DN, root=M.ROOT)
+                    disk.journal_seed("move.done", intent=mi, linked=[])
+                    inv = M.start_invocation(disk, "freeze-continue", M.A_CONT)
+                before, journal = disk.fs(), disk.journal()
+                seen = {}
+
+                def eff(s, f, kind=kind):
+                    seen["put"] = attempt(s.put, kind, attr="flags", lo=0, hi=0)
+                    return "FREEZE_BLOCKED", "journal_mismatch", {}
+                M.invoke(inv, eff)
+                self.assertEqual(seen["put"],
+                                 ("Refused", "completion not observed by the paired filesystem capability"))
+                self.assertEqual((disk.fs(), disk.journal(), inv.authority.renames), (before, journal, 0))
+
+    def test_completed_ep_gate_is_absent_and_the_allow_set_stays_empty(self):
+        """Not a safety property: pins the missing Completed-EP re-validation (PR-4e) for the activation gate.
+        The move completes although the journal's EP binding names no stored blob; the reader's allow-set
+        stays empty. An installed broker has no backend, so this path performs no real effect."""
+        disk = self.world()
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        self.assertEqual(M.invoke(inv, M.effect_freeze_start), ("COMMITTED", "MOVED", ""))
+        self.assertEqual((disk.world.o5.stores["blobs"].items, inv.authority.renames), ({}, 1))
+        self.assertEqual(inv.fscap._c.reader._allow, frozenset())
+        self.assertIsNone(fscap._BACKEND)
+
+
+# ---------------------------------------------------------------- N4: the pair reaches only the capability-gated stores
+
+class N4StoreScope(Repair):
+    def test_only_the_capability_gated_stores_are_reachable_and_read_only(self):
+        disk = self.world()
+        st = disk.world.o5.stores
+        inv = M.start_invocation(disk, "freeze-start", M.A_START)
+        seen = {}
+
+        def tries(fn):
+            try:
+                fn()
+                return "ok"
+            except (TypeError, KeyError, TxnError) as e:
+                return type(e).__name__
+
+        def eff(s, f):
+            r = f._c.reader
+            seen["maps"] = (s._stores, r._stores)
+            seen["puts"] = [attempt(s.put, "start")[0], attempt(s.put_blob, b"x")[0],
+                            attempt(s.put_artifact, {"header": M.HEADER})[0], attempt(r.journal, 0)[0]]
+            seen["forbidden"] = [tries(lambda: operator.setitem(s._stores, "barriers", st["barriers"])),
+                                 tries(lambda: operator.setitem(r._stores, "journals", st["barriers"])),
+                                 tries(lambda: s._stores["barriers"]), tries(lambda: r._stores["evidence"]),
+                                 tries(lambda: st["barriers"].put(s, "barrier/x", b"{}"))]
+            return "NONE", "store_error", {}
+        M.invoke(inv, eff)
+        for m in seen["maps"]:
+            self.assertEqual(sorted(m), ["artifacts", "blobs", "journals"])
+            self.assertTrue(all(m[n] is st[n] for n in m))
+            self.assertFalse(any(isinstance(v, (RecordStore, EvidenceStore)) for v in m.values()))
+        self.assertEqual(seen["puts"], ["ok"] * 4)
+        self.assertEqual(seen["forbidden"], ["TypeError", "TypeError", "KeyError", "KeyError", "TxnError"])
+        self.assertEqual((st["barriers"].items, sorted(st)), ({}, sorted(freeze.STORES + freeze.CAP_STORES +
+                                                                         ("evidence",))))
 
 
 if __name__ == "__main__":

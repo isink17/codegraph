@@ -29,6 +29,7 @@ OBSERVATIONS = ("slot", "slot_root", "quarantine", "walk_q")
 LOCATION = ("slot", "quarantine", "walk_q")      # the thaw pre-check's location and identity observations
 WALKS = ("walk_q", "call_pre", "call_post")      # observations that walk below quarantine/<op_id> (rows 1-7)
 CONTENT_VERDICT = {"originals": "identity", "attrs": "journal_mismatch"}   # the only content reasons, by source
+CAP_STORES = ("journals", "artifacts", "blobs")  # the only stores the pair can reach
 
 # The one place a filesystem backend comes from. None in an installed broker.
 _BACKEND = None

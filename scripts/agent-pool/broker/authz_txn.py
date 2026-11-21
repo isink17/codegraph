@@ -6,6 +6,7 @@ mint of the effect's two capabilities, referenced only by
 invocation._f_complete."""
 
 import itertools
+import types
 
 _COUNTER = itertools.count(1)
 
@@ -175,12 +176,14 @@ def _v2_ok(recs):
 def _issue_effect(txn, binding, header, mode, stores, faults):
     """The one mint of the effect's store capability and filesystem capability, with their shared FsCap
     authority and reader, from the invocation's live CommitTxn. At most one pair per CommitTxn; a second
-    attempt refuses and changes nothing. Protected mode refuses (the mode is the invocation's own trust)."""
+    attempt refuses and changes nothing. Protected mode refuses (the mode is the invocation's own trust).
+    The pair reaches only the capability-gated stores, through one read-only mapping."""
     if not isinstance(txn, CommitTxn):
         raise TxnError("mint without a CommitTxn")
     if txn._effect:
         raise fscap.Refused("second mint in this invocation")
     txn.require()
+    stores = types.MappingProxyType({n: stores[n] for n in fscap.CAP_STORES if n in stores})
     a, c = fscap._mint(binding, header, mode, stores, faults)
     txn._effect = True
     cap = fscap._wrap(StoreCap, a, c)

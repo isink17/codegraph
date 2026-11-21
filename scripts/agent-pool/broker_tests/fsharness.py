@@ -294,6 +294,7 @@ class Invocation:
     def __init__(self, disk, verb, auth, resume_auth=None):
         self.disk, self.verb, self.auth, self.resume_auth = disk, verb, auth, resume_auth
         self.authority = self.fscap = self.prepared = self.txn = None
+        self.cid, self.ctx = CID, None
 
     def mint(self):
         """A second mint attempt through the production mint on this invocation's CommitTxn."""
@@ -312,12 +313,13 @@ class Invocation:
         chain = types.SimpleNamespace(state="ESTABLISHED", id=BID, records=recs,
                                       head=h(recs[-1]) if recs else oc.ZERO64,
                                       authorized=dict.fromkeys(F.barrier.IMMUTABLE, ""))
-        gate = types.SimpleNamespace(ctx=CTX["freeze-start" if self.verb == "freeze-start" else "other"],
+        gate = types.SimpleNamespace(ctx=self.ctx or CTX["freeze-start" if self.verb == "freeze-start" else "other"],
                                      chain=chain, basis="barrier", picked={})
         _CURRENT["disk"], fscap._BACKEND = self.disk, Backend(self.disk)
         try:
-            invocation._f_complete(w, types.SimpleNamespace(o5=gate), types.SimpleNamespace(slot=SLOT, op_id=OP),
-                                   self.txn, self.verb, self.resume_auth or self.auth, CID)
+            invocation._f_complete(w, types.SimpleNamespace(o5=gate),
+                                   types.SimpleNamespace(slot=SLOT, op_id=OP, op=types.SimpleNamespace(gen=GEN)),
+                                   self.txn, self.verb, self.resume_auth or self.auth, self.cid)
         finally:
             self.prepared = w.fwal.prepared
             self.txn.close()

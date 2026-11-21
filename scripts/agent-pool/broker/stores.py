@@ -178,8 +178,9 @@ class CapStore:
     is an exclusive create, or a content-addressed one that accepts identical
     existing bytes; nothing is overwritten or deleted. In-memory model: a key
     whose put raised after the write stays in `pending` until `make_durable`,
-    so existence is never durability. Tests seed `items` directly (test setup,
-    not a write API)."""
+    so existence is never durability. A put of identical bytes over a pending
+    key does not make it durable (durable restricted stores are PR-4d). Tests
+    seed `items` directly (test setup, not a write API)."""
 
     def __init__(self, name, faults=None):
         self.name = name

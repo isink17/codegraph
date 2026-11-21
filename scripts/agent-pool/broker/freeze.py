@@ -7,13 +7,13 @@ from collections import namedtuple
 
 import recovery_state as rs
 
-from . import barrier, canonical, cutover, evidence, o5contract as oc, protocol
+from . import barrier, canonical, cutover, evidence, fscap, o5contract as oc, protocol
 from .canonical import is_hex64
 from .refusal import Code, Refused
 from .stores import CapStore, EvidenceStore, RecordStore
 
 STORES = ("cutovers", "cutover_heads", "enumerations", "barriers")
-CAP_STORES = ("journals", "artifacts", "blobs")
+CAP_STORES = fscap.CAP_STORES
 
 # ------------------------------------------------------------------ F relation and fold (F1 §4.3–§4.4, C1′, C2)
 
