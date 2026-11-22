@@ -233,6 +233,8 @@ class AstBoundaries(unittest.TestCase):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
                     for n in names:
+                        if path.name == "fscap.py" and n == "threading":
+                            continue  # the FsCap authority's one lock (P-B1(b) "Lock and linearization")
                         self.assertNotIn(n.split(".")[0], BANNED_IMPORTS, f"{path.name}: import {n}")
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                     self.assertNotIn(node.func.id, BANNED_CALLS, f"{path.name}: {node.func.id}()")
@@ -241,6 +243,8 @@ class AstBoundaries(unittest.TestCase):
 
     def test_private_constructors_are_referenced_only_where_allowed(self):
         allowed = {"_issue": {"authz_txn.py", "authz.py"}, "_new_capability": {"authz.py", "capability.py"},
+                   "_issue_effect": {"authz_txn.py", "invocation.py"}, "_mint": {"authz_txn.py", "fscap.py"},
+                   "_wrap": {"authz_txn.py", "fscap.py"}, "_BACKEND": {"fscap.py"},
                    "_SEAL": {"authz.py", "provenance.py", "capability.py"}, "_produce": {"provenance.py", "capability.py"}}
         for path, tree in modules(include_testsupport=True, observer=None):
             for node in ast.walk(tree):
@@ -250,6 +254,18 @@ class AstBoundaries(unittest.TestCase):
                     name = node.name
                 if name in allowed:
                     self.assertIn(path.name, allowed[name], f"{path.name} references {name}")
+
+    def test_fscap_uses_threading_only_for_its_lock(self):
+        tree = ast.parse((BROKER / "fscap.py").read_text())
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                and isinstance(n.value, ast.Name) and n.value.id == "threading"}
+        self.assertEqual(used, {"Condition", "current_thread"})
+
+    def test_issue_effect_is_called_only_in_f_complete(self):
+        tree = ast.parse((BROKER / "invocation.py").read_text())
+        callers = {f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                   for n in ast.walk(f) if isinstance(n, ast.Attribute) and n.attr == "_issue_effect"}
+        self.assertEqual(callers, {"_f_complete"})
 
     def test_no_production_module_imports_testsupport(self):
         for path, tree in modules(observer=None):

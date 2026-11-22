@@ -209,6 +209,54 @@ passed to the sandbox as text because the evidence root is unreadable
 there. Proposals may use only the PM fields with `codex`
 agents; a `command` agent is refused.
 
+## Plane synchronisation
+
+`scripts/agent-coordinator/plane_sync.py` is the reviewed `plane-sync.sh`
+(install a copy outside agent-writable paths and point
+`CG_CAMPAIGN_PLANE_SYNC` at it). It talks to the Plane Cloud REST API v2
+with a key read from the macOS Keychain (`plane-cloud-mac` / `api-token`)
+at run time; the key is never printed, logged or written.
+
+```sh
+plane_sync.py status                  # ledger: pending (ticket, PR) pairs
+plane_sync.py status CG-150 554       # read-only: work item, marker comment
+plane_sync.py sync CG-150 554 body.html [--comment-id UUID] [--dry-run]
+plane_sync.py CG-150 554 body.html    # the form campaign.py calls
+plane_sync.py bootstrap CG-150 [--dry-run]
+```
+
+- The PR must name the ticket (title, body or branch). The ticket resolves
+  to one work item of the CodeGraph project.
+- The comment is the one whose first line of visible text (taken from
+  `comment_html`, one line per block) is
+  `codegraph-coordinator-sync/v1 isink17/codegraph#<PR>`. One match is
+  updated in place, none is created once, two or more refuse. A marker
+  elsewhere in any comment, a hidden or reply match, or a match that
+  differs from `--comment-id` (or, without it, from the id the ledger last
+  recorded) also refuses. A `--comment-id` that Plane confirms as the only
+  match supersedes the ledger's id. Comments without the marker are never
+  touched.
+- Success only after a read-back returns the sent text (tags stripped,
+  entities decoded, whitespace collapsed, so sanitizer rewrites do not
+  count) with the marker still leading and, for an update, a later
+  `updated_at`. Unchanged text is not rewritten, so a retry after a crash
+  is a no-op. A create is never retried blindly: when its response is lost,
+  Plane is re-read and the comment it made is adopted; with no comment
+  there, no new create is sent until 300 s after the attempt.
+- 429 waits `Retry-After` (capped at 60 s); network errors and 5xx retry
+  reads and updates up to three times. Everything else fails closed.
+- State lives in `CG_PLANE_SYNC_STATE` (default
+  `~/Projekti/codegraph-ops/plane-sync/`, mode 0700): `ledger.jsonl`
+  (append-only, fsynced, 0600; `ATTEMPT`, `SYNCED`, `UNSYNCHRONIZED`
+  events with body hashes, never bodies or keys) and `plane-sync.lock`,
+  which admits one writer. Looser modes, a malformed or torn ledger line
+  refuse. `bootstrap` writes one `RECONSTRUCTED` point-in-time snapshot
+  from a live read, once, into an empty ledger; it is not history. The
+  ledger of the old `plane-sync.sh` was lost with the evidence tree; there
+  is nothing to migrate.
+- Exit codes: 0 synced, 1 `UNSYNCHRONIZED` (retry), 2 usage, 3 refused
+  (owner must look), 4 another writer holds the lock.
+
 ## Operating
 
 Live terminal (inside a plain terminal, or as a background terminal of an
@@ -264,6 +312,7 @@ model_reasoning_effort = "medium"
 ```sh
 TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) python3 scripts/agent-coordinator/test_coordinator.py
 TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) python3 scripts/agent-coordinator/test_campaign.py
+python3 scripts/agent-coordinator/test_plane_sync.py   # fake Plane, gh and key
 # dry run with the real codex CLI against a throwaway repository (model calls):
 CG_DEMO_REAL_CODEX=1 TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) \
   python3 scripts/agent-coordinator/test_campaign.py RealCodex
