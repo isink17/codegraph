@@ -173,6 +173,8 @@ jobs:
           python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes test_recovery_gate test_recovery_cli
           python3 -m unittest discover -s broker_tests -t broker_tests
           bash pool_test.sh
+      - name: Plane sync suite (fake Plane, gh and key)
+        run: python3 scripts/agent-coordinator/test_plane_sync.py
 
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.
