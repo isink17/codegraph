@@ -20,10 +20,12 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import html
 import http.client
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +52,8 @@ MAX_PAGES = 50
 PER_PAGE = 200
 MAX_TRIES = 3
 MAX_RETRY_AFTER = 60
+# An unanswered create is not repeated until any request still in flight has landed.
+CREATE_GRACE = 300
 
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 TICKET = re.compile(r"^CG-([1-9][0-9]{0,5})$")
@@ -232,23 +236,26 @@ def is_uuid(value):
 
 def check_comment(c, item):
     if (not isinstance(c, dict) or not is_uuid(c.get("id")) or c.get("work_item_id") != item
-            or not isinstance(c.get("comment_html"), str) or not isinstance(c.get("comment_stripped"), str)):
+            or not isinstance(c.get("comment_html"), str)):
         raise Refused("IDENTITY: malformed comment or comment of another work item")
 
 
-def first_line(c):
-    for line in c["comment_stripped"].splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
+BLOCK_END = re.compile(r"<br\s*/?>|</(?:p|div|li|h[1-6]|pre|blockquote|tr|ul|ol)\s*>", re.I)
+
+
+def text_of(markup):
+    """Visible text, one line per block, whitespace collapsed. Derived here
+    rather than from Plane's comment_stripped, whose block separators are not
+    part of any contract; it is also what read-back compares, so attribute
+    rewrites and entity re-encoding by Plane's sanitizer do not count."""
+    flat = html.unescape(re.sub(r"<[^>]*>", "", BLOCK_END.sub("\n", markup)))
+    return "\n".join(" ".join(line.split()) for line in flat.splitlines() if line.strip())
 
 
 def marker_pr(c):
-    """The PR named by the comment's leading marker, or None."""
-    m = ANY_PR_MARKER.match(first_line(c))
-    if m and (m.end() == len(first_line(c)) or first_line(c)[m.end()].isspace()):
-        return int(m.group(1))
-    return None
+    """The PR named by the comment's leading marker line, or None."""
+    m = ANY_PR_MARKER.match(text_of(c["comment_html"]))
+    return int(m.group(1)) if m else None
 
 
 def matches(comments, pr):
@@ -260,7 +267,7 @@ def matches(comments, pr):
     for c in comments:
         if marker_pr(c) == pr:
             hit.append(c)
-        elif any(int(m.group(1)) == pr for m in ANY_PR_MARKER.finditer(c["comment_stripped"] + " " + c["comment_html"])):
+        elif any(int(m.group(1)) == pr for m in ANY_PR_MARKER.finditer(text_of(c["comment_html"]))):
             raise Refused(f"AMBIGUOUS_MARKER: comment {c['id']} mentions {want} outside its leading line")
     return hit
 
@@ -294,6 +301,9 @@ class Ledger:
         except OSError as e:
             raise Refused(f"LEDGER: {self.path} unreadable ({errno.errorcode.get(e.errno, e.errno)})")
         with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+                raise Refused(f"LEDGER: {self.path} must be a regular file of this user with mode 0600")
             raw = f.read(MAX_LEDGER + 1)
         if len(raw) > MAX_LEDGER:
             raise Refused(f"LEDGER: over {MAX_LEDGER} bytes")
@@ -331,6 +341,17 @@ class Ledger:
                     cid = r["comment_id"]
         return cid
 
+    def unresolved_create(self, ticket, pr):
+        """utc of the last create attempt not yet followed by SYNCED, or None."""
+        when = None
+        for e in self.events():
+            if e.get("ticket") == ticket and e.get("pr") == pr:
+                if e["type"] == "ATTEMPT" and e.get("action") == "create":
+                    when = e.get("utc")
+                elif e["type"] == "SYNCED":
+                    when = None
+        return when
+
     def pending(self):
         last = {}
         for e in self.events():
@@ -341,6 +362,9 @@ class Ledger:
 
 def lock(state):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.stat(state, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+        raise Refused(f"LEDGER: {state} must be a directory of this user with mode 0700")
     fd = os.open(state / "plane-sync.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -371,11 +395,11 @@ def select(plane, ledger, ticket, pr, expect):
     """(work item id, the one existing comment or None), failing closed."""
     item = plane.work_item(ticket)
     hit = matches(plane.comments(item), pr)
-    known = ledger.known_comment(ticket, pr)
-    for label, cid in (("--comment-id", expect), ("the ledger", known)):
-        if cid and [c["id"] for c in hit] != [cid]:
-            raise Refused(f"AMBIGUOUS_MARKER: {label} names {cid}, Plane has "
-                          f"{[c['id'] for c in hit] or 'no'} marker comment for {ticket} #{pr}")
+    # An owner-given id that Plane confirms supersedes the one the ledger pinned.
+    label, cid = ("--comment-id", expect) if expect else ("the ledger", ledger.known_comment(ticket, pr))
+    if cid and [c["id"] for c in hit] != [cid]:
+        raise Refused(f"AMBIGUOUS_MARKER: {label} names {cid}, Plane has "
+                      f"{[c['id'] for c in hit] or 'no'} marker comment for {ticket} #{pr}")
     if len(hit) > 1:
         raise Refused(f"AMBIGUOUS_MARKER: {len(hit)} comments carry {marker(pr)}: {[c['id'] for c in hit]}")
     if hit and (hit[0].get("parent_id") or hit[0].get("hidden_at")):
@@ -383,45 +407,75 @@ def select(plane, ledger, ticket, pr, expect):
     return item, (hit[0] if hit else None)
 
 
-def cmd_sync(args, plane, gh, out):
-    ticket, pr = parse_target(args.ticket, args.pr)
+def read_body(args, pr):
     if args.comment_id and not is_uuid(args.comment_id):
         raise Refused("USAGE: --comment-id must be a lowercase UUID")
     try:
         text = Path(args.body).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         raise Refused(f"BODY: {args.body} unreadable ({type(e).__name__})")
-    body = prepare_body(text, pr)
-    digest = sha256(body)
+    return prepare_body(text, pr)
+
+
+def plan(cur, body):
+    if cur is None:
+        return "create"
+    return "noop" if text_of(cur["comment_html"]) == text_of(body) else "update"
+
+
+def parse_utc(value):
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else None
+
+
+def cmd_sync(args, plane, gh, out):
+    ticket, pr = parse_target(args.ticket, args.pr)
     ledger = Ledger(STATE_DIR, plane.redact)
     if args.dry_run:
+        body = read_body(args, pr)
         check_pr_maps_to_ticket(pr, ticket, gh)
         _, cur = select(plane, ledger, ticket, pr, args.comment_id)
-        plan = "CREATE" if cur is None else ("NOOP" if cur["comment_html"].strip() == body else f"UPDATE {cur['id']}")
-        out(f"plane-sync: DRY-RUN {ticket} #{pr}: would {plan} (body sha256 {digest}); nothing written")
+        action = plan(cur, body).upper() + ("" if cur is None else f" {cur['id']}")
+        out(f"plane-sync: DRY-RUN {ticket} #{pr}: would {action} (body sha256 {sha256(body)}); nothing written")
         return 0
     fd = lock(STATE_DIR)
     try:
         ledger.events()
-        record = {"ticket": ticket, "pr": pr, "body_sha256": digest}
+        record = {"ticket": ticket, "pr": pr}
+        cid = None
         try:
+            body = read_body(args, pr)
+            record["body_sha256"] = sha256(body)
             check_pr_maps_to_ticket(pr, ticket, gh)
             item, cur = select(plane, ledger, ticket, pr, args.comment_id)
             cid = cur and cur["id"]
-            action = "create" if cur is None else ("noop" if cur["comment_html"].strip() == body else "update")
+            action = plan(cur, body)
+            pending = ledger.unresolved_create(ticket, pr)
+            if action == "create" and pending:
+                age = (datetime.now(timezone.utc) - (parse_utc(pending) or datetime.now(timezone.utc))).total_seconds()
+                if age < CREATE_GRACE:
+                    raise Unsynced(f"CREATE_PENDING: the create attempted at {pending} has no comment on Plane "
+                                   f"yet; not creating again before {CREATE_GRACE} s have passed")
             ledger.append({"type": "ATTEMPT", **record, "comment_id": cid, "action": action})
             if action == "create":
                 cid = create(plane, item, pr, body)
             elif action == "update":
                 plane.call("PATCH", f"projects/{PROJECT}/work-items/{item}/comments/{cid}/", {"comment_html": body})
             back = plane.comment(item, cid)
-            if back["comment_html"].strip() != body or marker_pr(back) != pr:
-                raise Unsynced(f"READBACK: comment {cid} body sha256 {sha256(back['comment_html'].strip())} "
-                               f"!= sent {digest}")
-            if action == "update" and not str(back.get("updated_at") or "") > str(cur.get("updated_at") or ""):
-                raise Unsynced(f"READBACK: comment {cid} updated_at did not advance")
+            if marker_pr(back) != pr:
+                raise Unsynced(f"READBACK: comment {cid} no longer leads with {marker(pr)}")
+            if text_of(back["comment_html"]) != text_of(body):
+                raise Unsynced(f"READBACK: comment {cid} text sha256 {sha256(text_of(back['comment_html']))} "
+                               f"!= sent {sha256(text_of(body))}")
+            if action == "update":
+                before, after = parse_utc(cur.get("updated_at")), parse_utc(back.get("updated_at"))
+                if before is None or after is None or after <= before:
+                    raise Unsynced(f"READBACK: comment {cid} updated_at did not advance")
         except (Refused, Unsynced) as e:
-            ledger.append({"type": "UNSYNCHRONIZED", **record, "error": str(e)[:300]})
+            ledger.append({"type": "UNSYNCHRONIZED", **record, "comment_id": cid, "error": str(e)[:300]})
             raise
         ledger.append({"type": "SYNCED", **record, "comment_id": cid, "action": action,
                        "updated_at": back.get("updated_at"), "readback": "ok"})
@@ -484,7 +538,7 @@ def cmd_bootstrap(args, plane, gh, out):
             if len(cs) != 1:
                 raise Refused(f"AMBIGUOUS_MARKER: {len(cs)} comments for {ticket} #{pr}")
             rows.append({"ticket": ticket, "pr": pr, "comment_id": cs[0]["id"],
-                         "updated_at": cs[0].get("updated_at"), "body_sha256": sha256(cs[0]["comment_html"].strip())})
+                         "updated_at": cs[0].get("updated_at"), "body_sha256": sha256(cs[0]["comment_html"])})
     event = {"type": "RECONSTRUCTED", "source": "plane-cloud v2 read-back",
              "note": "point-in-time snapshot; no prior event history exists", "comments": rows}
     if args.dry_run:

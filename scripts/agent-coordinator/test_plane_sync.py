@@ -7,6 +7,7 @@ fake key. Never touches the Keychain, Plane or GitHub.
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -29,8 +30,8 @@ NEW = "4d963fff-210c-4b7c-82e1-12b05b1de6b8"
 
 def comment(cid, html, stripped=None, updated="2026-11-21T15:02:07.328673Z", **kw):
     return {"id": cid, "work_item_id": ITEM, "comment_html": html,
-            "comment_stripped": stripped if stripped is not None else html.replace("<p>", "").replace("</p>", "\n")
-            .replace("<code>", "").replace("</code>", ""),
+            # Django strip_tags, as Plane derives it: no separator between blocks.
+            "comment_stripped": stripped if stripped is not None else re.sub(r"<[^>]+>", "", html),
             "parent_id": None, "hidden_at": None, "updated_at": updated, **kw}
 
 
@@ -84,7 +85,7 @@ class FakePlane:
             return 404, {}, b'{"code": "not_found"}'
         if method == "PATCH":
             c = dict(self.comments[cid], comment_html=json.loads(data)["comment_html"], updated_at=self.now())
-            c["comment_stripped"] = comment(cid, c["comment_html"])["comment_stripped"]
+            c["comment_stripped"] = re.sub(r"<[^>]+>", "", c["comment_html"])
             self.comments[cid] = c
         return self.ok(self.comments[cid])
 
@@ -113,7 +114,8 @@ class PlaneSync(unittest.TestCase):
         ps.STATE_DIR = self.state
         self.addCleanup(setattr, ps, "STATE_DIR", self.old_state)
         self.body = self.tmp / "body.html"
-        self.body.write_text("<p>PR #554 merged as abc123.</p>\n")
+        self.body.write_text('<p>PR: <a href="https://github.com/isink17/codegraph/pull/554">#554</a> '
+                             'merged as abc123 &amp; read back.</p>\n')
         self.out, self.err, self.slept = [], [], []
         self.plane = FakePlane([comment(C553, marked(553)), comment(C554, marked(554)),
                                 comment(C55, marked(55))])
@@ -150,7 +152,7 @@ class PlaneSync(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_status_without_target_lists_pending_from_ledger(self):
-        self.state.mkdir()
+        self.state.mkdir(mode=0o700)
         ps.Ledger(self.state).append({"type": "UNSYNCHRONIZED", "ticket": "CG-150", "pr": 554, "error": "x"})
         self.assertEqual(self.run_sync("status"), 1)
         self.assertIn("PENDING CG-150 #554", self.out[0])
@@ -160,7 +162,7 @@ class PlaneSync(unittest.TestCase):
     def test_updates_only_the_verified_comment_and_reads_back(self):
         self.assertEqual(self.run_sync("CG-150", "554", str(self.body), "--comment-id", C554), 0)
         self.assertEqual(self.plane.writes(), [("PATCH", f"projects/{ps.PROJECT}/work-items/{ITEM}/comments/{C554}/")])
-        self.assertTrue(self.plane.comments[C554]["comment_html"].endswith("<p>PR #554 merged as abc123.</p>"))
+        self.assertIn("merged as abc123", self.plane.comments[C554]["comment_html"])
         self.assertEqual(self.plane.comments[C553]["comment_html"], marked(553))
         self.assertEqual(self.plane.calls[-1], ("GET", f"projects/{ps.PROJECT}/work-items/{ITEM}/comments/{C554}/"))
         types = [e["type"] for e in self.ledger()]
@@ -218,7 +220,7 @@ class PlaneSync(unittest.TestCase):
                                         "AMBIGUOUS_MARKER")
 
     def test_ledger_known_comment_missing_from_plane_is_not_recreated(self):
-        self.state.mkdir()
+        self.state.mkdir(mode=0o700)
         ps.Ledger(self.state).append({"type": "RECONSTRUCTED", "comments": [
             {"ticket": "CG-150", "pr": 554, "comment_id": C554}]})
         del self.plane.comments[C554]
@@ -247,9 +249,10 @@ class PlaneSync(unittest.TestCase):
     def test_body_with_its_own_marker_refuses(self):
         self.body.write_text(marked(553, "x"))
         self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "BODY")
+        self.assertEqual(self.ledger()[-1]["type"], "UNSYNCHRONIZED")
 
     def test_malformed_ledger_refuses(self):
-        self.state.mkdir()
+        self.state.mkdir(mode=0o700)
         (self.state / "ledger.jsonl").write_text("not json\n")
         self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "LEDGER")
 
@@ -312,20 +315,18 @@ class PlaneSync(unittest.TestCase):
             os.close(fd)
 
     def test_concurrent_syncs_write_once(self):
-        gate = threading.Event()
+        gate, entered = threading.Event(), threading.Event()
         real = self.plane.__call__
 
         def slow(method, url, headers, data):
             if method == "PATCH":
+                entered.set()
                 gate.wait(5)
             return real(method, url, headers, data)
         codes = []
         t = threading.Thread(target=lambda: codes.append(self.run_sync("CG-150", "554", str(self.body), plane=slow)))
         t.start()
-        for _ in range(200):
-            if any(m == "PATCH" for m, _ in self.plane.calls):
-                break
-            threading.Event().wait(0.01)
+        self.assertTrue(entered.wait(5))
         codes.append(self.run_sync("CG-150", "554", str(self.body), plane=slow))
         gate.set()
         t.join()
@@ -351,15 +352,128 @@ class PlaneSync(unittest.TestCase):
         self.assertFalse((self.state / "ledger.jsonl").exists())
 
 
+    # ---------------------------------------------------------------- review round 1
+
+    def sanitizing(self):
+        real = self.plane.__call__
+
+        def rewrite(method, url, headers, data):
+            if data is not None:
+                v = json.loads(data)
+                v["comment_html"] = v["comment_html"].replace("<a href=", '<a rel="noopener noreferrer" href=')
+                data = json.dumps(v).encode()
+            return real(method, url, headers, data)
+        return rewrite
+
+    def test_sanitized_storage_reads_back_and_retries_as_noop(self):
+        plane = self.sanitizing()
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body), plane=plane), 0)
+        self.assertIn('rel="noopener', self.plane.comments[NEW]["comment_html"])
+        self.plane.calls.clear()
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body), plane=plane), 0)
+        self.assertEqual(self.plane.writes(), [])
+
+    def test_unanswered_create_is_not_repeated_within_grace(self):
+        self.plane.script = [None, None, (500, {}, b"")]  # work item, comments, POST
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body)), 1)
+        self.assertEqual([m for m, _ in self.plane.writes()], ["POST"])
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body)), 1)
+        self.assertIn("CREATE_PENDING", self.err[-1])
+        self.assertEqual([m for m, _ in self.plane.writes()], ["POST"])
+        old = ps.CREATE_GRACE
+        ps.CREATE_GRACE = 0
+        self.addCleanup(setattr, ps, "CREATE_GRACE", old)
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body)), 0)
+        self.assertEqual([m for m, _ in self.plane.writes()], ["POST", "POST"])
+        self.assertEqual(self.ledger()[-1]["comment_id"], NEW)
+
+    def test_patch_network_error_is_retried(self):
+        real = self.plane.__call__
+        failed = []
+
+        def flaky(method, url, headers, data):
+            if method == "PATCH" and not failed:
+                failed.append(1)
+                raise ConnectionResetError("reset")
+            return real(method, url, headers, data)
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), plane=flaky), 0)
+        self.assertEqual(self.slept, [2])
+
+    def test_oversized_response_is_unsynchronized(self):
+        self.plane.script = [(200, {}, b" " * (ps.MAX_RESPONSE + 1))]
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 1)
+        self.assertIn("response over", self.err[-1])
+
+    def test_repeated_cursor_is_unsynchronized(self):
+        page = json.dumps({"data": [], "has_more": True, "next_cursor": "c1"}).encode()
+        self.plane.script = [None, (200, {}, page), (200, {}, page)]
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 1)
+        self.assertIn("pagination", self.err[-1])
+
+    def test_torn_ledger_line_refuses(self):
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        with open(self.state / "ledger.jsonl", "a") as f:
+            f.write('{"type": "ATT')
+        self.plane.calls.clear()
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "LEDGER")
+
+    def test_loose_permissions_refuse(self):
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        (self.state / "ledger.jsonl").chmod(0o644)
+        self.plane.calls.clear()
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "0600")
+        (self.state / "ledger.jsonl").chmod(0o600)
+        self.state.chmod(0o755)
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "0700")
+        self.state.chmod(0o700)
+
+    def test_owner_comment_id_supersedes_ledger_pin(self):
+        self.state.mkdir(mode=0o700)
+        ps.Ledger(self.state).append({"type": "RECONSTRUCTED", "comments": [
+            {"ticket": "CG-150", "pr": 554, "comment_id": C553}]})
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "the ledger")
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), "--comment-id", C554), 0)
+        self.assertEqual(self.ledger()[-1]["comment_id"], C554)
+        self.plane.calls.clear()
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+
+    def test_marker_lost_on_readback_has_its_own_message(self):
+        real = self.plane.__call__
+
+        def drop(method, url, headers, data):
+            status, h, raw = real(method, url, headers, data)
+            if method == "GET" and url.endswith(f"/comments/{C554}/"):
+                v = json.loads(raw)
+                v["comment_html"] = "<p>x</p>"
+                raw = json.dumps(v).encode()
+            return status, h, raw
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), plane=drop), 1)
+        self.assertIn("no longer leads with", self.err[-1])
+
+    def test_updated_at_compared_as_time_not_text(self):
+        # DRF drops zero microseconds; as text "...01Z" sorts after "...01.500000Z".
+        self.plane.comments[C554]["updated_at"] = "2026-11-22T10:00:01Z"
+        self.plane.now = lambda: "2026-11-22T10:00:01.500000Z"
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+
+
 class Matching(unittest.TestCase):
     def test_marker_boundaries(self):
-        for text, pr in [("codegraph-coordinator-sync/v1 isink17/codegraph#554", 554),
-                         ("codegraph-coordinator-sync/v1 isink17/codegraph#533 synced 2026-11-07", 533),
-                         ("codegraph-coordinator-sync/v1 isink17/codegraph#5540", 5540),
-                         ("codegraph-coordinator-sync/v1 isink17/codegraph#554x", None),
-                         ("codegraph-coordinator-sync/v1 isink17/codegraph design-decisions", None),
-                         ("note\ncodegraph-coordinator-sync/v1 isink17/codegraph#554", None)]:
-            self.assertEqual(ps.marker_pr(comment(C554, "", stripped=text)), pr, text)
+        m = "codegraph-coordinator-sync/v1 isink17/codegraph"
+        for markup, pr in [(f"<p><code>{m}#554</code></p><p>PR: x</p>", 554),
+                           (f"<p>{m}#533 synced 2026-11-07</p>", 533),
+                           (f"<p><code>{m}#5540</code></p>", 5540),
+                           (f"<p><code>{m}#55</code></p><p>0 items</p>", 55),
+                           (f"<p><code>{m} design-decisions</code></p>", None),
+                           (f"<p>note</p><p>{m}#554</p>", None),
+                           (f"<p>note<br>{m}#554</p>", None)]:
+            self.assertEqual(ps.marker_pr(comment(C554, markup)), pr, markup)
+
+    def test_text_ignores_sanitizer_rewrites(self):
+        sent = '<p>PR: <a href="https://x/1">#1</a> a &amp; b</p>'
+        stored = '<p>PR: <a href="https://x/1" rel="noopener noreferrer nofollow" target="_blank">#1</a> a &#38; b</p>'
+        self.assertEqual(ps.text_of(sent), ps.text_of(stored))
+        self.assertNotEqual(ps.text_of(sent), ps.text_of(sent.replace("a &amp; b", "a &amp; c")))
 
 
 if __name__ == "__main__":
