@@ -43,7 +43,7 @@ time, as the owner:
    mkdir -m 700 -p ~/Projekti/codegraph-ops
    for d in pool coordinator plane-sync; do
      src=~/Projekti/codegraph-evidence/$d dst=~/Projekti/codegraph-ops/$d
-     [ -L "$src" ] && continue                 # already migrated
+     [ -L "$src" ] && continue
      [ -e "$src" ] || continue
      [ ! -e "$dst" ] || rmdir "$dst" || { echo "$dst is not empty; stop" >&2; break; }
      mv "$src" "$dst" && ln -s "$dst" "$src"
