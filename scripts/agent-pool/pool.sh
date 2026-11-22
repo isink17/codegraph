@@ -23,6 +23,14 @@ cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
 LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
+# The default store moved out of the disposable evidence tree. Leases, locks
+# or recovery state left at the old default would be invisible here, so a
+# leased slot could look free: refuse until the owner migrates (docs/agent-pool.md).
+LEGACY_LEASES=$HOME/Projekti/codegraph-evidence/pool
+if [[ -z ${CG_POOL_LEASES:-} && ( -e $LEGACY_LEASES || -L $LEGACY_LEASES ) ]]; then
+	echo "refused: $LEGACY_LEASES still exists; migrate it to $LEASES (docs/agent-pool.md, Migration) or set CG_POOL_LEASES" >&2
+	exit 1
+fi
 REMOTE=${CG_POOL_REMOTE:-origin}
 BASE=${CG_POOL_BASE:-v2.0}
 # Every slot must be a worktree of this repository.

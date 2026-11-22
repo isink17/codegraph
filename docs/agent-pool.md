@@ -26,6 +26,21 @@ Leases live in `~/Projekti/codegraph-ops/pool/<slot>.lease` (`CG_POOL_LEASES`).
 Operational state lives under `~/Projekti/codegraph-ops/`, never under the
 disposable evidence root.
 
+**Migration.** The default used to be `~/Projekti/codegraph-evidence/pool`.
+While that path exists and `CG_POOL_LEASES` is unset, `pool.sh` refuses
+every command and the coordinator refuses to start (it does the same for
+`~/Projekti/codegraph-evidence/coordinator` without `CG_COORD_STATE`). One
+time, as the owner:
+
+1. stop the coordinator and every campaign; confirm no `pool.sh` runs;
+2. confirm no `.<slot>.lock` directory exists in the old store;
+3. `mv ~/Projekti/codegraph-evidence/pool ~/Projekti/codegraph-ops/pool`,
+   likewise `coordinator` and `plane-sync`, keeping mode 0700
+   (an empty target created earlier is removed first);
+4. `scripts/agent-pool/pool.sh status`.
+
+Never recreate leases or coordinator state by hand.
+
 ```sh
 scripts/agent-pool/pool.sh status
 scripts/agent-pool/pool.sh assess <slot>

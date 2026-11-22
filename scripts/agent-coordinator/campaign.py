@@ -990,6 +990,8 @@ def cmd_run(c, args):
     # of the agents' reach.
     writable = ["/private/tmp", "/tmp", "/dev",
                 *filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":"))]
+    if c.auth["merge"]["mode"] != "none" and not (os.path.isfile(PLANE_SYNC) and os.access(PLANE_SYNC, os.X_OK)):
+        raise Refused(f"plane-sync {PLANE_SYNC} is not an executable file; a merge could not be synchronised")
     owned = [c.dir, Path(PLANE_SYNC)]
     if c.auth["merge"]["mode"] == "exception":
         owned.append(Path(c.auth["merge"]["exception_dir"]))

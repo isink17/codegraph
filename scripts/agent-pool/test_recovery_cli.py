@@ -395,6 +395,9 @@ class Interlock(Cli):
         paths = [live, live + "/recovery", os.path.dirname(live), os.path.dirname(os.path.dirname(live)), "/"]
         if os.path.isdir("/System/Volumes/Data" + live):
             paths.append("/System/Volumes/Data" + live)
+        legacy = cli.legacy_live_pool()
+        self.assertEqual(legacy, os.path.join(os.path.dirname(os.path.dirname(live)), "codegraph-evidence", "pool"))
+        paths += [legacy, legacy + "/recovery", os.path.dirname(legacy)]
         for path in paths:
             with self.subTest(path=path), self.assertRaisesRegex(rs.Refused, "live pool"):
                 cli._not_live(path)

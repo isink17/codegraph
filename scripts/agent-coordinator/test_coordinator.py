@@ -1537,6 +1537,7 @@ class Pool(Fixture):
         no other coordinator's state under the evidence root, no ssh keys."""
         probes = {"keychain": self.t / "home/Library/Keychains/probe", "ssh": self.t / "home/.ssh/id_probe",
                   "evidence": self.t / "home/Projekti/codegraph-evidence/coordinator/tokens/x.token",
+                  "ops": self.t / "home/Projekti/codegraph-ops/plane-sync/plane-sync.sh",
                   "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json",
                   "aws": self.t / "home/.aws/credentials", "history": self.t / "home/.zsh_history",
                   "other": self.t / "home/Documents/canary.txt", "gitconfig": self.t / "home/.gitconfig"}
@@ -1918,13 +1919,15 @@ class ScratchSweep(unittest.TestCase):
 class StateDefaults(unittest.TestCase):
     def test_persistent_state_defaults_are_outside_the_evidence_root(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
-        probe = ("import json, coordinator, campaign; print(json.dumps([str(coordinator.STATE_DIR), "
-                 "str(coordinator.LEASES), campaign.PLANE_SYNC, str(coordinator.EVIDENCE)]))")
-        p = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(HERE)!r}); {probe}"],
+        probe = ("import json, coordinator, campaign, recovery_cli; print(json.dumps([str(coordinator.STATE_DIR), "
+                 "str(coordinator.LEASES), campaign.PLANE_SYNC, recovery_cli.live_pool(), str(coordinator.EVIDENCE)]))")
+        paths = f"sys.path[:0] = [{str(HERE)!r}, {str(HERE.parent / 'agent-pool')!r}]"
+        p = subprocess.run([sys.executable, "-I", "-c", f"import sys; {paths}; {probe}"],
                            env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
-        state, leases, plane_sync, evidence = json.loads(p.stdout)
+        state, leases, plane_sync, live_pool, evidence = json.loads(p.stdout)
         ops = str(Path.home() / "Projekti/codegraph-ops")
+        self.assertEqual(live_pool, leases)
         for path in (state, leases, plane_sync):
             self.assertTrue(path.startswith(ops + "/"), path)
             self.assertFalse(path.startswith(evidence.rstrip("/") + "/"), path)

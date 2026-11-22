@@ -65,8 +65,8 @@ STOP_FILE = Path(os.environ.get("CG_COORD_STOP", STATE_DIR / "STOP"))
 # ~/.codex (config, hooks, rules, MCP servers, sessions) is never loaded.
 CODEX_AUTH = Path(os.environ.get("CG_COORD_CODEX_AUTH", HOME / ".codex/auth.json"))
 CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
-# Unreadable to every agent and validation command: other coordinators' and
-# campaigns' state and tokens live under the evidence root.
+# Unreadable to every agent and validation command, like OPS_ROOT: campaign
+# state, evidence and review files live under the evidence root.
 EVIDENCE = Path(os.environ.get("CG_COORD_EVIDENCE", HOME / "Projekti/codegraph-evidence"))
 DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p]
 # Owner credentials no agent needs. Only denied explicitly in the legacy
@@ -191,6 +191,8 @@ def owner_writable():
         bad = [p for p in protected if (os.path.realpath(p) + "/").startswith(r.rstrip("/") + "/")]
         if bad:
             raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} contains protected {bad[0]}")
+        if (r.rstrip("/") + "/").startswith(os.path.realpath(OPS_ROOT) + "/"):
+            raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} lies inside {OPS_ROOT}")
         out.append(r)
     return out
 
@@ -1918,6 +1920,16 @@ def cmd_cancel(c, args):
     return 0
 
 
+def refuse_legacy_state():
+    """State left at the pre-codegraph-ops defaults would be silently
+    abandoned (tasks, lease tokens, run lock); the owner migrates it first."""
+    legacy = HOME / "Projekti/codegraph-evidence"
+    for var, old in (("CG_COORD_STATE", legacy / "coordinator"), ("CG_POOL_LEASES", legacy / "pool")):
+        if var not in os.environ and (old.exists() or old.is_symlink()):
+            raise Refused(f"{old} still exists; migrate it (docs/agent-coordinator.md, State and evidence) "
+                          f"or set {var}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="coordinator.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1930,8 +1942,9 @@ def main(argv=None):
     p = sub.add_parser("cancel")
     p.add_argument("task")
     args = ap.parse_args(argv)
-    c = Coordinator()
     try:
+        refuse_legacy_state()
+        c = Coordinator()
         c.lock()
         c.load()
         return {"plan": cmd_plan, "run": cmd_run, "resume": cmd_run, "status": cmd_status, "cancel": cmd_cancel}[args.cmd](c, args)

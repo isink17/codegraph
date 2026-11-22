@@ -1268,6 +1268,7 @@ class NotWired(unittest.TestCase):
         src = (HERE / "recovery_state.py").read_text()
         self.assertNotIn("__main__", src)
         self.assertNotIn("codegraph-evidence", src)
+        self.assertNotIn("codegraph-ops", src)
         # pool.sh prints a recovery_state= status key; it reaches the library only through pool_record.py
         # and recovery_cli.py.
         self.assertNotIn("recovery_state.py", (HERE / "pool.sh").read_text())

@@ -26,16 +26,16 @@ SLOT = "codegraph-worker-x"
 O5_SLOTS = (SLOT, "codegraph-worker-y")
 HEAD = "a" * 40
 T0 = 1762819200
-_LIVE = (Path.home() / "Projekti" / "codegraph-evidence").resolve()
+_LIVE = tuple((Path.home() / "Projekti" / n).resolve() for n in ("codegraph-evidence", "codegraph-ops"))
 
 
 def scratch_dir():
     """A fresh private directory under the system temporary directory, never
-    under the CodeGraph evidence tree (where the live pool lives)."""
+    under the CodeGraph evidence or ops trees (where live pool state lives)."""
     d = Path(tempfile.mkdtemp(prefix="o5-broker-")).resolve()
-    if d == _LIVE or _LIVE in d.parents:
+    if any(d == live or live in d.parents for live in _LIVE):
         shutil.rmtree(d)
-        raise RuntimeError("temporary directory resolves into the CodeGraph evidence tree")
+        raise RuntimeError("temporary directory resolves into the CodeGraph evidence or ops tree")
     os.chmod(d, 0o700)
     return d
 
