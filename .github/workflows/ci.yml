@@ -153,9 +153,9 @@ jobs:
         run: go test ./internal/jvmbinary ./internal/cli -count=1
 
   # The agent pool lease manager and its recovery library (Python and bash),
-  # on throwaway pools only. The coordinator and campaign suites are not run
-  # here: parts of them exercise macOS sandbox-exec and they are unvalidated
-  # on Linux.
+  # on throwaway pools only, and the Plane sync suite. The coordinator and
+  # campaign suites are not run here: parts of them exercise macOS
+  # sandbox-exec and they are unvalidated on Linux.
   pool-safety:
     needs: changes
     if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}

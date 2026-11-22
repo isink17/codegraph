@@ -229,9 +229,12 @@ plane_sync.py bootstrap CG-150 [--dry-run]
   to one work item of the CodeGraph project.
 - The comment is the one whose first line of visible text (taken from
   `comment_html`, one line per block) is
-  `codegraph-coordinator-sync/v1 isink17/codegraph#<PR>`. One match is
-  updated in place, none is created once, two or more refuse. A marker
-  elsewhere in any comment, a hidden or reply match, or a match that
+  `codegraph-coordinator-sync/v1 isink17/codegraph#<PR>`, with plain
+  spaces and the PR in canonical decimal (`#554`; HTML source whitespace
+  counts as one space). One match is updated in place, none is created
+  once, two or more refuse. A marker elsewhere in any comment, a marker
+  that spells this PR any other way (`#0554`, `#+554`, `# 554`, a
+  non-breaking space), a hidden or reply match, or a match that
   differs from `--comment-id` (or, without it, from the id the ledger last
   recorded) also refuses. A `--comment-id` that Plane confirms as the only
   match supersedes the ledger's id. Comments without the marker are never
@@ -247,15 +250,25 @@ plane_sync.py bootstrap CG-150 [--dry-run]
   reads and updates up to three times. Everything else fails closed.
 - State lives in `CG_PLANE_SYNC_STATE` (default
   `~/Projekti/codegraph-ops/plane-sync/`, mode 0700): `ledger.jsonl`
-  (append-only, fsynced, 0600; `ATTEMPT`, `SYNCED`, `UNSYNCHRONIZED`
-  events with body hashes, never bodies or keys) and `plane-sync.lock`,
-  which admits one writer. Looser modes, a malformed or torn ledger line
-  refuse. `bootstrap` writes one `RECONSTRUCTED` point-in-time snapshot
+  (append-only, 0600; `ATTEMPT`, `SYNCED`, `UNSYNCHRONIZED` events with
+  body hashes, never bodies or keys; the key is redacted before any
+  truncation) and `plane-sync.lock`,
+  which admits one writer. Each event is flushed before the step it
+  records goes on: the line with `F_FULLFSYNC` on macOS (plain `fsync`
+  only where the file system reports it unsupported; any other error
+  fails), then the directory entry. A failed flush stops the run before
+  any Plane write it would have covered. Looser modes, a malformed or
+  torn ledger line refuse. `bootstrap` writes one `RECONSTRUCTED` point-in-time snapshot
   from a live read, once, into an empty ledger; it is not history. The
   ledger of the old `plane-sync.sh` was lost with the evidence tree; there
   is nothing to migrate.
 - Exit codes: 0 synced, 1 `UNSYNCHRONIZED` (retry), 2 usage, 3 refused
-  (owner must look), 4 another writer holds the lock.
+  (owner must look), 4 another writer holds the lock. An unexpected
+  error, in the transport or anywhere else, is exit 1 naming only its
+  type, never a traceback. When the `UNSYNCHRONIZED` or `SYNCED` event
+  itself cannot be written, the run exits 1 and says so on stderr. A
+  retry re-reads Plane and the ledger: it adopts a comment an unanswered
+  create made and never re-sends a create within 300 s of one.
 
 ## Operating
 
