@@ -460,10 +460,10 @@ class Preservation(Base):
         self.w.handoff()
         self.ok("snapshot")
         readme = canonical.sha256(self.w.fx.tree(SLOT)[b"README"])
-        arts = self.w.w.o5.stores["artifacts"].items
+        blobs = self.w.w.o5.stores["blobs"].items
 
         def lose(r):
-            del arts[f"blob/{readme}"]
+            del blobs[f"blob/{readme}"]
             return r
         self.w.fx.k["subst"]["verify-preservation"] = lose
         self.rejected("verify-preservation", "fresult_rejected:artifact_mismatch", "VERIFY_INTENT")
@@ -472,13 +472,13 @@ class Preservation(Base):
         """N-3: on the barrier basis (no handoff yet) a missing EP blob refuses
         D-SNAP with no effect call, instead of failing after the snapshot."""
         self.w.to_p13()
-        del self.w.w.o5.stores["artifacts"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
+        del self.w.w.o5.stores["blobs"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
         self.refused("snapshot", Code.STATE_UNKNOWN, "artifact_mismatch")
 
     def test_missing_blob_refuses_verify_before_the_effect(self):
         self.w.to_p13()
         self.ok("snapshot")
-        del self.w.w.o5.stores["artifacts"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
+        del self.w.w.o5.stores["blobs"].items["blob/" + canonical.sha256(self.w.fx.tree(SLOT)[b"README"])]
         self.refused("verify-preservation", Code.STATE_UNKNOWN, "artifact_mismatch")
 
     def test_failure_row_past_revoked_needs_a_revoked_journal_point(self):
@@ -500,13 +500,13 @@ class Preservation(Base):
         """Q3e: a store value that is not bytes refuses H-VAL and the discharge."""
         self.w.to_ready()
         readme = canonical.sha256(self.w.fx.tree(SLOT)[b"README"])
-        self.w.w.o5.stores["artifacts"].items[f"blob/{readme}"] = "hello\n"
+        self.w.w.o5.stores["blobs"].items[f"blob/{readme}"] = "hello\n"
         self.assertNotIn(rel(self.w.release()), ("D3", "D4", "D3H", "D4H"))
 
     def test_missing_original_blob_makes_thaw_unsafe(self):
         self.ok("adopt", "request", "freeze-start", "freeze-continue")
         acl = self.w.st()["originals"]["acl"]
-        del self.w.w.o5.stores["artifacts"].items[f"blob/{acl}"]
+        del self.w.w.o5.stores["blobs"].items[f"blob/{acl}"]
         self.refused("thaw", Code.PROVENANCE_INSUFFICIENT, "thaw_not_safe(data_unavailable)")
 
     def test_irreversible_freeze_start(self):
@@ -680,7 +680,7 @@ class PackedObjects(Base):
         self.w.observe()
         self.assertEqual(rel(self.w.release()), "D3")
         pack = next(d for p, d in self.w.fx.tree(SLOT).items() if p.endswith(b".pack"))
-        self.w.w.o5.stores["artifacts"].items[f"blob/{canonical.sha256(pack)}"] = pack[:-1]
+        self.w.w.o5.stores["blobs"].items[f"blob/{canonical.sha256(pack)}"] = pack[:-1]
         self.w.observe()
         self.assertEqual(self.w.release(), DENIED)
 
@@ -936,7 +936,7 @@ class MalformedObjects(Base):
         self.assertEqual(rel(self.w.release()), "D3")
         head = files[b".git/refs/heads/main"][:40].decode()
         obj = self.w.fx.tree(SLOT)[pw.loose_key(head)]
-        self.w.w.o5.stores["artifacts"].items[f"blob/{canonical.sha256(obj)}"] = obj[:-1]
+        self.w.w.o5.stores["blobs"].items[f"blob/{canonical.sha256(obj)}"] = obj[:-1]
         self.w.observe()
         self.assertEqual(self.w.release(), DENIED)
 
@@ -1251,6 +1251,13 @@ class ProtectedBlobs(Base):
     def arts(self):
         return self.w.w.o5.stores["artifacts"].items
 
+    @property
+    def blobs(self):
+        return self.w.w.o5.stores["blobs"].items
+
+    def items(self, key):
+        return self.blobs if key.startswith("blob/") else self.arts
+
     def content(self, name=b"README"):
         return canonical.sha256(self.w.fx.tree(SLOT)[name])
 
@@ -1260,11 +1267,11 @@ class ProtectedBlobs(Base):
     def tamper(self, d, how):
         key = f"blob/{d}"
         if how == "delete":
-            del self.arts[key]
+            del self.blobs[key]
         elif how == "corrupt":
-            self.arts[key] = b"tampered\n"
+            self.blobs[key] = b"tampered\n"
         else:
-            self.arts[key] = next(v for k, v in sorted(self.arts.items()) if k.startswith("blob/") and k != key)
+            self.blobs[key] = next(v for k, v in sorted(self.blobs.items()) if k != key)
 
     def denied(self, bid=None):
         """The whole release refuses: no discharge, no effect, no write."""
@@ -1313,9 +1320,9 @@ class ProtectedBlobs(Base):
                         self.ok(*verbs)
                         key = f"blob/{self.content() if target == 'content' else self.original()}"
                         if change is None:
-                            del self.arts[key]
+                            del self.blobs[key]
                         else:
-                            self.arts[key] = change(self.arts[key])
+                            self.blobs[key] = change(self.blobs[key])
                         self.denied()
                         validate, discharge = self.direct(*(("D4", "P18") if stage == "ready" else ()))
                         self.assertEqual((validate().passed, validate().reasons), (False, ["artifact_mismatch"]))
@@ -1409,10 +1416,10 @@ class ProtectedBlobs(Base):
         self.at_p13()
         mine = self.original()
         theirs = b"original|acl|" + OTHER.encode()
-        self.arts[f"blob/{canonical.sha256(theirs)}"] = theirs
-        del self.arts[f"blob/{mine}"]
+        self.blobs[f"blob/{canonical.sha256(theirs)}"] = theirs
+        del self.blobs[f"blob/{mine}"]
         self.denied()
-        self.arts[f"blob/{mine}"] = theirs
+        self.blobs[f"blob/{mine}"] = theirs
         self.denied()
 
     # ---- C. D4 / D4H
@@ -1453,17 +1460,17 @@ class ProtectedBlobs(Base):
         validate, discharge = self.direct()
         self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
         d = self.content()
-        good = self.arts[f"blob/{d}"]
+        good = self.blobs[f"blob/{d}"]
         self.tamper(d, "corrupt")
         self.assertEqual((validate().passed, discharge()), (False, None))
-        self.arts[f"blob/{d}"] = good
+        self.blobs[f"blob/{d}"] = good
         self.assertEqual((validate().passed, discharge().kind), (True, "D3"))
 
     def test_protected_bytes_change_between_v_and_r(self):
         """D22: R re-runs H-VAL; nothing is written and the effect never runs."""
         self.at_p13()
         d = self.content()
-        good = self.arts[f"blob/{d}"]
+        good = self.blobs[f"blob/{d}"]
         self.w.observe()
         before = (self.w.env.snapshot(), pw.store_bytes(self.w), len(self.w.fx.calls))
         seen = []
@@ -1477,7 +1484,7 @@ class ProtectedBlobs(Base):
         r = self.w.run("snapshot", confirm_hook=lambda: self.tamper(d, "corrupt"))
         self.assertEqual(outcome(r), ("REFUSED", "QUIESCENCE_NOT_ESTABLISHED", "handoff_invalid"))
         self.assertEqual(seen, [True, False])
-        self.arts[f"blob/{d}"] = good
+        self.blobs[f"blob/{d}"] = good
         self.w.observe()
         self.assertEqual(len(self.w.fx.calls), before[2])
         self.assertEqual(self.w.row(), ("P13", "REVOKED"))
@@ -1548,15 +1555,16 @@ class ProtectedBlobs(Base):
                                  (f"artifact/{cid}/{m['entry_index'][-1]}",
                                   lambda v: self.arts[f"artifact/{cid}/{m['entry_index'][0]}"], "artifact_mismatch")):
             with self.subTest(key=key):
-                good = self.arts[key]
-                self.addCleanup(self.arts.__setitem__, key, good)
+                items = self.items(key)
+                good = items[key]
+                self.addCleanup(items.__setitem__, key, good)
                 if mutate is None:
-                    del self.arts[key]
+                    del items[key]
                 else:
-                    self.arts[key] = mutate(good)
+                    items[key] = mutate(good)
                 self.assertEqual((validate().reasons, discharge()), ([why], None))
                 self.denied()
-                self.arts[key] = good
+                items[key] = good
         self.assertEqual(discharge().kind, "D3")
 
     def test_omitted_blob_set_member(self):

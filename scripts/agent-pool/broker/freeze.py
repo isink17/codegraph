@@ -7,12 +7,13 @@ from collections import namedtuple
 
 import recovery_state as rs
 
-from . import barrier, canonical, cutover, evidence, o5contract as oc, protocol
+from . import barrier, canonical, cutover, evidence, fscap, o5contract as oc, protocol
 from .canonical import is_hex64
 from .refusal import Code, Refused
-from .stores import EvidenceStore, RecordStore
+from .stores import CapStore, EvidenceStore, RecordStore
 
-STORES = ("cutovers", "cutover_heads", "enumerations", "barriers", "journals", "artifacts")
+STORES = ("cutovers", "cutover_heads", "enumerations", "barriers")
+CAP_STORES = fscap.CAP_STORES
 
 # ------------------------------------------------------------------ F relation and fold (F1 §4.3–§4.4, C1′, C2)
 
@@ -111,6 +112,7 @@ def burned_docs(world, entries):
 
 def new_stores(faults):
     st = {n: RecordStore(n, faults) for n in STORES}
+    st.update((n, CapStore(n, faults)) for n in CAP_STORES)
     st["evidence"] = EvidenceStore()
     return st
 
@@ -321,13 +323,12 @@ def classify_burn(world, slot, docs, entries, auth, cycle_list):
 
 
 def _traces(world, cid, auth):
+    """A trace exists exactly when a journal or artifact key carries the cycle
+    id, or a barrier `refreshed` record names it; artifact and blob bytes,
+    which an effect writes, are never scanned."""
     st = world.o5.stores
-    if any(k.split("/")[1:2] == [cid] for k in st["journals"].keys()):
+    if any(k.split("/")[1:2] == [cid] for n in ("journals", "artifacts") for k in st[n].keys()):
         return True
-    for k in st["artifacts"].keys():
-        data = st["artifacts"].get(k)
-        if cid.encode() in data or auth.encode() in data:
-            return True
     for k in st["barriers"].keys():
         data = st["barriers"].get(k)
         if b'"refreshed"' in data and cid.encode() in data:

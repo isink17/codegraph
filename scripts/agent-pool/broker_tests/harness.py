@@ -106,7 +106,7 @@ class Env:
         self.ctx = authz.Ctx(principal, store_kind)
         self.world = invocation.World(
             library.Library(store, list_ops), self.ctx, clock=Clock(), observer=Observer(),
-            freeze=lambda verb, slot, op, ctx, cid: o5.fresult(
+            freeze=lambda verb, slot, op, ctx, cid, cap, fscap: o5.fresult(
                 self.freeze_results[verb], verb, slot, op, o5.expect_cycle(self.world, slot, op, cid)),
             backups=self._backup,
             ids=counter_hex("id"), tokens=counter_hex("token"), nonces=counter_hex("nonce"), faults=self.faults,
