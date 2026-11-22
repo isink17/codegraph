@@ -1921,16 +1921,21 @@ def cmd_cancel(c, args):
 
 
 def refuse_legacy_state():
-    """State left at the pre-codegraph-ops defaults would be silently
-    abandoned (tasks, lease tokens, run lock); the owner migrates it first.
-    A symlink to the new location, left for older copies, is the migrated form."""
+    """Copies of pool.sh and the coordinator older than the move to OPS_ROOT
+    use the old evidence-tree paths and create state of their own there when
+    it is missing; they share the live state only through the migration's
+    symlinks, so the live state is refused without them."""
     legacy = HOME / "Projekti/codegraph-evidence"
     for var, old, new in (("CG_COORD_STATE", legacy / "coordinator", STATE_DIR),
                           ("CG_POOL_LEASES", legacy / "pool", LEASES)):
-        migrated = old.is_symlink() and os.path.realpath(old) == os.path.realpath(new) and new.is_dir()
-        if var not in os.environ and (old.exists() or old.is_symlink()) and not migrated:
-            raise Refused(f"{old} still exists; migrate it (docs/agent-coordinator.md, State and evidence) "
-                          f"or set {var}")
+        live = OPS_ROOT / old.name
+        if var in os.environ and os.path.realpath(new) != os.path.realpath(live):
+            continue
+        linked = (old.is_symlink() and new.is_dir() and not new.is_symlink() and new.stat().st_uid == os.getuid()
+                  and os.path.realpath(old) == os.path.realpath(new))
+        if not linked:
+            raise Refused(f"{old} is not the migration symlink to {new}, so an older pool.sh or coordinator "
+                          "could keep separate state; run the migration (docs/agent-pool.md, Migration)")
 
 
 def main(argv=None):

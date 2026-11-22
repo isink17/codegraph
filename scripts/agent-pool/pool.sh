@@ -23,16 +23,19 @@ cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
 LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
-# The default store moved out of the disposable evidence tree. Leases, locks
-# or recovery state left at the old default would be invisible here, so a
-# leased slot could look free: refuse until the owner migrates (docs/agent-pool.md).
-# The migration leaves a symlink to the new store for older copies of pool.sh.
+# The default store moved out of the disposable evidence tree. Copies of
+# pool.sh older than the move still use the old path and create a store of
+# their own there when it is missing, so the live store is usable only while
+# the old path is the migration's symlink to it (docs/agent-pool.md, Migration).
+LIVE_LEASES=$HOME/Projekti/codegraph-ops/pool
 LEGACY_LEASES=$HOME/Projekti/codegraph-evidence/pool
-legacy_real=$(cd "$LEGACY_LEASES" 2>/dev/null && pwd -P) || legacy_real=
 leases_real=$(cd "$LEASES" 2>/dev/null && pwd -P) || leases_real=
-if [[ -z ${CG_POOL_LEASES:-} && ( -e $LEGACY_LEASES || -L $LEGACY_LEASES ) ]] &&
-	! [[ -L $LEGACY_LEASES && -n $legacy_real && $legacy_real == "$leases_real" ]]; then
-	echo "refused: $LEGACY_LEASES still exists; migrate it to $LEASES (docs/agent-pool.md, Migration) or set CG_POOL_LEASES" >&2
+live_real=$(cd "$LIVE_LEASES" 2>/dev/null && pwd -P) || live_real=
+legacy_real=$(cd "$LEGACY_LEASES" 2>/dev/null && pwd -P) || legacy_real=
+if [[ -z ${CG_POOL_LEASES:-} || ( -n $leases_real && $leases_real == "$live_real" ) ]] &&
+	! [[ -L $LEGACY_LEASES && -d $LEASES && ! -L $LEASES && -O $LEASES && -n $leases_real &&
+		$legacy_real == "$leases_real" ]]; then
+	echo "refused: $LEGACY_LEASES is not the migration symlink to $LEASES, so an older pool.sh could keep a separate lease store; run the migration (docs/agent-pool.md, Migration)" >&2
 	exit 1
 fi
 REMOTE=${CG_POOL_REMOTE:-origin}

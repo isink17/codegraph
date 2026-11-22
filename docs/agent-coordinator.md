@@ -344,9 +344,9 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 ## State and evidence
 
 `CG_COORD_STATE` (default `~/Projekti/codegraph-ops/coordinator/`; before
-the move it was `~/Projekti/codegraph-evidence/coordinator/`, and the
-coordinator refuses to start while that directory still exists unless
-`CG_COORD_STATE` is set; migrate as in `docs/agent-pool.md`, Migration):
+the move it was `~/Projekti/codegraph-evidence/coordinator/`; the
+coordinator refuses to use the live state unless that old path is the
+migration's symlink to it, see `docs/agent-pool.md`, Migration):
 
 | Path | Content |
 |---|---|

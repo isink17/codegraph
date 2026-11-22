@@ -1936,29 +1936,39 @@ class StateDefaults(unittest.TestCase):
         self.assertIn("LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}\n", pool)
 
 
-    def test_unmigrated_legacy_state_refuses_and_a_migration_symlink_does_not(self):
+    def test_live_state_needs_the_migration_symlinks(self):
         import coordinator
         from unittest import mock
-        home = Path(tempfile.mkdtemp())
+        home = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, home, True)
         legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
         env = {k: v for k, v in os.environ.items() if k not in ("CG_COORD_STATE", "CG_POOL_LEASES")}
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.multiple(coordinator, HOME=home, STATE_DIR=ops / "coordinator", LEASES=ops / "pool"):
-            coordinator.refuse_legacy_state()
+                mock.patch.multiple(coordinator, HOME=home, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
+                                    LEASES=ops / "pool"):
+            def refused():
+                with self.assertRaisesRegex(coordinator.Refused, "migration symlink"):
+                    coordinator.refuse_legacy_state()
+            refused()  # no old path ever existed
             for name in ("coordinator", "pool"):
                 with self.subTest(name=name):
                     (legacy / name).mkdir(parents=True)
-                    with self.assertRaisesRegex(coordinator.Refused, "migrate"):
-                        coordinator.refuse_legacy_state()
+                    refused()  # unmigrated
                     (ops / name).mkdir(parents=True)
                     (legacy / name).rmdir()
                     (legacy / name).symlink_to(ops / name)
             coordinator.refuse_legacy_state()
             (legacy / "pool").unlink()
-            (legacy / "pool").symlink_to(home)
-            with self.assertRaisesRegex(coordinator.Refused, "migrate"):
+            refused()  # removed after cutover
+            with mock.patch.dict(os.environ, {"CG_POOL_LEASES": str(ops / "pool")}):
+                refused()  # naming the live store does not skip the check
+            with mock.patch.dict(os.environ, {"CG_POOL_LEASES": str(home / "elsewhere")}), \
+                    mock.patch.object(coordinator, "LEASES", home / "elsewhere"):
                 coordinator.refuse_legacy_state()
+            for target in (home, home / "missing"):
+                (legacy / "pool").symlink_to(target)
+                refused()
+                (legacy / "pool").unlink()
 
 
 if __name__ == "__main__":

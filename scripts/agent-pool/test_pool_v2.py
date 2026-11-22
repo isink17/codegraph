@@ -506,31 +506,238 @@ class Helper(Pool):
 
 
 class LegacyStore(unittest.TestCase):
-    """The default lease store moved to codegraph-ops; a store left at the old
-    default refuses every command until migrated, and the migration symlink
-    does not."""
+    """The default lease store moved to codegraph-ops. Older copies of pool.sh
+    still use codegraph-evidence/pool and create a store there when it is
+    missing, so pool.sh uses the live store only while that path is the
+    migration's symlink to it, and the migration always leaves one."""
 
-    def run_pool(self, home):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.legacy = self.home / "Projekti/codegraph-evidence/pool"
+        self.new = self.home / "Projekti/codegraph-ops/pool"
+        (self.home / "Projekti").mkdir()
+
+    def env(self, **over):
         env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
-        return subprocess.run(["/bin/bash", str(POOL), "status"], capture_output=True, text=True,
-                              env={**env, "HOME": str(home)}, timeout=60)
+        return {**env, "HOME": str(self.home), **over}
 
-    def test_unmigrated_store_refuses_and_symlink_passes_the_guard(self):
-        home = Path(tempfile.mkdtemp()).resolve()
-        self.addCleanup(shutil.rmtree, home, True)
-        legacy, new = home / "Projekti/codegraph-evidence/pool", home / "Projekti/codegraph-ops/pool"
-        legacy.mkdir(parents=True)
-        p = self.run_pool(home)
+    def run_pool(self, **over):
+        return subprocess.run(["/bin/bash", str(POOL), "status"], capture_output=True, text=True,
+                              env=self.env(**over), timeout=60)
+
+    def migrate(self, *args):
+        return subprocess.run([sys.executable, "-I", str(HERE / "migrate_ops_state.py"), *args],
+                              capture_output=True, text=True, env=self.env(), timeout=60)
+
+    def assert_refused(self, **over):
+        p = self.run_pool(**over)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertIn("migrate", p.stderr)
-        self.assertFalse((home / "Projekti/codegraph-ops").exists())
-        legacy.rmdir()
-        new.mkdir(parents=True)
-        legacy.symlink_to(new)
-        self.assertNotIn("still exists", self.run_pool(home).stderr)
-        legacy.unlink()
-        legacy.symlink_to(home)
-        self.assertIn("still exists", self.run_pool(home).stderr)
+        self.assertIn("not the migration symlink", p.stderr)
+
+    def assert_passes(self, **over):
+        self.assertNotIn("not the migration symlink", self.run_pool(**over).stderr)
+
+    def assert_linked(self):
+        for n in ("pool", "coordinator", "plane-sync"):
+            old, new = self.home / "Projekti/codegraph-evidence" / n, self.home / "Projekti/codegraph-ops" / n
+            self.assertTrue(old.is_symlink(), n)
+            self.assertEqual(os.path.realpath(old), str(new))
+            self.assertTrue(stat.S_ISDIR(os.lstat(new).st_mode))
+            self.assertEqual(stat.S_IMODE(os.lstat(new).st_mode), 0o700)
+
+    def tree(self, root):
+        return {str(p.relative_to(root)): p.read_bytes() if p.is_file() else None for p in sorted(root.rglob("*"))}
+
+    def test_guard_needs_the_migration_symlink(self):
+        self.assert_refused()  # nothing ever existed
+        self.assertFalse((self.home / "Projekti/codegraph-ops").exists())
+        self.legacy.mkdir(parents=True)
+        self.assert_refused()  # unmigrated store
+        self.new.mkdir(parents=True)
+        self.assert_refused()  # both directories
+        self.legacy.rmdir()
+        self.legacy.symlink_to(self.new)
+        self.assert_passes()
+        self.assert_passes(CG_POOL_LEASES=str(self.new))
+        self.legacy.unlink()
+        self.assert_refused()  # symlink removed after cutover
+        # Naming the live store explicitly does not skip the guard; another store does.
+        self.assert_refused(CG_POOL_LEASES=str(self.new))
+        self.assert_passes(CG_POOL_LEASES=str(self.home / "elsewhere"))
+        for target in (self.home, self.home / "missing"):
+            self.legacy.symlink_to(target)
+            self.assert_refused()
+            self.legacy.unlink()
+
+    def test_migration_with_no_old_path_leaves_the_symlink(self):
+        p = self.migrate()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_linked()
+        self.assertEqual(list(self.new.iterdir()), [])
+        self.assert_passes()
+
+    def test_migration_moves_authentic_state_into_an_existing_empty_store(self):
+        self.legacy.mkdir(parents=True)
+        self.legacy.chmod(0o755)
+        (self.legacy / ".schema").write_text("2\n")
+        lease = self.legacy / f"{A}.lease"
+        lease.write_text(v1_lease())
+        lease.chmod(0o600)
+        (self.legacy / "recovery").mkdir()
+        (self.legacy / "recovery/op-1.json").write_text("{}")
+        before = self.tree(self.legacy)
+        self.new.mkdir(parents=True, mode=0o700)
+        check = self.migrate("--check")
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn("move:", check.stdout)
+        self.assertFalse(self.legacy.is_symlink(), "--check changed something")
+        p = self.migrate()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_linked()
+        self.assertEqual(self.tree(self.new), before)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.new / f"{A}.lease").st_mode), 0o600)
+        self.assert_passes()
+
+    def test_migration_is_idempotent(self):
+        self.assertEqual(self.migrate().returncode, 0)
+        p = self.migrate()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.count("done:"), 3)
+        self.assertNotIn("migrated", p.stdout)
+        self.assert_linked()
+
+    def test_migration_never_overwrites_or_guesses(self):
+        cases = {
+            "wrong symlink": lambda: self.legacy.symlink_to(self.home),
+            "dangling symlink": lambda: self.legacy.symlink_to(self.home / "missing"),
+            "both hold state": lambda: (self.legacy.mkdir(parents=True), (self.legacy / f"{A}.lease").write_text("x"),
+                                        self.new.mkdir(parents=True), (self.new / f"{B}.lease").write_text("y")),
+            "slot lock held": lambda: (self.legacy.mkdir(parents=True), (self.legacy / f".{A}.lock").mkdir()),
+            "new store is a file": lambda: (self.new.parent.mkdir(parents=True), self.new.write_text("x")),
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                self.reset_tree()
+                (self.home / "Projekti/codegraph-evidence").mkdir()
+                make()
+                before = self.tree(self.home)
+                links = {str(q): os.readlink(q) for q in self.home.rglob("*") if q.is_symlink()}
+                p = self.migrate()
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("stopped:", p.stderr)
+                self.assertEqual(self.tree(self.home), before)
+                self.assertEqual({str(q): os.readlink(q) for q in self.home.rglob("*") if q.is_symlink()}, links)
+                self.assert_refused()
+
+    def reset_tree(self):
+        for q in (self.home / "Projekti").iterdir():
+            shutil.rmtree(q) if q.is_dir() and not q.is_symlink() else q.unlink()
+
+    def test_removed_symlink_is_restored_by_rerunning_the_migration(self):
+        self.assertEqual(self.migrate().returncode, 0)
+        (self.new / f"{A}.lease").write_text(v1_lease())
+        self.legacy.unlink()
+        self.assert_refused()
+        p = self.migrate()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("link:", p.stdout)
+        self.assert_linked()
+        self.assert_passes()
+
+
+# The pool.sh before the store moved to codegraph-ops: (commit, blob).
+PRE_OPS = ("f742e6b2", "7f53432505")
+
+
+class Cutover(Pool):
+    """An older pool.sh and this one on the same slots, both on their default
+    stores. After the migration they share one store and its locks, so they
+    never both hold a slot; without the symlink the older one keeps a store of
+    its own, and this one then refuses every command."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        commit, blob = PRE_OPS
+        # Its whole directory, so it runs with the pool_record.py it shipped with.
+        p = subprocess.run(["git", "-C", str(HERE.parent.parent), "archive", "--format=tar", f"{commit}:scripts/agent-pool"],
+                           capture_output=True)
+        if p.returncode != 0:
+            raise unittest.SkipTest(f"git history for {commit} is not available")
+        import io
+        import tarfile
+        with tarfile.open(fileobj=io.BytesIO(p.stdout)) as tar:
+            tar.extractall(cls.t / "pre-ops", filter="data")
+        cls.old = cls.t / "pre-ops/pool.sh"
+        data = cls.old.read_bytes()
+        assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest().startswith(blob), commit
+
+    def setUp(self):
+        super().setUp()
+        home = self.t / "home"
+        shutil.rmtree(home / "Projekti", True)
+        (home / "Projekti").mkdir()
+        self.env = {k: v for k, v in self.env.items() if k != "CG_POOL_LEASES"}
+        self.legacy, self.new = home / "Projekti/codegraph-evidence/pool", home / "Projekti/codegraph-ops/pool"
+
+    def acquire(self, script, slot=A):
+        return self.pool("acquire", "--slot", slot, "--task", "t", "--agent", "ag", script=script)
+
+    def token(self, store, slot=A):
+        return [ln.split("=", 1)[1] for ln in (store / f"{slot}.lease").read_text().splitlines()
+                if ln.startswith("token=")][0]
+
+    def migrated(self):
+        p = subprocess.run([sys.executable, "-I", str(HERE / "migrate_ops_state.py")], capture_output=True,
+                           text=True, env=self.env, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_old_and_new_share_one_store_after_the_migration(self):
+        for first, second in ((self.old, POOL), (POOL, self.old)):
+            with self.subTest(first=first.name):
+                self.setUp()
+                self.migrated()
+                p = self.acquire(first)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                p = self.acquire(second)
+                self.assertNotEqual(p.returncode, 0, f"{second.name} leased a held slot: {p.stdout}")
+                self.assertEqual(sorted(q.name for q in self.new.glob("*.lease")), [f"{A}.lease"])
+                p = self.pool("release", "--slot", A, "--token", self.token(self.new), script=second)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                p = self.acquire(second)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotEqual(self.acquire(first).returncode, 0)
+                self.assertTrue(self.legacy.is_symlink())
+
+    def test_a_slot_lock_taken_through_the_old_path_holds_for_the_new_pool_sh(self):
+        self.migrated()
+        (self.legacy / f".{A}.lock").mkdir()
+        p = self.acquire(POOL)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("lock held", p.stderr)
+        self.assertFalse((self.new / f"{A}.lease").exists())
+
+    def test_without_the_symlink_the_new_pool_sh_fails_closed(self):
+        self.migrated()
+        p = self.acquire(POOL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.legacy.unlink()
+        # The hazard: an older copy recreates the old path and leases the held slot from a store of its own.
+        p = self.acquire(self.old)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(stat.S_ISDIR(os.lstat(self.legacy).st_mode))
+        self.assertTrue((self.legacy / f"{A}.lease").exists() and (self.new / f"{A}.lease").exists())
+        for args in (("status",), ("acquire", "--slot", B, "--task", "t", "--agent", "ag"),
+                     ("release", "--slot", A, "--token", self.token(self.new)), ("prepare", "--all")):
+            with self.subTest(args=args[0]):
+                p = self.pool(*args)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("not the migration symlink", p.stderr)
+        p = subprocess.run([sys.executable, "-I", str(HERE / "migrate_ops_state.py")], capture_output=True,
+                           text=True, env=self.env, timeout=60)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("both hold state", p.stderr)
 
 
 class DurableReplace(unittest.TestCase):
