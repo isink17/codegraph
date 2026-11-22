@@ -1915,5 +1915,22 @@ class ScratchSweep(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
 
+class StateDefaults(unittest.TestCase):
+    def test_persistent_state_defaults_are_outside_the_evidence_root(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
+        probe = ("import json, coordinator, campaign; print(json.dumps([str(coordinator.STATE_DIR), "
+                 "str(coordinator.LEASES), campaign.PLANE_SYNC, str(coordinator.EVIDENCE)]))")
+        p = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(HERE)!r}); {probe}"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        state, leases, plane_sync, evidence = json.loads(p.stdout)
+        ops = str(Path.home() / "Projekti/codegraph-ops")
+        for path in (state, leases, plane_sync):
+            self.assertTrue(path.startswith(ops + "/"), path)
+            self.assertFalse(path.startswith(evidence.rstrip("/") + "/"), path)
+        pool = (HERE.parent / "agent-pool/pool.sh").read_text()
+        self.assertIn("LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}\n", pool)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

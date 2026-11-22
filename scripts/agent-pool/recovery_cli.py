@@ -68,7 +68,7 @@ def _clean(text):
 def live_pool():
     """The live pool, as pool.sh names it by default. The home directory comes
     from the user database, so a redirected HOME does not move it."""
-    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-evidence", "pool")
+    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-ops", "pool")
 
 
 def _ids(path):

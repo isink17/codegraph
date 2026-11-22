@@ -342,7 +342,7 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 
 ## State and evidence
 
-`CG_COORD_STATE` (default `~/Projekti/codegraph-evidence/coordinator/`):
+`CG_COORD_STATE` (default `~/Projekti/codegraph-ops/coordinator/`):
 
 | Path | Content |
 |---|---|

@@ -36,7 +36,9 @@ from urllib.parse import urlparse
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()
 POOL = Path(os.environ.get("CG_COORD_POOL", HERE.parent / "agent-pool" / "pool.sh"))
-STATE_DIR = Path(os.environ.get("CG_COORD_STATE", HOME / "Projekti/codegraph-evidence/coordinator"))
+# Persistent operational state; the evidence root below is disposable.
+OPS_ROOT = HOME / "Projekti/codegraph-ops"
+STATE_DIR = Path(os.environ.get("CG_COORD_STATE", OPS_ROOT / "coordinator"))
 POOL_ROOT = Path(os.environ.get("CG_POOL_ROOT", HOME / "Projekti"))
 REPO = Path(os.environ.get("CG_POOL_REPO", HOME / "Projekti/codegraph"))
 REMOTE = os.environ.get("CG_POOL_REMOTE", "origin")
@@ -47,7 +49,7 @@ GIT = shutil.which("git") or "git"
 # checkout's copy, which may be stale or modified.
 GATE_OVERRIDE = os.environ.get("CG_COORD_GATE")
 GATE_PATH = ".github/scripts/merge-gate.sh"
-LEASES = Path(os.environ.get("CG_POOL_LEASES", HOME / "Projekti/codegraph-evidence/pool"))
+LEASES = Path(os.environ.get("CG_POOL_LEASES", OPS_ROOT / "pool"))
 CANCEL_WAIT = float(os.environ.get("CG_COORD_CANCEL_WAIT", "5"))
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # Files in a slot that tools load as configuration when the owner later
@@ -180,7 +182,7 @@ def sandbox_available():
 def owner_writable():
     """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
     protected path or a PATH directory."""
-    protected = [STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
+    protected = [OPS_ROOT, STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
                  HOME / ".gitconfig", HOME / ".config/git", HOME / ".config/gh",
                  *[d for d in os.environ.get("PATH", "").split(":") if d]]
     out = []
@@ -201,7 +203,7 @@ def tool_dirs():
     directory, contains it, or holds anything protected is not used;
     CG_COORD_SANDBOX_READABLE adds owner-listed directories under the same
     rule."""
-    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
+    protected = [HOME, OPS_ROOT, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
                  HOME / ".local", HOME / ".config", HOME / "Library"]
     home = os.path.realpath(HOME)
     def safe(d):
@@ -318,14 +320,14 @@ def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keycha
         # Branches only: remote-tracking refs decide which merge gate runs
         # and what pool.sh treats as the base.
         writable += [q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads")]
-    no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
+    no_write = [q(OPS_ROOT), q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 q(gitdir / "objects/info"),
                 rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
     if slot and not readonly:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
-    protected = [q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
+    protected = [q(OPS_ROOT), q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
     # Later rules win: allow-list first, then the denials it must not undo.
     profile = f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
     if keychain:

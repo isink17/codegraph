@@ -27,7 +27,7 @@ import pool_record  # noqa: E402
 import recovery_state as rs  # noqa: E402
 
 POOL = HERE / "pool.sh"
-LIVE_POOL = (Path.home() / "Projekti/codegraph-evidence/pool").resolve()
+LIVE_POOL = (Path.home() / "Projekti/codegraph-ops/pool").resolve()
 A, B, R = "codegraph-worker-a", "codegraph-worker-b", "codegraph-review"
 TOKEN = "a" * 32
 LEASE_ID = "1" * 32

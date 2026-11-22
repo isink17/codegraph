@@ -32,7 +32,7 @@ TOKEN = "a" * 32
 RTOKEN = "b" * 32
 OP = "op-1"
 HEAD = "c" * 40
-LIVE_POOL = (Path.home() / "Projekti/codegraph-evidence/pool").resolve()
+LIVE_POOL = (Path.home() / "Projekti/codegraph-ops/pool").resolve()
 HOLDER = {"task": "t", "agent": "a", "pr": "", "owner": "coordinator:x", "host": "h", "pid": "",
           "utc": "2026-11-07T00:00:00Z"}
 # The store seq each transition leaves when it is the legal next step.

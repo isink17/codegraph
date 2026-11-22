@@ -44,7 +44,7 @@ PLANE_PROJECT = "6f0dae86-fc12-4548-ae80-b5aa7de5f540"
 PLANE_KEYCHAIN = "plane-mcp-ivan-dev"
 PLANE_CMD = os.environ.get("CG_CAMPAIGN_PLANE_CMD")
 PLANE_SYNC = os.environ.get("CG_CAMPAIGN_PLANE_SYNC",
-                            str(Path.home() / "Projekti/codegraph-evidence/plane-sync/plane-sync.sh"))
+                            str(Path.home() / "Projekti/codegraph-ops/plane-sync/plane-sync.sh"))
 REPO_SLUG = "isink17/codegraph"
 OPEN_GROUPS = {"backlog", "unstarted", "started"}
 MERGE_MODES = ("none", "gate", "exception")

@@ -22,7 +22,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
-LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-evidence/pool}
+LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
 REMOTE=${CG_POOL_REMOTE:-origin}
 BASE=${CG_POOL_BASE:-v2.0}
 # Every slot must be a worktree of this repository.

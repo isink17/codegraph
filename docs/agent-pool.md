@@ -22,7 +22,9 @@ fetched `origin/v2.0`, no process has its cwd inside it, and it has no lease.
 
 ## Leasing
 
-Leases live in `~/Projekti/codegraph-evidence/pool/<slot>.lease`.
+Leases live in `~/Projekti/codegraph-ops/pool/<slot>.lease` (`CG_POOL_LEASES`).
+Operational state lives under `~/Projekti/codegraph-ops/`, never under the
+disposable evidence root.
 
 ```sh
 scripts/agent-pool/pool.sh status
@@ -166,7 +168,7 @@ them.
   releases it; an orphaned one needs the owner (CG-150 recovery protocol).
   Copies of `pool.sh` older than this change still offer it; do not run them.
 - Unfinished work in a slot is archived before the slot is recycled, to
-  `~/Projekti/codegraph-evidence/<slot>-recovery-<date>/`: HEAD,
+  `~/Projekti/codegraph-ops/recovery/<slot>-recovery-<date>/`: HEAD,
   `status --porcelain=v2`, `diff --binary HEAD`, raw changed and untracked
   files, `SHA256SUMS`, `RESTORE.md`. Verify by applying the patch to a clean
   export of HEAD and byte-comparing.
@@ -384,7 +386,7 @@ again under the slot lock:
 - `--pool` is given explicitly; there is no default. It must be absolute and
   canonical (no symlink, no `.` or `..` part, no trailing slash), and a
   directory of this user.
-- It is not the live pool, `~/Projekti/codegraph-evidence/pool`, a path
+- It is not the live pool, `~/Projekti/codegraph-ops/pool`, a path
   inside it or one of its parents. The home directory comes from the user
   database, not `$HOME`, and `CG_POOL_LEASES` plays no part: a live pool
   configured elsewhere is kept out only by its lack of a synthetic marker. Inode

@@ -341,7 +341,7 @@ class Interlock(Cli):
         (home, live pool)."""
         home = self.t / "userdb-home"
         shutil.rmtree(home, True)
-        live = home / "Projekti" / "codegraph-evidence" / "pool"
+        live = home / "Projekti" / "codegraph-ops" / "pool"
         live.parent.mkdir(parents=True)
         shutil.copytree(self.leases, live, symlinks=True)
         (live / "archive").mkdir()
@@ -388,7 +388,7 @@ class Interlock(Cli):
         """The real live pool is never handed to pool.sh. In process, its path,
         inside, parents and firmlink alias are refused; the check only stats."""
         live = cli.live_pool()
-        self.assertEqual(live, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-evidence",
+        self.assertEqual(live, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-ops",
                                             "pool"))
         with mock.patch.dict(os.environ, {"HOME": str(self.t / "home")}):
             self.assertEqual(cli.live_pool(), live)
