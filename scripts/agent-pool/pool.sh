@@ -28,8 +28,10 @@ LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
 # leased slot could look free: refuse until the owner migrates (docs/agent-pool.md).
 # The migration leaves a symlink to the new store for older copies of pool.sh.
 LEGACY_LEASES=$HOME/Projekti/codegraph-evidence/pool
+legacy_real=$(cd "$LEGACY_LEASES" 2>/dev/null && pwd -P) || legacy_real=
+leases_real=$(cd "$LEASES" 2>/dev/null && pwd -P) || leases_real=
 if [[ -z ${CG_POOL_LEASES:-} && ( -e $LEGACY_LEASES || -L $LEGACY_LEASES ) ]] &&
-	! [[ -L $LEGACY_LEASES && -d $LEASES && $(cd "$LEGACY_LEASES" 2>/dev/null && pwd -P) == "$(cd "$LEASES" && pwd -P)" ]]; then
+	! [[ -L $LEGACY_LEASES && -n $legacy_real && $legacy_real == "$leases_real" ]]; then
 	echo "refused: $LEGACY_LEASES still exists; migrate it to $LEASES (docs/agent-pool.md, Migration) or set CG_POOL_LEASES" >&2
 	exit 1
 fi

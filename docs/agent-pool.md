@@ -42,9 +42,11 @@ time, as the owner:
    ```sh
    mkdir -m 700 -p ~/Projekti/codegraph-ops
    for d in pool coordinator plane-sync; do
-     [ -e ~/Projekti/codegraph-evidence/$d ] || continue
-     mv ~/Projekti/codegraph-evidence/$d ~/Projekti/codegraph-ops/$d
-     ln -s ~/Projekti/codegraph-ops/$d ~/Projekti/codegraph-evidence/$d
+     src=~/Projekti/codegraph-evidence/$d dst=~/Projekti/codegraph-ops/$d
+     [ -L "$src" ] && continue                 # already migrated
+     [ -e "$src" ] || continue
+     [ ! -e "$dst" ] || rmdir "$dst" || { echo "$dst is not empty; stop" >&2; break; }
+     mv "$src" "$dst" && ln -s "$dst" "$src"
    done
    ```
 

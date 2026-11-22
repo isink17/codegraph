@@ -1186,9 +1186,9 @@ def main(argv=None):
     import coordinator
     co = coordinator
     try:
-        co.refuse_legacy_state()
         if args.cmd == "stop":
             return cmd_stop(c, args)
+        co.refuse_legacy_state()
         if args.cmd != "status":  # status only reads
             c.lock()
         c.load()
