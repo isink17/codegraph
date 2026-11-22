@@ -250,11 +250,14 @@ class PlaneSync(unittest.TestCase):
         self.body.write_text(marked(553, "x"))
         self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "BODY")
         self.assertEqual(self.ledger()[-1]["type"], "UNSYNCHRONIZED")
+        self.body.write_text("<p>see codegraph&#45;coordinator-sync/v1 isink17/codegraph#553</p>")
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "BODY")
 
     def test_malformed_ledger_refuses(self):
         self.state.mkdir(mode=0o700)
         (self.state / "ledger.jsonl").write_text("not json\n")
-        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "LEDGER")
+        (self.state / "ledger.jsonl").chmod(0o600)
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "malformed")
 
     def test_bad_usage(self):
         self.assertEqual(self.run_sync("sync", "CG-15x", "554", str(self.body)), 2)
@@ -474,6 +477,12 @@ class Matching(unittest.TestCase):
         stored = '<p>PR: <a href="https://x/1" rel="noopener noreferrer nofollow" target="_blank">#1</a> a &#38; b</p>'
         self.assertEqual(ps.text_of(sent), ps.text_of(stored))
         self.assertNotEqual(ps.text_of(sent), ps.text_of(sent.replace("a &amp; b", "a &amp; c")))
+        self.assertEqual(ps.text_of("<p>a\n  b</p><p>c</p>"), ps.text_of("<p>a b</p>\n<p>c</p>"))
+        self.assertEqual(ps.text_of("<p>a b</p><p>c</p>"), "a b\nc")
+
+    def test_utc_fractions_of_any_length(self):
+        self.assertLess(ps.parse_utc("2026-11-21T15:02:07Z"), ps.parse_utc("2026-11-21T15:02:07.3286Z"))
+        self.assertIsNone(ps.parse_utc("2026-11-21T15:02:07"))
 
 
 if __name__ == "__main__":

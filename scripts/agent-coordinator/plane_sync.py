@@ -248,7 +248,7 @@ def text_of(markup):
     rather than from Plane's comment_stripped, whose block separators are not
     part of any contract; it is also what read-back compares, so attribute
     rewrites and entity re-encoding by Plane's sanitizer do not count."""
-    flat = html.unescape(re.sub(r"<[^>]*>", "", BLOCK_END.sub("\n", markup)))
+    flat = html.unescape(re.sub(r"<[^>]*>", "", BLOCK_END.sub("\n", re.sub(r"\s+", " ", markup))))
     return "\n".join(" ".join(line.split()) for line in flat.splitlines() if line.strip())
 
 
@@ -280,7 +280,7 @@ def prepare_body(text, pr):
     body = text.strip()
     if body.startswith(head):
         body = body[len(head):].lstrip()
-    if "codegraph-coordinator-sync/" in body:
+    if "codegraph-coordinator-sync/" in body or "codegraph-coordinator-sync/" in text_of(body):
         raise Refused("BODY: carries a coordinator marker of its own")
     if not body:
         raise Refused("BODY: empty")
@@ -424,8 +424,10 @@ def plan(cur, body):
 
 
 def parse_utc(value):
+    # Python 3.9's fromisoformat takes only 3- or 6-digit fractions.
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], str(value).replace("Z", "+00:00"))
     try:
-        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        t = datetime.fromisoformat(text)
     except ValueError:
         return None
     return t if t.tzinfo else None
