@@ -505,6 +505,34 @@ class Helper(Pool):
         self.assertEqual(p.stdout.splitlines()[:3], ["record=v2", "state=quarantined", "generation=3"])
 
 
+class LegacyStore(unittest.TestCase):
+    """The default lease store moved to codegraph-ops; a store left at the old
+    default refuses every command until migrated, and the migration symlink
+    does not."""
+
+    def run_pool(self, home):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
+        return subprocess.run(["/bin/bash", str(POOL), "status"], capture_output=True, text=True,
+                              env={**env, "HOME": str(home)}, timeout=60)
+
+    def test_unmigrated_store_refuses_and_symlink_passes_the_guard(self):
+        home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, home, True)
+        legacy, new = home / "Projekti/codegraph-evidence/pool", home / "Projekti/codegraph-ops/pool"
+        legacy.mkdir(parents=True)
+        p = self.run_pool(home)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("migrate", p.stderr)
+        self.assertFalse((home / "Projekti/codegraph-ops").exists())
+        legacy.rmdir()
+        new.mkdir(parents=True)
+        legacy.symlink_to(new)
+        self.assertNotIn("still exists", self.run_pool(home).stderr)
+        legacy.unlink()
+        legacy.symlink_to(home)
+        self.assertIn("still exists", self.run_pool(home).stderr)
+
+
 class DurableReplace(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp()).resolve()

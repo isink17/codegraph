@@ -184,6 +184,13 @@ class CampaignFixture(Fixture):
 
 
 class Campaign(CampaignFixture):
+    def test_merging_campaign_refuses_without_an_executable_plane_sync(self):
+        self.authorize({"CG-1": {"tasks": [self.ctask("a")]}})
+        self.env["CG_CAMPAIGN_PLANE_SYNC"] = str(self.t / "bin/missing-plane-sync")
+        self.campaign("run", ok=False)
+        self.assertIn("is not an executable file", self.out)
+        self.assertNotIn("run_start", [e["event"] for e in self.cevents()])
+
     # ------------------------------------------------------------ continuation across executions
 
     def test_three_sequential_tasks_complete_in_one_unattended_run(self):

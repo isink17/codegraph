@@ -34,10 +34,24 @@ time, as the owner:
 
 1. stop the coordinator and every campaign; confirm no `pool.sh` runs;
 2. confirm no `.<slot>.lock` directory exists in the old store;
-3. `mv ~/Projekti/codegraph-evidence/pool ~/Projekti/codegraph-ops/pool`,
-   likewise `coordinator` and `plane-sync`, keeping mode 0700
-   (an empty target created earlier is removed first);
+3. move each directory and leave a symlink, so a copy of `pool.sh` or the
+   coordinator older than this change shares the same store and locks
+   instead of starting an empty one (an empty target created earlier is
+   removed first):
+
+   ```sh
+   mkdir -m 700 -p ~/Projekti/codegraph-ops
+   for d in pool coordinator plane-sync; do
+     [ -e ~/Projekti/codegraph-evidence/$d ] || continue
+     mv ~/Projekti/codegraph-evidence/$d ~/Projekti/codegraph-ops/$d
+     ln -s ~/Projekti/codegraph-ops/$d ~/Projekti/codegraph-evidence/$d
+   done
+   ```
+
 4. `scripts/agent-pool/pool.sh status`.
+
+Both programs accept such a symlink as migrated. Run them only from a
+checkout that contains this change.
 
 Never recreate leases or coordinator state by hand.
 

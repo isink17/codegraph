@@ -1927,12 +1927,38 @@ class StateDefaults(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         state, leases, plane_sync, live_pool, evidence = json.loads(p.stdout)
         ops = str(Path.home() / "Projekti/codegraph-ops")
-        self.assertEqual(live_pool, leases)
+        import pwd
+        self.assertEqual(live_pool, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti/codegraph-ops/pool"))
         for path in (state, leases, plane_sync):
             self.assertTrue(path.startswith(ops + "/"), path)
             self.assertFalse(path.startswith(evidence.rstrip("/") + "/"), path)
         pool = (HERE.parent / "agent-pool/pool.sh").read_text()
         self.assertIn("LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}\n", pool)
+
+
+    def test_unmigrated_legacy_state_refuses_and_a_migration_symlink_does_not(self):
+        import coordinator
+        from unittest import mock
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
+        env = {k: v for k, v in os.environ.items() if k not in ("CG_COORD_STATE", "CG_POOL_LEASES")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.multiple(coordinator, HOME=home, STATE_DIR=ops / "coordinator", LEASES=ops / "pool"):
+            coordinator.refuse_legacy_state()
+            for name in ("coordinator", "pool"):
+                with self.subTest(name=name):
+                    (legacy / name).mkdir(parents=True)
+                    with self.assertRaisesRegex(coordinator.Refused, "migrate"):
+                        coordinator.refuse_legacy_state()
+                    (ops / name).mkdir(parents=True)
+                    (legacy / name).rmdir()
+                    (legacy / name).symlink_to(ops / name)
+            coordinator.refuse_legacy_state()
+            (legacy / "pool").unlink()
+            (legacy / "pool").symlink_to(home)
+            with self.assertRaisesRegex(coordinator.Refused, "migrate"):
+                coordinator.refuse_legacy_state()
 
 
 if __name__ == "__main__":

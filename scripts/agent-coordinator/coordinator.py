@@ -1922,10 +1922,13 @@ def cmd_cancel(c, args):
 
 def refuse_legacy_state():
     """State left at the pre-codegraph-ops defaults would be silently
-    abandoned (tasks, lease tokens, run lock); the owner migrates it first."""
+    abandoned (tasks, lease tokens, run lock); the owner migrates it first.
+    A symlink to the new location, left for older copies, is the migrated form."""
     legacy = HOME / "Projekti/codegraph-evidence"
-    for var, old in (("CG_COORD_STATE", legacy / "coordinator"), ("CG_POOL_LEASES", legacy / "pool")):
-        if var not in os.environ and (old.exists() or old.is_symlink()):
+    for var, old, new in (("CG_COORD_STATE", legacy / "coordinator", STATE_DIR),
+                          ("CG_POOL_LEASES", legacy / "pool", LEASES)):
+        migrated = old.is_symlink() and os.path.realpath(old) == os.path.realpath(new) and new.is_dir()
+        if var not in os.environ and (old.exists() or old.is_symlink()) and not migrated:
             raise Refused(f"{old} still exists; migrate it (docs/agent-coordinator.md, State and evidence) "
                           f"or set {var}")
 
