@@ -36,7 +36,12 @@ from urllib.parse import urlparse
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()
 POOL = Path(os.environ.get("CG_COORD_POOL", HERE.parent / "agent-pool" / "pool.sh"))
-STATE_DIR = Path(os.environ.get("CG_COORD_STATE", HOME / "Projekti/codegraph-evidence/coordinator"))
+# Persistent operational state; the evidence root below is disposable.
+OPS_ROOT = HOME / "Projekti/codegraph-ops"
+# Pre-move home of that state; its entries are the migration's symlinks.
+LEGACY_ROOT = HOME / "Projekti/codegraph-evidence"
+LEGACY_LINKS = ("pool", "coordinator", "plane-sync")
+STATE_DIR = Path(os.environ.get("CG_COORD_STATE", OPS_ROOT / "coordinator"))
 POOL_ROOT = Path(os.environ.get("CG_POOL_ROOT", HOME / "Projekti"))
 REPO = Path(os.environ.get("CG_POOL_REPO", HOME / "Projekti/codegraph"))
 REMOTE = os.environ.get("CG_POOL_REMOTE", "origin")
@@ -47,7 +52,7 @@ GIT = shutil.which("git") or "git"
 # checkout's copy, which may be stale or modified.
 GATE_OVERRIDE = os.environ.get("CG_COORD_GATE")
 GATE_PATH = ".github/scripts/merge-gate.sh"
-LEASES = Path(os.environ.get("CG_POOL_LEASES", HOME / "Projekti/codegraph-evidence/pool"))
+LEASES = Path(os.environ.get("CG_POOL_LEASES", OPS_ROOT / "pool"))
 CANCEL_WAIT = float(os.environ.get("CG_COORD_CANCEL_WAIT", "5"))
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # Files in a slot that tools load as configuration when the owner later
@@ -63,8 +68,8 @@ STOP_FILE = Path(os.environ.get("CG_COORD_STOP", STATE_DIR / "STOP"))
 # ~/.codex (config, hooks, rules, MCP servers, sessions) is never loaded.
 CODEX_AUTH = Path(os.environ.get("CG_COORD_CODEX_AUTH", HOME / ".codex/auth.json"))
 CODEX_CONFIG = os.environ.get("CG_COORD_CODEX_CONFIG")
-# Unreadable to every agent and validation command: other coordinators' and
-# campaigns' state and tokens live under the evidence root.
+# Unreadable to every agent and validation command, like OPS_ROOT: campaign
+# state, evidence and review files live under the evidence root.
 EVIDENCE = Path(os.environ.get("CG_COORD_EVIDENCE", HOME / "Projekti/codegraph-evidence"))
 DENY_READ = [p for p in os.environ.get("CG_COORD_DENY_READ", "").split(":") if p]
 # Owner credentials no agent needs. Only denied explicitly in the legacy
@@ -180,7 +185,8 @@ def sandbox_available():
 def owner_writable():
     """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
     protected path or a PATH directory."""
-    protected = [STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
+    protected = [OPS_ROOT, STATE_DIR, LEASES, LEGACY_ROOT, REPO, HOME / ".claude",
+                 HOME / ".claude.json", HERE, POOL.parent,
                  HOME / ".gitconfig", HOME / ".config/git", HOME / ".config/gh",
                  *[d for d in os.environ.get("PATH", "").split(":") if d]]
     out = []
@@ -189,6 +195,8 @@ def owner_writable():
         bad = [p for p in protected if (os.path.realpath(p) + "/").startswith(r.rstrip("/") + "/")]
         if bad:
             raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} contains protected {bad[0]}")
+        if (r.rstrip("/") + "/").startswith(os.path.realpath(OPS_ROOT) + "/"):
+            raise Refused(f"CG_COORD_SANDBOX_WRITABLE entry {d} lies inside {OPS_ROOT}")
         out.append(r)
     return out
 
@@ -201,7 +209,7 @@ def tool_dirs():
     directory, contains it, or holds anything protected is not used;
     CG_COORD_SANDBOX_READABLE adds owner-listed directories under the same
     rule."""
-    protected = [HOME, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
+    protected = [HOME, OPS_ROOT, STATE_DIR, LEASES, EVIDENCE, REPO, HERE, *DENY_READ, *[HOME / d for d in SECRETS],
                  HOME / ".local", HOME / ".config", HOME / "Library"]
     home = os.path.realpath(HOME)
     def safe(d):
@@ -318,14 +326,16 @@ def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keycha
         # Branches only: remote-tracking refs decide which merge gate runs
         # and what pool.sh treats as the base.
         writable += [q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads")]
-    no_write = [q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
+    no_write = [q(OPS_ROOT), q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 q(gitdir / "objects/info"),
-                rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
+                rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent),
+                # The links themselves: q() would resolve them to their targets.
+                rx(LEGACY_ROOT, "/(" + "|".join(re.escape(n) for n in LEGACY_LINKS) + ")$")]
     if slot and not readonly:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
                      rx(slot, "/(.*/)?(" + "|".join(re.escape(f) for f in SLOT_CONFIG) + ")(/|$)")]
-    protected = [q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
+    protected = [q(OPS_ROOT), q(STATE_DIR), q(LEASES), q(EVIDENCE), *[q(d) for d in DENY_READ]]
     # Later rules win: allow-list first, then the denials it must not undo.
     profile = f"(version 1)(allow default)(deny file-write*)(allow file-write* {' '.join(writable)})"
     if keychain:
@@ -1916,6 +1926,27 @@ def cmd_cancel(c, args):
     return 0
 
 
+def refuse_legacy_state():
+    """Copies of pool.sh and the coordinator older than the move to OPS_ROOT
+    use the old evidence-tree paths and create state of their own there when
+    it is missing; they share the live state only through the migration's
+    symlinks, so the live state is refused without them."""
+    def same(a, b):
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            return False
+    for var, name, new in (("CG_COORD_STATE", "coordinator", STATE_DIR), ("CG_POOL_LEASES", "pool", LEASES)):
+        old = LEGACY_ROOT / name
+        if var in os.environ and not same(new, OPS_ROOT / old.name):
+            continue
+        linked = (old.is_symlink() and new.is_dir() and not new.is_symlink() and new.stat().st_uid == os.getuid()
+                  and same(old, new))
+        if not linked:
+            raise Refused(f"{old} is not the migration symlink to {new}, so an older pool.sh or coordinator "
+                          "could keep separate state; run the migration (docs/agent-pool.md, Migration)")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="coordinator.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1928,8 +1959,9 @@ def main(argv=None):
     p = sub.add_parser("cancel")
     p.add_argument("task")
     args = ap.parse_args(argv)
-    c = Coordinator()
     try:
+        refuse_legacy_state()
+        c = Coordinator()
         c.lock()
         c.load()
         return {"plan": cmd_plan, "run": cmd_run, "resume": cmd_run, "status": cmd_status, "cancel": cmd_cancel}[args.cmd](c, args)

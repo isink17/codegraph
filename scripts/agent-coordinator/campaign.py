@@ -44,7 +44,7 @@ PLANE_PROJECT = "6f0dae86-fc12-4548-ae80-b5aa7de5f540"
 PLANE_KEYCHAIN = "plane-mcp-ivan-dev"
 PLANE_CMD = os.environ.get("CG_CAMPAIGN_PLANE_CMD")
 PLANE_SYNC = os.environ.get("CG_CAMPAIGN_PLANE_SYNC",
-                            str(Path.home() / "Projekti/codegraph-evidence/plane-sync/plane-sync.sh"))
+                            str(Path.home() / "Projekti/codegraph-ops/plane-sync/plane-sync.sh"))
 REPO_SLUG = "isink17/codegraph"
 OPEN_GROUPS = {"backlog", "unstarted", "started"}
 MERGE_MODES = ("none", "gate", "exception")
@@ -990,6 +990,8 @@ def cmd_run(c, args):
     # of the agents' reach.
     writable = ["/private/tmp", "/tmp", "/dev",
                 *filter(None, os.environ.get("CG_COORD_SANDBOX_WRITABLE", "").split(":"))]
+    if c.auth["merge"]["mode"] != "none" and not (os.path.isfile(PLANE_SYNC) and os.access(PLANE_SYNC, os.X_OK)):
+        raise Refused(f"plane-sync {PLANE_SYNC} is not an executable file; a merge could not be synchronised")
     owned = [c.dir, Path(PLANE_SYNC)]
     if c.auth["merge"]["mode"] == "exception":
         owned.append(Path(c.auth["merge"]["exception_dir"]))
@@ -1186,6 +1188,7 @@ def main(argv=None):
     try:
         if args.cmd == "stop":
             return cmd_stop(c, args)
+        co.refuse_legacy_state()
         if args.cmd != "status":  # status only reads
             c.lock()
         c.load()

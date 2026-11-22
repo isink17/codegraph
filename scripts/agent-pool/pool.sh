@@ -22,7 +22,18 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 cd /
 
 POOL_ROOT=${CG_POOL_ROOT:-$HOME/Projekti}
-LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-evidence/pool}
+LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
+# The default store moved out of the disposable evidence tree. Copies of
+# pool.sh older than the move still use the old path and create a store of
+# their own there when it is missing, so the live store is usable only while
+# the old path is the migration's symlink to it (docs/agent-pool.md, Migration).
+LIVE_LEASES=$HOME/Projekti/codegraph-ops/pool
+LEGACY_LEASES=$HOME/Projekti/codegraph-evidence/pool
+if [[ -z ${CG_POOL_LEASES:-} || $LEASES -ef $LIVE_LEASES ]] &&
+	! [[ -L $LEGACY_LEASES && $LEGACY_LEASES -ef $LEASES && -d $LEASES && ! -L $LEASES && -O $LEASES ]]; then
+	echo "refused: $LEGACY_LEASES is not the migration symlink to $LEASES, so an older pool.sh could keep a separate lease store; run the migration (docs/agent-pool.md, Migration)" >&2
+	exit 1
+fi
 REMOTE=${CG_POOL_REMOTE:-origin}
 BASE=${CG_POOL_BASE:-v2.0}
 # Every slot must be a worktree of this repository.

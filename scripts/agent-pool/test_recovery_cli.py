@@ -341,7 +341,7 @@ class Interlock(Cli):
         (home, live pool)."""
         home = self.t / "userdb-home"
         shutil.rmtree(home, True)
-        live = home / "Projekti" / "codegraph-evidence" / "pool"
+        live = home / "Projekti" / "codegraph-ops" / "pool"
         live.parent.mkdir(parents=True)
         shutil.copytree(self.leases, live, symlinks=True)
         (live / "archive").mkdir()
@@ -388,13 +388,16 @@ class Interlock(Cli):
         """The real live pool is never handed to pool.sh. In process, its path,
         inside, parents and firmlink alias are refused; the check only stats."""
         live = cli.live_pool()
-        self.assertEqual(live, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-evidence",
+        self.assertEqual(live, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-ops",
                                             "pool"))
         with mock.patch.dict(os.environ, {"HOME": str(self.t / "home")}):
             self.assertEqual(cli.live_pool(), live)
         paths = [live, live + "/recovery", os.path.dirname(live), os.path.dirname(os.path.dirname(live)), "/"]
         if os.path.isdir("/System/Volumes/Data" + live):
             paths.append("/System/Volumes/Data" + live)
+        legacy = cli.legacy_live_pool()
+        self.assertEqual(legacy, os.path.join(os.path.dirname(os.path.dirname(live)), "codegraph-evidence", "pool"))
+        paths += [legacy, legacy + "/recovery", os.path.dirname(legacy)]
         for path in paths:
             with self.subTest(path=path), self.assertRaisesRegex(rs.Refused, "live pool"):
                 cli._not_live(path)

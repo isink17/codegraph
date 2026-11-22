@@ -32,7 +32,7 @@ TOKEN = "a" * 32
 RTOKEN = "b" * 32
 OP = "op-1"
 HEAD = "c" * 40
-LIVE_POOL = (Path.home() / "Projekti/codegraph-evidence/pool").resolve()
+LIVE_POOL = (Path.home() / "Projekti/codegraph-ops/pool").resolve()
 HOLDER = {"task": "t", "agent": "a", "pr": "", "owner": "coordinator:x", "host": "h", "pid": "",
           "utc": "2026-11-07T00:00:00Z"}
 # The store seq each transition leaves when it is the legal next step.
@@ -1268,6 +1268,7 @@ class NotWired(unittest.TestCase):
         src = (HERE / "recovery_state.py").read_text()
         self.assertNotIn("__main__", src)
         self.assertNotIn("codegraph-evidence", src)
+        self.assertNotIn("codegraph-ops", src)
         # pool.sh prints a recovery_state= status key; it reaches the library only through pool_record.py
         # and recovery_cli.py.
         self.assertNotIn("recovery_state.py", (HERE / "pool.sh").read_text())

@@ -22,7 +22,47 @@ fetched `origin/v2.0`, no process has its cwd inside it, and it has no lease.
 
 ## Leasing
 
-Leases live in `~/Projekti/codegraph-evidence/pool/<slot>.lease`.
+Leases live in `~/Projekti/codegraph-ops/pool/<slot>.lease` (`CG_POOL_LEASES`).
+Operational state lives under `~/Projekti/codegraph-ops/`, never under the
+disposable evidence root.
+
+**Migration.** The default used to be `~/Projekti/codegraph-evidence/pool`
+(and `.../coordinator`, `.../plane-sync`). Copies of `pool.sh`, the
+coordinator and campaigns older than the move still use those paths, and
+create a fresh store there when one is missing, so they could lease a slot
+that this `pool.sh` already leased. The live store is therefore usable only
+while the old `pool` and `coordinator` paths are symlinks to their new
+directories (`plane-sync` gets one too, for older campaigns): `pool.sh` refuses
+every command and the coordinator and campaigns refuse to start otherwise,
+whether the old path is missing, a directory or a wrong symlink, and also
+when `CG_POOL_LEASES` or `CG_COORD_STATE` names the live store explicitly.
+One time, as the owner:
+
+1. stop the coordinator and every campaign; confirm no `pool.sh` runs;
+2. `python3 scripts/agent-pool/migrate_ops_state.py --check` prints, per
+   path, `move` (old directory moved to the new path), `link` (no old
+   directory; the symlink is created) or `done`, and stops on anything else;
+3. `python3 scripts/agent-pool/migrate_ops_state.py`;
+4. `scripts/agent-pool/pool.sh status`.
+
+The script checks all three paths before changing anything. It moves an old
+directory only when the new one is missing or empty and the old one holds no
+`.<slot>.lock` and no running coordinator's lock, and replaces an empty old
+directory with the link; it stops when both hold
+state, a path is not this user's directory, or an old path is a symlink
+anywhere else. It never merges, overwrites or creates leases or coordinator
+state, sets the new directories to mode 0700, and is safe to rerun.
+
+Older copies stay supported only through these symlinks, which are a shared
+path, not isolation: never remove them. If one disappears, `pool.sh` and the
+coordinator refuse until it is back; rerunning the script restores a missing
+link. An older copy that ran meanwhile may have recreated the old directory;
+if it left state there, it is a store of its own: the script then stops with
+`both hold state` and the owner reconciles the two stores. Support for older copies ends only through a
+reviewed change that drops this check, once no checkout, slot or copy older
+than this change remains.
+
+Never recreate leases or coordinator state by hand.
 
 ```sh
 scripts/agent-pool/pool.sh status
@@ -166,7 +206,7 @@ them.
   releases it; an orphaned one needs the owner (CG-150 recovery protocol).
   Copies of `pool.sh` older than this change still offer it; do not run them.
 - Unfinished work in a slot is archived before the slot is recycled, to
-  `~/Projekti/codegraph-evidence/<slot>-recovery-<date>/`: HEAD,
+  `~/Projekti/codegraph-ops/recovery/<slot>-recovery-<date>/`: HEAD,
   `status --porcelain=v2`, `diff --binary HEAD`, raw changed and untracked
   files, `SHA256SUMS`, `RESTORE.md`. Verify by applying the patch to a clean
   export of HEAD and byte-comparing.
@@ -384,7 +424,7 @@ again under the slot lock:
 - `--pool` is given explicitly; there is no default. It must be absolute and
   canonical (no symlink, no `.` or `..` part, no trailing slash), and a
   directory of this user.
-- It is not the live pool, `~/Projekti/codegraph-evidence/pool`, a path
+- It is not the live pool, `~/Projekti/codegraph-ops/pool`, a path
   inside it or one of its parents. The home directory comes from the user
   database, not `$HOME`, and `CG_POOL_LEASES` plays no part: a live pool
   configured elsewhere is kept out only by its lack of a synthetic marker. Inode

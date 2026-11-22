@@ -1537,6 +1537,7 @@ class Pool(Fixture):
         no other coordinator's state under the evidence root, no ssh keys."""
         probes = {"keychain": self.t / "home/Library/Keychains/probe", "ssh": self.t / "home/.ssh/id_probe",
                   "evidence": self.t / "home/Projekti/codegraph-evidence/coordinator/tokens/x.token",
+                  "ops": self.t / "home/Projekti/codegraph-ops/plane-sync/plane-sync.sh",
                   "gh": self.t / "home/.config/gh/hosts.yml", "codex": self.t / "home/.codex/auth.json",
                   "aws": self.t / "home/.aws/credentials", "history": self.t / "home/.zsh_history",
                   "other": self.t / "home/Documents/canary.txt", "gitconfig": self.t / "home/.gitconfig"}
@@ -1913,6 +1914,86 @@ class ScratchSweep(unittest.TestCase):
         Path(s, "auth.json").write_text("SECRET-CANARY")
         self.c.release_scratch(s)
         self.assertEqual(list(self.root.iterdir()), [])
+
+
+class StateDefaults(unittest.TestCase):
+    def test_persistent_state_defaults_are_outside_the_evidence_root(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
+        probe = ("import json, coordinator, campaign, recovery_cli; print(json.dumps([str(coordinator.STATE_DIR), "
+                 "str(coordinator.LEASES), campaign.PLANE_SYNC, recovery_cli.live_pool(), str(coordinator.EVIDENCE)]))")
+        paths = f"sys.path[:0] = [{str(HERE)!r}, {str(HERE.parent / 'agent-pool')!r}]"
+        p = subprocess.run([sys.executable, "-I", "-c", f"import sys; {paths}; {probe}"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        state, leases, plane_sync, live_pool, evidence = json.loads(p.stdout)
+        ops = str(Path.home() / "Projekti/codegraph-ops")
+        import pwd
+        self.assertEqual(live_pool, os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti/codegraph-ops/pool"))
+        for path in (state, leases, plane_sync):
+            self.assertTrue(path.startswith(ops + "/"), path)
+            self.assertFalse(path.startswith(evidence.rstrip("/") + "/"), path)
+        pool = (HERE.parent / "agent-pool/pool.sh").read_text()
+        self.assertIn("LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}\n", pool)
+
+
+    def test_agents_cannot_replace_the_migration_symlinks(self):
+        import coordinator
+        from unittest import mock
+        if not coordinator.sandbox_available():
+            self.skipTest("needs macOS sandbox-exec")
+        home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, home, True)
+        legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
+        (ops / "pool").mkdir(parents=True)
+        (legacy / "wave").mkdir(parents=True)
+        (legacy / "pool").symlink_to(ops / "pool")
+        with mock.patch.multiple(coordinator, LEGACY_ROOT=legacy, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
+                                 LEASES=ops / "pool"):
+            with mock.patch.dict(os.environ, {"CG_COORD_SANDBOX_WRITABLE": str(legacy)}), \
+                    self.assertRaisesRegex(coordinator.Refused, "contains protected"):
+                coordinator.owner_writable()
+            with mock.patch.dict(os.environ, {"CG_COORD_SANDBOX_WRITABLE": str(legacy / "wave")}):
+                self.assertEqual(coordinator.owner_writable(), [str(legacy / "wave")])
+            # Even a writable evidence root leaves the links alone.
+            argv, _ = coordinator.sandbox_argv(["/bin/sh", "-c", f'rm "{legacy}/pool"; touch "{legacy}/wave/x"'],
+                                               str(home), [str(legacy)], [], None, True, False, True, str(home))
+        subprocess.run(argv, capture_output=True, timeout=60)
+        self.assertTrue((legacy / "pool").is_symlink())
+        self.assertTrue((legacy / "wave/x").exists())
+
+    def test_live_state_needs_the_migration_symlinks(self):
+        import coordinator
+        from unittest import mock
+        home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, home, True)
+        legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
+        env = {k: v for k, v in os.environ.items() if k not in ("CG_COORD_STATE", "CG_POOL_LEASES")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.multiple(coordinator, LEGACY_ROOT=legacy, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
+                                    LEASES=ops / "pool"):
+            def refused():
+                with self.assertRaisesRegex(coordinator.Refused, "migration symlink"):
+                    coordinator.refuse_legacy_state()
+            refused()  # no old path ever existed
+            for name in ("coordinator", "pool"):
+                with self.subTest(name=name):
+                    (legacy / name).mkdir(parents=True)
+                    refused()  # unmigrated
+                    (ops / name).mkdir(parents=True)
+                    (legacy / name).rmdir()
+                    (legacy / name).symlink_to(ops / name)
+            coordinator.refuse_legacy_state()
+            (legacy / "pool").unlink()
+            refused()  # removed after cutover
+            with mock.patch.dict(os.environ, {"CG_POOL_LEASES": str(ops / "pool")}):
+                refused()  # naming the live store does not skip the check
+            with mock.patch.dict(os.environ, {"CG_POOL_LEASES": str(home / "elsewhere")}), \
+                    mock.patch.object(coordinator, "LEASES", home / "elsewhere"):
+                coordinator.refuse_legacy_state()
+            for target in (home, home / "missing"):
+                (legacy / "pool").symlink_to(target)
+                refused()
+                (legacy / "pool").unlink()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Disposable Git repositories for the observer tests, and two oracles.
 
 Everything lives under one private temporary directory that must not resolve
-into the CodeGraph checkouts or the evidence tree (where the live pool lives).
+into the CodeGraph checkouts, the evidence tree or the ops tree (live pool state).
 Git runs here only as a test oracle, inside these fixtures, with no system or
 global config, no hooks, no credential helper, no network protocol and no
 optional index refresh."""
@@ -22,7 +22,8 @@ from broker import indexverify  # noqa: E402
 GIT = shutil.which("git")
 _HOME = Path.home().resolve()
 PROTECTED = tuple(_HOME / "Projekti" / n for n in (
-    "codegraph", "codegraph-worker-a", "codegraph-worker-b", "codegraph-review", "codegraph-evidence"))
+    "codegraph", "codegraph-worker-a", "codegraph-worker-b", "codegraph-review", "codegraph-evidence",
+    "codegraph-ops"))
 HAS_BIRTHTIME = hasattr(os.stat("/"), "st_birthtime")
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "protocol.allow=never",

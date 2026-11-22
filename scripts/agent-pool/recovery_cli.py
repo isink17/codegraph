@@ -68,7 +68,7 @@ def _clean(text):
 def live_pool():
     """The live pool, as pool.sh names it by default. The home directory comes
     from the user database, so a redirected HOME does not move it."""
-    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-evidence", "pool")
+    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Projekti", "codegraph-ops", "pool")
 
 
 def _ids(path):
@@ -90,8 +90,18 @@ def _related(a, b):
     return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
 
 
+def legacy_live_pool():
+    """The live pool's location before it moved to codegraph-ops; refused too
+    while a store may still be left there."""
+    return os.path.join(os.path.dirname(os.path.dirname(live_pool())), "codegraph-evidence", "pool")
+
+
 def _not_live(pool):
-    live = live_pool()
+    for live in (live_pool(), legacy_live_pool()):
+        _not_this_live(pool, live)
+
+
+def _not_this_live(pool, live):
     for form in {live, os.path.realpath(live)}:
         if _related(pool, form):
             raise rs.Refused("the pool path is the live pool, inside it or one of its parents; nothing changed")

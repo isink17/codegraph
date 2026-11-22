@@ -276,7 +276,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   git directory, owner-writable directories and their scratch directory.
   Nothing else in the home directory is readable (synthetic canaries in
   `~/.aws`, `~/.ssh`, `~/.gitconfig`, shell history, `~/Documents`, the
-  keychain, the evidence root and the primary checkout were verified
+  keychain, the evidence root, the ops root (`~/Projekti/codegraph-ops`)
+  and the primary checkout were verified
   unreadable; `go build` with cgo, `go test` and `git commit` work).
   File metadata (existence, size) stays visible. Writes: only the scratch
   directory, `/dev`, owner-listed directories and, for implementers, the
@@ -304,8 +305,8 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
   by host name, so there is no destination allow-list, and what they can
   send is what they can read. Claude Code agents are refused unless the
   owner sets `CG_COORD_ALLOW_CLAUDE=1`; they then run in the legacy
-  profile (reads allowed except the evidence root, coordinator
-  state, `CG_COORD_DENY_READ`, `~/.ssh`, `~/.config/gh`, `~/.netrc`,
+  profile (reads allowed except the evidence root, the ops root,
+  coordinator state, `CG_COORD_DENY_READ`, `~/.ssh`, `~/.config/gh`, `~/.netrc`,
   `~/.git-credentials`, `~/.codex`; keychain readable; network open),
   because Claude Code keeps its login in the keychain — where `gh` also
   keeps the owner's GitHub token, so a Claude agent can read it. The
@@ -342,7 +343,10 @@ blocked · failed · interrupted   (need the owner; nothing is retried automatic
 
 ## State and evidence
 
-`CG_COORD_STATE` (default `~/Projekti/codegraph-evidence/coordinator/`):
+`CG_COORD_STATE` (default `~/Projekti/codegraph-ops/coordinator/`; before
+the move it was `~/Projekti/codegraph-evidence/coordinator/`; the
+coordinator refuses to use the live state unless that old path is the
+migration's symlink to it, see `docs/agent-pool.md`, Migration):
 
 | Path | Content |
 |---|---|
