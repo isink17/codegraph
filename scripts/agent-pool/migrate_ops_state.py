@@ -70,6 +70,8 @@ def plan(src, dst):
     why = busy(src)
     if why:
         raise Stop(why)
+    if not os.listdir(src):
+        return "link"  # left empty by an older pool.sh's mkdir -p
     if os.path.lexists(dst) and os.listdir(dst):
         raise Stop(f"{src} and {dst} both hold state; the owner reconciles them")
     return "move"
@@ -77,11 +79,12 @@ def plan(src, dst):
 
 def apply(action, src, dst):
     if action == "move":
-        if os.path.lexists(dst):
-            os.rmdir(dst)
-        os.rename(src, dst)
-    elif not os.path.lexists(dst):
-        os.mkdir(dst, 0o700)
+        os.rename(src, dst)  # replaces an empty dst atomically
+    else:
+        if os.path.lexists(src):
+            os.rmdir(src)
+        if not os.path.lexists(dst):
+            os.mkdir(dst, 0o700)
     os.chmod(dst, 0o700)
     tmp = f"{src}.{os.getpid()}.migrating"
     os.symlink(dst, tmp)
@@ -116,7 +119,7 @@ def main(argv):
         for action, src, dst in steps:
             if action != "done":
                 apply(action, src, dst)
-    except Stop as e:
+    except (Stop, OSError) as e:
         print(f"stopped: {e}; nothing further changed", file=sys.stderr)
         return 1
     print("migrated")

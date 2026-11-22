@@ -38,6 +38,9 @@ HOME = Path.home()
 POOL = Path(os.environ.get("CG_COORD_POOL", HERE.parent / "agent-pool" / "pool.sh"))
 # Persistent operational state; the evidence root below is disposable.
 OPS_ROOT = HOME / "Projekti/codegraph-ops"
+# Pre-move home of that state; its entries are the migration's symlinks.
+LEGACY_ROOT = HOME / "Projekti/codegraph-evidence"
+LEGACY_LINKS = ("pool", "coordinator", "plane-sync")
 STATE_DIR = Path(os.environ.get("CG_COORD_STATE", OPS_ROOT / "coordinator"))
 POOL_ROOT = Path(os.environ.get("CG_POOL_ROOT", HOME / "Projekti"))
 REPO = Path(os.environ.get("CG_POOL_REPO", HOME / "Projekti/codegraph"))
@@ -182,7 +185,8 @@ def sandbox_available():
 def owner_writable():
     """CG_COORD_SANDBOX_WRITABLE entries, refused if one would contain a
     protected path or a PATH directory."""
-    protected = [OPS_ROOT, STATE_DIR, LEASES, REPO, HOME / ".claude", HOME / ".claude.json", HERE, POOL.parent,
+    protected = [OPS_ROOT, STATE_DIR, LEASES, LEGACY_ROOT, REPO, HOME / ".claude",
+                 HOME / ".claude.json", HERE, POOL.parent,
                  HOME / ".gitconfig", HOME / ".config/git", HOME / ".config/gh",
                  *[d for d in os.environ.get("PATH", "").split(":") if d]]
     out = []
@@ -324,7 +328,9 @@ def sandbox_argv(argv, scratch, extra, allow_read, slot, readonly, codex, keycha
         writable += [q(gitdir / "objects"), q(gitdir / "refs/heads"), q(gitdir / "logs/refs/heads")]
     no_write = [q(OPS_ROOT), q(STATE_DIR), q(LEASES), q(gitdir / "config", "literal"), q(gitdir / "hooks"),
                 q(gitdir / "objects/info"),
-                rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent)]
+                rx(gitdir / "worktrees", r"/[^/]+/(config|commondir|gitdir)"), q(HERE), q(POOL.parent),
+                # The links themselves: q() would resolve them to their targets.
+                rx(LEGACY_ROOT, "/(" + "|".join(re.escape(n) for n in LEGACY_LINKS) + ")$")]
     if slot and not readonly:
         writable += [q(slot), q(gitdir / "worktrees" / Path(slot).name)]
         no_write += [q(Path(slot) / ".git", "literal"),
@@ -1925,14 +1931,17 @@ def refuse_legacy_state():
     use the old evidence-tree paths and create state of their own there when
     it is missing; they share the live state only through the migration's
     symlinks, so the live state is refused without them."""
-    legacy = HOME / "Projekti/codegraph-evidence"
-    for var, old, new in (("CG_COORD_STATE", legacy / "coordinator", STATE_DIR),
-                          ("CG_POOL_LEASES", legacy / "pool", LEASES)):
-        live = OPS_ROOT / old.name
-        if var in os.environ and os.path.realpath(new) != os.path.realpath(live):
+    def same(a, b):
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            return False
+    for var, name, new in (("CG_COORD_STATE", "coordinator", STATE_DIR), ("CG_POOL_LEASES", "pool", LEASES)):
+        old = LEGACY_ROOT / name
+        if var in os.environ and not same(new, OPS_ROOT / old.name):
             continue
         linked = (old.is_symlink() and new.is_dir() and not new.is_symlink() and new.stat().st_uid == os.getuid()
-                  and os.path.realpath(old) == os.path.realpath(new))
+                  and same(old, new))
         if not linked:
             raise Refused(f"{old} is not the migration symlink to {new}, so an older pool.sh or coordinator "
                           "could keep separate state; run the migration (docs/agent-pool.md, Migration)")

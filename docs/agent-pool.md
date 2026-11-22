@@ -47,7 +47,8 @@ One time, as the owner:
 
 The script checks all three paths before changing anything. It moves an old
 directory only when the new one is missing or empty and the old one holds no
-`.<slot>.lock` and no running coordinator's lock; it stops when both hold
+`.<slot>.lock` and no running coordinator's lock, and replaces an empty old
+directory with the link; it stops when both hold
 state, a path is not this user's directory, or an old path is a symlink
 anywhere else. It never merges, overwrites or creates leases or coordinator
 state, sets the new directories to mode 0700, and is safe to rerun.
@@ -55,9 +56,9 @@ state, sets the new directories to mode 0700, and is safe to rerun.
 Older copies stay supported only through these symlinks, which are a shared
 path, not isolation: never remove them. If one disappears, `pool.sh` and the
 coordinator refuse until it is back; rerunning the script restores a missing
-link. An older copy that ran meanwhile has recreated the old directory as a
-store of its own; the script then stops with `both hold state` and the owner
-reconciles the two stores. Support for older copies ends only through a
+link. An older copy that ran meanwhile may have recreated the old directory;
+if it left state there, it is a store of its own: the script then stops with
+`both hold state` and the owner reconciles the two stores. Support for older copies ends only through a
 reviewed change that drops this check, once no checkout, slot or copy older
 than this change remains.
 

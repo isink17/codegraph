@@ -564,6 +564,9 @@ class LegacyStore(unittest.TestCase):
         self.assert_refused()  # symlink removed after cutover
         # Naming the live store explicitly does not skip the guard; another store does.
         self.assert_refused(CG_POOL_LEASES=str(self.new))
+        alias = "/System/Volumes/Data" + str(self.new)  # macOS firmlink: same directory, other string
+        if os.path.isdir(alias):
+            self.assert_refused(CG_POOL_LEASES=alias)
         self.assert_passes(CG_POOL_LEASES=str(self.home / "elsewhere"))
         for target in (self.home, self.home / "missing"):
             self.legacy.symlink_to(target)
@@ -637,13 +640,18 @@ class LegacyStore(unittest.TestCase):
     def test_removed_symlink_is_restored_by_rerunning_the_migration(self):
         self.assertEqual(self.migrate().returncode, 0)
         (self.new / f"{A}.lease").write_text(v1_lease())
-        self.legacy.unlink()
-        self.assert_refused()
-        p = self.migrate()
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn("link:", p.stdout)
-        self.assert_linked()
-        self.assert_passes()
+        for leftover in (None, "empty directory"):
+            with self.subTest(leftover=leftover):
+                self.legacy.unlink()
+                if leftover:
+                    self.legacy.mkdir()  # an older pool.sh's mkdir -p
+                self.assert_refused()
+                p = self.migrate()
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("link:", p.stdout)
+                self.assert_linked()
+                self.assertTrue((self.new / f"{A}.lease").exists())
+                self.assert_passes()
 
 
 # The pool.sh before the store moved to codegraph-ops: (commit, blob).

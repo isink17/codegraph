@@ -1936,6 +1936,31 @@ class StateDefaults(unittest.TestCase):
         self.assertIn("LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}\n", pool)
 
 
+    def test_agents_cannot_replace_the_migration_symlinks(self):
+        import coordinator
+        from unittest import mock
+        if not coordinator.sandbox_available():
+            self.skipTest("needs macOS sandbox-exec")
+        home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, home, True)
+        legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
+        (ops / "pool").mkdir(parents=True)
+        (legacy / "wave").mkdir(parents=True)
+        (legacy / "pool").symlink_to(ops / "pool")
+        with mock.patch.multiple(coordinator, LEGACY_ROOT=legacy, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
+                                 LEASES=ops / "pool"):
+            with mock.patch.dict(os.environ, {"CG_COORD_SANDBOX_WRITABLE": str(legacy)}), \
+                    self.assertRaisesRegex(coordinator.Refused, "contains protected"):
+                coordinator.owner_writable()
+            with mock.patch.dict(os.environ, {"CG_COORD_SANDBOX_WRITABLE": str(legacy / "wave")}):
+                self.assertEqual(coordinator.owner_writable(), [str(legacy / "wave")])
+            # Even a writable evidence root leaves the links alone.
+            argv, _ = coordinator.sandbox_argv(["/bin/sh", "-c", f'rm "{legacy}/pool"; touch "{legacy}/wave/x"'],
+                                               str(home), [str(legacy)], [], None, True, False, True, str(home))
+        subprocess.run(argv, capture_output=True, timeout=60)
+        self.assertTrue((legacy / "pool").is_symlink())
+        self.assertTrue((legacy / "wave/x").exists())
+
     def test_live_state_needs_the_migration_symlinks(self):
         import coordinator
         from unittest import mock
@@ -1944,7 +1969,7 @@ class StateDefaults(unittest.TestCase):
         legacy, ops = home / "Projekti/codegraph-evidence", home / "Projekti/codegraph-ops"
         env = {k: v for k, v in os.environ.items() if k not in ("CG_COORD_STATE", "CG_POOL_LEASES")}
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.multiple(coordinator, HOME=home, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
+                mock.patch.multiple(coordinator, LEGACY_ROOT=legacy, OPS_ROOT=ops, STATE_DIR=ops / "coordinator",
                                     LEASES=ops / "pool"):
             def refused():
                 with self.assertRaisesRegex(coordinator.Refused, "migration symlink"):

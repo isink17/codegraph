@@ -29,12 +29,8 @@ LEASES=${CG_POOL_LEASES:-$HOME/Projekti/codegraph-ops/pool}
 # the old path is the migration's symlink to it (docs/agent-pool.md, Migration).
 LIVE_LEASES=$HOME/Projekti/codegraph-ops/pool
 LEGACY_LEASES=$HOME/Projekti/codegraph-evidence/pool
-leases_real=$(cd "$LEASES" 2>/dev/null && pwd -P) || leases_real=
-live_real=$(cd "$LIVE_LEASES" 2>/dev/null && pwd -P) || live_real=
-legacy_real=$(cd "$LEGACY_LEASES" 2>/dev/null && pwd -P) || legacy_real=
-if [[ -z ${CG_POOL_LEASES:-} || ( -n $leases_real && $leases_real == "$live_real" ) ]] &&
-	! [[ -L $LEGACY_LEASES && -d $LEASES && ! -L $LEASES && -O $LEASES && -n $leases_real &&
-		$legacy_real == "$leases_real" ]]; then
+if [[ -z ${CG_POOL_LEASES:-} || $LEASES -ef $LIVE_LEASES ]] &&
+	! [[ -L $LEGACY_LEASES && $LEGACY_LEASES -ef $LEASES && -d $LEASES && ! -L $LEASES && -O $LEASES ]]; then
 	echo "refused: $LEGACY_LEASES is not the migration symlink to $LEASES, so an older pool.sh could keep a separate lease store; run the migration (docs/agent-pool.md, Migration)" >&2
 	exit 1
 fi
