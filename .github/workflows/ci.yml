@@ -21,10 +21,10 @@ concurrency:
 jobs:
   # Classifies the change. Only a change limited to CHANGELOG.md, README.md
   # and docs/**/*.md, without the windows-stress label, is docs-only; it gets
-  # whitespace and Markdown checks here and skips the Go jobs. Every other
-  # change, and any classification that fails or cannot see both commits,
-  # runs the full suite. No workflow-level paths filter: every job always
-  # reports a result.
+  # whitespace and Markdown checks here and skips the Go jobs. All changes
+  # also run the public boundary check. Any non-docs-only change, and any
+  # classification that fails or cannot see both commits, runs the full suite.
+  # No workflow-level paths filter: every job always reports a result.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
