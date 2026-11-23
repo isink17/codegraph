@@ -5,14 +5,19 @@ fake key. Never touches the Keychain, Plane or GitHub.
     python3 scripts/agent-coordinator/test_plane_sync.py
 """
 
+import errno
+import fcntl
 import json
 import os
 import re
+import shutil
+import stat
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 HERE = Path(__file__).resolve().parent
@@ -26,6 +31,11 @@ C554 = "1a963fff-210c-4b7c-82e1-12b05b1de6b8"
 C553 = "2b963fff-210c-4b7c-82e1-12b05b1de6b8"
 C55 = "3c963fff-210c-4b7c-82e1-12b05b1de6b8"
 NEW = "4d963fff-210c-4b7c-82e1-12b05b1de6b8"
+
+
+def fragments(text, key=KEY):
+    """Every 8-character piece of the key found in text."""
+    return sorted({key[i:i + 8] for i in range(len(key) - 7) if key[i:i + 8] in text})
 
 
 def comment(cid, html, stripped=None, updated="2026-11-21T15:02:07.328673Z", **kw):
@@ -109,6 +119,7 @@ def gh_for(ticket="CG-150"):
 class PlaneSync(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="plane-sync-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
         self.state = self.tmp / "state"
         self.old_state = ps.STATE_DIR
         ps.STATE_DIR = self.state
@@ -134,7 +145,7 @@ class PlaneSync(unittest.TestCase):
         p = self.state / "ledger.jsonl"
         if p.exists():
             everything += p.read_text()
-        self.assertNotIn(KEY, everything)
+        self.assertEqual(fragments(everything), [])
 
     # ---------------------------------------------------------------- read-only paths
 
@@ -459,6 +470,179 @@ class PlaneSync(unittest.TestCase):
         self.plane.now = lambda: "2026-11-22T10:00:01.500000Z"
         self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
 
+    # ---------------------------------------------------------------- durability
+
+    def patch_flush(self, fullfsync, fail=lambda call: None):
+        """Record every flush as (call, "file" | "dir"); fail(call) may return an error to raise."""
+        calls, real_fcntl = [], fcntl.fcntl
+
+        def kind(fd):
+            return "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+
+        def record(call, fd):
+            calls.append((call, kind(fd)))
+            error = fail(call)
+            if error:
+                raise error
+
+        def fake_fcntl(fd, cmd, *a):
+            if fullfsync is None or cmd != fullfsync:
+                return real_fcntl(fd, cmd, *a)
+            record("F_FULLFSYNC", fd)
+            return 0
+        for target, name, value in ((ps, "FULLFSYNC", fullfsync), (fcntl, "fcntl", fake_fcntl),
+                                    (os, "fsync", lambda fd: record("fsync", fd))):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return calls
+
+    def test_darwin_flushes_file_then_directory_with_full_fsync(self):
+        if sys.platform == "darwin":
+            self.assertEqual(ps.FULLFSYNC, fcntl.F_FULLFSYNC)
+        calls = self.patch_flush(51)
+        os.close(ps.lock(self.state))
+        self.assertEqual(calls, [("F_FULLFSYNC", "dir")])
+        calls.clear()
+        for _ in range(2):
+            ps.Ledger(self.state).append({"type": "UNSYNCHRONIZED", "ticket": "CG-150", "pr": 554, "error": "x"})
+        self.assertEqual(calls, [("F_FULLFSYNC", "file"), ("F_FULLFSYNC", "dir")] * 2)
+
+    def test_unsupported_full_fsync_falls_back_to_fsync(self):
+        calls = self.patch_flush(51, lambda call: OSError(errno.ENOTSUP, "x") if call == "F_FULLFSYNC" else None)
+        self.state.mkdir(mode=0o700)
+        ps.Ledger(self.state).append({"type": "UNSYNCHRONIZED", "ticket": "CG-150", "pr": 554, "error": "x"})
+        self.assertEqual(calls, [("F_FULLFSYNC", "file"), ("fsync", "file"), ("F_FULLFSYNC", "dir"), ("fsync", "dir")])
+
+    def test_without_full_fsync_flushes_file_then_directory_with_fsync(self):
+        calls = self.patch_flush(None)
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        self.assertEqual(calls, [("fsync", "dir")] + [("fsync", "file"), ("fsync", "dir")] * 2)
+
+    def test_failed_full_fsync_surfaces_before_any_write(self):
+        only_ledger = []
+        calls = self.patch_flush(51, lambda call: None if only_ledger and not (self.state / "ledger.jsonl").exists()
+                                 else OSError(errno.EIO, "x"))
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 1)
+        self.assertIn("local I/O error", self.err[-1])
+        only_ledger.append(1)
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 1)
+        self.assertEqual(self.out, [])
+        self.assertEqual(self.plane.writes(), [])
+        self.assertIn("UNSYNCHRONIZED event could not be written", self.err[-1])
+        self.assertNotIn("fsync", [c for c, _ in calls])
+
+    def test_unflushed_synced_event_is_not_claimed_and_retry_is_a_noop(self):
+        healthy = []
+        self.patch_flush(None, lambda call: None if healthy or not self.plane.writes() else OSError(errno.EIO, "x"))
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 1)
+        self.assertEqual(self.out, [])
+        self.assertIn("SYNCED event could not be written", self.err[-1])
+        healthy.append(1)
+        self.plane.calls.clear()
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        self.assertEqual(self.plane.writes(), [])
+        self.assertEqual(self.ledger()[-1]["type"], "SYNCED")
+
+    def test_live_reconstructed_snapshot_line_still_loads_and_pins(self):
+        self.state.mkdir(mode=0o700)
+        line = {"type": "RECONSTRUCTED", "source": "plane-cloud v2 read-back",
+                "note": "point-in-time snapshot; no prior event history exists",
+                "comments": [{"ticket": "CG-150", "pr": 554, "comment_id": C554,
+                              "updated_at": "2026-11-21T15:02:07.328673Z", "body_sha256": "0" * 64}],
+                "utc": "2026-11-22T12:00:00.000000Z"}
+        p = self.state / "ledger.jsonl"
+        p.write_text(json.dumps(line, sort_keys=True) + "\n")
+        p.chmod(0o600)
+        self.assertEqual(ps.Ledger(self.state).known_comment("CG-150", 554), C554)
+        self.plane.comments[C554]["comment_html"] = marked(554, "x")
+        self.plane.comments.pop(C553)
+        self.plane.comments["5e963fff-210c-4b7c-82e1-12b05b1de6b8"] = comment(
+            "5e963fff-210c-4b7c-82e1-12b05b1de6b8", marked(554, "dup"))
+        self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "AMBIGUOUS_MARKER")
+        self.plane.comments.pop("5e963fff-210c-4b7c-82e1-12b05b1de6b8")
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        self.assertEqual(self.plane.writes(), [("PATCH", f"projects/{ps.PROJECT}/work-items/{ITEM}/comments/{C554}/")])
+        self.assertEqual(self.ledger()[0], line)
+
+    # ---------------------------------------------------------------- canonical marker
+
+    def test_noncanonical_marker_comment_refuses_and_is_never_updated(self):
+        for html in ["<p><code>codegraph-coordinator-sync/v1 isink17/codegraph#0554</code></p><p>old</p>",
+                     "<p><code>codegraph-coordinator-sync/v1&nbsp;isink17/codegraph#554</code></p><p>old</p>"]:
+            self.plane.comments[C554] = comment(C554, html)
+            self.assertRefusedWithoutWrites(self.run_sync("CG-150", "554", str(self.body)), "AMBIGUOUS_MARKER")
+            self.assertEqual(self.plane.comments[C554]["comment_html"], html)
+
+    def test_marker_naming_no_pr_does_not_block_the_canonical_comment(self):
+        self.plane.comments[NEW] = comment(NEW, "<p><code>codegraph-coordinator-sync/v1 isink17/codegraph#00</code></p>")
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 0)
+        self.assertEqual(self.plane.writes(), [("PATCH", f"projects/{ps.PROJECT}/work-items/{ITEM}/comments/{C554}/")])
+
+    # ---------------------------------------------------------------- redaction
+
+    def test_server_code_echoing_the_key_late_is_redacted_before_truncation(self):
+        self.plane.script = [(401, {}, json.dumps({"code": "x" * 51 + KEY}).encode())]
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body)), 3)
+        self.assertIn("AUTH", self.err[-1])
+        self.assertEqual(fragments(self.err[-1] + (self.state / "ledger.jsonl").read_text()), [])
+
+    def test_long_error_message_is_redacted_before_truncation(self):
+        def leak(pr):
+            raise ps.Unsynced("GITHUB: " + "y" * 280 + KEY)
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), gh=leak), 1)
+        self.assertEqual(fragments((self.state / "ledger.jsonl").read_text()), [])
+
+    def test_escaped_spellings_of_the_key_are_redacted(self):
+        key = 'k"\\\u00e9-SECRET-0123456789'
+        self.state.mkdir(mode=0o700)
+        ps.Ledger(self.state, ps.Plane(key).redact).append({"type": "UNSYNCHRONIZED", "error": "x " + key})
+        self.assertEqual(fragments((self.state / "ledger.jsonl").read_text(), key), [])
+        self.assertEqual(fragments(ps.redact(f"got {key!r} and {json.dumps(key)}", key), key), [])
+
+    # ---------------------------------------------------------------- unexpected errors
+
+    def test_unexpected_transport_error_is_unsynchronized_without_its_message(self):
+        def bad(method, url, headers, data):
+            raise ValueError(f"Invalid header value {headers['X-API-Key']!r}")
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), plane=bad), 1)
+        self.assertIn("transport failure (ValueError)", self.err[-1])
+        self.assertNotIn("Invalid header", self.err[-1])
+        self.assertEqual(self.ledger()[-1]["type"], "UNSYNCHRONIZED")
+        self.assertEqual(self.slept, [])
+
+    def test_unexpected_error_after_post_adopts_instead_of_posting_again(self):
+        real = self.plane.__call__
+
+        def lost(method, url, headers, data):
+            r = real(method, url, headers, data)
+            if method == "POST":
+                raise RuntimeError(f"boom {KEY}")
+            return r
+        self.assertEqual(self.run_sync("CG-150", "560", str(self.body), plane=lost), 0)
+        self.assertEqual([m for m, _ in self.plane.writes()], ["POST"])
+        self.assertEqual(self.ledger()[-1]["comment_id"], NEW)
+
+    def test_unexpected_error_never_escapes_main(self):
+        def broken(pr):
+            raise KeyError(KEY)
+        self.assertEqual(self.run_sync("CG-150", "554", str(self.body), gh=broken), 1)
+        self.assertEqual(self.err, ["plane-sync: UNSYNCHRONIZED: internal error (KeyError)"])
+        self.assertEqual(self.ledger()[-1]["error"], "internal error (KeyError)")
+
+    def test_unwritable_unsynchronized_event_keeps_the_refusal_and_says_so(self):
+        real = ps.Ledger.append
+
+        def append(ledger, event):
+            if event["type"] == "UNSYNCHRONIZED":
+                raise OSError(errno.ENOSPC, "full")
+            return real(ledger, event)
+        with mock.patch.object(ps.Ledger, "append", append):
+            self.assertEqual(self.run_sync("CG-150", "554", str(self.body), gh=gh_for("CG-1500")), 3)
+        self.assertEqual(self.out, [])
+        self.assertIn("UNSYNCHRONIZED event could not be written", self.err[-1])
+        self.assertIn("MAPPING", self.err[-1])
+
 
 class Matching(unittest.TestCase):
     def test_marker_boundaries(self):
@@ -471,6 +655,36 @@ class Matching(unittest.TestCase):
                            (f"<p>note</p><p>{m}#554</p>", None),
                            (f"<p>note<br>{m}#554</p>", None)]:
             self.assertEqual(ps.marker_pr(comment(C554, markup)), pr, markup)
+
+    def test_only_the_canonical_spelling_is_a_marker(self):
+        m = "codegraph-coordinator-sync/v1 isink17/codegraph"
+        real = f"<p><code>{m}#554</code></p>"
+        self.assertEqual(ps.marker_pr(comment(C554, real)), 554)
+        self.assertEqual(ps.matches([comment(C554, real)], 554)[0]["id"], C554)
+        self.assertEqual(ps.marker_pr(comment(C554, "<p><code>codegraph-coordinator-sync/v1\n\t isink17/codegraph#554"
+                                                   "</code></p>")), 554)
+        blank_first = f"<p>&nbsp;</p><p>\u2003</p><p><code>{m}#554</code></p>"
+        self.assertEqual(ps.marker_pr(comment(C554, blank_first)), 554)
+        self.assertEqual(ps.matches([comment(C554, blank_first)], 554)[0]["id"], C554)
+        for markup, names_554 in [(f"<p><code>{m}#0554</code></p>", True),
+                                  (f"<p><code>{m}#00554</code></p>", True),
+                                  (f"<p><code>{m}#+554</code></p>", True),
+                                  (f"<p><code>{m}#-554</code></p>", True),
+                                  (f"<p><code>{m}# 554</code></p>", True),
+                                  (f"<p><code>{m}#&nbsp;554</code></p>", True),
+                                  (f"<p>&nbsp;<code>{m}#554</code></p>", True),
+                                  ("<p><code>codegraph-coordinator-sync/v1&nbsp;isink17/codegraph#554</code></p>", True),
+                                  ("<p><code>codegraph-coordinator-sync/v1\u00a0isink17/codegraph#554</code></p>", True),
+                                  ("<p><code>codegraph-coordinator-sync/v1 isink17/codegraph&#160;#554</code></p>", True),
+                                  (f"<p><code>{m}#00</code></p>", False),
+                                  (f"<p><code>{m}#05540</code></p>", False)]:
+            c = comment(C554, markup)
+            self.assertIsNone(ps.marker_pr(c), markup)
+            if names_554:
+                with self.assertRaises(ps.Refused, msg=markup):
+                    ps.matches([c], 554)
+            else:
+                self.assertEqual(ps.matches([c], 554), [], markup)
 
     def test_text_ignores_sanitizer_rewrites(self):
         sent = '<p>PR: <a href="https://x/1">#1</a> a &amp; b</p>'

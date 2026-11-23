@@ -14,6 +14,8 @@ macOS Keychain at run time and never printed, logged or written.
 
 Exit codes: 0 synced or read-only check passed, 1 UNSYNCHRONIZED (retry),
 2 usage, 3 refused (owner must look), 4 another writer holds the lock.
+A retry after exit 1 re-reads Plane and the ledger: it adopts a comment that
+an unanswered create made and never re-sends a create inside CREATE_GRACE.
 """
 
 import argparse
@@ -58,7 +60,13 @@ CREATE_GRACE = 300
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 TICKET = re.compile(r"^CG-([1-9][0-9]{0,5})$")
 PR_NUMBER = re.compile(r"^[1-9][0-9]{0,6}$")
-ANY_PR_MARKER = re.compile(re.escape(MARKER_PREFIX) + r"([0-9]+)(?![0-9])")
+CANONICAL_MARKER = re.compile(re.escape(MARKER_PREFIX) + r"([1-9][0-9]*)(?![0-9])")
+# Any spelling a reader could take for a PR's marker: zero padding, a sign,
+# spaces around '#', or a Unicode space where the marker has a plain one.
+LOOSE_MARKER = re.compile(r"codegraph-coordinator-sync/v1 ?" + re.escape(REPO_SLUG) + r" ?# ?[+-]? ?([0-9]+)(?![0-9])")
+FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", None)
+# F_FULLFSYNC errors that mean the file system does not support it, not that the flush failed.
+NO_FULLFSYNC = {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOTTY}
 
 
 class Refused(Exception):
@@ -83,6 +91,34 @@ def sha256(text):
 
 def marker(pr):
     return f"{MARKER_PREFIX}{pr}"
+
+
+def redact(text, key):
+    """Every spelling of the key that str(), repr() or json.dumps() can emit."""
+    for form in sorted({key, repr(key)[1:-1], json.dumps(key)[1:-1]}, key=len, reverse=True):
+        text = text.replace(form, "[REDACTED]")
+    return text
+
+
+def flush(fd):
+    """Durable or raise. On macOS fsync leaves data in the drive's cache, so
+    F_FULLFSYNC is used; plain fsync only where it is unsupported."""
+    if FULLFSYNC is not None:
+        try:
+            fcntl.fcntl(fd, FULLFSYNC)
+            return
+        except OSError as e:
+            if e.errno not in NO_FULLFSYNC:
+                raise
+    os.fsync(fd)
+
+
+def flush_dir(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        flush(fd)
+    finally:
+        os.close(fd)
 
 
 def keychain_key():
@@ -132,7 +168,7 @@ class Plane:
         self.key, self.transport, self.sleep = key, transport, sleep
 
     def redact(self, text):
-        return text.replace(self.key, "[REDACTED]")
+        return redact(text, self.key)
 
     def call(self, method, path, body=None):
         """Bounded: 429 waits Retry-After (capped) and retries; 5xx and
@@ -152,6 +188,9 @@ class Plane:
                 if attempt < MAX_TRIES:
                     self.sleep(2 ** attempt)
                 continue
+            except Exception as e:
+                # Its message may quote request headers, the key among them.
+                raise Unsynced(f"PLANE: {method} {path}: transport failure ({type(e).__name__})") from None
             if status == 429:
                 last = "rate limited"
                 if attempt < MAX_TRIES:
@@ -171,9 +210,9 @@ class Plane:
             except ValueError:
                 value = None
             if status in (401, 403):
-                raise Refused(f"AUTH: {method} {path}: HTTP {status} {error_code(value)}")
+                raise Refused(f"AUTH: {method} {path}: HTTP {status} {error_code(value, self.redact)}")
             if status >= 400:
-                raise Refused(f"PLANE: {method} {path}: HTTP {status} {error_code(value)}")
+                raise Refused(f"PLANE: {method} {path}: HTTP {status} {error_code(value, self.redact)}")
             if not isinstance(value, dict):
                 raise Unsynced(f"PLANE: {method} {path}: malformed response")
             return value
@@ -225,9 +264,9 @@ def retry_after(headers):
         return 5
 
 
-def error_code(value):
+def error_code(value, scrub):
     code = value.get("code") if isinstance(value, dict) else None
-    return re.sub(r"[^A-Za-z0-9_.-]", "", code)[:60] if isinstance(code, str) else ""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", scrub(code))[:60] if isinstance(code, str) else ""
 
 
 def is_uuid(value):
@@ -253,22 +292,27 @@ def text_of(markup):
 
 
 def marker_pr(c):
-    """The PR named by the comment's leading marker line, or None."""
-    m = ANY_PR_MARKER.match(text_of(c["comment_html"]))
+    """The PR named by the comment's leading marker line, or None. Only HTML's
+    own whitespace is collapsed here: a marker spelled with a non-breaking or
+    other Unicode space, or a noncanonical number, is not one."""
+    flat = html.unescape(re.sub(r"<[^>]*>", "", BLOCK_END.sub("\n", re.sub(r"[ \t\n\r\f]+", " ", c["comment_html"]))))
+    first = next((line.strip(" ") for line in flat.split("\n") if line.strip()), "")
+    m = CANONICAL_MARKER.match(first)
     return int(m.group(1)) if m else None
 
 
 def matches(comments, pr):
     """Every comment that carries this PR's marker anywhere. A marker that is
-    not the comment's leading line is never a safe target, so it makes the
-    selection ambiguous instead of being ignored."""
+    not the comment's canonical leading line, or that spells this PR in any
+    other way (#0554, # 554, a non-breaking space), is never a safe target, so
+    it makes the selection ambiguous instead of being ignored."""
     want = marker(pr)
     hit = []
     for c in comments:
         if marker_pr(c) == pr:
             hit.append(c)
-        elif any(int(m.group(1)) == pr for m in ANY_PR_MARKER.finditer(text_of(c["comment_html"]))):
-            raise Refused(f"AMBIGUOUS_MARKER: comment {c['id']} mentions {want} outside its leading line")
+        elif any(int(m.group(1)) == pr for m in LOOSE_MARKER.finditer(text_of(c["comment_html"]))):
+            raise Refused(f"AMBIGUOUS_MARKER: comment {c['id']} names {want} outside a canonical leading marker line")
     return hit
 
 
@@ -288,7 +332,8 @@ def prepare_body(text, pr):
 
 
 class Ledger:
-    """Append-only JSON lines, one fsynced object per event, mode 0600."""
+    """Append-only JSON lines, mode 0600. append() returns only once the line
+    and the directory entry are flushed (see flush), and raises otherwise."""
 
     def __init__(self, state, redact=lambda s: s):
         self.path, self.redact = state / "ledger.jsonl", redact
@@ -324,13 +369,17 @@ class Ledger:
         return out
 
     def append(self, event):
-        line = self.redact(json.dumps({"utc": utc(), **event}, sort_keys=True)) + "\n"
+        data = (self.redact(json.dumps({"utc": utc(), **event}, sort_keys=True)) + "\n").encode()
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            os.write(fd, line.encode())
-            os.fsync(fd)
+            if os.write(fd, data) != len(data):
+                raise OSError(errno.EIO, "short ledger write")
+            flush(fd)
         finally:
             os.close(fd)
+        # Every time, not just on create: an earlier append may have created the
+        # file and then failed before its directory entry was flushed.
+        flush_dir(self.path.parent)
 
     def known_comment(self, ticket, pr):
         cid = None
@@ -361,7 +410,11 @@ class Ledger:
 
 
 def lock(state):
+    missing = [p for p in state.parents if not p.exists()]
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The state directory's own entry on every run, as in Ledger.append.
+    for p in (state, *missing):
+        flush_dir(p.parent)
     st = os.stat(state, follow_symlinks=False)
     if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
         raise Refused(f"LEDGER: {state} must be a directory of this user with mode 0700")
@@ -476,11 +529,21 @@ def cmd_sync(args, plane, gh, out):
                 before, after = parse_utc(cur.get("updated_at")), parse_utc(back.get("updated_at"))
                 if before is None or after is None or after <= before:
                     raise Unsynced(f"READBACK: comment {cid} updated_at did not advance")
-        except (Refused, Unsynced) as e:
-            ledger.append({"type": "UNSYNCHRONIZED", **record, "comment_id": cid, "error": str(e)[:300]})
+        except Exception as e:
+            error = str(e) if isinstance(e, (Refused, Unsynced)) else f"internal error ({type(e).__name__})"
+            try:
+                ledger.append({"type": "UNSYNCHRONIZED", **record, "comment_id": cid,
+                               "error": ledger.redact(error)[:300]})
+            except Exception as le:
+                raise (Refused if isinstance(e, Refused) else Unsynced)(
+                    f"LEDGER: the UNSYNCHRONIZED event could not be written ({type(le).__name__}); {error}") from None
             raise
-        ledger.append({"type": "SYNCED", **record, "comment_id": cid, "action": action,
-                       "updated_at": back.get("updated_at"), "readback": "ok"})
+        try:
+            ledger.append({"type": "SYNCED", **record, "comment_id": cid, "action": action,
+                           "updated_at": back.get("updated_at"), "readback": "ok"})
+        except OSError as e:
+            raise Unsynced(f"LEDGER: comment {cid} read back, but the SYNCED event could not be written "
+                           f"({type(e).__name__}); a retry records it") from None
         out(f"plane-sync: SYNCED {ticket} #{pr} comment {cid} ({action}, read back)")
         return 0
     finally:
@@ -590,7 +653,7 @@ def main(argv=None, transport=urllib_transport, key=keychain_key, gh=gh_pr, slee
         return 2 if e.code else 0
 
     def safe(s):
-        return s.replace(secret, "[REDACTED]") if secret else s
+        return redact(s, secret) if secret else s
 
     try:
         if args.cmd == "status" and args.ticket is None:
@@ -610,6 +673,10 @@ def main(argv=None, transport=urllib_transport, key=keychain_key, gh=gh_pr, slee
         return 1
     except OSError as e:
         err(safe(f"plane-sync: UNSYNCHRONIZED: local I/O error ({type(e).__name__})"))
+        return 1
+    except Exception as e:
+        # Never a traceback: it could quote the key.
+        err(f"plane-sync: UNSYNCHRONIZED: internal error ({type(e).__name__})")
         return 1
 
 
