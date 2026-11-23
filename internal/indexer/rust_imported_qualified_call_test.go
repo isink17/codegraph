@@ -101,7 +101,52 @@ var rustImportedQualifiedCases = []struct {
 		"a.rs":   "pub fn f() {}",
 		"m.rs":   "use crate::a;\nmacro_rules! mk { ($n:ident) => { fn $n() {} } }\nmk!(g);\npub fn c() {\n    a::f();\n}\n",
 	}, "", "a::f", "a.rs:crate::a::f"},
+	{"type parameter of another name", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<U>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", "a.rs:crate::a::T::make"},
+	{"lifetime named like the segment", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c<'a>(_x: &'a u8) {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
 	// -- refused
+	// A generic type parameter shadows the imported or own type of its name;
+	// rustc calls the parameter's trait method.
+	{"fn type parameter shadows an imported type", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<T: crate::Make>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", ""},
+	{"impl type parameter shadows an imported type", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub struct W<T>(pub T);\nimpl<T: crate::Make> W<T> {\n    pub fn k(&self) {\n        T::make();\n    }\n}\n",
+	}, "", "T::make", ""},
+	{"fn type parameter shadows an own type", tree{
+		"lib.rs": "mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"m.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\npub fn g<T: crate::Make>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", ""},
+	// rustc calls the glob's module `c`; a value-only import of `c` is not
+	// followed, so the call stays unresolved rather than guessed.
+	{"value import beside a glob module of that name", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "pub fn c() {}",
+		"q.rs":   "pub mod c {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::c;\nuse crate::q::*;\npub fn k() {\n    c::f();\n}\n",
+	}, "", "c::f", ""},
+	{"import of a re-exported module", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "pub use crate::q::b;",
+		"q.rs":   "pub mod b {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::b;\npub fn k() {\n    b::f();\n}\n",
+	}, "", "b::f", ""},
+	{"enum variant of an imported enum", tree{
+		"lib.rs": "mod e; mod m;",
+		"e.rs":   "pub enum E {\n    V(u8),\n}\n",
+		"m.rs":   "use crate::e::E;\npub fn k() {\n    E::V(1);\n}\n",
+	}, "", "E::V", ""},
 	{"attribute macro on the caller", tree{
 		"lib.rs": "mod a; mod m;",
 		"a.rs":   "pub fn f() {}",
