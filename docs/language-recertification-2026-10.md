@@ -59,7 +59,7 @@ needed for each language: representative pinned repositories, compiler/source
 truth comparisons where practical, correct/incorrect/unresolved edge audits,
 known-limitations review, and fresh/incremental/no-op convergence over those
 corpora. Kotlin compiler validation remains unverified. C/C++ real-repository
-certification is excluded here and reserved for the Windows CG-99 campaign.
+certification is excluded here and reserved for a separate Windows certification.
 No public score, benchmark, or whole-language correctness claim is made.
 
 

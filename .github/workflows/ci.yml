@@ -1,16 +1,12 @@
 name: CI
 
 on:
-  # integration/v2.0-wave-* branches stage one wave of reviewed feature PRs
-  # before a single PR carries them into v2.0; they get the same full gate.
   push:
     branches:
       - v2.0
-      - 'integration/v2.0-wave-*'
   pull_request:
     branches:
       - v2.0
-      - 'integration/v2.0-wave-*'
     # The windows-stress label forces the full remaining non-docs suite; it
     # cannot select a Windows runner during the temporary pause.
     # No workflow_dispatch or schedule can accidentally run against master.
@@ -25,10 +21,10 @@ concurrency:
 jobs:
   # Classifies the change. Only a change limited to CHANGELOG.md, README.md
   # and docs/**/*.md, without the windows-stress label, is docs-only; it gets
-  # whitespace and Markdown checks here and skips the Go jobs. Every other
-  # change, and any classification that fails or cannot see both commits,
-  # runs the full suite. No workflow-level paths filter: every job always
-  # reports a result.
+  # whitespace and Markdown checks here and skips the Go jobs. All changes
+  # also run the public boundary check. Any non-docs-only change, and any
+  # classification that fails or cannot see both commits, runs the full suite.
+  # No workflow-level paths filter: every job always reports a result.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -43,10 +39,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Test the classifier and the merge gate
-        run: |
-          bash .github/scripts/ci-changes_test.sh
-          bash .github/scripts/merge-gate_test.sh
+      - name: Test the classifier
+        run: bash .github/scripts/ci-changes_test.sh
+      - name: Test the public boundary check
+        run: bash .github/scripts/public-boundary_test.sh
+      - name: Check the public boundary
+        run: bash .github/scripts/public-boundary.sh
       - name: Classify changed files
         id: classify
         run: bash .github/scripts/ci-changes.sh classify >> "$GITHUB_OUTPUT"
@@ -66,11 +64,12 @@ jobs:
         include:
           - os: ubuntu-latest
             go_test_timeout: 20m
-    # Temporary Windows CI pause: reduce Actions minutes while CG-117 tracks
-    # outstanding Windows compatibility issues. Windows remains supported.
+    # Temporary Windows CI pause: reduce Actions minutes while outstanding
+    # Windows compatibility issues are tracked. Windows remains supported.
     # Reassess by 2026-11-30; this is not an automatic re-enable date. To
-    # restore: reassess CG-117, add windows-latest and its native test/stress/
-    # smoke steps, then verify the aggregate ci check. Do not auto-enable.
+    # restore: reassess those issues, add windows-latest and its native
+    # test/stress/smoke steps, then verify the aggregate ci check. Do not
+    # auto-enable.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -152,35 +151,11 @@ jobs:
       - name: Run Go JVM inspector integration tests
         run: go test ./internal/jvmbinary ./internal/cli -count=1
 
-  # The agent pool lease manager and its recovery library (Python and bash),
-  # on throwaway pools only, and the Plane sync suite. The coordinator and
-  # campaign suites are not run here: parts of them exercise macOS
-  # sandbox-exec and they are unvalidated on Linux.
-  pool-safety:
-    needs: changes
-    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # test_pool_v2 extracts every historical pool.sh from git.
-          fetch-depth: 0
-      - name: Pool and recovery suites
-        working-directory: scripts/agent-pool
-        run: |
-          python3 --version
-          python3 -m unittest test_recovery_state test_pool_v2 test_pool_v2_writes test_recovery_gate test_recovery_cli
-          python3 -m unittest discover -s broker_tests -t broker_tests
-          bash pool_test.sh
-      - name: Plane sync suite (fake Plane, gh and key)
-        run: python3 scripts/agent-coordinator/test_plane_sync.py
-
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.
   # Fails on any failed or cancelled job, and when classification failed.
   ci:
-    needs: [changes, test-native, quality, race, no-cgo, jvm-binary-inspector, pool-safety]
+    needs: [changes, test-native, quality, race, no-cgo, jvm-binary-inspector]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

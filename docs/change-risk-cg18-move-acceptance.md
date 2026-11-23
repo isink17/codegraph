@@ -1,6 +1,6 @@
 # CG-18 modified-content move acceptance
 
-Task: `c28-cg18-move-continuity`. Production baseline:
+Production baseline:
 `783d1222ecdbfb8fec6b54090f34678c58e6a368`.
 
 No incorrect production result was reproduced on these pinned source trees.

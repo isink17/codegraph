@@ -51,12 +51,12 @@ not a product failure. The reference run of this script on Darwin arm64, Go
 | internal/diff | 135.5 s | 419 |
 | all 53 packages | 199 s wall | 7,218 |
 
-Focused `internal/diff` tests ran in another worker slot during part of
+Focused `internal/diff` tests ran in another checkout during part of
 that run, so its timings are slightly loaded. 20m leaves more than 6×
 headroom over the slowest package for a loaded or slower machine.
 
-Do not run two full suites at the same time on one machine, for example two
-worker slots or a suite beside the local CI reproduction. The packages then
+Do not run two full suites at the same time on one machine, for example in two
+checkouts or a suite beside the local CI reproduction. The packages then
 compete for the same cores, and timings and timeouts stop being comparable.
 
 Results are local to the machine and toolchain that ran them. They are not

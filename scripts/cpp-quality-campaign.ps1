@@ -19,8 +19,8 @@ Copy the checkout to a temporary directory, then test add/update/delete behavior
 there. The original checkout is never changed.
 
 Example:
-  .\scripts\cpp-quality-campaign.ps1 -RepositoryPath D:\RebornEP8Source `
-    -CodeGraph C:\tools\codegraph.exe -OutputDirectory D:\cg-evidence\archlord
+  .\scripts\cpp-quality-campaign.ps1 -RepositoryPath D:\src\project `
+    -CodeGraph C:\tools\codegraph.exe -OutputDirectory D:\cg-evidence\run
 #>
 [CmdletBinding()]
 param(

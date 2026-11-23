@@ -8541,9 +8541,8 @@ func StrongerRelatedTest(a, b RelatedTest) bool {
 // Go rather than in SQL so the query needs no math extension.
 //
 // Every figure quoted here and below was produced by tools/retrievalbench
-// against the pinned corpora; the reports, query plans and timings are in
-// codegraph-evidence/v2-cg142-scoring-20261103 and, for the baseline it is
-// measured against, v2-semantic-retrieval-benchmark-20261103.
+// against the pinned corpora; the reports, query plans and timings, and those
+// of the baseline it is measured against, are kept outside this repository.
 func (s *Store) SemanticSearch(ctx context.Context, repoID int64, query string, limit, offset int) ([]map[string]any, error) {
 	ctx, readTx, err := s.beginParserSemanticGraphRead(ctx, repoID)
 	if err != nil {

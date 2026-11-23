@@ -2,7 +2,7 @@
 
 ## CG-105 bounded acceptance record (29-10-2026)
 
-Task `c28-cg105-freshness-acceptance` evaluated merged head
+This record evaluated merged head
 `783d1222ecdbfb8fec6b54090f34678c58e6a368` (also the local `origin/v2.0`),
 tree `5c7f420df0576f637d7707e61099fb8806c1785c`, on macOS arm64,
 Go 1.26.1, CGO enabled. This record changes documentation only; the tested
@@ -24,7 +24,7 @@ review of a subsequent PR head.
 | Watch lifecycle and MCP bootstrap | Pass: `TestRunWatchJSONL*`, `TestWatchStopsGracefullyOnSignal`, `TestServe*`; readiness/cancellation, signal shutdown, `tools/list` and `tools/call` on the production serve path. |
 | Active-write snapshot/open refusal | Preserved, not newly exercised: active-scan exit 2 with no verdict remains an acceptable fail-closed result. A successfully opened read with a held scan lock instead reaches freshness-unknown (exit 4); the pre-insert lock parity test covers that separate path. No attempt was made to turn an open failure into a verdict. |
 | Native Windows runtime | Deferred to release preparation, as requested. Neither cross-compilation nor this macOS run establishes Windows lock, watcher, path or file-handle behavior. Native Linux was not run here either. |
-| Original Plane acceptance (retrieved from Plane Cloud, 2026-10-29) | CG-105 asks for the smallest read-only status contract covering last successful scan, dirty/pending work, active watcher/writer ownership, worktree identity, and scan failure; unknown dimensions stay unknown. It also requires local-first behavior, no unmanaged daemon or build execution, no perfect-freshness claim, and separate compatibility/multi-writer proof for any durable lifecycle redesign. The rows above map existing local evidence to these dimensions; they do not claim a durable status for process-local facts or ticket completion. |
+| Original acceptance criteria (retrieved 2026-10-29) | CG-105 asks for the smallest read-only status contract covering last successful scan, dirty/pending work, active watcher/writer ownership, worktree identity, and scan failure; unknown dimensions stay unknown. It also requires local-first behavior, no unmanaged daemon or build execution, no perfect-freshness claim, and separate compatibility/multi-writer proof for any durable lifecycle redesign. The rows above map existing local evidence to these dimensions; they do not claim a durable status for process-local facts or ticket completion. |
 | Independent exact-head review | This matrix was first committed at `f2eb1d13452d452c162252b04db56b5ab59735b1`; that head's review does not cover a later amendment. Any amendment requires a fresh review naming its exact final SHA. |
 
 Reproduction commands (each test invocation has an explicit timeout):

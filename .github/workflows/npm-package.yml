@@ -142,7 +142,7 @@ jobs:
           done
 
   packed-install:
-    # Pause routine Windows install tests during development (CG-117).
+    # Pause routine Windows install tests during development.
     # Run Windows validation during explicit release preparation, not every npm PR.
     # Release-shaped Windows jobs remain opt-in; release-tag builds are unchanged.
     runs-on: ${{ matrix.os }}
