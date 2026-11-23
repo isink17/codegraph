@@ -64,6 +64,7 @@ Only the Rust module pass resolves Rust calls, and generic repository-wide match
 
 Lookup starts from the calling symbol's container, or otherwise from the file's module:
 1. A `use` with a matching local name takes precedence.
+   For a qualified call, a single explicit `use` whose local name is the first segment (`use crate::a;` then `a::f()`) resolves the call as the path that import names, unless the module declares its own module or type of that name. Two imports of the segment, or one that names no module path, leave the call unresolved.
 2. Otherwise, `crate::`, `self::`, `super::` and relative paths resolve against the starting module.
 3. A candidate must be visible, and either in the caller's file or in a module proven to belong to the caller's crate.
 4. If none qualifies, named and glob `pub use` re-exports of the caller's own crate are followed, with cycle protection.

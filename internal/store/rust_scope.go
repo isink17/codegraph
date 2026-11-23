@@ -811,6 +811,22 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		root := rootOfFile[caller.id]
 		return root != "" && globModules[[2]string{root, module}]
 	}
+	// ownTypeItem reports a module or non-function item named name declared in
+	// owner, in the caller's crate: what a path's first segment, resolved in
+	// the type namespace, finds before any glob.
+	ownTypeItem := func(owner, name string, caller rustScopeFile) bool {
+		for _, m := range decls {
+			if m.owner == owner && m.name == name && rootOfFile[m.file] != "" && rootOfFile[m.file] == rootOfFile[caller.id] {
+				return true
+			}
+		}
+		for _, c := range byQ[owner+"::"+name] {
+			if c.kind != "function" && inCallerCrate(c, caller) {
+				return true
+			}
+		}
+		return false
+	}
 	// A private impl method is an inherent impl's: a trait impl's items are
 	// recorded with their own visibility, which nothing here binds. An
 	// inherent `m` is what `Type::m` finds first, and a type has at most one
@@ -1091,6 +1107,28 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				strategy = ResolutionStrategyRustUseScope
 				explicit = true
 			}
+			// A qualified call whose first segment an explicit `use` binds
+			// resolves as the path that import names. An own module or type of
+			// that name wins: beside it an import of a type-namespace item would
+			// not compile, so the import binds a value or macro. Two imports of
+			// the segment, or one naming no module path, leave the call
+			// unresolved rather than guess.
+			if seg, rest, qualified := strings.Cut(dst, "::"); !explicit && qualified && seg != "" && seg != "crate" && seg != "self" && seg != "super" && !ownTypeItem(owner, seg, caller) {
+				var segPaths []string
+				for _, im := range importsBy[file] {
+					if p := resolvePath(im.source, owner); im.owner == owner && !im.glob && im.local == seg && !slices.Contains(segPaths, p) {
+						segPaths = append(segPaths, p)
+					}
+				}
+				if len(segPaths) > 1 || (len(segPaths) == 1 && segPaths[0] == "") {
+					continue
+				}
+				if len(segPaths) == 1 {
+					path = segPaths[0] + "::" + rest
+					strategy = ResolutionStrategyRustUseScope
+					explicit = true
+				}
+			}
 			if path == dst && strings.Contains(dst, "::") {
 				path = resolvePath(dst, owner)
 			} else if path == dst {
@@ -1115,18 +1153,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				own, ownStruct := false, false
 				seg, _, qualified := strings.Cut(dst, "::")
 				if qualified {
-					// An explicit `use` of the first segment shadows the glob
-					// too; the call is not resolved through that import, so it
-					// stays unresolved rather than reaching the glob.
-					for _, im := range importsBy[file] {
-						own = own || (im.owner == owner && !im.glob && im.local == seg)
-					}
-					for _, m := range decls {
-						own = own || (m.owner == owner && m.name == seg && rootOfFile[m.file] != "" && rootOfFile[m.file] == rootOfFile[caller.id])
-					}
-					for _, c := range byQ[owner+"::"+seg] {
-						own = own || (c.kind != "function" && inCallerCrate(c, caller))
-					}
+					// An explicit `use` of the first segment was followed above.
+					own = ownTypeItem(owner, seg, caller)
 				} else {
 					for _, c := range byQ[path] {
 						if inCallerCrate(c, caller) {

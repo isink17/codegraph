@@ -175,23 +175,24 @@ var rustPrivateVisibilityCases = []struct {
 	}, "lib.rs", "S::m", "lib.rs:crate::S::m", false},
 	// A trait impl method is recorded under the type as the impl writes it,
 	// but `Type::m` finds an inherent method first, wherever its impl is.
-	// rustc calls the inherent nfa.rs NFA::swap in all three; the parser
-	// cannot tell a trait impl from an inherent one, so each stays unresolved.
+	// rustc calls the inherent nfa.rs NFA::swap in all three. The caller's
+	// path follows its import to that type, so the trait impl's own record,
+	// kept under the type as r.rs writes it, is never the candidate.
 	{"trait impl method of a module-qualified type", tree{
 		"lib.rs": "mod nfa; mod r;",
 		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
 		"r.rs":   "use crate::nfa;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for nfa::NFA {\n    fn swap(&mut self) {\n        nfa::NFA::swap(self);\n    }\n}\n",
-	}, "r.rs", "nfa::NFA::swap", "", false},
+	}, "r.rs", "nfa::NFA::swap", "nfa.rs:crate::nfa::NFA::swap", false},
 	{"free fn beside a trait impl of a module-qualified type", tree{
 		"lib.rs": "mod nfa; mod r;",
 		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
 		"r.rs":   "use crate::nfa;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for nfa::NFA {\n    fn swap(&mut self) {}\n}\npub fn go(n: &mut nfa::NFA) {\n    nfa::NFA::swap(n);\n}\n",
-	}, "r.rs", "nfa::NFA::swap", "", false},
+	}, "r.rs", "nfa::NFA::swap", "nfa.rs:crate::nfa::NFA::swap", false},
 	{"trait impl method of an imported type", tree{
 		"lib.rs": "mod nfa; mod r;",
 		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
 		"r.rs":   "use crate::nfa::NFA;\npub trait R {\n    fn swap(&mut self);\n}\nimpl R for NFA {\n    fn swap(&mut self) {\n        NFA::swap(self);\n    }\n}\n",
-	}, "r.rs", "NFA::swap", "", false},
+	}, "r.rs", "NFA::swap", "nfa.rs:crate::nfa::NFA::swap", false},
 	// An item declared in a block shadows the module's item of that name
 	// throughout the block, nested items included; it is not recorded, so the
 	// call stays unresolved. rustc calls the block's item in each.
