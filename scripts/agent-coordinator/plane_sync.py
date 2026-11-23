@@ -264,9 +264,9 @@ def retry_after(headers):
         return 5
 
 
-def error_code(value, redact):
+def error_code(value, scrub):
     code = value.get("code") if isinstance(value, dict) else None
-    return re.sub(r"[^A-Za-z0-9_.-]", "", redact(code))[:60] if isinstance(code, str) else ""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", scrub(code))[:60] if isinstance(code, str) else ""
 
 
 def is_uuid(value):
@@ -296,7 +296,7 @@ def marker_pr(c):
     own whitespace is collapsed here: a marker spelled with a non-breaking or
     other Unicode space, or a noncanonical number, is not one."""
     flat = html.unescape(re.sub(r"<[^>]*>", "", BLOCK_END.sub("\n", re.sub(r"[ \t\n\r\f]+", " ", c["comment_html"]))))
-    first = next((line.strip(" ") for line in flat.split("\n") if line.strip(" ")), "")
+    first = next((line.strip(" ") for line in flat.split("\n") if line.strip()), "")
     m = CANONICAL_MARKER.match(first)
     return int(m.group(1)) if m else None
 
@@ -535,8 +535,8 @@ def cmd_sync(args, plane, gh, out):
                 ledger.append({"type": "UNSYNCHRONIZED", **record, "comment_id": cid,
                                "error": ledger.redact(error)[:300]})
             except Exception as le:
-                raise Unsynced(f"LEDGER: the UNSYNCHRONIZED event could not be written "
-                               f"({type(le).__name__}); {error}") from None
+                raise (Refused if isinstance(e, Refused) else Unsynced)(
+                    f"LEDGER: the UNSYNCHRONIZED event could not be written ({type(le).__name__}); {error}") from None
             raise
         try:
             ledger.append({"type": "SYNCED", **record, "comment_id": cid, "action": action,

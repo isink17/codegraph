@@ -256,8 +256,10 @@ plane_sync.py bootstrap CG-150 [--dry-run]
   which admits one writer. Each event is flushed before the step it
   records goes on: the line with `F_FULLFSYNC` on macOS (plain `fsync`
   only where the file system reports it unsupported; any other error
-  fails), then the directory entry. A failed flush stops the run before
-  any Plane write it would have covered. Looser modes, a malformed or
+  fails), then the directory entry, so the state directory's parent must
+  be readable. A failed flush stops the run before any Plane write it
+  would have covered; when it is the `ATTEMPT` of a create, the line may
+  still be on disk and a retry within 300 s reports `CREATE_PENDING`. Looser modes, a malformed or
   torn ledger line refuse. `bootstrap` writes one `RECONSTRUCTED` point-in-time snapshot
   from a live read, once, into an empty ledger; it is not history. The
   ledger of the old `plane-sync.sh` was lost with the evidence tree; there
@@ -266,7 +268,8 @@ plane_sync.py bootstrap CG-150 [--dry-run]
   (owner must look), 4 another writer holds the lock. An unexpected
   error, in the transport or anywhere else, is exit 1 naming only its
   type, never a traceback. When the `UNSYNCHRONIZED` or `SYNCED` event
-  itself cannot be written, the run exits 1 and says so on stderr. A
+  itself cannot be written, the run exits 1 (3 if it was refused) and
+  says so on stderr. A
   retry re-reads Plane and the ledger: it adopts a comment an unanswered
   create made and never re-sends a create within 300 s of one.
 

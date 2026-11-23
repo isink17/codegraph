@@ -498,6 +498,8 @@ class PlaneSync(unittest.TestCase):
         return calls
 
     def test_darwin_flushes_file_then_directory_with_full_fsync(self):
+        if sys.platform == "darwin":
+            self.assertEqual(ps.FULLFSYNC, fcntl.F_FULLFSYNC)
         calls = self.patch_flush(51)
         os.close(ps.lock(self.state))
         self.assertEqual(calls, [("F_FULLFSYNC", "dir")])
@@ -628,7 +630,7 @@ class PlaneSync(unittest.TestCase):
         self.assertEqual(self.err, ["plane-sync: UNSYNCHRONIZED: internal error (KeyError)"])
         self.assertEqual(self.ledger()[-1]["error"], "internal error (KeyError)")
 
-    def test_unwritable_unsynchronized_event_exits_1_and_says_so(self):
+    def test_unwritable_unsynchronized_event_keeps_the_refusal_and_says_so(self):
         real = ps.Ledger.append
 
         def append(ledger, event):
@@ -636,7 +638,7 @@ class PlaneSync(unittest.TestCase):
                 raise OSError(errno.ENOSPC, "full")
             return real(ledger, event)
         with mock.patch.object(ps.Ledger, "append", append):
-            self.assertEqual(self.run_sync("CG-150", "554", str(self.body), gh=gh_for("CG-1500")), 1)
+            self.assertEqual(self.run_sync("CG-150", "554", str(self.body), gh=gh_for("CG-1500")), 3)
         self.assertEqual(self.out, [])
         self.assertIn("UNSYNCHRONIZED event could not be written", self.err[-1])
         self.assertIn("MAPPING", self.err[-1])
@@ -661,12 +663,16 @@ class Matching(unittest.TestCase):
         self.assertEqual(ps.matches([comment(C554, real)], 554)[0]["id"], C554)
         self.assertEqual(ps.marker_pr(comment(C554, "<p><code>codegraph-coordinator-sync/v1\n\t isink17/codegraph#554"
                                                    "</code></p>")), 554)
+        blank_first = f"<p>&nbsp;</p><p>\u2003</p><p><code>{m}#554</code></p>"
+        self.assertEqual(ps.marker_pr(comment(C554, blank_first)), 554)
+        self.assertEqual(ps.matches([comment(C554, blank_first)], 554)[0]["id"], C554)
         for markup, names_554 in [(f"<p><code>{m}#0554</code></p>", True),
                                   (f"<p><code>{m}#00554</code></p>", True),
                                   (f"<p><code>{m}#+554</code></p>", True),
                                   (f"<p><code>{m}#-554</code></p>", True),
                                   (f"<p><code>{m}# 554</code></p>", True),
                                   (f"<p><code>{m}#&nbsp;554</code></p>", True),
+                                  (f"<p>&nbsp;<code>{m}#554</code></p>", True),
                                   ("<p><code>codegraph-coordinator-sync/v1&nbsp;isink17/codegraph#554</code></p>", True),
                                   ("<p><code>codegraph-coordinator-sync/v1\u00a0isink17/codegraph#554</code></p>", True),
                                   ("<p><code>codegraph-coordinator-sync/v1 isink17/codegraph&#160;#554</code></p>", True),
