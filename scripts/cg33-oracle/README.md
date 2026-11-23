@@ -35,8 +35,6 @@ class at the selected path, empty prefix, production/dev collision, dev-only,
 malformed prefix, and unmapped class. Production-only exclusion of
 `autoload-dev` is an explicit CodeGraph policy.
 
-Original CG-49 outputs, binaries, corpora, and databases are preserved locally
-outside the repository at:
-`~/Library/Application Support/CodeGraph/evidence/cg49-acceptance-20261002/`.
-They are evidence snapshots, not reproduction inputs. No CG-49 acceptance test
+Original CG-49 outputs, binaries, corpora, and databases are kept outside this
+repository. They are evidence snapshots, not reproduction inputs. No CG-49 acceptance test
 was rerun while preparing this setup.

@@ -149,7 +149,7 @@ func TestCLIPattern(t *testing.T) {
 		"grep -rn codegraph .",
 		"ls .codegraph",
 		"cd /work/src/codegraph && go test ./...",
-		"cd ~/Projekti/codegraph-worker-a",
+		"cd ~/src/codegraph-fork",
 		"which codegraph",
 		"cat codegraph.txt",
 		"./bin/notcodegraph stats",

@@ -323,7 +323,7 @@ func TestDefaultToolModeIsFull(t *testing.T) {
 // safe_to_edit is listed in full mode: 13448 -> 13761 bytes (+313 bytes, +79
 // estimated tokens). It is not gateway core, so the gateway payload is
 // unchanged; gateway clients reach it through tool_search and tool_call.
-// CG-120 adds compact-v2: full +180 bytes/+45 estimated tokens; gateway +60/+15.
+// compact-v2 adds full +180 bytes/+45 estimated tokens; gateway +60/+15.
 //
 // tool_search's description now states the query forms it accepts, because an
 // agent that invents a directive syntax learns otherwise only from a bad result:

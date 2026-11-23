@@ -2,7 +2,7 @@
 
 ## CG-105 bounded acceptance record (29-10-2026)
 
-Task `c28-cg105-freshness-acceptance` evaluated merged head
+This record evaluated merged head
 `783d1222ecdbfb8fec6b54090f34678c58e6a368` (also the local `origin/v2.0`),
 tree `5c7f420df0576f637d7707e61099fb8806c1785c`, on macOS arm64,
 Go 1.26.1, CGO enabled. This record changes documentation only; the tested

@@ -66,8 +66,8 @@ import "sort"
 // frequency gain with none of the length that pays for it, which is the
 // domination failure in the other direction.
 //
-// Every figure above comes from tools/retrievalbench; the reports are in
-// codegraph-evidence/v2-cg144-identifier-tokens-20261104/raw.
+// Every figure above comes from tools/retrievalbench; the reports are kept
+// outside this repository.
 //
 // Repetition inside the identity -- `connection` appears in the package
 // path, the type name and the method name of the symbol above -- is real

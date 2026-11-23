@@ -159,8 +159,8 @@ func (s *Service) rankContextCandidates(ctx context.Context, repoID int64, task 
 	//
 	// Semantic search does not stand in for it. It scores a symbol's whole
 	// token vocabulary, so a long test method repeating a common word can
-	// still outweigh the small implementation the task named. Since CG-144
-	// its tokenizer does decompose a symbol's identity, so the reference
+	// still outweigh the small implementation the task named. Its tokenizer
+	// does decompose a symbol's identity, so the reference
 	// `RealCall.execute` and the stored qualified name
 	// `okhttp3.internal.connection.RealCall.execute` share `realcall` and
 	// `execute` where they used to share nothing -- the measured effect is

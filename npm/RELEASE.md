@@ -40,8 +40,8 @@ Publishing for later releases.
    passes.
 9. Run the public npm install smoke below.
 10. Configure the future Trusted Publisher as described below.
-11. CG-26 promotes npm as the recommended README install after public install
-    smoke passes.
+11. A follow-up change promotes npm as the recommended README install after
+    public install smoke passes.
 
 Do not perform these release steps as part of metadata preparation.
 
@@ -156,7 +156,7 @@ codegraph doctor
 
 Confirm `codegraph --version` reports `codegraph v2.0.0`. An optional MCP smoke
 may follow. Do not add npm to the root README until this public install smoke
-passes; CG-26 owns that documentation promotion.
+passes; that documentation promotion is a separate change.
 
 ### First-release recovery
 
