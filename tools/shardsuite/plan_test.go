@@ -53,9 +53,32 @@ func TestParseList(t *testing.T) {
 	if !failed["m/broken"] || failed["m/a"] {
 		t.Errorf("failed = %v", failed)
 	}
-	dup := `{"Action":"output","Package":"m/a","Output":"TestA\n"}` + "\n" + `{"Action":"output","Package":"m/a","Output":"TestA\n"}`
+	dup := `{"Action":"output","Package":"m/a","Output":"TestA\n"}` + "\n" + `{"Action":"output","Package":"m/a","Output":"TestA\n"}` + "\n" + passListed
 	if _, _, _, err := parseList([]byte(dup)); err == nil {
 		t.Error("duplicate listed name: want error")
+	}
+	// A list cut short must never become a smaller inventory.
+	for name, cut := range map[string]string{
+		"half line":          stream + "\n" + `{"Action":"start","Pack`,
+		"unfinished package": stream + "\n" + `{"Action":"start","Package":"m/z"}` + "\n" + `{"Action":"output","Package":"m/z","Output":"TestZ\n"}`,
+	} {
+		if _, _, _, err := parseList([]byte(cut)); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}
+
+const passListed = `{"Action":"pass","Package":"m/a"}`
+
+func TestSamePackages(t *testing.T) {
+	if err := samePackages([]string{"m/a", "m/b"}, []string{"m/b", "m/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := samePackages([]string{"m/a"}, []string{"m/a", "m/b"}); err == nil || !strings.Contains(err.Error(), "m/b") {
+		t.Fatalf("missing package: %v", err)
+	}
+	if err := samePackages([]string{"m/a", "m/x"}, []string{"m/a"}); err == nil {
+		t.Fatal("unexpected package: want error")
 	}
 }
 

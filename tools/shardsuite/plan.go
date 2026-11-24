@@ -68,17 +68,29 @@ func parseShardSpec(s string) ([]shardSpec, error) {
 var testListRE = regexp.MustCompile(`^(Test|Example|Fuzz)[^\s]*$`)
 
 // parseList reads `go test -json -list . PKGS` and returns every package seen
-// with its top-level test names, plus packages that failed to build.
+// with its top-level test names, plus packages that failed to build. A list
+// that was cut short (a non-JSON line, or a package with no final event) is an
+// error: trusting it would leave packages out of every job.
 func parseList(data []byte) (pkgs []string, names map[string][]string, failed map[string]bool, err error) {
 	names = map[string][]string{}
 	failed = map[string]bool{}
 	seen := map[string]bool{}
+	done := map[string]bool{}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
 	for sc.Scan() {
-		var e event
-		if json.Unmarshal(sc.Bytes(), &e) != nil || e.Package == "" {
+		if len(bytes.TrimSpace(sc.Bytes())) == 0 {
 			continue
+		}
+		var e event
+		if json.Unmarshal(sc.Bytes(), &e) != nil {
+			return nil, nil, nil, fmt.Errorf("test list has a non-JSON line: %.80q", sc.Text())
+		}
+		if e.Package == "" {
+			continue
+		}
+		if e.Test == "" && isTerminal(e.Action) {
+			done[e.Package] = true
 		}
 		if !seen[e.Package] {
 			seen[e.Package] = true
@@ -97,6 +109,11 @@ func parseList(data []byte) (pkgs []string, names map[string][]string, failed ma
 		return nil, nil, nil, err
 	}
 	sort.Strings(pkgs)
+	for _, p := range pkgs {
+		if !done[p] {
+			return nil, nil, nil, fmt.Errorf("test list for %s never finished", p)
+		}
+	}
 	for p, ns := range names {
 		sort.Strings(ns)
 		for i := 1; i < len(ns); i++ {
@@ -211,17 +228,51 @@ func jobSlug(pkg string) string {
 	return strings.Join(parts, "_")
 }
 
+// goList returns the import paths go list resolves for patterns.
+func goList(dir string, patterns ...string) ([]string, error) {
+	cmd := exec.Command("go", append([]string{"list"}, patterns...)...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go list %s: %w", strings.Join(patterns, " "), err)
+	}
+	return strings.Fields(string(out)), nil
+}
+
+// samePackages reports the packages go list resolves but the test list lacks,
+// and the reverse.
+func samePackages(listed, resolved []string) error {
+	in := map[string]bool{}
+	for _, p := range listed {
+		in[p] = true
+	}
+	var missing []string
+	for _, p := range resolved {
+		if !in[p] {
+			missing = append(missing, p)
+		}
+		delete(in, p)
+	}
+	if len(missing) > 0 || len(in) > 0 {
+		var extra []string
+		for p := range in {
+			extra = append(extra, p)
+		}
+		sort.Strings(extra)
+		return fmt.Errorf("test list does not match go list: missing %v, unexpected %v", missing, extra)
+	}
+	return nil
+}
+
 // resolvePackages maps -shard patterns to import paths with go list.
 func resolvePackages(dir string, specs []shardSpec) (map[string]int, error) {
 	heavy := map[string]int{}
 	for _, s := range specs {
-		cmd := exec.Command("go", "list", s.Pattern)
-		cmd.Dir = dir
-		out, err := cmd.Output()
+		pkgs, err := goList(dir, s.Pattern)
 		if err != nil {
-			return nil, fmt.Errorf("go list %s: %w", s.Pattern, err)
+			return nil, err
 		}
-		for _, p := range strings.Fields(string(out)) {
+		for _, p := range pkgs {
 			heavy[p] = s.K
 		}
 	}
@@ -243,7 +294,20 @@ func eventFiles(path string) ([]string, error) {
 	return shardEventFiles(path)
 }
 
+// shardEventFiles takes the jobs from OUT/plan.json when it exists, so stale
+// shard directories from an earlier run into the same OUT are not counted.
 func shardEventFiles(out string) ([]string, error) {
+	if b, err := os.ReadFile(filepath.Join(out, "plan.json")); err == nil {
+		var plan struct{ Jobs []struct{ Name string } }
+		if err := json.Unmarshal(b, &plan); err != nil {
+			return nil, fmt.Errorf("%s/plan.json: %w", out, err)
+		}
+		var files []string
+		for _, j := range plan.Jobs {
+			files = append(files, filepath.Join(out, "shards", j.Name, "events.jsonl"))
+		}
+		return files, nil
+	}
 	files, err := filepath.Glob(filepath.Join(out, "shards", "*", "events.jsonl"))
 	if err != nil {
 		return nil, err

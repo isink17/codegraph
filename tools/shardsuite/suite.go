@@ -75,7 +75,9 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if err := os.MkdirAll(filepath.Join(listTmp, "go"), 0o755); err != nil {
 		return sum, err
 	}
-	lc := exec.CommandContext(ctx, "go", append([]string{"test", "-json", "-list", "."}, cfg.patterns...)...)
+	lctx, lcancel := context.WithTimeout(ctx, cfg.jobTimeout)
+	defer lcancel()
+	lc := exec.CommandContext(lctx, "go", append([]string{"test", "-json", "-list", "."}, cfg.patterns...)...)
 	listErrLog, err := os.Create(filepath.Join(out, "list-stderr.log"))
 	if err != nil {
 		return sum, err
@@ -93,12 +95,25 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 		return sum, nil
 	}
 	_ = os.WriteFile(filepath.Join(out, "list.jsonl"), listOut, 0o644)
+	if lctx.Err() != nil {
+		return sum, fmt.Errorf("go test -list did not finish within -job-timeout %s", cfg.jobTimeout)
+	}
 	pkgs, names, failed, err := parseList(listOut)
 	if err != nil {
 		return sum, err
 	}
 	if len(pkgs) == 0 {
 		return sum, fmt.Errorf("go test -list found no packages (%v); see %s", listErr, filepath.Join(out, "list-stderr.log"))
+	}
+	if listErr != nil && len(failed) == 0 {
+		return sum, fmt.Errorf("go test -list failed without a failing package (%v); see %s", listErr, filepath.Join(out, "list-stderr.log"))
+	}
+	resolved, err := goList(cfg.dir, cfg.patterns...)
+	if err != nil {
+		return sum, err
+	}
+	if err := samePackages(pkgs, resolved); err != nil {
+		return sum, err
 	}
 	sum.Packages = len(pkgs)
 	for _, ns := range names {

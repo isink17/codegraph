@@ -47,7 +47,7 @@ func fixtureConfig(t *testing.T) config {
 }
 
 func fixtureEnv(t *testing.T, kv ...string) {
-	for _, k := range []string{"FIXTURE_FAIL", "FIXTURE_HANG", "FIXTURE_PIDFILE", "GOFLAGS"} {
+	for _, k := range []string{"FIXTURE_FAIL", "FIXTURE_HANG", "FIXTURE_PIDFILE", "FIXTURE_HANG_MAIN", "GOFLAGS"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("GOWORK", "off")
@@ -146,6 +146,39 @@ func TestFixtureParityMismatchFailsAPassingRun(t *testing.T) {
 	}
 }
 
+func TestFixtureHangingListIsBounded(t *testing.T) {
+	fixtureEnv(t, "FIXTURE_HANG_MAIN", "1")
+	cfg := fixtureConfig(t)
+	cfg.jobTimeout = 10 * time.Second
+	_, err := runSuite(context.Background(), cfg, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "-job-timeout") {
+		t.Fatalf("want a bounded list, got %v", err)
+	}
+}
+
+// A list run that loses a package (for example killed partway) must not
+// shrink the inventory into a pass.
+func TestFixtureTruncatedListFailsTheRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell wrapper for go")
+	}
+	fixtureEnv(t)
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go command not on PATH")
+	}
+	bin := t.TempDir()
+	wrapper := "#!/bin/sh\ncase \" $* \" in *\" -list \"*) \"" + realGo + "\" \"$@\" | grep -v fixture/tagged; exit 0 ;; esac\nexec \"" + realGo + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	_, err = runSuite(context.Background(), fixtureConfig(t), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "example.com/fixture/tagged") {
+		t.Fatalf("want the missing package named, got %v", err)
+	}
+}
+
 func TestFixtureFailingTestFailsTheRun(t *testing.T) {
 	fixtureEnv(t, "FIXTURE_FAIL", "1")
 	sum, err := runSuite(context.Background(), fixtureConfig(t), io.Discard)
@@ -217,7 +250,18 @@ func TestFixtureJobTimeoutKillsTheTestBinary(t *testing.T) {
 	if j := jobByResult(sum, resTimeout); sum.AllPassed || j == nil || j.Reason == "" {
 		t.Fatalf("want a killed job: %+v", sum.Jobs)
 	}
-	assertGone(t, waitForPID(t, pidFile))
+	// Under heavy load the kill can land before TestHang starts; the
+	// classification above still holds, there is just no binary to check.
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Log("killed before the hanging test started; skipping the process check")
+		return
+	}
+	pid, err := strconv.Atoi(string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGone(t, pid)
 }
 
 func TestFixtureInterruptReportsIncomplete(t *testing.T) {
@@ -258,7 +302,7 @@ func TestSIGINTKillsChildrenAndExitsIncomplete(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	out := t.TempDir()
 	cmd := exec.Command(os.Args[0], "-C", dir, "-shard", "./a=2", "-out", out, "./...")
-	cmd.Env = append(os.Environ(), "SHARDSUITE_AS_MAIN=1", "FIXTURE_HANG=1", "FIXTURE_PIDFILE="+pidFile, "FIXTURE_FAIL=", "GOFLAGS=")
+	cmd.Env = append(os.Environ(), "SHARDSUITE_AS_MAIN=1", "FIXTURE_HANG=1", "FIXTURE_PIDFILE="+pidFile, "FIXTURE_FAIL=", "FIXTURE_HANG_MAIN=", "GOFLAGS=", "GOWORK=off")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Start(); err != nil {

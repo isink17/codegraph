@@ -7,7 +7,12 @@ import (
 	"time"
 )
 
-func TestMain(m *testing.M) { os.Exit(m.Run()) }
+func TestMain(m *testing.M) {
+	if os.Getenv("FIXTURE_HANG_MAIN") == "1" {
+		time.Sleep(time.Hour)
+	}
+	os.Exit(m.Run())
+}
 
 func TestA(t *testing.T)      {}
 func TestAB(t *testing.T)     {}
