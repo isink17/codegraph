@@ -86,7 +86,7 @@ type jobResult struct {
 	Result      string      `json:"result"`
 	Reason      string      `json:"reason,omitempty"`
 	Exit        int         `json:"exit"`
-	Started     time.Time   `json:"started"`
+	Started     time.Time   `json:"started,omitzero"`
 	WallSeconds float64     `json:"wall_seconds"`
 	Malformed   int         `json:"malformed_lines"`
 	Counts      counts      `json:"tests"`

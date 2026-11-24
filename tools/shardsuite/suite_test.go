@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -571,16 +572,28 @@ func TestRunJobsBoundsConcurrency(t *testing.T) {
 	}
 	for _, limit := range []int{1, 2, 3} {
 		var mu sync.Mutex
-		running, peak, order := 0, 0, []string{}
+		running, peak, done, order := 0, 0, 0, []string{}
 		runJobs(context.Background(), jobs, limit, func(j job) jobResult {
 			mu.Lock()
 			running++
 			peak = max(peak, running)
 			order = append(order, j.Name)
 			mu.Unlock()
-			time.Sleep(20 * time.Millisecond)
+			// Hold the slot until every slot is taken (or no job is left to
+			// take one), so the peak does not depend on scheduling.
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				mu.Lock()
+				full := running == min(limit, len(jobs)-done)
+				mu.Unlock()
+				if full {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
 			mu.Lock()
 			running--
+			done++
 			mu.Unlock()
 			return jobResult{job: j, Result: resPass}
 		})
@@ -608,15 +621,19 @@ func TestJobDeadlineCoversEveryPackageTimeout(t *testing.T) {
 		jobs int
 		want time.Duration
 	}{
-		{pkgs(1), 11, 25 * time.Minute},
-		{pkgs(11), 11, 25 * time.Minute},
-		{pkgs(50), 11, 5*20*time.Minute + 5*time.Minute},
-		{pkgs(50), 1, 50*20*time.Minute + 5*time.Minute},
+		{pkgs(1), 11, 26 * time.Minute},
+		{pkgs(11), 11, 26 * time.Minute},
+		{pkgs(50), 11, 5*21*time.Minute + 5*time.Minute},
+		{pkgs(50), 1, 50*21*time.Minute + 5*time.Minute},
 	} {
 		cfg.jobs = tc.jobs
 		if got := jobDeadline(cfg, tc.j); got != tc.want {
 			t.Errorf("%d packages, -jobs=%d: %s, want %s", len(tc.j.Packages), tc.jobs, got, tc.want)
 		}
+	}
+	cfg.timeout = math.MaxInt64 / 10
+	if got := jobDeadline(cfg, pkgs(50)); got != math.MaxInt64 {
+		t.Errorf("a deadline past the largest duration must saturate, got %s", got)
 	}
 	cfg.jobTimeout = time.Hour
 	if got := jobDeadline(cfg, pkgs(50)); got != time.Hour {

@@ -117,12 +117,15 @@ How it works:
 - `-out` must also be new or empty, and a run owns it: before writing
   anything else the runner creates `OUT/owner.json` exclusively, with a random
   run ID, its process ID, host and start time. Two runs started with the
-  same `-out` cannot both get it; the second exits 1 and names the owner. An
+  same `-out` cannot both get it; the second exits 1 and, once the record is
+  complete, names the owner. An
   `-out` is never reused or taken over, even after its run ended or was
   killed: start a new run in a new directory. `plan.json` and `summary.json`
   carry the run ID, and `parity` (and `-baseline` or `-timings` given a
   shardsuite OUT) reads shard events only when `plan.json` has the run ID of
-  `owner.json`, so an unplanned or foreign directory is refused.
+  `owner.json`, so an unplanned or foreign directory is refused. That
+  includes an OUT written before runs claimed their directory; point
+  `-timings` at a `run.sh` OUT instead, or run again.
 - Every process gets its own directory `OUT/shards/<job>/` with
   `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
@@ -138,12 +141,13 @@ How it works:
 - `-timeout` (default 20m) is passed to every test binary, as in `run.sh`:
   that is the per-test-binary limit. `-job-timeout` is a separate limit per
   `go test` process, which in `rest` covers about 50 packages together. By
-  default each process gets `-timeout` × ⌈packages ÷ `-jobs`⌉ + 5m, so every
-  package can use its whole `-timeout`, `-jobs` at a time, and the process
-  limit only fires when something outside the test binaries hangs, for
-  example a build. An explicit `-job-timeout` applies to every process as
-  given, whatever its package count. `plan.json` records each process's
-  limit.
+  default each process gets (`-timeout` + 1m) × ⌈packages ÷ `-jobs`⌉ + 5m:
+  `go test` kills a binary one minute after its `-timeout`, so every package
+  can run until `go test` gives up on it, `-jobs` at a time, before the
+  process limit applies. An explicit `-job-timeout` applies to every process
+  as given, whatever its package count. `plan.json` records each process's
+  limit. The list step is bounded by `-job-timeout`, or `-timeout` + 5m when
+  that is not set.
 
 Each process is classified as `pass`, `no_tests`, `test_fail`, `build_fail`,
 `timeout` (a test binary hit `-timeout`, or the process was killed at its

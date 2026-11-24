@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,7 +137,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	}
 	_ = os.WriteFile(filepath.Join(out, "list.jsonl"), listOut, 0o644)
 	if lctx.Err() != nil {
-		return sum, fmt.Errorf("go test -list did not finish within %s (-job-timeout)", cfg.listTimeout)
+		return sum, fmt.Errorf("go test -list did not finish within %s (-job-timeout, or -timeout + 5m when it is not set)", cfg.listTimeout)
 	}
 	pkgs, names, failed, err := parseList(listOut)
 	if err != nil {
@@ -307,22 +308,27 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
-// jobSlack is the time a go test process gets beyond its test binaries'
-// -timeout, for building and linking.
+// jobSlack is the time a go test process gets beyond its packages' slots,
+// for building and linking.
 const jobSlack = 5 * time.Minute
 
-const autoJobTimeout = "auto: -timeout x ceil(packages / -jobs) + 5m per process"
+const autoJobTimeout = "auto: (-timeout + 1m) x ceil(packages / -jobs) + 5m per process"
 
 // jobDeadline bounds one go test process. Unless -job-timeout is set, it lets
-// every package of the process use its whole -timeout, -jobs (go test -p) at a
-// time, so it fires only when something outside the test binaries hangs and
-// never cuts a multi-package process short of its per-binary limit.
+// every package of the process run until go test itself gives up on it
+// (-timeout, plus the minute go test waits before killing the binary), -jobs
+// (go test -p) at a time, so a multi-package process is not cut short of its
+// per-binary limit.
 func jobDeadline(cfg config, j job) time.Duration {
 	if cfg.jobTimeout > 0 {
 		return cfg.jobTimeout
 	}
-	waves := (max(len(j.Packages), 1) + cfg.jobs - 1) / cfg.jobs
-	return time.Duration(waves)*cfg.timeout + jobSlack
+	waves := time.Duration((max(len(j.Packages), 1) + cfg.jobs - 1) / cfg.jobs)
+	slot := cfg.timeout + time.Minute
+	if slot > (math.MaxInt64-jobSlack)/waves {
+		return math.MaxInt64
+	}
+	return waves*slot + jobSlack
 }
 
 func testArgs(cfg config, j job) []string {
