@@ -210,6 +210,8 @@ jobs:
       - name: Test npm packed installation
         if: ${{ !cancelled() }}
         working-directory: npm
+        # bash -e: pwsh would report only the last command's exit status.
+        shell: bash
         run: |
           npm test
           npm pack --dry-run
