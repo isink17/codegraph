@@ -7,8 +7,8 @@ on:
   pull_request:
     branches:
       - v2.0
-    # The windows-stress label forces the full remaining non-docs suite; it
-    # cannot select a Windows runner during the temporary pause.
+    # The windows-stress label forces the full non-docs suite and selects the
+    # advisory test-windows job.
     # No workflow_dispatch or schedule can accidentally run against master.
     types: [opened, synchronize, reopened, edited, labeled]
 
@@ -64,12 +64,8 @@ jobs:
         include:
           - os: ubuntu-latest
             go_test_timeout: 20m
-    # Temporary Windows CI pause: reduce Actions minutes while outstanding
-    # Windows compatibility issues are tracked. Windows remains supported.
-    # Reassess by 2026-11-30; this is not an automatic re-enable date. To
-    # restore: reassess those issues, add windows-latest and its native
-    # test/stress/smoke steps, then verify the aggregate ci check. Do not
-    # auto-enable.
+    # Windows runs in the separate, advisory test-windows job below until it
+    # has a green record; then it can move into this matrix and the ci needs.
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -150,6 +146,115 @@ jobs:
         working-directory: tools/jvm-binary-inspector
       - name: Run Go JVM inspector integration tests
         run: go test ./internal/jvmbinary ./internal/cli -count=1
+
+  # Windows runtime validation on the standard hosted windows-latest runner.
+  # Advisory: it is not in the ci job's needs, so it neither blocks nor
+  # replaces any required Linux check. It runs on pushes to v2.0 and on pull
+  # requests labelled windows-stress; docs-only changes skip it. The summary
+  # step lists every failed and skipped test; nothing is quarantined.
+  test-windows:
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') && (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'windows-stress')) }}
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Use the runner temp volume
+        # %TEMP% on C: makes the store suite's scratch SQLite databases several
+        # times slower than on the D: volume that holds RUNNER_TEMP.
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED CC
+          gcc --version | head -n 1
+          git --version
+          node --version
+
+      - name: Build
+        run: go build ./cmd/codegraph
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set +e
+          go test -json -timeout 30m ./internal/store ./... > go-test-windows.json
+          status=$?
+          python .github/scripts/go-test-summary.py go-test-windows.json
+          exit $status
+
+      - name: Upload test log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-test-windows
+          path: go-test-windows.json
+          retention-days: 14
+
+      - name: Check concurrent database open regression
+        if: ${{ !cancelled() }}
+        run: go test -timeout 20m ./internal/store -run '^(TestOpen_ConcurrentMigrateIsSafe|TestOpen_ConcurrentBootstrapRepeated)$' -count=5
+
+      - name: Test npm packed installation
+        if: ${{ !cancelled() }}
+        working-directory: npm
+        run: |
+          npm test
+          npm pack --dry-run
+
+      - name: Test install.ps1
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./.github/scripts/install-test.ps1
+
+      - name: Smoke native binary
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-NativeSuccess([string]$name) {
+            if ($LASTEXITCODE -ne 0) { throw "$name failed with exit code $LASTEXITCODE" }
+          }
+          $work = Join-Path $env:RUNNER_TEMP ("codegraph-smoke-" + [guid]::NewGuid())
+          try {
+            $repo = Join-Path $work 'repo'
+            $cgHome = Join-Path $work 'home'
+            New-Item -ItemType Directory -Path $repo, $cgHome | Out-Null
+            "module smoke`n`ngo 1.26`n" | Set-Content (Join-Path $repo 'go.mod')
+            "package smoke`nfunc Target() {}`nfunc Caller() { Target() }`n" | Set-Content (Join-Path $repo 'smoke.go')
+            $binary = Join-Path $work 'codegraph.exe'
+            go build -o $binary ./cmd/codegraph
+            Assert-NativeSuccess 'go build'
+            & $binary --version
+            Assert-NativeSuccess 'codegraph --version'
+            $env:CODEGRAPH_HOME = $cgHome
+            & $binary index $repo
+            Assert-NativeSuccess 'codegraph index'
+            & $binary stats $repo
+            Assert-NativeSuccess 'codegraph stats'
+            $callees = & $binary find_callees $repo Caller
+            Assert-NativeSuccess 'codegraph find_callees'
+            $calleesJson = ($callees -join "`n") | ConvertFrom-Json
+            if (-not $calleesJson.target_found -or $calleesJson.count -ne 1 -or $calleesJson.callees[0].qualified_name -ne 'smoke.Target') {
+              throw "Caller -> smoke.Target not found: $($callees -join "`n")"
+            }
+            & $binary update $repo
+            Assert-NativeSuccess 'codegraph update'
+          } finally {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work
+          }
 
   # One stable result for branch rules: a skipped matrix job does not report
   # its per-OS check names, so require this job rather than the matrix legs.
