@@ -132,7 +132,7 @@ func rustItemAttrKind(item *sitter.Node, content []byte, attrs rustAttrs) rustAt
 	case "attribute_item", "inner_attribute_item", "let_declaration", "expression_statement":
 		return rustAttrNeutral
 	}
-	kind := rustAttrNeutral
+	kind := rustInnerCfgKind(item, content)
 	for prev := item.PrevSibling(); prev != nil; prev = prev.PrevSibling() {
 		switch {
 		case isComment(prev):
@@ -143,6 +143,66 @@ func rustItemAttrKind(item *sitter.Node, content []byte, attrs rustAttrs) rustAt
 		}
 	}
 	return kind
+}
+
+// rustInnerCfgKind reads the inner attributes at the head of item's body, or
+// of the file for a source_file, as rustItemAttrKind reads outer ones: an
+// inner cfg, or a cfg_attr that may expand to one, removes the item or file
+// in some configuration, so it is unproven. No other inner attribute is: stable
+// Rust has no inner attribute macros.
+func rustInnerCfgKind(item *sitter.Node, content []byte) rustAttrKind {
+	body := item
+	if item.Type() != "source_file" {
+		if body = childByFieldName(item, "body"); body == nil {
+			return rustAttrNeutral
+		}
+	}
+	for i := range int(body.NamedChildCount()) {
+		child := body.NamedChild(i)
+		if isComment(child) {
+			continue
+		}
+		if child.Type() != "inner_attribute_item" {
+			break // rustc accepts inner attributes only before every item
+		}
+		attr := firstChild(child, "attribute")
+		if attr == nil || child.HasError() {
+			return rustAttrRewrite
+		}
+		switch rustAttrName(child, content) {
+		case "cfg":
+			return rustAttrRewrite
+		case "cfg_attr":
+			if rustCfgAttrHasCfg(childByFieldName(attr, "arguments"), content) {
+				return rustAttrRewrite
+			}
+		}
+	}
+	return rustAttrNeutral
+}
+
+// rustCfgAttrHasCfg reports whether a cfg_attr's arguments may expand to a cfg,
+// directly or through a nested cfg_attr. A cfg inside another attribute, as in
+// doc(cfg(..)), removes nothing.
+func rustCfgAttrHasCfg(args *sitter.Node, content []byte) bool {
+	if args == nil {
+		return true
+	}
+	for i := range int(args.NamedChildCount()) {
+		id := args.NamedChild(i)
+		if id.Type() != "identifier" {
+			continue
+		}
+		switch nodeText(id, content) {
+		case "cfg":
+			return true
+		case "cfg_attr":
+			if next := id.NextNamedSibling(); next != nil && next.Type() == "token_tree" && rustCfgAttrHasCfg(next, content) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rustAddAttrEvidence records what an unproven attribute on item leaves
@@ -167,6 +227,10 @@ func rustAddAttrEvidence(item *sitter.Node, module, container string, content []
 		add("", graph.RustValueItemMacro)
 	}
 	if kind != rustAttrRewrite {
+		return
+	}
+	if item.Type() == "source_file" {
+		add(module, graph.RustValueItemUnproven)
 		return
 	}
 	field := "name"

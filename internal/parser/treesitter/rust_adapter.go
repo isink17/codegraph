@@ -40,8 +40,17 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	}
 
 	attrs := rustAttrScope(root, content)
-	rustExtractImports(root, module, content, attrs, &pf)
+	// A file under an inner #![cfg] is read like an item under #[cfg]: none of
+	// its imports, child modules or items is proven, and no call in it binds.
+	gated := rustItemAttrKind(root, content, attrs) == rustAttrRewrite
+	if !gated {
+		rustExtractImports(root, module, content, attrs, &pf)
+	}
 	rustExtractSymbols(root, module, "", path, content, attrs, &pf)
+	if gated {
+		pf.Scope.Modules = nil
+		rustAddAttrEvidence(root, module, "", content, attrs, &pf)
+	}
 	rustExtractCalls(root, content, attrs, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:rust:" + testTargetModule(module, "_test") + ":" + target
@@ -60,7 +69,7 @@ func rustExtractImports(root *sitter.Node, module string, content []byte, attrs 
 				rustUseTree(arg, "", rustVisibility(child, content) == "public", module, content, &pf.Scope.Imports)
 			}
 		}
-		if child.Type() == "mod_item" {
+		if child.Type() == "mod_item" && rustItemAttrKind(child, content, attrs) != rustAttrRewrite {
 			if name := childByFieldName(child, "name"); name != nil {
 				if body := childByFieldName(child, "body"); body != nil {
 					rustExtractImports(body, module+"::"+nodeText(name, content), content, attrs, pf)
@@ -453,10 +462,10 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rust
 	inMod := false
 	for node := call.Parent(); node != nil; node = node.Parent() {
 		switch node.Type() {
-		case "function_item", "impl_item", "trait_item", "mod_item":
+		case "function_item", "impl_item", "trait_item", "mod_item", "source_file":
 			// An attribute macro on an enclosing item may rewrite the whole
 			// body, `crate::` paths included, so none of its original calls is
-			// proven to bind what it names.
+			// proven to bind what it names. A cfg, outer or inner, may remove it.
 			if rustItemAttrKind(node, content, attrs) == rustAttrRewrite {
 				return true
 			}
