@@ -113,7 +113,41 @@ var rustCfgGateCases = []struct {
 		"n.rs":   "#![cfg_attr(foo, cfg_attr(bar, cfg(baz)))]\npub fn f() {}\n",
 		"m.rs":   "pub fn c() {\n    crate::n::f();\n}\n",
 	}, "", "", ""},
-	// -- inner attributes that remove nothing
+	{"inner cfg in a trait body", tree{
+		"lib.rs": "mod n; mod m;",
+		"n.rs":   "pub trait T {\n    #![cfg(foo)]\n    fn f() {}\n}\npub struct S;\nimpl T for S {}\n",
+		"m.rs":   "pub fn c() {\n    crate::n::S::f();\n}\n",
+	}, "", "crate::n::S::f", ""},
+	{"inner cfg after a shebang", tree{
+		"lib.rs": "mod n; mod m;",
+		"n.rs":   "#!/usr/bin/env run-cargo-script\n#![cfg(foo)]\npub fn f() {}\n",
+		"m.rs":   "pub fn c() {\n    crate::n::f();\n}\n",
+	}, "", "", ""},
+	{"inner cfg fn beside a glob of the same name", tree{
+		"lib.rs": "mod a; mod n; mod m;",
+		"a.rs":   "pub fn f() {}\n",
+		"n.rs":   "use crate::a::*;\nfn f() {\n    #![cfg(foo)]\n}\npub fn c() {\n    f();\n}\n",
+	}, "n.rs", "f", ""},
+	{"glob re-export of an inner cfg file", tree{
+		"lib.rs": "mod n; mod r; mod m;",
+		"n.rs":   "#![cfg(foo)]\npub fn f() {}\n",
+		"r.rs":   "pub use crate::n::*;\n",
+		"m.rs":   "pub fn c() {\n    crate::r::f();\n}\n",
+	}, "", "crate::r::f", ""},
+	// -- a cfg on a statement or block gates the call site only: caller and
+	// target exist in every configuration, and a gated target is refused on
+	// its own. rustc: without foo, nothing runs; with foo, each call runs.
+	{"cfg on statements and blocks", tree{
+		"lib.rs": "mod n; mod m;",
+		"n.rs":   "pub fn f() {}\n",
+		"m.rs":   "pub fn c() {\n    #[cfg(foo)]\n    crate::n::f();\n    #[cfg(foo)]\n    let _x = crate::n::f();\n    {\n        #![cfg(foo)]\n        crate::n::f();\n    }\n}\n",
+	}, "", "", "n.rs:crate::n::f"},
+	// -- attributes that remove nothing
+	{"allow on the call statement", tree{
+		"lib.rs": "mod n; mod m;",
+		"n.rs":   "pub fn f() {}\n",
+		"m.rs":   "pub fn c() {\n    #[allow(unused_must_use)]\n    crate::n::f();\n    {\n        #![allow(unused)]\n        crate::n::f();\n    }\n}\n",
+	}, "", "", "n.rs:crate::n::f"},
 	{"inner cfg_attr without a cfg", tree{
 		"lib.rs": "#![cfg_attr(not(feature = \"std\"), no_std)]\n#![cfg_attr(docsrs, feature(doc_cfg))]\nmod n; mod m;",
 		"n.rs":   "#![cfg_attr(feature = \"cfg\", allow(dead_code))]\n#![cfg_attr(docsrs, doc(cfg(feature = \"x\")))]\npub fn f() {}\n",
@@ -165,6 +199,11 @@ func TestRustCfgGateFollowsIncrementalChanges(t *testing.T) {
 		{"crate root gate removed", "lib.rs", "mod a; mod n; mod m;", "a.rs:crate::a::f"},
 		{"callee gated by cfg_attr", "n.rs", "#![cfg_attr(foo, cfg(bar))]\npub fn f() {}\n", ""},
 		{"cfg_attr without a cfg", "n.rs", "#![cfg_attr(foo, allow(dead_code))]\npub fn f() {}\n", "n.rs:crate::n::f"},
+		{"callee body gated", "n.rs", "pub fn f() {\n    #![cfg(foo)]\n}\n", ""},
+		{"callee moved into an inline module gated", "n.rs", "pub mod x {\n    #![cfg(foo)]\n    pub fn f() {}\n}\npub use x::f;\n", ""},
+		{"inline module gate removed", "n.rs", "pub mod x {\n    pub fn f() {}\n}\npub use x::f;\n", "n.rs:crate::n::x::f"},
+		{"caller body gated", "m.rs", "pub fn c() {\n    #![cfg(foo)]\n    crate::n::f();\n}\n", ""},
+		{"caller body ungated", "m.rs", caller, "n.rs:crate::n::x::f"},
 	}
 	for _, scoped := range []bool{true, false} {
 		r := newLifecycleRepo(t, tree{

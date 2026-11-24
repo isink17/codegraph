@@ -159,11 +159,18 @@ func rustInnerCfgKind(item *sitter.Node, content []byte) rustAttrKind {
 	}
 	for i := range int(body.NamedChildCount()) {
 		child := body.NamedChild(i)
-		if isComment(child) {
+		switch {
+		case isComment(child), child.Type() == "shebang":
 			continue
-		}
-		if child.Type() != "inner_attribute_item" {
-			break // rustc accepts inner attributes only before every item
+		case child.Type() == "ERROR":
+			// The grammar splits a shebang line, and other syntax it cannot
+			// read, into ERROR nodes; one may still hold an inner attribute.
+			if strings.Contains(nodeText(child, content), "#![") {
+				return rustAttrRewrite
+			}
+			continue
+		case child.Type() != "inner_attribute_item":
+			return rustAttrNeutral // rustc accepts inner attributes only before every item
 		}
 		attr := firstChild(child, "attribute")
 		if attr == nil || child.HasError() {

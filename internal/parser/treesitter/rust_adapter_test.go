@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/isink17/codegraph/internal/graph"
@@ -223,5 +224,63 @@ func TestRustPathAttributeDeclaresNoDefaultModule(t *testing.T) {
 	}
 	if got["plain"] != "plain" {
 		t.Errorf("plain mod lost its default path: %v", got)
+	}
+}
+
+// TestRustInnerCfgEvidence pins which inner attributes gate a file or module
+// and that a gated module's `use` declarations stay file imports while giving
+// no scope evidence.
+func TestRustInnerCfgEvidence(t *testing.T) {
+	cases := []struct {
+		name, src   string
+		wantItems   []string
+		wantImports []string
+		wantScope   int
+		wantModules int
+	}{
+		{"inner cfg on the file", "#![cfg(unix)]\nuse std::fs;\nmod sub;\npub fn f() {}\n",
+			[]string{"crate::n macro ", "crate::n unproven crate::n"}, []string{"std::fs"}, 0, 0},
+		{"nested cfg_attr to cfg", "#![cfg_attr(a, cfg_attr(b, cfg(c)))]\npub fn f() {}\n",
+			[]string{"crate::n macro ", "crate::n unproven crate::n"}, nil, 0, 0},
+		{"doc(cfg) inside cfg_attr", "#![cfg_attr(docsrs, doc(cfg(feature = \"x\")))]\npub fn f() {}\n", nil, nil, 0, 0},
+		{"cfg named in a predicate", "#![cfg_attr(feature = \"cfg\", allow(unused))]\n#![cfg_attr(cfg_x, no_std)]\npub fn f() {}\n", nil, nil, 0, 0},
+		{"cfg_attr without arguments", "#![cfg_attr]\npub fn f() {}\n",
+			[]string{"crate::n macro ", "crate::n unproven crate::n"}, nil, 0, 0},
+		{"inner cfg after the first item is not read", "pub fn f() {}\n#![cfg(unix)]\n", nil, nil, 0, 0},
+		{"ungated file", "//! docs\n#![allow(dead_code)]\nuse std::fs;\nmod sub;\n", nil, []string{"std::fs"}, 1, 1},
+		{"cfg(test) module keeps its imports", "use std::fmt;\n#[cfg(test)]\nmod tests {\n    use std::collections::HashMap;\n}\n",
+			[]string{"crate::n macro ", "crate::n unproven crate::n::tests"}, []string{"std::fmt", "std::collections::HashMap"}, 1, 0},
+		{"inner cfg on an inline module", "mod x {\n    #![cfg(unix)]\n    use std::fs;\n}\n",
+			[]string{"crate::n macro ", "crate::n unproven crate::n::x"}, []string{"std::fs"}, 0, 0},
+		{"inner cfg on an extern block", "extern \"C\" {\n    #![cfg(unix)]\n    fn g();\n}\n", []string{"crate::n macro "}, nil, 0, 0},
+	}
+	for _, tc := range cases {
+		pf, err := NewRust().Parse(context.Background(), "src/n.rs", []byte(tc.src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, item := range pf.Scope.RustValueItems {
+			if item.Kind != graph.RustValueItemDecl {
+				got[item.OwnerModule+" "+item.Kind+" "+item.Name] = true
+			}
+		}
+		for _, w := range tc.wantItems {
+			if !got[w] {
+				t.Errorf("%s: missing %q in %v", tc.name, w, got)
+			}
+		}
+		if len(got) != len(tc.wantItems) {
+			t.Errorf("%s: value items = %v, want exactly %v", tc.name, got, tc.wantItems)
+		}
+		if !slices.Equal(pf.Imports, tc.wantImports) {
+			t.Errorf("%s: imports = %v, want %v", tc.name, pf.Imports, tc.wantImports)
+		}
+		if len(pf.Scope.Imports) != tc.wantScope {
+			t.Errorf("%s: scope imports = %v, want %d", tc.name, pf.Scope.Imports, tc.wantScope)
+		}
+		if len(pf.Scope.Modules) != tc.wantModules {
+			t.Errorf("%s: modules = %v, want %d", tc.name, pf.Scope.Modules, tc.wantModules)
+		}
 	}
 }
