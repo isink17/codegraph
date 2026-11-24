@@ -61,6 +61,8 @@ var resolverPolicyRegistry = map[string]int{
 	// a receiver spelled like a type to that type's static method.
 	// Kotlin's 2 re-decides stale receiver-helper bindings left by incremental
 	// updates that did not track the helper name in ordinary-lambda evidence.
+	// Rust's 2 follows an explicit `use` of a qualified call's first segment
+	// (`use crate::a; a::f()`); epoch 1 left every such call unresolved.
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
@@ -73,7 +75,7 @@ var resolverPolicyRegistry = map[string]int{
 	"php":        1,
 	"python":     1,
 	"ruby":       1,
-	"rust":       1,
+	"rust":       2,
 	"swift":      1,
 	"typescript": 1,
 }

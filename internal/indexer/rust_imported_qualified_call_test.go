@@ -1,0 +1,342 @@
+//go:build cgo
+
+package indexer
+
+import "testing"
+
+// rustImportedQualifiedCases pin qualified calls whose first segment an
+// explicit `use` binds. A followed import must give the answer the fully
+// qualified spelling gives; a "" target is the fail-closed answer.
+var rustImportedQualifiedCases = []struct {
+	name   string
+	files  tree
+	src    string // defaults to m.rs
+	call   string
+	target string // "" means the call must stay unresolved
+}{
+	{"fully qualified control", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "pub fn c() {\n    crate::a::f();\n}\n",
+	}, "", "crate::a::f", "a.rs:crate::a::f"},
+	{"use_free", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"self in a use list", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}\npub struct T;",
+		"m.rs":   "use crate::a::{self, T};\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"renamed import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as b;\npub fn c() {\n    b::f();\n}\n",
+	}, "", "b::f", "a.rs:crate::a::f"},
+	{"super import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use super::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"nested module path", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub mod b {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::b::f();\n}\n",
+	}, "", "a::b::f", "a.rs:crate::a::b::f"},
+	{"use_impl", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub struct S;\nimpl S {\n    pub fn c(&self) {\n        a::f();\n    }\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"use_trait_impl", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub trait T {\n    fn c(&self);\n}\npub struct S;\nimpl T for S {\n    fn c(&self) {\n        a::f();\n    }\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"inline module import", tree{
+		"lib.rs": "mod a;\nmod m {\n    use crate::a;\n    pub fn c() {\n        a::f();\n    }\n}\n",
+		"a.rs":   "pub fn f() {}",
+	}, "lib.rs", "a::f", "a.rs:crate::a::f"},
+	{"imported type associated function", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() -> S {\n        S\n    }\n}\n",
+		"m.rs":   "use crate::a::S;\npub fn c() {\n    S::new();\n}\n",
+	}, "", "S::new", "a.rs:crate::a::S::new"},
+	{"imported type associated function control", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() -> S {\n        S\n    }\n}\n",
+		"m.rs":   "pub fn c() {\n    crate::a::S::new();\n}\n",
+	}, "", "crate::a::S::new", "a.rs:crate::a::S::new"},
+	// The fully qualified spelling of rust_visibility_test's nfa cases.
+	{"inherent method beside a trait impl control", tree{
+		"lib.rs": "mod nfa; mod r;",
+		"nfa.rs": "pub struct NFA;\nimpl NFA {\n    pub(crate) fn swap(&mut self) {}\n}\n",
+		"r.rs":   "pub trait R {\n    fn swap(&mut self);\n}\nimpl R for crate::nfa::NFA {\n    fn swap(&mut self) {\n        crate::nfa::NFA::swap(self);\n    }\n}\n",
+	}, "r.rs", "crate::nfa::NFA::swap", "nfa.rs:crate::nfa::NFA::swap"},
+	// An explicit import shadows a glob that brings the same module name.
+	{"explicit import beats glob", tree{
+		"lib.rs": "mod a; mod g; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"g.rs":   "pub mod a {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::a;\nuse crate::g::*;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	// Without an explicit import the glob's module answers, as before.
+	{"glob brings the segment", tree{
+		"lib.rs": "mod g; mod m;",
+		"g.rs":   "pub mod a {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::g::*;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "g.rs:crate::g::a::f"},
+	// An own module wins over an imported function of the same name; the
+	// path's first segment lives in the type namespace.
+	{"own module beats imported fn", tree{
+		"lib.rs": "mod b; mod m;",
+		"b.rs":   "pub fn a() {}",
+		"m.rs":   "use crate::b::a;\nmod a {\n    pub fn f() {}\n}\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "m.rs:crate::m::a::f"},
+	// An item macro may not declare a second `a` in the type namespace beside
+	// the explicit import (E0255), so it does not shadow the import.
+	{"item macro beside the import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\nmacro_rules! mk { ($n:ident) => { fn $n() {} } }\nmk!(g);\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	{"type parameter of another name", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<U>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", "a.rs:crate::a::T::make"},
+	// The caller's own module decides which of two same-named imports
+	// applies: an inline module's import, or the file module's beside it.
+	{"inline module import beside a file-level one", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\nmod inner {\n    use crate::b as x;\n    pub fn c() {\n        x::f();\n    }\n}\n",
+	}, "", "x::f", "b.rs:crate::b::f"},
+	{"inline module impl method import beside a file-level one", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\nmod inner {\n    use crate::b as x;\n    pub struct S;\n    impl S {\n        pub fn k() {\n            x::f();\n        }\n    }\n}\n",
+	}, "", "x::f", "b.rs:crate::b::f"},
+	{"file-level import beside an inline module's", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\npub fn c() {\n    x::f();\n}\nmod inner {\n    use crate::b as x;\n}\n",
+	}, "", "x::f", "a.rs:crate::a::f"},
+	// A re-export inside the imported module is followed, as rustc does.
+	{"glob re-export behind the imported module", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub use crate::b::*;",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "b.rs:crate::b::f"},
+	{"named re-export behind the imported module", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub use crate::b::f;",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "b.rs:crate::b::f"},
+	// A private module is visible in its parent module and every module
+	// nested in it.
+	{"private module imported from a nested module", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod c {\n    pub fn f() {}\n}\npub mod q {\n    use super::c;\n    pub fn k() {\n        c::f();\n    }\n}\n",
+	}, "", "c::f", "m.rs:crate::m::c::f"},
+	{"lifetime named like the segment", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c<'a>(_x: &'a u8) {\n    a::f();\n}\n",
+	}, "", "a::f", "a.rs:crate::a::f"},
+	// -- refused
+	// A generic type parameter shadows the imported or own type of its name;
+	// rustc calls the parameter's trait method.
+	{"fn type parameter shadows an imported type", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<T: crate::Make>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", ""},
+	{"impl type parameter shadows an imported type", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub struct W<T>(pub T);\nimpl<T: crate::Make> W<T> {\n    pub fn k(&self) {\n        T::make();\n    }\n}\n",
+	}, "", "T::make", ""},
+	{"fn type parameter shadows an own type", tree{
+		"lib.rs": "mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"m.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\npub fn g<T: crate::Make>() -> T {\n    T::make()\n}\n",
+	}, "", "T::make", ""},
+	{"closure in a generic fn", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<T: crate::Make>() -> T {\n    let c = || T::make();\n    c()\n}\n",
+	}, "", "T::make", ""},
+	{"method type parameter bound in a where clause", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub struct W;\nimpl W {\n    pub fn k<T>() -> T\n    where\n        T: crate::Make,\n    {\n        T::make()\n    }\n}\n",
+	}, "", "T::make", ""},
+	// Since the 2018 edition a leading `::` names an extern crate, never the
+	// crate's own module of that name; rustc calls the standard library here.
+	{"leading :: import beside an own module of that name", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs;\npub fn c() {\n    let _ = fs::read(\"x\");\n}\n",
+	}, "", "fs::read", ""},
+	{"leading :: import of the called fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs::read;\npub fn c() {\n    let _ = read(\"x\");\n}\n",
+	}, "", "read", ""},
+	{"leading :: glob import", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs::*;\npub fn c() {\n    let _ = read(\"x\");\n}\n",
+	}, "", "read", ""},
+	{"leading :: call path", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\npub fn c() {\n    let _ = ::std::fs::read(\"x\");\n}\n",
+	}, "", "::std::fs::read", ""},
+	// An explicit import shadows the glob even when it names an extern
+	// crate; rustc calls the standard library, not the glob's module.
+	{"leading :: import beside a glob module of that name", tree{
+		"lib.rs": "mod g; mod m;",
+		"g.rs":   "pub mod fs {\n    pub fn read(_p: &str) {}\n}\n",
+		"m.rs":   "use ::std::fs;\nuse crate::g::*;\npub fn c() {\n    let _ = fs::read(\"x\");\n}\n",
+	}, "", "fs::read", ""},
+	// rustc resolves each namespace of an import on its own: a module or type
+	// the importer cannot see is not imported, so the path's first segment
+	// finds the glob's module or the prelude type instead.
+	{"import of a private module beside a pub fn of that name", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "mod c {\n    pub fn f() {}\n}\npub fn c() {}\n",
+		"q.rs":   "pub mod c {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::c;\nuse crate::q::*;\npub fn k() {\n    c::f();\n}\n",
+	}, "", "c::f", ""},
+	{"import of a private struct beside a pub fn of that name", tree{
+		"lib.rs": "mod p; mod m;",
+		"p.rs":   "#[allow(non_snake_case)]\npub fn String() {}\nstruct String {\n    x: u8,\n}\nimpl String {\n    pub fn new() -> u8 {\n        0\n    }\n}\n",
+		"m.rs":   "use crate::p::String;\npub fn k() -> std::string::String {\n    String::new()\n}\n",
+	}, "", "String::new", ""},
+	// rustc calls the glob's module `c`; a value-only import of `c` is not
+	// followed, so the call stays unresolved rather than guessed.
+	{"value import beside a glob module of that name", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "pub fn c() {}",
+		"q.rs":   "pub mod c {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::c;\nuse crate::q::*;\npub fn k() {\n    c::f();\n}\n",
+	}, "", "c::f", ""},
+	{"import of a re-exported module", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "pub use crate::q::b;",
+		"q.rs":   "pub mod b {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::b;\npub fn k() {\n    b::f();\n}\n",
+	}, "", "b::f", ""},
+	{"enum variant of an imported enum", tree{
+		"lib.rs": "mod e; mod m;",
+		"e.rs":   "pub enum E {\n    V(u8),\n}\n",
+		"m.rs":   "use crate::e::E;\npub fn k() {\n    E::V(1);\n}\n",
+	}, "", "E::V", ""},
+	{"attribute macro on the caller", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\n#[inject]\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	{"cfg-gated import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "#[cfg(unix)]\nuse crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	// Legal Rust when the imports live in different namespaces (rustc binds
+	// crate::a::f); the resolver does not model namespaces here, so this is
+	// a recall limit, not an ambiguity.
+	{"two imports of the segment", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn a() {}\npub fn f() {}",
+		"m.rs":   "use crate::a;\nuse crate::b::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	{"conflicting cfg-arm imports", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "#[cfg(unix)]\nuse crate::a;\n#[cfg(not(unix))]\nuse crate::b as a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	{"block-local import shadows", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    use crate::b as a;\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	{"unresolved import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::nope;\npub fn c() {\n    nope::f();\n}\n",
+	}, "", "nope::f", ""},
+	{"external crate import", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"m.rs":   "use serde;\npub fn c() {\n    serde::f();\n}\n",
+	}, "", "serde::f", ""},
+	{"private target stays private", tree{
+		"lib.rs": "mod a; mod m;",
+		"a.rs":   "fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+	{"import in another module", tree{
+		"lib.rs": "mod a; mod m; mod n;",
+		"a.rs":   "pub fn f() {}",
+		"n.rs":   "use crate::a;",
+		"m.rs":   "pub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", ""},
+}
+
+func TestRustImportedQualifiedCalls(t *testing.T) {
+	for _, layout := range []string{"src/", ""} {
+		for _, tc := range rustImportedQualifiedCases {
+			files := tree{}
+			for path, content := range tc.files {
+				files[layout+path] = content
+			}
+			src, target := tc.src, tc.target
+			if src == "" {
+				src = "m.rs"
+			}
+			if target != "" {
+				target = layout + target
+			}
+			runRustCallEntrypoints(t, "layout="+layout+"/"+tc.name, files, layout+src, tc.call, target)
+		}
+	}
+}
+
+// TestRustImportedQualifiedCallsFollowIncrementalChanges adds and removes the
+// import, the target and a competing import through both update shapes; every
+// step must match a fresh index of the same tree.
+func TestRustImportedQualifiedCallsFollowIncrementalChanges(t *testing.T) {
+	const caller = "pub fn c() {\n    a::f();\n}\n"
+	for _, scoped := range []bool{true, false} {
+		r := newLifecycleRepo(t, tree{"lib.rs": "mod a; mod b; mod m;", "a.rs": "pub fn f() {}", "b.rs": "pub fn a() {}", "m.rs": caller})
+		update := func(paths ...string) {
+			if scoped {
+				r.update(t, paths...)
+			} else {
+				r.update(t)
+			}
+		}
+		assertRustCallTarget(t, r, "no import", "m.rs", "a::f", "")
+		for _, step := range []struct {
+			name, path, content, target string
+		}{
+			{"import added", "m.rs", "use crate::a;\n" + caller, "a.rs:crate::a::f"},
+			{"target removed", "a.rs", "pub fn g() {}", ""},
+			{"target restored", "a.rs", "pub fn f() {}", "a.rs:crate::a::f"},
+			{"competing import added", "m.rs", "use crate::a;\nuse crate::b::a;\n" + caller, ""},
+			{"competing import removed", "m.rs", "use crate::a;\n" + caller, "a.rs:crate::a::f"},
+			{"import removed", "m.rs", caller, ""},
+		} {
+			r.write(t, step.path, step.content)
+			update(step.path)
+			r.assertFreshParity(t, step.name)
+			assertRustCallTarget(t, r, step.name, "m.rs", "a::f", step.target)
+		}
+	}
+}

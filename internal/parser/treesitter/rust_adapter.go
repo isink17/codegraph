@@ -462,6 +462,14 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rust
 			}
 		}
 		switch node.Type() {
+		case "function_item", "impl_item", "trait_item":
+			// A generic type parameter shadows a type of that name, imported or
+			// declared, as a qualified call's first segment (`T::make()`).
+			if !bare && rustTypeParamDeclares(childByFieldName(node, "type_parameters"), head, content) {
+				return true
+			}
+		}
+		switch node.Type() {
 		case "mod_item":
 			inMod = true
 		case "block":
@@ -493,6 +501,30 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rust
 			if bare && rustPatternBinds(childByFieldName(node, "condition"), head, content) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// rustTypeParamDeclares reports whether a type_parameters list declares a type
+// parameter named name. Lifetimes and const parameters name no type.
+func rustTypeParamDeclares(params *sitter.Node, name string, content []byte) bool {
+	if params == nil {
+		return false
+	}
+	for i := range int(params.NamedChildCount()) {
+		param := params.NamedChild(i)
+		var id *sitter.Node
+		switch param.Type() {
+		case "type_identifier":
+			id = param
+		case "constrained_type_parameter":
+			id = childByFieldName(param, "left")
+		case "optional_type_parameter":
+			id = childByFieldName(param, "name")
+		}
+		if id != nil && nodeText(id, content) == name {
+			return true
 		}
 	}
 	return false

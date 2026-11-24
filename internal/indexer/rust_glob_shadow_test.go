@@ -101,23 +101,23 @@ var rustGlobShadowCases = []struct {
 		"lib.rs": "mod a; use a::*; trait T { fn new(); }\nimpl T for S {\n    fn new() {}\n}\npub fn caller() {\n    S::new();\n}\n",
 		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
 	}, "a.rs:crate::a::S::new", "", "S::new"},
-	// An explicit import of the first segment shadows the glob as well. The
-	// call is not resolved through that import, so it stays unresolved.
+	// An explicit import of the first segment shadows the glob as well, and
+	// the call resolves through that import.
 	{"explicit type use after glob, type path", tree{
 		"lib.rs": "mod a; mod b; use a::*; use b::S;\npub fn caller() {\n    S::new();\n}\n",
 		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
 		"b.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
-	}, "", "", "S::new"},
+	}, "b.rs:crate::b::S::new", "", "S::new"},
 	{"explicit type use before glob, type path", tree{
 		"lib.rs": "mod a; mod b; use b::S; use a::*;\npub fn caller() {\n    S::new();\n}\n",
 		"a.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
 		"b.rs":   "pub struct S;\nimpl S {\n    pub fn new() {}\n}\n",
-	}, "", "", "S::new"},
+	}, "b.rs:crate::b::S::new", "", "S::new"},
 	{"explicit module use, module path", tree{
 		"lib.rs": "mod a; mod b; use a::*; use b::x;\npub fn caller() {\n    x::f();\n}\n",
 		"a.rs":   "pub mod x {\n    pub fn f() {}\n}\n",
 		"b.rs":   "pub mod x {\n    pub fn f() {}\n}\n",
-	}, "", "", "x::f"},
+	}, "b.rs:crate::b::x::f", "", "x::f"},
 	// Two explicit imports of one name must live in different namespaces;
 	// the function is the called value, in either order.
 	{"explicit struct then fn", tree{

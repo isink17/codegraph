@@ -199,6 +199,10 @@ func (a *TypeScriptAdapter) Profile() parser.Profile {
 	return parser.NewProfile("typescript", "treesitter:typescript:v2", true)
 }
 
+// Rust v6 marks a qualified call whose first path segment an enclosing
+// function, impl or trait declares as a generic type parameter
+// (graph.RustCallBlockScopeEvidence); unchanged bytes persist a different edge
+// evidence, so every Rust file has to reach the parser again.
 // Rust v5 records module-level const, static, extern-block items and item
 // macro invocations (graph.RustValueItem), which can shadow a glob-imported
 // function; unchanged bytes persist different evidence, so every Rust file has
@@ -213,7 +217,7 @@ func (a *TypeScriptAdapter) Profile() parser.Profile {
 // directory. Unchanged bytes persist a different row, and the resolver joins
 // the new spelling exactly, so every Rust file has to reach the parser again.
 func (a *RustAdapter) Profile() parser.Profile {
-	return parser.NewProfile("rust", "treesitter:rust:v5", true)
+	return parser.NewProfile("rust", "treesitter:rust:v6", true)
 }
 
 // Ruby v6 records a `def` passed as the only argument of a visibility modifier
