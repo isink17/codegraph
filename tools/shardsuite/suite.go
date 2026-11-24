@@ -70,6 +70,9 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 			return sum, fmt.Errorf("-out %s is inside the module; leftover shard temp trees would be picked up by ./...", out)
 		}
 	}
+	if ents, err := os.ReadDir(out); err == nil && len(ents) > 0 {
+		return sum, fmt.Errorf("-out %s is not empty; an earlier run's summary.json, plan.json and shards would read as this run's", out)
+	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return sum, err
 	}

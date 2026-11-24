@@ -190,6 +190,19 @@ func TestOutInsideModuleIsRefused(t *testing.T) {
 	}
 }
 
+// A failed run into a reused -out must not leave the previous run's passing
+// summary and shards behind for `parity` or a reader to pick up.
+func TestNonEmptyOutIsRefused(t *testing.T) {
+	cfg := fixtureConfig(t)
+	stale := write(t, cfg.out, "summary.json", `{"all_passed":true}`)
+	if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("got %v", err)
+	}
+	if b, err := os.ReadFile(stale); err != nil || string(b) != "{\"all_passed\":true}\n" {
+		t.Errorf("refused -out was modified: %q %v", b, err)
+	}
+}
+
 func TestFixtureFailingTestFailsTheRun(t *testing.T) {
 	fixtureEnv(t, "FIXTURE_FAIL", "1")
 	sum, err := runSuite(context.Background(), fixtureConfig(t), io.Discard)

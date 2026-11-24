@@ -109,7 +109,9 @@ How it works:
   never drop out of the run unnoticed.
 - `-out` must be outside the module (the default is a new temp directory);
   leftover `shards/*/tmp` trees inside it would be picked up by `./...`, so
-  the runner refuses such a path.
+  the runner refuses such a path. It must also be new or empty, so an earlier
+  run's `summary.json`, `plan.json` and shards can never be read as this
+  run's.
 - Every process gets its own directory `OUT/shards/<job>/` with
   `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
