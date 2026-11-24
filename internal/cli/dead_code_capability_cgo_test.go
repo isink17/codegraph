@@ -141,20 +141,27 @@ func TestFindDeadCodeSkipsSameFileCallGraphs(t *testing.T) {
 	}
 }
 
-// SvelteKit components import library code through the `$lib` alias and
-// through barrel files that re-export it. Neither leaves a reference, so the
+// SvelteKit components import library code through the `$lib` alias, with or
+// without the `.js` the ESM convention adds (Svelte 5 rune modules are
+// `.svelte.js`), and through barrel files that re-export it, nested or not. Neither leaves a reference, so the
 // import is the only trace of the use, and it must withhold the TS symbols.
 func TestFindDeadCodeWithholdsSvelteKitAliasAndBarrelImports(t *testing.T) {
 	answer, _ := serveDeadCode(t, writeDeadCodeFixture(t, map[string]string{
-		"tsconfig.json":            `{"compilerOptions":{"paths":{"$lib/*":["./src/lib/*"]}}}`,
-		"src/lib/fmt.ts":           "export function fmtDate(d: Date): string { return d.toISOString(); }\n",
-		"src/lib/Chart.ts":         "export default class Chart {}\n",
-		"src/lib/barrel/index.ts":  "export { fmtBarrel } from './fmt';\nexport * from './more';\n",
-		"src/lib/barrel/fmt.ts":    "export function fmtBarrel(): string { return ''; }\n",
-		"src/lib/barrel/more.ts":   "export function moreStar(): number { return 1; }\n",
-		"src/lib/unused.ts":        "export function unusedTs(): number { return 1; }\n",
-		"src/routes/+page.svelte":  "<script lang=\"ts\">\n  import { fmtDate } from \"$lib/fmt\";\n  import Chart from \"$lib/Chart\";\n  const d = new Date();\n</script>\n\n<p>{fmtDate(d)}</p>\n<Chart/>\n",
-		"src/routes/Barrel.svelte": "<script lang=\"ts\">\n  import { fmtBarrel, moreStar } from \"../lib/barrel\";\n</script>\n\n<p>{fmtBarrel()}{moreStar()}</p>\n",
+		"tsconfig.json":             `{"compilerOptions":{"paths":{"$lib/*":["./src/lib/*"]}}}`,
+		"src/lib/fmt.ts":            "export function fmtDate(d: Date): string { return d.toISOString(); }\n",
+		"src/lib/Chart.ts":          "export default class Chart {}\n",
+		"src/lib/barrel/index.ts":   "export { fmtBarrel } from './fmt';\nexport * from './more';\n",
+		"src/lib/barrel/fmt.ts":     "export function fmtBarrel(): string { return ''; }\n",
+		"src/lib/barrel/more.ts":    "export function moreStar(): number { return 1; }\n",
+		"src/lib/unused.ts":         "export function unusedTs(): number { return 1; }\n",
+		"src/lib/jsext.ts":          "export function aJsExt(): number { return 1; }\n",
+		"src/lib/counter.svelte.ts": "export function counterRune(): number { return 1; }\n",
+		"src/lib/nest/index.ts":     "export * from './sub';\n",
+		"src/lib/nest/sub/index.ts": "export { nestedLeaf } from './leaf';\n",
+		"src/lib/nest/sub/leaf.ts":  "export function nestedLeaf(): number { return 1; }\n",
+		"src/routes/Ext.svelte":     "<script lang=\"ts\">\n  import { aJsExt } from \"$lib/jsext.js\";\n  import { counterRune } from \"$lib/counter.svelte.js\";\n  import { nestedLeaf } from \"$lib/nest\";\n</script>\n\n<p>{aJsExt()}{counterRune()}{nestedLeaf()}</p>\n",
+		"src/routes/+page.svelte":   "<script lang=\"ts\">\n  import { fmtDate } from \"$lib/fmt\";\n  import Chart from \"$lib/Chart\";\n  const d = new Date();\n</script>\n\n<p>{fmtDate(d)}</p>\n<Chart/>\n",
+		"src/routes/Barrel.svelte":  "<script lang=\"ts\">\n  import { fmtBarrel, moreStar } from \"../lib/barrel\";\n</script>\n\n<p>{fmtBarrel()}{moreStar()}</p>\n",
 	}))
 	var names []string
 	for _, item := range answer.Data.DeadCode {

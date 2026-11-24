@@ -272,3 +272,56 @@ func TestFindDeadCodeWithholdsQualifiedAndImportedUsesFromSkippedLanguages(t *te
 		t.Fatalf("dead code = %s, want %s", got, want)
 	}
 }
+
+func TestImportTargetsMatch(t *testing.T) {
+	targets := newImportTargets()
+	for id, p := range []string{
+		"src/lib/fmt.ts", "src/lib/counter.svelte.ts", "src/lib/barrel/index.ts", "src/lib/other/fmt.ts",
+		"src/routes/util.ts", "web/a/utils.ts", "web/b/utils.ts",
+	} {
+		targets.add(int64(id), p)
+	}
+	for _, c := range []struct {
+		importer, specifier string
+		want                []int64
+	}{
+		{"src/routes/+page.svelte", "$lib/fmt", []int64{0}},
+		{"src/routes/+page.svelte", "$lib/fmt.js", []int64{0}},
+		{"src/routes/+page.svelte", "$lib/counter.svelte.js", []int64{1}},
+		{"src/routes/+page.svelte", "$lib/counter.svelte", []int64{1}},
+		{"src/routes/+page.svelte", "$lib/barrel", []int64{2}},
+		{"src/routes/+page.svelte", "@/fmt", []int64{0, 3}},
+		{"src/routes/+page.svelte", "./util.js", []int64{4}},
+		{"src/routes/+page.svelte", "../lib/barrel", []int64{2}},
+		{"web/a/x.svelte", "./utils", []int64{5}},
+		{"web/b/x.svelte", "./utils", []int64{6}},
+		{"src/routes/+page.svelte", "svelte/store", []int64{}},
+		{"src/routes/+page.svelte", "$", []int64{}},
+		{"src/routes/+page.svelte", " ", nil},
+	} {
+		if got := targets.match(c.importer, c.specifier); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("match(%q, %q) = %v, want %v", c.importer, c.specifier, got, c.want)
+		}
+	}
+}
+
+// Matching looks files up by path, stem and last segment, so the files it
+// examines grow with the imports, not with imports times files.
+func TestImportTargetsScaleLinearly(t *testing.T) {
+	const n = 4000
+	targets := newImportTargets()
+	for i := range n {
+		targets.add(int64(i), fmt.Sprintf("src/lib/m%d/f%d.ts", i, i))
+	}
+	for i := range n {
+		if got := targets.match(fmt.Sprintf("src/routes/r%d/+page.svelte", i), fmt.Sprintf("$lib/m%d/f%d.js", i, i)); len(got) != 1 || got[0] != int64(i) {
+			t.Fatalf("import %d matched %v", i, got)
+		}
+		if got := targets.match(fmt.Sprintf("src/lib/m%d/x.svelte", i), fmt.Sprintf("./f%d", i)); len(got) != 1 {
+			t.Fatalf("relative import %d matched %v", i, got)
+		}
+	}
+	if targets.probes > 4*n {
+		t.Fatalf("examined %d candidates for %d imports over %d files", targets.probes, 2*n, n)
+	}
+}

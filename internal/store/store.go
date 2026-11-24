@@ -10625,10 +10625,11 @@ func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, off
 // skippedLanguageUses returns, as JSON arrays, the names and the file IDs the
 // files of skipped languages may use. A name is every identifier segment of a
 // reference those files hold (`demo.Util.helper`, `M:help`), since the
-// reference may name the type as well as the member. A file is one a relative
-// import of theirs resolves to (`./util` -> util.ts or util/index.ts): Svelte
-// markup and `new Box()` leave no reference, so the import is the only trace of
-// the use. Both over-approximate on purpose; a withheld symbol is not a claim.
+// reference may name the type as well as the member. A file is one an import of
+// theirs may load, directly or through re-exports (importedClassifiedFiles):
+// Svelte markup and `new Box()` leave no reference, so the import is the only
+// trace of the use. Both over-approximate on purpose; a withheld symbol is not
+// a claim.
 func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped []DeadCodeSkippedLanguage, callCapable []any) (string, string, error) {
 	q := s.parserSemanticQueryer(ctx)
 	languages := make([]any, 0, len(skipped)+1)
@@ -10707,18 +10708,11 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 
 // importedClassifiedFiles returns the files of classified languages that the
 // given (importer path, specifier) pairs may load, plus every file those reach
-// through re-exports (`export * from './more'` in a barrel index). A specifier
-// whose first segment is an alias (`$lib/fmt`, `@/x`, `~/x`) cannot be
-// resolved without the bundler config, so it matches every file whose path
-// ends in the rest of the specifier, with the alias name kept when it has one
-// (`$lib/fmt` -> `.../lib/fmt`).
+// through re-exports (`export * from './more'` in a barrel index); see
+// importTargets for how a specifier names files.
 func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callCapable []any, imports [][2]string) ([]int64, error) {
 	q := s.parserSemanticQueryer(ctx)
-	type file struct {
-		id         int64
-		path, stem string
-	}
-	var files []file
+	targets := newImportTargets()
 	rows, err := q.QueryContext(ctx, `
 		SELECT id, path FROM files
 		WHERE repo_id = ? AND is_deleted = 0 AND language IN (`+placeholders(len(callCapable))+`)
@@ -10729,14 +10723,14 @@ func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callC
 	}
 	pathOf := map[int64]string{}
 	for rows.Next() {
-		var f file
-		if err := rows.Scan(&f.id, &f.path); err != nil {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		f.stem = strings.TrimSuffix(f.path, path.Ext(f.path))
-		files = append(files, f)
-		pathOf[f.id] = f.path
+		targets.add(id, p)
+		pathOf[id] = p
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -10762,35 +10756,10 @@ func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callC
 		return nil, err
 	}
 
-	matches := func(importer, specifier string) []int64 {
-		exact := map[string]bool{}
-		if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
-			exact[resolved] = true
-			exact[strings.TrimSuffix(resolved, path.Ext(resolved))] = true
-			exact[resolved+"/index"] = true
-		}
-		suffix := ""
-		if strings.ContainsAny(specifier[:1], "$@~#") {
-			first, rest, _ := strings.Cut(specifier, "/")
-			suffix = path.Join(strings.TrimLeft(first, "$@~#"), rest)
-		}
-		var out []int64
-		for _, f := range files {
-			if exact[f.path] || exact[f.stem] ||
-				suffix != "" && suffix != "." && (f.stem == suffix || strings.HasSuffix(f.stem, "/"+suffix) ||
-					f.stem == suffix+"/index" || strings.HasSuffix(f.stem, "/"+suffix+"/index")) {
-				out = append(out, f.id)
-			}
-		}
-		return out
-	}
 	seen := map[int64]bool{}
 	var queue []int64
 	for _, e := range imports {
-		if strings.TrimSpace(e[1]) == "" {
-			continue
-		}
-		queue = append(queue, matches(e[0], e[1])...)
+		queue = append(queue, targets.match(e[0], e[1])...)
 	}
 	// Never nil: json_each('null') yields one NULL row, and NOT IN over a NULL
 	// withholds everything.
@@ -10804,11 +10773,100 @@ func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callC
 		seen[id] = true
 		out = append(out, id)
 		for _, specifier := range reexports[id] {
-			queue = append(queue, matches(pathOf[id], specifier)...)
+			queue = append(queue, targets.match(pathOf[id], specifier)...)
 		}
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+// importTargets answers which files a specifier may name, from indexes built
+// once per call, so the cost grows with imports plus files, not their product.
+// A relative or root path names the file with or without its extension, or the
+// directory's index. An alias (`$lib/fmt`, `@/x`, `~/x`, `#x/y`) cannot be
+// resolved without the bundler config, so it names every file whose path,
+// extension or not, ends in the rest of the specifier, with the alias name
+// kept when it has one (`$lib/fmt.js` -> `.../lib/fmt`).
+type importTargets struct {
+	byPath, byStem map[string][]int64
+	// byBase keys a stem by its last segment; byIndexDir keys an `.../index`
+	// stem by the last segment of its directory.
+	byBase, byIndexDir map[string][]importTarget
+	memo               map[[2]string][]int64
+	probes             int
+}
+
+type importTarget struct {
+	id   int64
+	stem string
+}
+
+func newImportTargets() *importTargets {
+	return &importTargets{
+		byPath: map[string][]int64{}, byStem: map[string][]int64{},
+		byBase: map[string][]importTarget{}, byIndexDir: map[string][]importTarget{},
+		memo: map[[2]string][]int64{},
+	}
+}
+
+func (t *importTargets) add(id int64, p string) {
+	stem := strings.TrimSuffix(p, path.Ext(p))
+	t.byPath[p] = append(t.byPath[p], id)
+	t.byStem[stem] = append(t.byStem[stem], id)
+	t.byBase[path.Base(stem)] = append(t.byBase[path.Base(stem)], importTarget{id, stem})
+	if dir, base := path.Split(stem); base == "index" && dir != "" {
+		key := path.Base(dir)
+		t.byIndexDir[key] = append(t.byIndexDir[key], importTarget{id, stem})
+	}
+}
+
+func (t *importTargets) match(importer, specifier string) []int64 {
+	if strings.TrimSpace(specifier) == "" {
+		return nil
+	}
+	key := [2]string{path.Dir(importer), specifier}
+	if out, ok := t.memo[key]; ok {
+		return out
+	}
+	found := map[int64]bool{}
+	if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
+		for _, k := range []string{resolved, strings.TrimSuffix(resolved, path.Ext(resolved)), resolved + "/index"} {
+			for _, id := range t.byPath[k] {
+				found[id] = true
+			}
+			for _, id := range t.byStem[k] {
+				found[id] = true
+			}
+		}
+	}
+	if strings.ContainsAny(specifier[:1], "$@~#") {
+		first, rest, _ := strings.Cut(specifier, "/")
+		suffix := path.Join(strings.TrimLeft(first, "$@~#"), rest)
+		for _, sfx := range []string{suffix, strings.TrimSuffix(suffix, path.Ext(suffix))} {
+			if sfx == "" || sfx == "." {
+				continue
+			}
+			for _, f := range t.byBase[path.Base(sfx)] {
+				t.probes++
+				if f.stem == sfx || strings.HasSuffix(f.stem, "/"+sfx) {
+					found[f.id] = true
+				}
+			}
+			for _, f := range t.byIndexDir[path.Base(sfx)] {
+				t.probes++
+				if f.stem == sfx+"/index" || strings.HasSuffix(f.stem, "/"+sfx+"/index") {
+					found[f.id] = true
+				}
+			}
+		}
+	}
+	out := make([]int64, 0, len(found))
+	for id := range found {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	t.memo[key] = out
+	return out
 }
 
 // --- Embedding methods ---

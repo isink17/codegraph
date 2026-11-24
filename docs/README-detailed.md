@@ -410,10 +410,12 @@ may still use a symbol of a classified one, so a symbol is also withheld when
 any identifier segment of a reference in such a file names it (`Store.create`
 withholds `Store` and `create`), or when it is declared in a file such a file
 imports. A relative import covers `util.ts` and `util/index.ts`; an alias such
-as `$lib/fmt` or `@/x`, which needs bundler config to resolve, covers every file
-whose path ends in `lib/fmt` or `x`; and re-exports from an imported file
-(`export * from './more'`) are followed. The key is absent when no language is
-skipped. A listed symbol
+as `$lib/fmt.js` or `@/x`, which needs bundler config to resolve, covers every
+file whose path, without its extension, ends in `lib/fmt` or `x`; and
+re-exports from an imported file (`export * from './more'`) are followed. Not
+followed: an alias whose target directory has another name, bare `baseUrl` or
+workspace-package specifiers, and a barrel that imports a name and exports it
+in a separate statement. The key is absent when no language is skipped. A listed symbol
 is a candidate, not proof: exported API, reflection, dynamic dispatch and calls
 the resolver left unresolved are not callers in the graph.
 
