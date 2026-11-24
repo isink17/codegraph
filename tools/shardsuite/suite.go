@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +23,7 @@ const summarySchema = "codegraph.shardsuite/v1"
 
 type summary struct {
 	Schema      string        `json:"schema"`
+	RunID       string        `json:"run_id"`
 	Patterns    []string      `json:"patterns"`
 	GOOS        string        `json:"goos"`
 	GOARCH      string        `json:"goarch"`
@@ -26,6 +31,7 @@ type summary struct {
 	CGOEnabled  string        `json:"cgo_enabled"`
 	Timeout     string        `json:"timeout_per_binary"`
 	JobTimeout  string        `json:"job_timeout"`
+	MaxJobs     int           `json:"max_parallel_jobs"`
 	Timings     string        `json:"timings,omitempty"`
 	Packages    int           `json:"packages"`
 	TopLevel    int           `json:"top_level_tests_listed"`
@@ -59,10 +65,17 @@ func unsupportedOS(goos string) error {
 
 func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error) {
 	start := time.Now()
+	if cfg.jobs < 1 {
+		cfg.jobs = runtime.GOMAXPROCS(0)
+	}
+	jobTimeout := autoJobTimeout
+	if cfg.jobTimeout > 0 {
+		jobTimeout = cfg.jobTimeout.String()
+	}
 	sum := summary{
 		Schema: summarySchema, Patterns: cfg.patterns, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 		GoFlags: goEnv(cfg.dir, "GOFLAGS"), CGOEnabled: goEnv(cfg.dir, "CGO_ENABLED"),
-		Timeout: cfg.timeout.String(), JobTimeout: cfg.jobTimeout.String(), Timings: cfg.timings,
+		Timeout: cfg.timeout.String(), JobTimeout: jobTimeout, MaxJobs: cfg.jobs, Timings: cfg.timings,
 	}
 	if err := unsupportedOS(runtime.GOOS); err != nil {
 		return sum, err
@@ -77,17 +90,18 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if out, err = filepath.Abs(out); err != nil {
 		return sum, err
 	}
-	if dir, err := filepath.Abs(cfg.dir); err == nil {
-		if rel, err := filepath.Rel(dir, out); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return sum, fmt.Errorf("-out %s is inside the module; leftover shard temp trees would be picked up by ./...", out)
-		}
+	inside, err := insideDir(cfg.dir, out)
+	if err != nil {
+		return sum, fmt.Errorf("cannot check -out %s against the module: %w", out, err)
 	}
-	if ents, err := os.ReadDir(out); err == nil && len(ents) > 0 {
-		return sum, fmt.Errorf("-out %s is not empty; an earlier run's summary.json, plan.json and shards would read as this run's", out)
+	if inside {
+		return sum, fmt.Errorf("-out %s is inside the module; leftover shard temp trees would be picked up by ./...", out)
 	}
-	if err := os.MkdirAll(out, 0o755); err != nil {
+	own, err := claimOut(out)
+	if err != nil {
 		return sum, err
 	}
+	sum.RunID = own.RunID
 
 	// The list runs every test binary once, so it shares the run's build tags,
 	// CGO setting and GOFLAGS, and each package's TestMain.
@@ -97,10 +111,13 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	}
 	if cfg.listTimeout == 0 {
 		cfg.listTimeout = cfg.jobTimeout
+		if cfg.listTimeout == 0 {
+			cfg.listTimeout = cfg.timeout + jobSlack
+		}
 	}
 	lctx, lcancel := context.WithTimeout(ctx, cfg.listTimeout)
 	defer lcancel()
-	lc := exec.CommandContext(lctx, "go", append([]string{"test", "-json", "-list", "."}, cfg.patterns...)...)
+	lc := exec.CommandContext(lctx, "go", append([]string{"test", "-json", "-p", strconv.Itoa(cfg.jobs), "-list", "."}, cfg.patterns...)...)
 	listErrLog, err := os.Create(filepath.Join(out, "list-stderr.log"))
 	if err != nil {
 		return sum, err
@@ -119,7 +136,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	}
 	_ = os.WriteFile(filepath.Join(out, "list.jsonl"), listOut, 0o644)
 	if lctx.Err() != nil {
-		return sum, fmt.Errorf("go test -list did not finish within -job-timeout %s", cfg.listTimeout)
+		return sum, fmt.Errorf("go test -list did not finish within %s (-job-timeout)", cfg.listTimeout)
 	}
 	pkgs, names, failed, err := parseList(listOut)
 	if err != nil {
@@ -156,6 +173,9 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if err != nil {
 		return sum, err
 	}
+	for i := range jobs {
+		jobs[i].JobTimeout = jobDeadline(cfg, jobs[i]).String()
+	}
 	type planEntry struct {
 		job
 		Run      string              `json:"run,omitempty"`
@@ -165,35 +185,39 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	for i, j := range jobs {
 		plan[i] = planEntry{j, j.Run, j.Expected}
 	}
-	if err := writeJSON(filepath.Join(out, "plan.json"), map[string]any{"jobs": plan, "timings": cfg.timings}); err != nil {
+	if err := writeJSON(filepath.Join(out, "plan.json"), map[string]any{"run_id": own.RunID, "jobs": plan, "timings": cfg.timings}); err != nil {
 		return sum, err
 	}
-	fmt.Fprintf(stdout, "shardsuite: out=%s packages=%d jobs=%d timeout=%s\n", out, len(pkgs), len(jobs), cfg.timeout)
+	fmt.Fprintf(stdout, "shardsuite: out=%s packages=%d jobs=%d max_parallel=%d timeout=%s\n", out, len(pkgs), len(jobs), cfg.jobs, cfg.timeout)
 
-	results := make([]jobResult, len(jobs))
-	var wg sync.WaitGroup
 	var mu sync.Mutex
-	for i, j := range jobs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i] = runJob(ctx, cfg, filepath.Join(out, "shards", j.Name), j)
-			r := results[i]
-			mu.Lock()
-			fmt.Fprintf(stdout, "%s\t%s\t%.1fs\t%d tests", strings.ToUpper(r.Result), r.Name, r.WallSeconds, r.Counts.Pass+r.Counts.Fail+r.Counts.Skip)
-			if r.Reason != "" {
-				fmt.Fprintf(stdout, "\t%s", r.Reason)
-			}
-			fmt.Fprintln(stdout)
-			mu.Unlock()
-		}()
+	report := func(r jobResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(stdout, "%s\t%s\t%.1fs\t%d tests", strings.ToUpper(r.Result), r.Name, r.WallSeconds, r.Counts.Pass+r.Counts.Fail+r.Counts.Skip)
+		if r.Reason != "" {
+			fmt.Fprintf(stdout, "\t%s", r.Reason)
+		}
+		fmt.Fprintln(stdout)
 	}
-	wg.Wait()
+	results := runJobs(ctx, jobs, cfg.jobs, func(j job) jobResult {
+		r := runJob(ctx, cfg, filepath.Join(out, "shards", j.Name), j)
+		report(r)
+		return r
+	})
+	for _, r := range results {
+		if r.Reason == reasonNotStarted {
+			report(r)
+		}
+	}
 	sum.Jobs = results
 	sum.Interrupted = ctx.Err() != nil
 	sum.AllPassed = !sum.Interrupted && len(results) > 0
 	for _, r := range results {
 		sum.AllPassed = sum.AllPassed && r.passed()
+	}
+	if err := checkOwner(out, own.RunID); err != nil {
+		return sum, err
 	}
 	if cfg.baseline != "" && !sum.Interrupted {
 		var files []string
@@ -238,14 +262,9 @@ func runJob(ctx context.Context, cfg config, dir string, j job) jobResult {
 	if err := os.MkdirAll(filepath.Join(tmp, "go"), 0o755); err != nil {
 		return jobResult{job: j, Result: resIncomplete, Reason: err.Error(), Exit: -1}
 	}
-	args := []string{"test", "-json", "-count=1", "-timeout", cfg.timeout.String()}
-	if j.Run != "" {
-		args = append(args, "-run", j.Run)
-	}
-	args = append(args, j.Packages...)
-	jctx, cancel := context.WithTimeout(ctx, cfg.jobTimeout)
+	jctx, cancel := context.WithTimeout(ctx, jobDeadline(cfg, j))
 	defer cancel()
-	cmd := exec.CommandContext(jctx, "go", args...)
+	cmd := exec.CommandContext(jctx, "go", testArgs(cfg, j)...)
 	cmd.Dir, cmd.Env = cfg.dir, isolatedEnv(tmp)
 	setProcGroup(cmd)
 	cmd.Cancel = func() error { return killTree(cmd) }
@@ -275,7 +294,7 @@ func runJob(ctx context.Context, cfg config, dir string, j job) jobResult {
 		return jobResult{job: j, Result: resIncomplete, Reason: err.Error(), Exit: exit}
 	}
 	r := classify(j, evs, malformed, exit, killed, interrupted)
-	r.WallSeconds = wall
+	r.Started, r.WallSeconds = start, wall
 	_ = writeJSON(filepath.Join(dir, "result.json"), r)
 	return r
 }
@@ -286,4 +305,172 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 	return os.WriteFile(path, append(b, '\n'), 0o644)
+}
+
+// jobSlack is the time a go test process gets beyond its test binaries'
+// -timeout, for building and linking.
+const jobSlack = 5 * time.Minute
+
+const autoJobTimeout = "auto: -timeout x ceil(packages / -jobs) + 5m per process"
+
+// jobDeadline bounds one go test process. Unless -job-timeout is set, it lets
+// every package of the process use its whole -timeout, -jobs (go test -p) at a
+// time, so it fires only when something outside the test binaries hangs and
+// never cuts a multi-package process short of its per-binary limit.
+func jobDeadline(cfg config, j job) time.Duration {
+	if cfg.jobTimeout > 0 {
+		return cfg.jobTimeout
+	}
+	waves := (max(len(j.Packages), 1) + cfg.jobs - 1) / cfg.jobs
+	return time.Duration(waves)*cfg.timeout + jobSlack
+}
+
+func testArgs(cfg config, j job) []string {
+	args := []string{"test", "-json", "-count=1", "-p", strconv.Itoa(cfg.jobs), "-timeout", cfg.timeout.String()}
+	if j.Run != "" {
+		args = append(args, "-run", j.Run)
+	}
+	return append(args, j.Packages...)
+}
+
+const reasonNotStarted = "interrupted before it started"
+
+// runJobs runs at most limit jobs at once, starting them in plan order. A job
+// still waiting when ctx ends never starts and is reported incomplete.
+func runJobs(ctx context.Context, jobs []job, limit int, run func(job) jobResult) []jobResult {
+	results := make([]jobResult, len(jobs))
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i, j := range jobs {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			results[i] = jobResult{job: j, Result: resIncomplete, Reason: reasonNotStarted, Exit: -1}
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = run(j)
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+const ownerFile = "owner.json"
+
+// owner identifies the run that claimed an output directory.
+type owner struct {
+	RunID   string `json:"run_id"`
+	PID     int    `json:"pid"`
+	Host    string `json:"host"`
+	Started string `json:"started"`
+}
+
+// claimOut makes out this run's own. owner.json is created exclusively before
+// any other artifact, so two runs can never share one -out, and a used -out is
+// never taken over, even when the run that claimed it is gone.
+func claimOut(out string) (owner, error) {
+	if ents, err := os.ReadDir(out); err == nil && len(ents) > 0 {
+		return owner{}, usedOut(out)
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return owner{}, err
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return owner{}, err
+	}
+	host, _ := os.Hostname()
+	o := owner{RunID: hex.EncodeToString(nonce[:]), PID: os.Getpid(), Host: host, Started: time.Now().UTC().Format(time.RFC3339Nano)}
+	f, err := os.OpenFile(filepath.Join(out, ownerFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		return owner{}, usedOut(out)
+	}
+	if err != nil {
+		return owner{}, err
+	}
+	b, _ := json.Marshal(o)
+	_, werr := f.Write(append(b, '\n'))
+	if err := errors.Join(werr, f.Sync(), f.Close()); err != nil {
+		return owner{}, err
+	}
+	// Something other than a runner may have written here after the check.
+	if ents, err := os.ReadDir(out); err != nil || len(ents) != 1 {
+		return owner{}, errors.Join(usedOut(out), err)
+	}
+	return o, nil
+}
+
+func usedOut(out string) error {
+	msg := fmt.Sprintf("-out %s is not empty; an earlier run's summary.json, plan.json and shards would read as this run's", out)
+	if o, err := readOwner(out); err == nil {
+		msg = fmt.Sprintf("-out %s already belongs to shardsuite run %s (pid %d on %s, started %s); an output directory is never reused, even after its run ended", out, o.RunID, o.PID, o.Host, o.Started)
+	}
+	return errors.New(msg + "; choose a new -out")
+}
+
+func readOwner(out string) (owner, error) {
+	var o owner
+	b, err := os.ReadFile(filepath.Join(out, ownerFile))
+	if err == nil {
+		err = json.Unmarshal(b, &o)
+	}
+	if err == nil && o.RunID == "" {
+		err = errors.New("no run_id")
+	}
+	if err != nil {
+		return o, fmt.Errorf("%s has no complete %s, so it is not a claimed shardsuite output: %w", out, ownerFile, err)
+	}
+	return o, nil
+}
+
+func checkOwner(out, runID string) error {
+	o, err := readOwner(out)
+	if err != nil {
+		return err
+	}
+	if o.RunID != runID {
+		return fmt.Errorf("%s now belongs to run %s, not this run %s; its files are not this run's results", out, o.RunID, runID)
+	}
+	return nil
+}
+
+// insideDir reports whether path, or the part of it that exists, lies inside
+// dir. It compares filesystem identity rather than spelling, so a symlink, a
+// relative path or a different letter case on a case-insensitive filesystem
+// cannot hide that path is in dir.
+func insideDir(dir, path string) (bool, error) {
+	di, err := os.Stat(dir)
+	if err != nil {
+		return false, err
+	}
+	p := filepath.Clean(path)
+	for {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	if p, err = filepath.EvalSymlinks(p); err != nil {
+		return false, err
+	}
+	for {
+		if st, err := os.Stat(p); err == nil && os.SameFile(di, st) {
+			return true, nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false, nil
+		}
+		p = parent
+	}
 }

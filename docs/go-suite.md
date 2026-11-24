@@ -109,19 +109,45 @@ How it works:
   never drop out of the run unnoticed.
 - `-out` must be outside the module (the default is a new temp directory);
   leftover `shards/*/tmp` trees inside it would be picked up by `./...`, so
-  the runner refuses such a path. It must also be new or empty, so an earlier
-  run's `summary.json`, `plan.json` and shards can never be read as this
-  run's.
+  the runner refuses such a path. The check compares filesystem identity, not
+  spelling: the deepest existing part of `-out` is resolved through symlinks,
+  and each of its parents is compared with the module directory, so a
+  symlink, a relative path or a different letter case on a case-insensitive
+  filesystem cannot hide that the path is inside.
+- `-out` must also be new or empty, and a run owns it: before writing
+  anything else the runner creates `OUT/owner.json` exclusively, with a random
+  run ID, its process ID, host and start time. Two runs started with the
+  same `-out` cannot both get it; the second exits 1 and names the owner. An
+  `-out` is never reused or taken over, even after its run ended or was
+  killed: start a new run in a new directory. `plan.json` and `summary.json`
+  carry the run ID, and `parity` (and `-baseline` or `-timings` given a
+  shardsuite OUT) reads shard events only when `plan.json` has the run ID of
+  `owner.json`, so an unplanned or foreign directory is refused.
 - Every process gets its own directory `OUT/shards/<job>/` with
   `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
-- `-timeout` (default 20m) is passed to every test binary, as in `run.sh`.
-  `-job-timeout` (default `-timeout` + 5m) kills a whole process tree that
-  is still running, for example a hung build.
+- `-jobs` (default `GOMAXPROCS`, the number of usable cores) bounds how many
+  `go test` processes run at once; further processes wait and start in plan
+  order. Each process also gets `-p` set to `-jobs`. Only the `rest` process
+  holds more than one package, so at most about twice `-jobs` test binaries
+  run at once, instead of the number of processes times the core count. On a
+  machine with at least as many cores as processes (the M3 Pro below: 11
+  cores, nine processes) the default runs everything at once with Go's own
+  `-p`, as before. `-jobs=1` runs one process and one package at a time.
+  Each test binary still sets its own `GOMAXPROCS`.
+- `-timeout` (default 20m) is passed to every test binary, as in `run.sh`:
+  that is the per-test-binary limit. `-job-timeout` is a separate limit per
+  `go test` process, which in `rest` covers about 50 packages together. By
+  default each process gets `-timeout` × ⌈packages ÷ `-jobs`⌉ + 5m, so every
+  package can use its whole `-timeout`, `-jobs` at a time, and the process
+  limit only fires when something outside the test binaries hangs, for
+  example a build. An explicit `-job-timeout` applies to every process as
+  given, whatever its package count. `plan.json` records each process's
+  limit.
 
 Each process is classified as `pass`, `no_tests`, `test_fail`, `build_fail`,
-`timeout` (a test binary hit `-timeout`, or the job was killed at
-`-job-timeout`), `incomplete` (interrupted, a package that started but never
+`timeout` (a test binary hit `-timeout`, or the process was killed at its
+job timeout), `incomplete` (interrupted, a package that started but never
 finished, a half-written event line, or a listed test that never reported) or
 `inventory_mismatch` (a top-level test ran twice, or ran without being
 listed). Skipped tests are counted per package. The run passes only when
@@ -133,7 +159,8 @@ On Ctrl-C, SIGTERM or SIGHUP it kills every `go test` process group
 (a test that puts its own children in a new process group is outside it), writes the summary
 with `interrupted: true`, prints `INCOMPLETE` and exits 130. A run that was
 interrupted is never reported as passed, even when every finished shard
-passed. A runner killed with SIGKILL cannot do this, and its `go test`
+passed. A process that was still waiting for a `-jobs` slot never starts
+and is `incomplete`. A runner killed with SIGKILL cannot do this, and its `go test`
 processes keep running until their own `-timeout`.
 
 Pass counts matching is not proof of equivalence. `-baseline` (or the
@@ -143,7 +170,8 @@ reported exactly once with the same action. A `t.TempDir` path embedded in a
 subtest name is normalized, because each process has a different temp root.
 
 Hardware: sharding helps when cores are idle. With the default
-`store=3, indexer=3, diff=2` it runs nine processes at once. Measured on an
+`store=3, indexer=3, diff=2` it runs nine processes, all at once when
+`-jobs` is at least 9. Measured on an
 Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs
 (`run.sh`, then shardsuite with `-timings` from the first `run.sh` run,
 warm build cache) on a shared machine. The pairs used the runner as first
@@ -167,7 +195,9 @@ one machine and four pairs. As an estimate, not measured elsewhere: plan for
 at least 8 cores and about 4 GiB of free memory, and on 4 cores or fewer
 expect little gain, since the suite's
 total CPU work then exceeds what the cores can run in
-parallel. Do not run it beside another full suite on the same machine.
+parallel. There the default `-jobs` is lower, and a smaller `-jobs` also
+lowers peak memory, at the cost of wall time. Do not run it beside another
+full suite on the same machine.
 
 `CGO_ENABLED=0`: the list and the run both honor it, so the tree-sitter
 adapters that need cgo are compiled out of both and the inventory matches

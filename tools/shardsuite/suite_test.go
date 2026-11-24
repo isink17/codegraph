@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -181,17 +182,158 @@ func TestFixtureTruncatedListFailsTheRun(t *testing.T) {
 
 func TestOutInsideModuleIsRefused(t *testing.T) {
 	cfg := fixtureConfig(t)
-	cfg.out = filepath.Join(cfg.dir, "out")
-	if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "inside the module") {
-		t.Fatalf("got %v", err)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(cfg.dir, link); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(cfg.out); err == nil {
-		t.Error("refused -out was created")
+	for _, out := range []string{
+		filepath.Join(cfg.dir, "out"),
+		filepath.Join("testdata", "fixture", "out"),
+		filepath.Join(link, "new", "out"),
+	} {
+		c := cfg
+		c.out = out
+		if _, err := runSuite(context.Background(), c, io.Discard); err == nil || !strings.Contains(err.Error(), "inside the module") {
+			t.Fatalf("%s: got %v", out, err)
+		}
+		if _, err := os.Lstat(out); err == nil {
+			t.Errorf("refused -out %s was created", out)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(cfg.dir, "new")); err == nil {
+		t.Error("refused -out parents were created")
 	}
 }
 
-// A failed run into a reused -out must not leave the previous run's passing
-// summary and shards behind for `parity` or a reader to pick up.
+func TestInsideDirComparesFileIdentity(t *testing.T) {
+	root := t.TempDir()
+	mod := filepath.Join(root, "mod")
+	for _, d := range []string{filepath.Join(mod, "pkg"), filepath.Join(root, "mod2")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"to-mod": mod, "to-pkg": filepath.Join(mod, "pkg"), "to-root": root} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]bool{
+		mod:                                      true,
+		filepath.Join(mod, "pkg", "x", "y"):      true,
+		filepath.Join(root, "to-mod", "x"):       true,
+		filepath.Join(root, "to-pkg", "x", "y"):  true,
+		filepath.Join(root, "to-root", "mod"):    true,
+		filepath.Join(root, "mod2", "out"):       false,
+		filepath.Join(root, "to-root", "mod2"):   false,
+		filepath.Join(root, "out", "mod", "pkg"): false,
+		root:                                     false,
+	}
+	// APFS and NTFS are case-insensitive by default, most Linux filesystems are not.
+	upper := filepath.Join(root, "MOD")
+	if a, err := os.Stat(upper); err == nil {
+		if b, _ := os.Stat(mod); os.SameFile(a, b) {
+			cases[filepath.Join(upper, "out")] = true
+		}
+	} else {
+		t.Log("case-sensitive filesystem: no case alias to check")
+	}
+	for path, want := range cases {
+		got, err := insideDir(mod, path)
+		if err != nil || got != want {
+			t.Errorf("insideDir(%s) = %v, %v; want %v", path, got, err, want)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "missing"), filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insideDir(mod, filepath.Join(root, "dangling", "out")); err == nil {
+		t.Error("a dangling symlink must not be judged outside the module")
+	}
+}
+
+func TestClaimOutIsExclusive(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	errs := make([]error, 16)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = claimOut(out)
+		}()
+	}
+	wg.Wait()
+	won := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			won++
+		case !strings.Contains(err.Error(), "choose a new -out"):
+			t.Error(err)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d runs claimed one -out", won)
+	}
+}
+
+func TestConcurrentRunsShareNoOut(t *testing.T) {
+	fixtureEnv(t)
+	cfg := fixtureConfig(t)
+	sums := make([]summary, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range sums {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sums[i], errs[i] = runSuite(context.Background(), cfg, io.Discard)
+		}()
+	}
+	wg.Wait()
+	winner := 0
+	if errs[0] != nil {
+		winner = 1
+	}
+	if loser := errs[1-winner]; loser == nil || !strings.Contains(loser.Error(), "choose a new -out") {
+		t.Fatalf("both runs used one -out: %v", errs)
+	}
+	if errs[winner] != nil || !sums[winner].AllPassed {
+		t.Fatalf("the run that claimed -out: %v %+v", errs[winner], sums[winner])
+	}
+	o, err := readOwner(cfg.out)
+	if err != nil || o.RunID != sums[winner].RunID {
+		t.Fatalf("owner %+v %v, summary run %s", o, err, sums[winner].RunID)
+	}
+}
+
+// An owner record is never taken over, even when its run is long gone or
+// died before it finished writing the record.
+func TestUsedOutIsNeverReclaimed(t *testing.T) {
+	stale := `{"run_id":"0123","pid":999999,"host":"elsewhere","started":"2020-01-01T00:00:00Z"}`
+	for name, tc := range map[string]struct{ owner, want string }{
+		"stale owner":   {stale, "already belongs to shardsuite run 0123"},
+		"partial owner": {`{"run_`, "not empty"},
+	} {
+		cfg := fixtureConfig(t)
+		p := write(t, cfg.out, ownerFile, tc.owner)
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(cfg.out, link); err != nil {
+			t.Fatal(err)
+		}
+		for _, out := range []string{cfg.out, link} {
+			cfg.out = out
+			if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s via %s: got %v", name, out, err)
+			}
+		}
+		if b, err := os.ReadFile(p); err != nil || string(b) != tc.owner+"\n" {
+			t.Errorf("%s: owner record changed: %q %v", name, b, err)
+		}
+	}
+}
+
 func TestWindowsIsRefused(t *testing.T) {
 	if unsupportedOS("windows") == nil {
 		t.Error("windows: want a refusal")
@@ -203,6 +345,8 @@ func TestWindowsIsRefused(t *testing.T) {
 	}
 }
 
+// A failed run into a reused -out must not leave the previous run's passing
+// summary and shards behind for `parity` or a reader to pick up.
 func TestNonEmptyOutIsRefused(t *testing.T) {
 	cfg := fixtureConfig(t)
 	stale := write(t, cfg.out, "summary.json", `{"all_passed":true}`)
@@ -326,7 +470,71 @@ func TestFixtureInterruptReportsIncomplete(t *testing.T) {
 	if err != nil || json.Unmarshal(b, &onDisk) != nil || !onDisk.Interrupted || onDisk.AllPassed {
 		t.Fatalf("summary.json after interrupt: %s %v", b, err)
 	}
+	if o, err := readOwner(cfg.out); err != nil || onDisk.RunID == "" || o.RunID != onDisk.RunID {
+		t.Errorf("summary run %q, owner %+v %v", onDisk.RunID, o, err)
+	}
 	assertGone(t, waitForPID(t, pidFile))
+	if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), onDisk.RunID) {
+		t.Errorf("rerun into an interrupted run's -out: %v", err)
+	}
+}
+
+func TestFixtureInterruptLeavesQueuedJobsUnstarted(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	fixtureEnv(t, "FIXTURE_HANG", "1", "FIXTURE_PIDFILE", pidFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		readPID(pidFile)
+		cancel()
+	}()
+	cfg := fixtureConfig(t)
+	// Round-robin over sorted names puts TestHang, the sixth, in a.0.
+	cfg.shards, cfg.jobs = []shardSpec{{Pattern: "./a", K: 5}}, 1
+	sum, err := runSuite(ctx, cfg, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, j := range sum.Jobs {
+		names = append(names, j.Name+":"+j.Result+":"+j.Reason)
+	}
+	want := []string{"rest:pass:", "fixture_a.0:incomplete:interrupted"}
+	for i := 1; i < 5; i++ {
+		want = append(want, "fixture_a."+strconv.Itoa(i)+":incomplete:"+reasonNotStarted)
+	}
+	if strings.Join(names, " ") != strings.Join(want, " ") || sum.AllPassed {
+		t.Fatalf("jobs:\n%s\nwant:\n%s", strings.Join(names, "\n"), strings.Join(want, "\n"))
+	}
+	for _, j := range sum.Jobs[2:] {
+		if fileExists(filepath.Join(cfg.out, "shards", j.Name, "events.jsonl")) {
+			t.Errorf("%s ran", j.Name)
+		}
+	}
+}
+
+func TestFixtureJobsLimitIsHonored(t *testing.T) {
+	fixtureEnv(t)
+	for _, limit := range []int{1, 2} {
+		cfg := fixtureConfig(t)
+		cfg.jobs = limit
+		sum, err := runSuite(context.Background(), cfg, io.Discard)
+		if err != nil || !sum.AllPassed || sum.MaxJobs != limit || len(sum.Jobs) != 4 {
+			t.Fatalf("-jobs=%d: %v %+v", limit, err, sum)
+		}
+		for _, a := range sum.Jobs {
+			running := 0
+			for _, b := range sum.Jobs {
+				end := b.Started.Add(time.Duration(b.WallSeconds * float64(time.Second)))
+				if !a.Started.Before(b.Started) && a.Started.Before(end) {
+					running++
+				}
+			}
+			if running > limit {
+				t.Errorf("-jobs=%d: %d processes ran at once when %s started", limit, running, a.Name)
+			}
+		}
+	}
 }
 
 func TestSIGINTKillsChildrenAndExitsIncomplete(t *testing.T) {
@@ -354,4 +562,71 @@ func TestSIGINTKillsChildrenAndExitsIncomplete(t *testing.T) {
 		t.Errorf("stdout does not say incomplete:\n%s", stdout.String())
 	}
 	assertGone(t, pid)
+}
+
+func TestRunJobsBoundsConcurrency(t *testing.T) {
+	jobs := make([]job, 7)
+	for i := range jobs {
+		jobs[i].Name = strconv.Itoa(i)
+	}
+	for _, limit := range []int{1, 2, 3} {
+		var mu sync.Mutex
+		running, peak, order := 0, 0, []string{}
+		runJobs(context.Background(), jobs, limit, func(j job) jobResult {
+			mu.Lock()
+			running++
+			peak = max(peak, running)
+			order = append(order, j.Name)
+			mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			running--
+			mu.Unlock()
+			return jobResult{job: j, Result: resPass}
+		})
+		if peak != limit {
+			t.Errorf("limit %d: peak %d", limit, peak)
+		}
+		if limit == 1 && strings.Join(order, "") != "0123456" {
+			t.Errorf("limit 1 started out of plan order: %v", order)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, r := range runJobs(ctx, jobs, 2, func(j job) jobResult { t.Error("started after cancel"); return jobResult{} }) {
+		if r.Result != resIncomplete || r.Reason != reasonNotStarted {
+			t.Errorf("%s: %s %s", r.Name, r.Result, r.Reason)
+		}
+	}
+}
+
+func TestJobDeadlineCoversEveryPackageTimeout(t *testing.T) {
+	pkgs := func(n int) job { return job{Packages: make([]string, n)} }
+	cfg := config{timeout: 20 * time.Minute, jobs: 11}
+	for _, tc := range []struct {
+		j    job
+		jobs int
+		want time.Duration
+	}{
+		{pkgs(1), 11, 25 * time.Minute},
+		{pkgs(11), 11, 25 * time.Minute},
+		{pkgs(50), 11, 5*20*time.Minute + 5*time.Minute},
+		{pkgs(50), 1, 50*20*time.Minute + 5*time.Minute},
+	} {
+		cfg.jobs = tc.jobs
+		if got := jobDeadline(cfg, tc.j); got != tc.want {
+			t.Errorf("%d packages, -jobs=%d: %s, want %s", len(tc.j.Packages), tc.jobs, got, tc.want)
+		}
+	}
+	cfg.jobTimeout = time.Hour
+	if got := jobDeadline(cfg, pkgs(50)); got != time.Hour {
+		t.Errorf("explicit -job-timeout: %s", got)
+	}
+}
+
+func TestTestArgsPassJobsAsP(t *testing.T) {
+	got := strings.Join(testArgs(config{jobs: 3, timeout: time.Minute}, job{Packages: []string{"./a"}, Run: "^(TestA)$"}), " ")
+	if got != "test -json -count=1 -p 3 -timeout 1m0s -run ^(TestA)$ ./a" {
+		t.Error(got)
+	}
 }

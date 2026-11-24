@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // event is one `go test -json` record.
@@ -85,6 +86,7 @@ type jobResult struct {
 	Result      string      `json:"result"`
 	Reason      string      `json:"reason,omitempty"`
 	Exit        int         `json:"exit"`
+	Started     time.Time   `json:"started"`
 	WallSeconds float64     `json:"wall_seconds"`
 	Malformed   int         `json:"malformed_lines"`
 	Counts      counts      `json:"tests"`
@@ -205,7 +207,7 @@ func classify(j job, evs []event, malformed, exit int, killed, interrupted bool)
 	case interrupted:
 		r.Result, r.Reason = resIncomplete, "interrupted"
 	case killed:
-		r.Result, r.Reason = resTimeout, "killed at -job-timeout"
+		r.Result, r.Reason = resTimeout, "process killed at job timeout "+j.JobTimeout
 	case malformed > 0:
 		r.Result, r.Reason = resIncomplete, fmt.Sprintf("%d malformed event lines", malformed)
 	case seenRes[resTimeout]:
