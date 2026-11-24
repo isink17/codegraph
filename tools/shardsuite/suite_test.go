@@ -214,21 +214,32 @@ func TestInsideDirComparesFileIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for name, target := range map[string]string{"to-mod": mod, "to-pkg": filepath.Join(mod, "pkg"), "to-root": root} {
-		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
-			t.Fatal(err)
-		}
-	}
 	cases := map[string]bool{
 		mod:                                      true,
 		filepath.Join(mod, "pkg", "x", "y"):      true,
-		filepath.Join(root, "to-mod", "x"):       true,
-		filepath.Join(root, "to-pkg", "x", "y"):  true,
-		filepath.Join(root, "to-root", "mod"):    true,
 		filepath.Join(root, "mod2", "out"):       false,
-		filepath.Join(root, "to-root", "mod2"):   false,
 		filepath.Join(root, "out", "mod", "pkg"): false,
 		root:                                     false,
+	}
+	// Windows creates symlinks only with a privilege or developer mode.
+	symlinks := true
+	if err := os.Symlink(mod, filepath.Join(root, "to-mod")); err != nil {
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+		t.Logf("cannot create symlinks (%v): checking only the cases without one", err)
+		symlinks = false
+	}
+	if symlinks {
+		for name, target := range map[string]string{"to-pkg": filepath.Join(mod, "pkg"), "to-root": root, "dangling": filepath.Join(root, "missing")} {
+			if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cases[filepath.Join(root, "to-mod", "x")] = true
+		cases[filepath.Join(root, "to-pkg", "x", "y")] = true
+		cases[filepath.Join(root, "to-root", "mod")] = true
+		cases[filepath.Join(root, "to-root", "mod2")] = false
 	}
 	// APFS and NTFS are case-insensitive by default, most Linux filesystems are not.
 	upper := filepath.Join(root, "MOD")
@@ -245,8 +256,8 @@ func TestInsideDirComparesFileIdentity(t *testing.T) {
 			t.Errorf("insideDir(%s) = %v, %v; want %v", path, got, err, want)
 		}
 	}
-	if err := os.Symlink(filepath.Join(root, "missing"), filepath.Join(root, "dangling")); err != nil {
-		t.Fatal(err)
+	if !symlinks {
+		return
 	}
 	if _, err := insideDir(mod, filepath.Join(root, "dangling", "out")); err == nil {
 		t.Error("a dangling symlink must not be judged outside the module")
@@ -331,6 +342,102 @@ func TestUsedOutIsNeverReclaimed(t *testing.T) {
 		}
 		if b, err := os.ReadFile(p); err != nil || string(b) != tc.owner+"\n" {
 			t.Errorf("%s: owner record changed: %q %v", name, b, err)
+		}
+	}
+}
+
+func setHook(t *testing.T, hook *func(string), f func(string)) {
+	old := *hook
+	*hook = f
+	t.Cleanup(func() { *hook = old })
+}
+
+func tree(t *testing.T, dir string) string {
+	t.Helper()
+	var paths []string
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil {
+			paths = append(paths, p)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(paths, "\n")
+}
+
+// replaceOut moves the claimed -out aside and puts a directory owned by
+// another run in its place.
+func replaceOut(t *testing.T, out string) {
+	t.Helper()
+	if err := os.Rename(out, out+".claimed"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, out, ownerFile, `{"run_id":"foreign","pid":1,"host":"h","started":"s"}`)
+}
+
+// The claim is checked again once owner.json exists: a file that appeared in
+// -out, or -out now leading to another directory, refuses the run before it
+// writes anything there.
+func TestOutChangedAfterClaimIsRefused(t *testing.T) {
+	fixtureEnv(t)
+	for name, change := range map[string]func(t *testing.T, cfg config){
+		"foreign file": func(t *testing.T, cfg config) {
+			write(t, cfg.out, "summary.json", `{"all_passed":true}`)
+		},
+		"alias into the module": func(t *testing.T, cfg config) {
+			if err := os.Rename(cfg.out, cfg.out+".claimed"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(cfg.dir, cfg.out); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"another run's directory": func(t *testing.T, cfg config) { replaceOut(t, cfg.out) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := fixtureConfig(t)
+			cfg.dir = filepath.Join(t.TempDir(), "module")
+			if err := os.CopyFS(cfg.dir, os.DirFS(fixtureDir(t))); err != nil {
+				t.Fatal(err)
+			}
+			cfg.out = filepath.Join(t.TempDir(), "out")
+			module := tree(t, cfg.dir)
+			setHook(t, &afterOwnerCreated, func(string) { change(t, cfg) })
+			if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "choose a new -out") {
+				t.Errorf("got %v", err)
+			}
+			if got := tree(t, cfg.dir); got != module {
+				t.Errorf("the module changed:\n%s", got)
+			}
+			for _, f := range []string{"plan.json", "list.jsonl", "shards"} {
+				for _, dir := range []string{cfg.out, cfg.out + ".claimed"} {
+					if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+						t.Errorf("refused run wrote %s", filepath.Join(dir, f))
+					}
+				}
+			}
+			if b, err := os.ReadFile(filepath.Join(cfg.out, "summary.json")); err == nil && string(b) != "{\"all_passed\":true}\n" {
+				t.Errorf("refused run wrote a summary: %s", b)
+			}
+		})
+	}
+}
+
+// A run whose -out was taken over while it ran reports an error and writes no
+// summary, neither into the new directory nor into the one it claimed.
+func TestOwnerChangedDuringRunWritesNoSummary(t *testing.T) {
+	fixtureEnv(t)
+	cfg := fixtureConfig(t)
+	cfg.out = filepath.Join(t.TempDir(), "out")
+	setHook(t, &afterJobs, func(out string) { replaceOut(t, out) })
+	if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "not this run") {
+		t.Fatalf("got %v", err)
+	}
+	for _, dir := range []string{cfg.out, cfg.out + ".claimed"} {
+		if fileExists(filepath.Join(dir, "summary.json")) {
+			t.Errorf("summary.json written in %s", dir)
 		}
 	}
 }
@@ -631,9 +738,11 @@ func TestJobDeadlineCoversEveryPackageTimeout(t *testing.T) {
 			t.Errorf("%d packages, -jobs=%d: %s, want %s", len(tc.j.Packages), tc.jobs, got, tc.want)
 		}
 	}
-	cfg.timeout = math.MaxInt64 / 10
-	if got := jobDeadline(cfg, pkgs(50)); got != math.MaxInt64 {
-		t.Errorf("a deadline past the largest duration must saturate, got %s", got)
+	for _, timeout := range []time.Duration{math.MaxInt64 / 10, math.MaxInt64 - time.Second} {
+		cfg.timeout = timeout
+		if got := jobDeadline(cfg, pkgs(50)); got != math.MaxInt64 {
+			t.Errorf("-timeout %s: a deadline past the largest duration must saturate, got %s", timeout, got)
+		}
 	}
 	cfg.jobTimeout = time.Hour
 	if got := jobDeadline(cfg, pkgs(50)); got != time.Hour {

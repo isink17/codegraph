@@ -113,7 +113,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if cfg.listTimeout == 0 {
 		cfg.listTimeout = cfg.jobTimeout
 		if cfg.listTimeout == 0 {
-			cfg.listTimeout = cfg.timeout + jobSlack
+			cfg.listTimeout = min(cfg.timeout, math.MaxInt64-jobSlack) + jobSlack
 		}
 	}
 	lctx, lcancel := context.WithTimeout(ctx, cfg.listTimeout)
@@ -211,6 +211,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 			report(r)
 		}
 	}
+	afterJobs(out)
 	sum.Jobs = results
 	sum.Interrupted = ctx.Err() != nil
 	sum.AllPassed = !sum.Interrupted && len(results) > 0
@@ -325,7 +326,7 @@ func jobDeadline(cfg config, j job) time.Duration {
 	}
 	waves := time.Duration((max(len(j.Packages), 1) + cfg.jobs - 1) / cfg.jobs)
 	slot := cfg.timeout + time.Minute
-	if slot > (math.MaxInt64-jobSlack)/waves {
+	if slot < cfg.timeout || slot > (math.MaxInt64-jobSlack)/waves {
 		return math.MaxInt64
 	}
 	return waves*slot + jobSlack
@@ -369,6 +370,10 @@ func runJobs(ctx context.Context, jobs []job, limit int, run func(job) jobResult
 
 const ownerFile = "owner.json"
 
+// Test hooks: called right after owner.json is created, and right after the
+// jobs ran.
+var afterOwnerCreated, afterJobs = func(string) {}, func(string) {}
+
 // owner identifies the run that claimed an output directory.
 type owner struct {
 	RunID   string `json:"run_id"`
@@ -405,8 +410,10 @@ func claimOut(out string) (owner, error) {
 	if err := errors.Join(werr, f.Sync(), f.Close()); err != nil {
 		return owner{}, err
 	}
-	// Something other than a runner may have written here after the check.
-	if ents, err := os.ReadDir(out); err != nil || len(ents) != 1 {
+	afterOwnerCreated(out)
+	// Something other than a runner may have written here after the check, or
+	// -out may now lead to another directory.
+	if ents, err := os.ReadDir(out); err != nil || len(ents) != 1 || checkOwner(out, o.RunID) != nil {
 		return owner{}, errors.Join(usedOut(out), err)
 	}
 	return o, nil

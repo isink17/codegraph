@@ -120,7 +120,12 @@ How it works:
   same `-out` cannot both get it; the second exits 1 and, once the record is
   complete, names the owner. An
   `-out` is never reused or taken over, even after its run ended or was
-  killed: start a new run in a new directory. `plan.json` and `summary.json`
+  killed: start a new run in a new directory. Right after the claim the
+  runner checks that `-out` holds nothing but its own `owner.json`, so a file
+  that appeared there, or `-out` now leading to another directory, refuses
+  the run before it writes anything else. After the last process it checks
+  `owner.json` again; if the directory changed owner, it exits 1 and writes
+  no `summary.json`. `plan.json` and `summary.json`
   carry the run ID, and `parity` (and `-baseline` or `-timings` given a
   shardsuite OUT) reads shard events only when `plan.json` has the run ID of
   `owner.json`, so an unplanned or foreign directory is refused. That
@@ -131,7 +136,8 @@ How it works:
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
 - `-jobs` (default `GOMAXPROCS`, the number of usable cores) bounds how many
   `go test` processes run at once; further processes wait and start in plan
-  order. Each process also gets `-p` set to `-jobs`. Only the `rest` process
+  order. Each process also gets `-p` set to `-jobs`, which overrides a `-p`
+  in `GOFLAGS`, since command-line flags win. Only the `rest` process
   holds more than one package, so at most about twice `-jobs` test binaries
   run at once, instead of the number of processes times the core count. On a
   machine with at least as many cores as processes (the M3 Pro below: 11
@@ -156,8 +162,11 @@ finished, a half-written event line, or a listed test that never reported) or
 `inventory_mismatch` (a top-level test ran twice, or ran without being
 listed). Skipped tests are counted per package. The run passes only when
 every process is `pass` or `no_tests`; otherwise it exits 1 and prints each
-failing process and package. `OUT/summary.json` records every process, the
-`GOFLAGS` and `CGO_ENABLED` in effect, and the wall time.
+failing process and package. `OUT/summary.json` records the run ID, every
+process, the `GOFLAGS` and `CGO_ENABLED` in effect, and the wall time. Its
+`job_timeout` is the `-job-timeout` given, or the default's formula
+(`auto: ...`); the limit each process actually got is its own `job_timeout`
+under `jobs`, as in `plan.json`.
 
 On Ctrl-C, SIGTERM or SIGHUP it kills every `go test` process group
 (a test that puts its own children in a new process group is outside it), writes the summary
