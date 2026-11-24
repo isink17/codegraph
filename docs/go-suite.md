@@ -85,7 +85,7 @@ package that used to run one after another now run at the same time in
 separate processes, so anything shared outside the private temp directory
 (a fixed port, a file in the repository, a path under the home directory)
 can collide and fail. `TestMain` and `init` in a listed package must not
-print to stdout, because the list is parsed from that output; a list with
+print (stdout or stderr), because the list is parsed from that output; a list with
 unexpected lines is refused. That is a
 different execution than CI and `run.sh`, so a sharded pass does not replace
 them.
@@ -146,7 +146,8 @@ Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs
 (`run.sh`, then shardsuite with `-timings` from the first `run.sh` run,
 warm build cache) on a shared machine. The pairs used the runner as first
 added; one further pair on the runner as merged here gave 197 s against
-112 s with identical identities (7,882). Without `-timings` (round-robin)
+112 s with identical identities (7,882; the later base commit and this
+runner's own tests add tests). Without `-timings` (round-robin)
 the speedup was not measured. Peak RSS is the largest of
 the four runs, sampled once a second as the summed RSS of the whole process
 tree:
@@ -157,10 +158,9 @@ tree:
 | `shardsuite -timings` | 113 ± 6 s (107-120) | 833 s | 3.8 GiB |
 
 That is 1.75-1.85× faster per pair for about 40 % more CPU and almost twice
-the memory, with the same 7,778 test identities in every pair. Pair 2
-overlapped another test run on the machine and system daemons were busy at
-the start of the other pairs; pairs 3 and 4 were 192 s against 107-110 s
-(1.75× and 1.79×). These are
+the memory, with the same 7,778 test identities in every pair. Other
+processes, including other test runs, were present at the start of most
+runs; pairs 3 and 4 were 192 s against 107-110 s (1.75× and 1.79×). These are
 one machine and four pairs. As an estimate, not measured elsewhere: plan for
 at least 8 cores and about 4 GiB of free memory, and on 4 cores or fewer
 expect little gain, since the suite's
