@@ -108,7 +108,7 @@ var parserSemanticEpochs = map[string]int{
 
 // SameFileCallsOnly reports whether a profile's call edges only ever reach a
 // function the calling file itself declares (Dart lexical calls, Lua and Scala
-// local functions). A function such a profile indexed gets no caller from any
+// local functions, Swift's same-file passes). A function such a profile indexed gets no caller from any
 // other file, so its missing callers are no evidence that it is unused. Keyed by
 // family and language like the semantic epochs, so a build without the adapter
 // can read it off a graph another build wrote.
@@ -118,7 +118,7 @@ func SameFileCallsOnly(id string) bool {
 }
 
 var sameFileCallFamilies = map[string]bool{
-	"treesitter:dart": true, "treesitter:lua": true, "treesitter:scala": true,
+	"treesitter:dart": true, "treesitter:lua": true, "treesitter:scala": true, "treesitter:swift": true,
 }
 
 // NewProfile constructs a production profile with the current family/language

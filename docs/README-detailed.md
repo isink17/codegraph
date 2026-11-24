@@ -403,13 +403,17 @@ change it. `codegraph doctor` reports the same four states per repository under
 callers from every file. Each other indexed language is left out of `dead_code`
 and named in `data.skipped_languages` with its `graph_capability` and a `reason`:
 `no_call_edges` (symbols-only: Svelte, Solidity, and every language but Go and
-Python in a `CGO_ENABLED=0` index), `same_file_calls_only` (Dart, Lua and Scala,
-whose call edges reach only functions of the calling file),
+Python in a `CGO_ENABLED=0` index), `same_file_calls_only` (Dart, Lua, Scala and Swift,
+whose calls bind only to functions of the calling file),
 `mixed_parser_profiles` or `unknown_parser_provenance`. A skipped language's file
 may still use a symbol of a classified one, so a symbol is also withheld when
 any identifier segment of a reference in such a file names it (`Store.create`
 withholds `Store` and `create`), or when it is declared in a file such a file
-imports by a relative path (`./util` covers `util.ts` and `util/index.ts`). The key is absent when no language is skipped. A listed symbol
+imports. A relative import covers `util.ts` and `util/index.ts`; an alias such
+as `$lib/fmt` or `@/x`, which needs bundler config to resolve, covers every file
+whose path ends in `lib/fmt` or `x`; and re-exports from an imported file
+(`export * from './more'`) are followed. The key is absent when no language is
+skipped. A listed symbol
 is a candidate, not proof: exported API, reflection, dynamic dispatch and calls
 the resolver left unresolved are not callers in the graph.
 

@@ -194,7 +194,7 @@ func TestLanguageCapabilitiesAreSortedAndExplicit(t *testing.T) {
 
 func TestSameFileCallsOnly(t *testing.T) {
 	for id, want := range map[string]bool{
-		"treesitter:dart:v3": true, "treesitter:lua:v4": true, "treesitter:scala:v4": true, "treesitter:scala:v9": true,
+		"treesitter:dart:v3": true, "treesitter:lua:v4": true, "treesitter:scala:v4": true, "treesitter:scala:v9": true, "treesitter:swift:v7": true,
 		"treesitter:java:v14": false, "heuristic:scala:v1": false, "go-ast:go:v6": false, "treesitter": false, "": false,
 	} {
 		if got := SameFileCallsOnly(id); got != want {

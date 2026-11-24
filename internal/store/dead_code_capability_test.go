@@ -158,6 +158,8 @@ func TestFindDeadCodeWithholdsSymbolsNamedFromLanguagesWithoutCallGraph(t *testi
 	seedDeadCodeSymbol(t, s, repo.ID, svelte, "svelte", "greet")
 	seedDeadCodeReference(t, s, repo.ID, svelte, "formatName")
 	seedDeadCodeReference(t, s, repo.ID, svelte, "utils.trimAll")
+	// An import that matches no file withholds nothing.
+	seedDeadCodeImport(t, s, repo.ID, svelte, "svelte/store")
 
 	result, err := s.FindDeadCodeResult(ctx, repo.ID, 100, 0)
 	if err != nil {

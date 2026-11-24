@@ -10663,7 +10663,7 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 		return "", "", err
 	}
 
-	targets := map[string]bool{}
+	var imports [][2]string
 	rows, err = q.QueryContext(ctx, `
 		SELECT DISTINCT rf.path, fi.import_path
 		FROM files rf JOIN file_imports fi ON fi.file_id = rf.id
@@ -10673,45 +10673,22 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 		return "", "", err
 	}
 	for rows.Next() {
-		var importer, specifier string
-		if err := rows.Scan(&importer, &specifier); err != nil {
+		var e [2]string
+		if err := rows.Scan(&e[0], &e[1]); err != nil {
 			rows.Close()
 			return "", "", err
 		}
-		if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
-			targets[resolved] = true
-			targets[strings.TrimSuffix(resolved, path.Ext(resolved))] = true
-			targets[resolved+"/index"] = true
-		}
+		imports = append(imports, e)
 	}
 	if err := rows.Close(); err != nil {
 		return "", "", err
 	}
 	fileIDs := []int64{}
-	if len(targets) > 0 {
-		rows, err = q.QueryContext(ctx, `
-			SELECT id, path FROM files
-			WHERE repo_id = ? AND is_deleted = 0 AND language IN (`+placeholders(len(callCapable))+`)
-		`, append([]any{repoID}, callCapable...)...)
-		if err != nil {
-			return "", "", err
-		}
-		for rows.Next() {
-			var id int64
-			var p string
-			if err := rows.Scan(&id, &p); err != nil {
-				rows.Close()
-				return "", "", err
-			}
-			if targets[p] || targets[strings.TrimSuffix(p, path.Ext(p))] {
-				fileIDs = append(fileIDs, id)
-			}
-		}
-		if err := rows.Close(); err != nil {
+	if len(imports) > 0 {
+		if fileIDs, err = s.importedClassifiedFiles(ctx, repoID, callCapable, imports); err != nil {
 			return "", "", err
 		}
 	}
-
 	names := make([]string, 0, len(nameSet))
 	for name := range nameSet {
 		names = append(names, name)
@@ -10726,6 +10703,112 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 		return "", "", err
 	}
 	return string(namesJSON), string(filesJSON), nil
+}
+
+// importedClassifiedFiles returns the files of classified languages that the
+// given (importer path, specifier) pairs may load, plus every file those reach
+// through re-exports (`export * from './more'` in a barrel index). A specifier
+// whose first segment is an alias (`$lib/fmt`, `@/x`, `~/x`) cannot be
+// resolved without the bundler config, so it matches every file whose path
+// ends in the rest of the specifier, with the alias name kept when it has one
+// (`$lib/fmt` -> `.../lib/fmt`).
+func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callCapable []any, imports [][2]string) ([]int64, error) {
+	q := s.parserSemanticQueryer(ctx)
+	type file struct {
+		id         int64
+		path, stem string
+	}
+	var files []file
+	rows, err := q.QueryContext(ctx, `
+		SELECT id, path FROM files
+		WHERE repo_id = ? AND is_deleted = 0 AND language IN (`+placeholders(len(callCapable))+`)
+		ORDER BY id
+	`, append([]any{repoID}, callCapable...)...)
+	if err != nil {
+		return nil, err
+	}
+	pathOf := map[int64]string{}
+	for rows.Next() {
+		var f file
+		if err := rows.Scan(&f.id, &f.path); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		f.stem = strings.TrimSuffix(f.path, path.Ext(f.path))
+		files = append(files, f)
+		pathOf[f.id] = f.path
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	reexports := map[int64][]string{}
+	rows, err = q.QueryContext(ctx, `
+		SELECT file_id, source_specifier FROM scope_import_evidence
+		WHERE repo_id = ? AND is_reexport = 1 AND source_specifier <> ''
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id int64
+		var specifier string
+		if err := rows.Scan(&id, &specifier); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		reexports[id] = append(reexports[id], specifier)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	matches := func(importer, specifier string) []int64 {
+		exact := map[string]bool{}
+		if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
+			exact[resolved] = true
+			exact[strings.TrimSuffix(resolved, path.Ext(resolved))] = true
+			exact[resolved+"/index"] = true
+		}
+		suffix := ""
+		if strings.ContainsAny(specifier[:1], "$@~#") {
+			first, rest, _ := strings.Cut(specifier, "/")
+			suffix = path.Join(strings.TrimLeft(first, "$@~#"), rest)
+		}
+		var out []int64
+		for _, f := range files {
+			if exact[f.path] || exact[f.stem] ||
+				suffix != "" && suffix != "." && (f.stem == suffix || strings.HasSuffix(f.stem, "/"+suffix) ||
+					f.stem == suffix+"/index" || strings.HasSuffix(f.stem, "/"+suffix+"/index")) {
+				out = append(out, f.id)
+			}
+		}
+		return out
+	}
+	seen := map[int64]bool{}
+	var queue []int64
+	for _, e := range imports {
+		if strings.TrimSpace(e[1]) == "" {
+			continue
+		}
+		queue = append(queue, matches(e[0], e[1])...)
+	}
+	// Never nil: json_each('null') yields one NULL row, and NOT IN over a NULL
+	// withholds everything.
+	out := []int64{}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		for _, specifier := range reexports[id] {
+			queue = append(queue, matches(pathOf[id], specifier)...)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 // --- Embedding methods ---
