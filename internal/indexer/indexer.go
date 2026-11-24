@@ -1394,6 +1394,11 @@ func processFileTask(ctx context.Context, task fileTask, prev store.ExistingFile
 	if task.language == "swift" && task.swiftProject {
 		force = true
 	}
+	// Recorded under another adapter, or none (a language the indexing binary
+	// did not support). A missing adapter keeps the row, as profile planning does.
+	if hasPrev && task.language != "" && prev.Language != task.language {
+		force = true
+	}
 	// Eligibility under THIS run's configuration, decided before change
 	// detection rather than after it. The size cap is a property of the run,
 	// not of the file, so "nothing about the file changed" is not an answer to

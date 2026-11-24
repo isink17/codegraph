@@ -1804,10 +1804,14 @@ func QueryDBPragmas(ctx context.Context, db *sql.DB) (DBPragmas, error) {
 // parser, never reaches the file. It is one short interned-ish string per
 // row, which is why it is affordable here and the hash is not.
 // See ParseStateDescribesCurrentBytes.
+//
+// Language is the adapter language the row was recorded under ("" for none);
+// a binary whose adapter differs must parse the unchanged bytes again.
 type ExistingFileMeta struct {
 	SizeBytes   int64
 	MtimeUnixNS int64
 	ParseState  string
+	Language    string
 }
 
 // ExistingFiles returns active (non-deleted) file records for the repo,
@@ -1818,7 +1822,7 @@ type ExistingFileMeta struct {
 // when (size, mtime) differs from disk.
 func (s *Store) ExistingFiles(ctx context.Context, repoID int64) (map[string]ExistingFileMeta, error) {
 	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
-		SELECT path, size_bytes, mtime_unix_ns, parse_state
+		SELECT path, size_bytes, mtime_unix_ns, parse_state, language
 		FROM files
 		WHERE repo_id = ? AND is_deleted = 0
 	`, repoID)
@@ -1845,7 +1849,7 @@ func (s *Store) ExistingFilesForPaths(ctx context.Context, repoID int64, paths [
 		chunk := paths[start:end]
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
 		query := `
-			SELECT path, size_bytes, mtime_unix_ns, parse_state
+			SELECT path, size_bytes, mtime_unix_ns, parse_state, language
 			FROM files
 			WHERE repo_id = ? AND is_deleted = 0 AND path IN (` + placeholders + `)
 		`
@@ -1894,7 +1898,7 @@ func scanExistingFileMetasInto(rows *sql.Rows, dst map[string]ExistingFileMeta) 
 	for rows.Next() {
 		var path string
 		var meta ExistingFileMeta
-		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ParseState); err != nil {
+		if err := rows.Scan(&path, &meta.SizeBytes, &meta.MtimeUnixNS, &meta.ParseState, &meta.Language); err != nil {
 			return err
 		}
 		dst[path] = meta
