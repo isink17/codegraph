@@ -922,6 +922,38 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}
 		return owner + "::" + strings.Join(p, "::")
 	}
+	// importedTypeItem reports a module or non-function item at path p that
+	// module owner can see. rustc resolves each namespace of an import on its
+	// own, so an import whose type-namespace item owner cannot see binds only
+	// a value, and a path through it finds a glob or prelude item instead.
+	// `pub(super)` and `pub(in path)` modules are not proven here.
+	importedTypeItem := func(p, owner string, caller rustScopeFile) bool {
+		i := strings.LastIndex(p, "::")
+		root := rootOfFile[caller.id]
+		if i < 0 || root == "" {
+			return false
+		}
+		parent, name := p[:i], p[i+2:]
+		for _, m := range decls {
+			if m.owner != parent || m.name != name || rootOfFile[m.file] != root {
+				continue
+			}
+			switch m.visibility {
+			case "public", "restricted:crate":
+				return true
+			case "private", "restricted:self":
+				if owner == parent || strings.HasPrefix(owner, parent+"::") {
+					return true
+				}
+			}
+		}
+		for _, c := range byQ[p] {
+			if c.kind != "function" && eligible(c, caller) && inCallerCrate(c, caller) {
+				return true
+			}
+		}
+		return false
+	}
 	// exportCandidates walks the re-exports of one crate root. A module path is
 	// only meaningful inside its crate, so another root's `crate::x` re-exports
 	// are not this module's.
@@ -1117,16 +1149,19 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			// that name wins: beside it an import of a type-namespace item would
 			// not compile, so the import binds a value or macro. Two imports of
 			// the segment (legal in different namespaces, which are not
-			// modelled here), or one naming no module path, leave the call
-			// unresolved.
+			// modelled here), one naming no module path, or one whose module
+			// or type the caller's module cannot see leave the call unresolved.
 			if seg, rest, qualified := strings.Cut(dst, "::"); !explicit && qualified && seg != "" && seg != "crate" && seg != "self" && seg != "super" && !ownTypeItem(owner, seg, caller) {
 				var segPaths []string
 				for _, im := range importsBy[file] {
-					if p := resolvePath(im.source, owner); im.owner == owner && !im.glob && im.local == seg && !slices.Contains(segPaths, p) {
+					if im.owner != owner || im.glob || im.local != seg {
+						continue
+					}
+					if p := resolvePath(im.source, owner); !slices.Contains(segPaths, p) {
 						segPaths = append(segPaths, p)
 					}
 				}
-				if len(segPaths) > 1 || (len(segPaths) == 1 && segPaths[0] == "") {
+				if len(segPaths) > 1 || (len(segPaths) == 1 && (segPaths[0] == "" || !importedTypeItem(segPaths[0], owner, caller))) {
 					continue
 				}
 				if len(segPaths) == 1 {

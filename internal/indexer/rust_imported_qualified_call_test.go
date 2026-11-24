@@ -139,6 +139,12 @@ var rustImportedQualifiedCases = []struct {
 		"b.rs":   "pub fn f() {}",
 		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
 	}, "", "a::f", "b.rs:crate::b::f"},
+	// A private module is visible in its parent module and every module
+	// nested in it.
+	{"private module imported from a nested module", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod c {\n    pub fn f() {}\n}\npub mod q {\n    use super::c;\n    pub fn k() {\n        c::f();\n    }\n}\n",
+	}, "", "c::f", "m.rs:crate::m::c::f"},
 	{"lifetime named like the segment", tree{
 		"lib.rs": "mod a; mod m;",
 		"a.rs":   "pub fn f() {}",
@@ -189,6 +195,27 @@ var rustImportedQualifiedCases = []struct {
 		"lib.rs": "mod m;",
 		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\npub fn c() {\n    let _ = ::std::fs::read(\"x\");\n}\n",
 	}, "", "::std::fs::read", ""},
+	// An explicit import shadows the glob even when it names an extern
+	// crate; rustc calls the standard library, not the glob's module.
+	{"leading :: import beside a glob module of that name", tree{
+		"lib.rs": "mod g; mod m;",
+		"g.rs":   "pub mod fs {\n    pub fn read(_p: &str) {}\n}\n",
+		"m.rs":   "use ::std::fs;\nuse crate::g::*;\npub fn c() {\n    let _ = fs::read(\"x\");\n}\n",
+	}, "", "fs::read", ""},
+	// rustc resolves each namespace of an import on its own: a module or type
+	// the importer cannot see is not imported, so the path's first segment
+	// finds the glob's module or the prelude type instead.
+	{"import of a private module beside a pub fn of that name", tree{
+		"lib.rs": "mod p; mod q; mod m;",
+		"p.rs":   "mod c {\n    pub fn f() {}\n}\npub fn c() {}\n",
+		"q.rs":   "pub mod c {\n    pub fn f() {}\n}\n",
+		"m.rs":   "use crate::p::c;\nuse crate::q::*;\npub fn k() {\n    c::f();\n}\n",
+	}, "", "c::f", ""},
+	{"import of a private struct beside a pub fn of that name", tree{
+		"lib.rs": "mod p; mod m;",
+		"p.rs":   "#[allow(non_snake_case)]\npub fn String() {}\nstruct String {\n    x: u8,\n}\nimpl String {\n    pub fn new() -> u8 {\n        0\n    }\n}\n",
+		"m.rs":   "use crate::p::String;\npub fn k() -> std::string::String {\n    String::new()\n}\n",
+	}, "", "String::new", ""},
 	// rustc calls the glob's module `c`; a value-only import of `c` is not
 	// followed, so the call stays unresolved rather than guessed.
 	{"value import beside a glob module of that name", tree{
