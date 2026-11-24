@@ -80,14 +80,18 @@ It is opt-in developer feedback. **`scripts/go-suite/run.sh` stays the only
 evidence that "the full suite passed"**, for release checks and any statement
 that has to hold. Sharding changes how tests are grouped into processes:
 each shard runs its package's `TestMain` and package-level setup again, and
-tests that would have run in one process no longer share it. That is a
+tests that would have run in one process no longer share it. Tests of one
+package that used to run one after another now run at the same time in
+separate processes, so anything shared outside the private temp directory
+(a fixed port, a file in the repository, a path under the home directory)
+can collide and fail. That is a
 different execution than CI and `run.sh`, so a sharded pass does not replace
 them.
 
 How it works:
 
 - `go test -json -list .` over the requested packages gives the expected
-  top-level tests, examples and fuzz seeds per package. It runs with the same
+  top-level tests, examples and fuzz targets per package. It runs with the same
   environment as the shards, so `GOFLAGS` (for example `-tags=...`) and
   `CGO_ENABLED` decide which files and tests exist, exactly as they do for
   the run itself.
@@ -99,6 +103,9 @@ How it works:
   time, longest first; without it, sorted names are dealt round-robin. Both
   are deterministic. A package that fails to list, or has fewer than two
   tests, runs unsharded.
+- Keep `-out` outside the module (the default is a new temp directory): a
+  relative `-out` is resolved against the current directory, and leftover
+  `shards/*/tmp` trees inside the module would be picked up by `./...`.
 - Every process gets its own directory `OUT/shards/<job>/` with
   `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
@@ -129,18 +136,22 @@ subtest name is normalized, because each process has a different temp root.
 
 Hardware: sharding helps when cores are idle. With the default
 `store=3, indexer=3, diff=2` it runs nine processes at once. Measured on an
-Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs on a
-shared, not idle, machine:
+Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs
+(`run.sh`, then shardsuite) on a shared machine. Peak RSS is the largest of
+the four runs, sampled once a second as the summed RSS of the whole process
+tree:
 
-| | wall (mean ± stdev) | CPU user+sys | peak RSS, whole process tree |
+| | wall (mean ± stdev) | CPU user+sys | peak RSS (max of 4, sampled) |
 |---|---|---|---|
 | `run.sh` | 204 ± 15 s (192-222) | 601 s | 2.1 GiB |
 | `shardsuite -timings` | 113 ± 6 s (107-120) | 833 s | 3.8 GiB |
 
 That is 1.75-1.85× faster per pair for about 40 % more CPU and almost twice
-the memory, with the same 7,778 test identities in every pair. Plan for at
-least 8 cores and about 4 GiB of free memory. On 4 cores or fewer, expect little
-gain, since the suite's total CPU work then exceeds what the cores can run in
+the memory, with the same 7,778 test identities in every pair. The first two
+pairs overlapped other test runs on the machine; the two quiet pairs were
+192 s against 107-110 s (1.75× and 1.79×). Plan for at least 8 cores and about 4 GiB
+of free memory. On 4 cores or fewer, expect little gain, since the suite's
+total CPU work then exceeds what the cores can run in
 parallel. Do not run it beside another full suite on the same machine.
 
 `CGO_ENABLED=0`: the list and the run both honor it, so the tree-sitter

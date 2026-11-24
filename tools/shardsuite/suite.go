@@ -81,6 +81,9 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 		return sum, err
 	}
 	lc.Dir, lc.Env, lc.Stderr = cfg.dir, isolatedEnv(listTmp), listErrLog
+	setProcGroup(lc)
+	lc.Cancel = func() error { return killTree(lc) }
+	lc.WaitDelay = 10 * time.Second
 	listOut, listErr := lc.Output()
 	listErrLog.Close()
 	if ctx.Err() != nil {

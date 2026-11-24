@@ -50,6 +50,7 @@ func fixtureEnv(t *testing.T, kv ...string) {
 	for _, k := range []string{"FIXTURE_FAIL", "FIXTURE_HANG", "FIXTURE_PIDFILE", "GOFLAGS"} {
 		t.Setenv(k, "")
 	}
+	t.Setenv("GOWORK", "off")
 	for i := 0; i < len(kv); i += 2 {
 		t.Setenv(kv[i], kv[i+1])
 	}
@@ -126,6 +127,25 @@ func TestFixtureShardedRunMatchesUnshardedRun(t *testing.T) {
 	}
 }
 
+func TestFixtureParityMismatchFailsAPassingRun(t *testing.T) {
+	fixtureEnv(t)
+	cfg := fixtureConfig(t)
+	cfg.baseline = write(t, t.TempDir(), "base.jsonl",
+		`{"Action":"pass","Package":"example.com/fixture/a","Test":"TestGone"}`)
+	sum, err := runSuite(context.Background(), cfg, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.AllPassed || sum.Parity == nil || sum.Parity.OK {
+		t.Fatalf("every shard passed, but parity failed: %+v", sum.Parity)
+	}
+	for _, j := range sum.Jobs {
+		if !j.passed() {
+			t.Errorf("%s: %s", j.Name, j.Result)
+		}
+	}
+}
+
 func TestFixtureFailingTestFailsTheRun(t *testing.T) {
 	fixtureEnv(t, "FIXTURE_FAIL", "1")
 	sum, err := runSuite(context.Background(), fixtureConfig(t), io.Discard)
@@ -188,7 +208,8 @@ func TestFixtureJobTimeoutKillsTheTestBinary(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	fixtureEnv(t, "FIXTURE_HANG", "1", "FIXTURE_PIDFILE", pidFile)
 	cfg := fixtureConfig(t)
-	cfg.jobTimeout = 8 * time.Second
+	// Covers linking the fixture binary too, so it leaves room for a loaded machine.
+	cfg.jobTimeout = 25 * time.Second
 	sum, err := runSuite(context.Background(), cfg, io.Discard)
 	if err != nil {
 		t.Fatal(err)

@@ -177,3 +177,22 @@ func TestBuildJobsAssignsEveryPackageOnce(t *testing.T) {
 	}
 	assertCoversOnce(t, shards, names(9))
 }
+
+func TestBuildJobsKeepsJobNamesUnique(t *testing.T) {
+	two := []string{"TestA", "TestB"}
+	jobs, err := buildJobs([]string{"x/a/b", "y/a/b"}, map[string][]string{"x/a/b": two, "y/a/b": two}, nil,
+		map[string]int{"x/a/b": 2, "y/a/b": 2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, j := range jobs {
+		if seen[j.Name] {
+			t.Fatalf("duplicate job name %s", j.Name)
+		}
+		seen[j.Name] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("jobs %v", seen)
+	}
+}

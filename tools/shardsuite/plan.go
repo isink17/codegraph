@@ -171,6 +171,7 @@ func partition(names []string, k int, weight map[string]float64) ([][]string, []
 func buildJobs(pkgs []string, names map[string][]string, failed map[string]bool, heavy map[string]int, timings map[string]map[string]float64) ([]job, error) {
 	var jobs []job
 	rest := job{Name: "rest", Expected: map[string][]string{}}
+	slugs := map[string]string{}
 	for _, p := range pkgs {
 		k := heavy[p]
 		if k < 2 || failed[p] || len(names[p]) < 2 {
@@ -179,6 +180,11 @@ func buildJobs(pkgs []string, names map[string][]string, failed map[string]bool,
 			rest.Tests += len(names[p])
 			continue
 		}
+		slug := jobSlug(p)
+		if other, dup := slugs[slug]; dup && other != p {
+			slug = strings.NewReplacer("/", "_", ".", "_").Replace(p)
+		}
+		slugs[slug] = p
 		bins, load := partition(names[p], k, timings[p])
 		for i, b := range bins {
 			re := runRegex(b)
@@ -186,7 +192,7 @@ func buildJobs(pkgs []string, names map[string][]string, failed map[string]bool,
 				return nil, fmt.Errorf("%s shard %d: -run pattern is %d bytes, too long for a Windows command line; raise K", p, i, len(re))
 			}
 			jobs = append(jobs, job{
-				Name: fmt.Sprintf("%s.%d", jobSlug(p), i), Packages: []string{p}, Run: re,
+				Name: fmt.Sprintf("%s.%d", slug, i), Packages: []string{p}, Run: re,
 				Expected: map[string][]string{p: b}, Weight: load[i], Tests: len(b),
 			})
 		}
