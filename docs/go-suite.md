@@ -61,3 +61,88 @@ compete for the same cores, and timings and timeouts stop being comparable.
 
 Results are local to the machine and toolchain that ran them. They are not
 GitHub Actions results, and a macOS run says nothing about Linux or Windows.
+
+## Faster local feedback: the opt-in sharded runner
+
+`internal/store`, `internal/indexer` and `internal/diff` run their tests one
+after another and take most of the suite's wall time while other cores sit
+idle. `tools/shardsuite` splits those packages by top-level test across
+separate `go test` processes and runs every other package in one ordinary
+`go test`, all at the same time:
+
+    go run ./tools/shardsuite                              # ./..., default shards
+    go run ./tools/shardsuite -timings OUT_OF_EARLIER_RUN  # balance shards by test time
+    go run ./tools/shardsuite -baseline RUN_SH_OUT         # also compare test identities
+    go run ./tools/shardsuite -shard ./internal/store=4,./internal/indexer=4 ./internal/...
+    go run ./tools/shardsuite parity RUN_SH_OUT SHARDED_OUT
+
+It is opt-in developer feedback. **`scripts/go-suite/run.sh` stays the only
+evidence that "the full suite passed"**, for release checks and any statement
+that has to hold. Sharding changes how tests are grouped into processes:
+each shard runs its package's `TestMain` and package-level setup again, and
+tests that would have run in one process no longer share it. That is a
+different execution than CI and `run.sh`, so a sharded pass does not replace
+them.
+
+How it works:
+
+- `go test -json -list .` over the requested packages gives the expected
+  top-level tests, examples and fuzz seeds per package. It runs with the same
+  environment as the shards, so `GOFLAGS` (for example `-tags=...`) and
+  `CGO_ENABLED` decide which files and tests exist, exactly as they do for
+  the run itself.
+- A sharded package is split into `K` disjoint sets, each run with
+  `-run '^(TestA|TestB|...)$'`. Names are regex-quoted and anchored, so
+  `TestA` never also selects `TestAB`. Subtests run inside their parent.
+  With `-timings` (an `events.jsonl`, a `run.sh` OUT directory or an earlier
+  shardsuite OUT directory) sets are balanced by each test's earlier elapsed
+  time, longest first; without it, sorted names are dealt round-robin. Both
+  are deterministic. A package that fails to list, or has fewer than two
+  tests, runs unsharded.
+- Every process gets its own directory `OUT/shards/<job>/` with
+  `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
+  `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
+- `-timeout` (default 20m) is passed to every test binary, as in `run.sh`.
+  `-job-timeout` (default `-timeout` + 5m) kills a whole process tree that
+  is still running, for example a hung build.
+
+Each process is classified as `pass`, `no_tests`, `test_fail`, `build_fail`,
+`timeout` (a test binary hit `-timeout`, or the job was killed at
+`-job-timeout`), `incomplete` (interrupted, a package that started but never
+finished, a half-written event line, or a listed test that never reported) or
+`inventory_mismatch` (a top-level test ran twice, or ran without being
+listed). Skipped tests are counted per package. The run passes only when
+every process is `pass` or `no_tests`; otherwise it exits 1 and prints each
+failing process and package. `OUT/summary.json` records every process, the
+`GOFLAGS` and `CGO_ENABLED` in effect, and the wall time.
+
+On Ctrl-C or SIGTERM it kills every child process tree, writes the summary
+with `interrupted: true`, prints `INCOMPLETE` and exits 130. A run that was
+interrupted is never reported as passed, even when every finished shard
+passed.
+
+Pass counts matching is not proof of equivalence. `-baseline` (or the
+`parity` subcommand) compares the multiset of package + test identities,
+subtests included, with an unsharded `run.sh` run: every identity must be
+reported exactly once with the same action. A `t.TempDir` path embedded in a
+subtest name is normalized, because each process has a different temp root.
+
+Hardware: sharding helps when cores are idle. With the default
+`store=3, indexer=3, diff=2` it runs nine processes at once; on an 11-core
+Apple M3 Pro that roughly halved wall time for about 40-50 % more total CPU
+(measurements below). On 4 cores or fewer, expect little gain, since the
+suite's total CPU work then exceeds what the cores can run in parallel. Do not
+run it beside another full suite on the same machine.
+
+`CGO_ENABLED=0`: the list and the run both honor it, so the tree-sitter
+adapters that need cgo are compiled out of both and the inventory matches
+what that build can run. Compare a no-CGO sharded run only with a no-CGO
+`run.sh` baseline.
+
+Platforms: written in Go with the standard library only. On macOS and Linux
+each `go test` runs in its own process group, so a kill reaches the test
+binary too. On Windows it uses `taskkill /T /F`; a shard's `-run` pattern
+must also fit the 32,767-character command line, so the runner refuses a
+shard whose pattern exceeds 30,000 bytes and asks for a larger `K`. The
+runner was not executed on Windows; Windows support is cross-compiled and
+reasoned, not run.
