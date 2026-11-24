@@ -25,6 +25,8 @@ type config struct {
 	baseline   string
 	timeout    time.Duration
 	jobTimeout time.Duration
+	// listTimeout bounds the list step; it defaults to jobTimeout.
+	listTimeout time.Duration
 }
 
 type shardSpec struct {
@@ -64,8 +66,13 @@ func parseShardSpec(s string) ([]shardSpec, error) {
 }
 
 // testListRE matches what `go test -list .` prints for runnable top-level
-// functions. Benchmarks are listed too but never run without -bench.
-var testListRE = regexp.MustCompile(`^(Test|Example|Fuzz)[^\s]*$`)
+// functions. Benchmarks are listed too but never run without -bench; the
+// trailer is go test's per-package summary line.
+var (
+	testListRE    = regexp.MustCompile(`^(Test|Example|Fuzz)[^\s]*$`)
+	benchListRE   = regexp.MustCompile(`^Benchmark[^\s]*$`)
+	listTrailerRE = regexp.MustCompile(`^(ok  |\?   |FAIL)\t`)
+)
 
 // parseList reads `go test -json -list . PKGS` and returns every package seen
 // with its top-level test names, plus packages that failed to build. A list
@@ -76,6 +83,7 @@ func parseList(data []byte) (pkgs []string, names map[string][]string, failed ma
 	failed = map[string]bool{}
 	seen := map[string]bool{}
 	done := map[string]bool{}
+	stray := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
 	for sc.Scan() {
@@ -98,8 +106,15 @@ func parseList(data []byte) (pkgs []string, names map[string][]string, failed ma
 		}
 		switch e.Action {
 		case "output":
-			if line := strings.TrimSuffix(e.Output, "\n"); testListRE.MatchString(line) {
+			line := strings.TrimSuffix(e.Output, "\n")
+			switch {
+			case testListRE.MatchString(line):
 				names[e.Package] = append(names[e.Package], line)
+			case benchListRE.MatchString(line), listTrailerRE.MatchString(line):
+			default:
+				if _, ok := stray[e.Package]; !ok {
+					stray[e.Package] = line
+				}
 			}
 		case "fail":
 			failed[e.Package] = true
@@ -112,6 +127,11 @@ func parseList(data []byte) (pkgs []string, names map[string][]string, failed ma
 	for _, p := range pkgs {
 		if !done[p] {
 			return nil, nil, nil, fmt.Errorf("test list for %s never finished", p)
+		}
+		// Output from TestMain or init could have swallowed a test name, so a
+		// listed test would silently drop out of every shard.
+		if line, ok := stray[p]; ok && !failed[p] {
+			return nil, nil, nil, fmt.Errorf("test list for %s has unexpected output %q; TestMain or init must not print", p, line)
 		}
 	}
 	for p, ns := range names {

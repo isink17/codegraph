@@ -65,6 +65,11 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if out, err = filepath.Abs(out); err != nil {
 		return sum, err
 	}
+	if dir, err := filepath.Abs(cfg.dir); err == nil {
+		if rel, err := filepath.Rel(dir, out); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return sum, fmt.Errorf("-out %s is inside the module; leftover shard temp trees would be picked up by ./...", out)
+		}
+	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return sum, err
 	}
@@ -75,7 +80,10 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if err := os.MkdirAll(filepath.Join(listTmp, "go"), 0o755); err != nil {
 		return sum, err
 	}
-	lctx, lcancel := context.WithTimeout(ctx, cfg.jobTimeout)
+	if cfg.listTimeout == 0 {
+		cfg.listTimeout = cfg.jobTimeout
+	}
+	lctx, lcancel := context.WithTimeout(ctx, cfg.listTimeout)
 	defer lcancel()
 	lc := exec.CommandContext(lctx, "go", append([]string{"test", "-json", "-list", "."}, cfg.patterns...)...)
 	listErrLog, err := os.Create(filepath.Join(out, "list-stderr.log"))
@@ -96,7 +104,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	}
 	_ = os.WriteFile(filepath.Join(out, "list.jsonl"), listOut, 0o644)
 	if lctx.Err() != nil {
-		return sum, fmt.Errorf("go test -list did not finish within -job-timeout %s", cfg.jobTimeout)
+		return sum, fmt.Errorf("go test -list did not finish within -job-timeout %s", cfg.listTimeout)
 	}
 	pkgs, names, failed, err := parseList(listOut)
 	if err != nil {

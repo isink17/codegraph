@@ -84,7 +84,9 @@ tests that would have run in one process no longer share it. Tests of one
 package that used to run one after another now run at the same time in
 separate processes, so anything shared outside the private temp directory
 (a fixed port, a file in the repository, a path under the home directory)
-can collide and fail. That is a
+can collide and fail. `TestMain` and `init` in a listed package must not
+print to stdout, because the list is parsed from that output; a list with
+unexpected lines is refused. That is a
 different execution than CI and `run.sh`, so a sharded pass does not replace
 them.
 
@@ -105,9 +107,9 @@ How it works:
   tests, runs unsharded. The listed packages must match `go list` for the
   same patterns, and a list that was cut short is an error, so a package can
   never drop out of the run unnoticed.
-- Keep `-out` outside the module (the default is a new temp directory): a
-  relative `-out` is resolved against the current directory, and leftover
-  `shards/*/tmp` trees inside the module would be picked up by `./...`.
+- `-out` must be outside the module (the default is a new temp directory);
+  leftover `shards/*/tmp` trees inside it would be picked up by `./...`, so
+  the runner refuses such a path.
 - Every process gets its own directory `OUT/shards/<job>/` with
   `events.jsonl`, `stderr.log`, `result.json` and a private `tmp/` that
   `TMPDIR`, `TMP`, `TEMP` and `GOTMPDIR` point at.
@@ -125,7 +127,8 @@ every process is `pass` or `no_tests`; otherwise it exits 1 and prints each
 failing process and package. `OUT/summary.json` records every process, the
 `GOFLAGS` and `CGO_ENABLED` in effect, and the wall time.
 
-On Ctrl-C, SIGTERM or SIGHUP it kills every child process tree, writes the summary
+On Ctrl-C, SIGTERM or SIGHUP it kills every `go test` process group
+(a test that puts its own children in a new process group is outside it), writes the summary
 with `interrupted: true`, prints `INCOMPLETE` and exits 130. A run that was
 interrupted is never reported as passed, even when every finished shard
 passed. A runner killed with SIGKILL cannot do this, and its `go test`
@@ -140,8 +143,10 @@ subtest name is normalized, because each process has a different temp root.
 Hardware: sharding helps when cores are idle. With the default
 `store=3, indexer=3, diff=2` it runs nine processes at once. Measured on an
 Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs
-(`run.sh`, then shardsuite as first added; later changes only tightened its
-checks) on a shared machine. Peak RSS is the largest of
+(`run.sh`, then shardsuite with `-timings` from the first `run.sh` run,
+warm build cache) on a shared machine. The pairs used the runner as first
+added; one further pair on the final runner gave 198 s against 114 s with
+identical identities. Peak RSS is the largest of
 the four runs, sampled once a second as the summed RSS of the whole process
 tree:
 
@@ -151,11 +156,12 @@ tree:
 | `shardsuite -timings` | 113 ± 6 s (107-120) | 833 s | 3.8 GiB |
 
 That is 1.75-1.85× faster per pair for about 40 % more CPU and almost twice
-the memory, with the same 7,778 test identities in every pair. Other test
-processes ran on the machine during the first two pairs; the last two, with
-less overlap in process snapshots, were 192 s against 107-110 s (1.75× and
-1.79×). Plan for at least 8 cores and about 4 GiB
-of free memory. On 4 cores or fewer, expect little gain, since the suite's
+the memory, with the same 7,778 test identities in every pair. Other
+test processes were seen at the start of runs in the first three pairs; the
+last two pairs were 192 s against 107-110 s (1.75× and 1.79×). These are
+one machine and four pairs. As an estimate, not measured elsewhere: plan for
+at least 8 cores and about 4 GiB of free memory, and on 4 cores or fewer
+expect little gain, since the suite's
 total CPU work then exceeds what the cores can run in
 parallel. Do not run it beside another full suite on the same machine.
 

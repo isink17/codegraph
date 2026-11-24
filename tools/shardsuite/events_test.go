@@ -79,6 +79,10 @@ func TestClassifyCountsSubtestsButMatchesTopLevel(t *testing.T) {
 func TestNormalizeTestName(t *testing.T) {
 	a := "TestEscape//private/tmp/x/s1/tmp/TestEscape462961359/001/repo-b/secret.go"
 	b := "TestEscape//var/folders/zz/TestEscape4211070298/001/repo-b/secret.go"
+	sp := "TestEscape//Users/John Doe/tmp/TestEscape98765432/001/repo-b/secret.go"
+	if normalizeTestName(sp) != normalizeTestName(a) {
+		t.Errorf("temp path with a space: %q", normalizeTestName(sp))
+	}
 	w := `TestEscape/C:\Users\me\AppData\Local\Temp\TestEscape12345678\001\repo-b/secret.go`
 	if normalizeTestName(a) != normalizeTestName(b) || normalizeTestName(a) != normalizeTestName(w) {
 		t.Fatalf("%q / %q / %q", normalizeTestName(a), normalizeTestName(b), normalizeTestName(w))

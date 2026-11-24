@@ -42,7 +42,7 @@ func fixtureConfig(t *testing.T) config {
 	return config{
 		dir: fixtureDir(t), out: t.TempDir(), patterns: []string{"./..."},
 		shards:  []shardSpec{{Pattern: "./a", K: 3}},
-		timeout: time.Minute, jobTimeout: 2 * time.Minute,
+		timeout: time.Minute, jobTimeout: 2 * time.Minute, listTimeout: 2 * time.Minute,
 	}
 }
 
@@ -149,7 +149,7 @@ func TestFixtureParityMismatchFailsAPassingRun(t *testing.T) {
 func TestFixtureHangingListIsBounded(t *testing.T) {
 	fixtureEnv(t, "FIXTURE_HANG_MAIN", "1")
 	cfg := fixtureConfig(t)
-	cfg.jobTimeout = 10 * time.Second
+	cfg.listTimeout = 10 * time.Second
 	_, err := runSuite(context.Background(), cfg, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "-job-timeout") {
 		t.Fatalf("want a bounded list, got %v", err)
@@ -176,6 +176,17 @@ func TestFixtureTruncatedListFailsTheRun(t *testing.T) {
 	_, err = runSuite(context.Background(), fixtureConfig(t), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "example.com/fixture/tagged") {
 		t.Fatalf("want the missing package named, got %v", err)
+	}
+}
+
+func TestOutInsideModuleIsRefused(t *testing.T) {
+	cfg := fixtureConfig(t)
+	cfg.out = filepath.Join(cfg.dir, "out")
+	if _, err := runSuite(context.Background(), cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "inside the module") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(cfg.out); err == nil {
+		t.Error("refused -out was created")
 	}
 }
 
@@ -308,6 +319,7 @@ func TestSIGINTKillsChildrenAndExitsIncomplete(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	pid := waitForPID(t, pidFile)
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)

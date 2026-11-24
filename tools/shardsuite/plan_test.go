@@ -60,6 +60,7 @@ func TestParseList(t *testing.T) {
 	// A list cut short must never become a smaller inventory.
 	for name, cut := range map[string]string{
 		"half line":          stream + "\n" + `{"Action":"start","Pack`,
+		"TestMain output":    strings.Replace(stream, `"Output":"TestA\n"`, `"Output":"setupTestA\n"`, 1),
 		"unfinished package": stream + "\n" + `{"Action":"start","Package":"m/z"}` + "\n" + `{"Action":"output","Package":"m/z","Output":"TestZ\n"}`,
 	} {
 		if _, _, _, err := parseList([]byte(cut)); err == nil {

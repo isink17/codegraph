@@ -244,7 +244,7 @@ func contains(s []string, v string) bool {
 
 // tempPathRE matches a t.TempDir path embedded in a subtest name; each process
 // gets a different random directory, so it cannot be part of the identity.
-var tempPathRE = regexp.MustCompile(`[/\\]\S*[/\\](Test\w*?)\d{5,}[/\\](\d{3})[/\\]`)
+var tempPathRE = regexp.MustCompile(`[/\\][^\n]*[/\\](Test\w*?)\d{5,}[/\\](\d{3})[/\\]`)
 
 func normalizeTestName(n string) string {
 	return tempPathRE.ReplaceAllString(n, "/<TEMPDIR>/$1/$2/")
