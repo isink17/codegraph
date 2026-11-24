@@ -106,6 +106,39 @@ var rustImportedQualifiedCases = []struct {
 		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
 		"m.rs":   "use crate::a::T;\npub fn g<U>() -> T {\n    T::make()\n}\n",
 	}, "", "T::make", "a.rs:crate::a::T::make"},
+	// The caller's own module decides which of two same-named imports
+	// applies: an inline module's import, or the file module's beside it.
+	{"inline module import beside a file-level one", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\nmod inner {\n    use crate::b as x;\n    pub fn c() {\n        x::f();\n    }\n}\n",
+	}, "", "x::f", "b.rs:crate::b::f"},
+	{"inline module impl method import beside a file-level one", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\nmod inner {\n    use crate::b as x;\n    pub struct S;\n    impl S {\n        pub fn k() {\n            x::f();\n        }\n    }\n}\n",
+	}, "", "x::f", "b.rs:crate::b::f"},
+	{"file-level import beside an inline module's", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub fn f() {}",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a as x;\npub fn c() {\n    x::f();\n}\nmod inner {\n    use crate::b as x;\n}\n",
+	}, "", "x::f", "a.rs:crate::a::f"},
+	// A re-export inside the imported module is followed, as rustc does.
+	{"glob re-export behind the imported module", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub use crate::b::*;",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "b.rs:crate::b::f"},
+	{"named re-export behind the imported module", tree{
+		"lib.rs": "mod a; mod b; mod m;",
+		"a.rs":   "pub use crate::b::f;",
+		"b.rs":   "pub fn f() {}",
+		"m.rs":   "use crate::a;\npub fn c() {\n    a::f();\n}\n",
+	}, "", "a::f", "b.rs:crate::b::f"},
 	{"lifetime named like the segment", tree{
 		"lib.rs": "mod a; mod m;",
 		"a.rs":   "pub fn f() {}",
@@ -128,6 +161,34 @@ var rustImportedQualifiedCases = []struct {
 		"lib.rs": "mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
 		"m.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\npub fn g<T: crate::Make>() -> T {\n    T::make()\n}\n",
 	}, "", "T::make", ""},
+	{"closure in a generic fn", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub fn g<T: crate::Make>() -> T {\n    let c = || T::make();\n    c()\n}\n",
+	}, "", "T::make", ""},
+	{"method type parameter bound in a where clause", tree{
+		"lib.rs": "mod a; mod m;\npub trait Make {\n    fn make() -> Self;\n}\n",
+		"a.rs":   "pub struct T;\nimpl T {\n    pub fn make() -> T {\n        T\n    }\n}\n",
+		"m.rs":   "use crate::a::T;\npub struct W;\nimpl W {\n    pub fn k<T>() -> T\n    where\n        T: crate::Make,\n    {\n        T::make()\n    }\n}\n",
+	}, "", "T::make", ""},
+	// Since the 2018 edition a leading `::` names an extern crate, never the
+	// crate's own module of that name; rustc calls the standard library here.
+	{"leading :: import beside an own module of that name", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs;\npub fn c() {\n    let _ = fs::read(\"x\");\n}\n",
+	}, "", "fs::read", ""},
+	{"leading :: import of the called fn", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs::read;\npub fn c() {\n    let _ = read(\"x\");\n}\n",
+	}, "", "read", ""},
+	{"leading :: glob import", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\nuse ::std::fs::*;\npub fn c() {\n    let _ = read(\"x\");\n}\n",
+	}, "", "read", ""},
+	{"leading :: call path", tree{
+		"lib.rs": "mod m;",
+		"m.rs":   "mod std {\n    pub mod fs {\n        pub fn read(_p: &str) {}\n    }\n}\npub fn c() {\n    let _ = ::std::fs::read(\"x\");\n}\n",
+	}, "", "::std::fs::read", ""},
 	// rustc calls the glob's module `c`; a value-only import of `c` is not
 	// followed, so the call stays unresolved rather than guessed.
 	{"value import beside a glob module of that name", tree{
@@ -157,6 +218,9 @@ var rustImportedQualifiedCases = []struct {
 		"a.rs":   "pub fn f() {}",
 		"m.rs":   "#[cfg(unix)]\nuse crate::a;\npub fn c() {\n    a::f();\n}\n",
 	}, "", "a::f", ""},
+	// Legal Rust when the imports live in different namespaces (rustc binds
+	// crate::a::f); the resolver does not model namespaces here, so this is
+	// a recall limit, not an ambiguity.
 	{"two imports of the segment", tree{
 		"lib.rs": "mod a; mod b; mod m;",
 		"a.rs":   "pub fn f() {}",

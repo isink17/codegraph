@@ -886,7 +886,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		return false
 	}
 	resolvePath := func(raw, owner string) string {
-		p := strings.Split(strings.TrimPrefix(raw, "::"), "::")
+		// Since the 2018 edition a leading `::` names an extern crate, never
+		// a module of this crate, and external crates are not modelled.
+		if strings.HasPrefix(raw, "::") {
+			return ""
+		}
+		p := strings.Split(raw, "::")
 		if len(p) == 0 || p[0] == "" {
 			return ""
 		}
@@ -1111,8 +1116,9 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			// resolves as the path that import names. An own module or type of
 			// that name wins: beside it an import of a type-namespace item would
 			// not compile, so the import binds a value or macro. Two imports of
-			// the segment, or one naming no module path, leave the call
-			// unresolved rather than guess.
+			// the segment (legal in different namespaces, which are not
+			// modelled here), or one naming no module path, leave the call
+			// unresolved.
 			if seg, rest, qualified := strings.Cut(dst, "::"); !explicit && qualified && seg != "" && seg != "crate" && seg != "self" && seg != "super" && !ownTypeItem(owner, seg, caller) {
 				var segPaths []string
 				for _, im := range importsBy[file] {
