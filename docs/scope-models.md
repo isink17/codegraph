@@ -10,7 +10,7 @@ Call-site references follow their edges. A reference carries the syntax fact and
 
 Queries read the persisted relationship. For a known symbol, callers and callees follow the stored destination identity, so a stale ID returns nothing and a refused edge is never reconstructed from spelling. Only a name no symbol carries may return unresolved-spelling hints, which are hints and not relationships.
 
-Release archives are built with CGO and include the tree-sitter parsers. In an explicit `CGO_ENABLED=0` build, Go (via `go/ast`) and Python (via the pure fallback parser) still produce call edges. The other languages keep heuristic symbol and import navigation but produce no call edges, so none of the call-resolution behaviour below applies to them in that build. CodeGraph will not update a tree-sitter graph using one of those heuristic parsers, because the update would delete its call edges.
+Release archives are built with CGO and include the tree-sitter parsers. In an explicit `CGO_ENABLED=0` build, Go (via `go/ast`) and Python (via the pure fallback parser) still produce call edges. The other languages, except Solidity and Svelte, which have no such parser, keep heuristic symbol and import navigation but produce no call edges, so none of the call-resolution behaviour below applies to them in that build. CodeGraph will not update a tree-sitter graph using one of those heuristic parsers, because the update would delete its call edges.
 
 ## Go
 
@@ -91,7 +91,7 @@ An incremental update maps changed files to the crates they affect, clears every
 
 ## C and C++
 
-`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx` and `.ipp` files are all indexed as one language, `cpp`. The tree-sitter parser uses the C grammar for `.c` files and the C++ grammar for the rest.
+`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.ipp`, Metal `.metal` and CUDA `.cu` and `.cuh` files are all indexed as one language, `cpp`. The tree-sitter parser uses the C grammar for `.c` files and the C++ grammar for the rest. Before parsing a Metal or CUDA file it blanks Metal `[[...]]` attributes, CUDA execution-space specifiers, `__launch_bounds__(...)` and `<<<...>>>` launch configurations in a same-length copy, so positions are unchanged and a kernel launch `k<<<grid, block>>>(a)` is the call `k(a)`; a `.h` or `.hpp` header gets this only when it contains `__global__`, `__device__` or `<<<`.
 
 It records:
 - function definitions, and separate declaration rows from headers and class bodies, each with a canonical parameter signature and any `static` or `extern "C"` linkage
@@ -440,6 +440,10 @@ A Swift call never binds a symbol in another language. A change to any Swift fil
 ## Solidity
 
 The CGO Tree-sitter adapter extracts contracts, interfaces, libraries, functions, constructors, modifiers, events, custom errors, structs, enums and user-defined value types. It records import paths, modifier invocations and grammar call-expression syntax as unbound references. Calls, imports, inheritance, overloads, library dispatch, modifier execution and dynamic dispatch are not resolved; it emits no edges or generic file-import rows. Solidity is unavailable in no-CGO builds. The parser does not claim compiler or EVM parity. See [Solidity parser provenance and validation](solidity-lp2-validation.md).
+
+## Svelte
+
+The CGO adapter reads only the leading instance and module `<script>` blocks of a `.svelte` file and extracts their declarations, literal imports and call references with the TypeScript/JavaScript parser. Templates, directives, styles and scripts after markup contribute nothing. No call is resolved and no edges are written. Svelte is unavailable in no-CGO builds. See [Svelte component parsing](svelte-parser-provenance.md).
 
 ## Ruby
 
