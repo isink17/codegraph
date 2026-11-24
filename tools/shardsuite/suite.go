@@ -76,10 +76,18 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 		return sum, err
 	}
 	lc := exec.CommandContext(ctx, "go", append([]string{"test", "-json", "-list", "."}, cfg.patterns...)...)
-	lc.Dir, lc.Env, lc.Stderr = cfg.dir, isolatedEnv(listTmp), os.Stderr
+	listErrLog, err := os.Create(filepath.Join(out, "list-stderr.log"))
+	if err != nil {
+		return sum, err
+	}
+	lc.Dir, lc.Env, lc.Stderr = cfg.dir, isolatedEnv(listTmp), listErrLog
 	listOut, listErr := lc.Output()
+	listErrLog.Close()
 	if ctx.Err() != nil {
-		return sum, ctx.Err()
+		sum.Interrupted = true
+		_ = writeJSON(filepath.Join(out, "summary.json"), sum)
+		fmt.Fprintf(stdout, "shardsuite: INCOMPLETE (interrupted while listing tests) out=%s\n", out)
+		return sum, nil
 	}
 	_ = os.WriteFile(filepath.Join(out, "list.jsonl"), listOut, 0o644)
 	pkgs, names, failed, err := parseList(listOut)
@@ -87,7 +95,7 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 		return sum, err
 	}
 	if len(pkgs) == 0 {
-		return sum, fmt.Errorf("go test -list found no packages: %v", listErr)
+		return sum, fmt.Errorf("go test -list found no packages (%v); see %s", listErr, filepath.Join(out, "list-stderr.log"))
 	}
 	sum.Packages = len(pkgs)
 	for _, ns := range names {
@@ -107,7 +115,16 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	if err != nil {
 		return sum, err
 	}
-	if err := writeJSON(filepath.Join(out, "plan.json"), map[string]any{"jobs": jobs, "timings": cfg.timings}); err != nil {
+	type planEntry struct {
+		job
+		Run      string              `json:"run,omitempty"`
+		Expected map[string][]string `json:"expected_tests"`
+	}
+	plan := make([]planEntry, len(jobs))
+	for i, j := range jobs {
+		plan[i] = planEntry{j, j.Run, j.Expected}
+	}
+	if err := writeJSON(filepath.Join(out, "plan.json"), map[string]any{"jobs": plan, "timings": cfg.timings}); err != nil {
 		return sum, err
 	}
 	fmt.Fprintf(stdout, "shardsuite: out=%s packages=%d jobs=%d timeout=%s\n", out, len(pkgs), len(jobs), cfg.timeout)
