@@ -2,20 +2,10 @@
 
 package main
 
-import (
-	"os/exec"
-	"strconv"
-)
+import "os/exec"
 
+// runSuite refuses Windows before starting any process; these only keep the
+// package building there.
 func setProcGroup(*exec.Cmd) {}
 
-// taskkill /T also ends the test binary that go test started.
-func killTree(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	if err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run(); err != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
+func killTree(cmd *exec.Cmd) error { return cmd.Process.Kill() }

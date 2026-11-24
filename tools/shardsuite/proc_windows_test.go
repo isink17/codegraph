@@ -4,5 +4,5 @@ package main
 
 import "testing"
 
-// Not checked on Windows: there is no portable signal-0 probe.
+// Unused: the fixture tests skip on Windows, which the runner refuses.
 func assertGone(*testing.T, int) {}

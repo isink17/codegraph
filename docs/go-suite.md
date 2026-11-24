@@ -174,10 +174,8 @@ adapters that need cgo are compiled out of both and the inventory matches
 what that build can run. Compare a no-CGO sharded run only with a no-CGO
 `run.sh` baseline.
 
-Platforms: written in Go with the standard library only. On macOS and Linux
-each `go test` runs in its own process group, so a kill reaches the test
-binary too. On Windows it uses `taskkill /T /F`; a shard's `-run` pattern
-must also fit the 32,767-character command line, so the runner refuses a
-shard whose pattern exceeds 30,000 bytes and asks for a larger `K`. The
-runner was not executed on Windows; Windows support is cross-compiled and
-reasoned, not run.
+Platforms: macOS and Linux only. There each `go test` runs in its own
+process group, so a kill reaches the test binary too. On Windows the runner
+refuses to start: ending a `go test` process tree on timeout or Ctrl-C was
+never run there, and cross-compiling is not that check. Use `go test ./...`
+on Windows. The `parity` subcommand only reads files and works everywhere.

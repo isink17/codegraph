@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,9 +43,6 @@ type job struct {
 	Weight   float64             `json:"estimated_seconds,omitempty"`
 	Tests    int                 `json:"tests_assigned"`
 }
-
-// Windows CreateProcess caps a command line at 32,767 UTF-16 units.
-const windowsMaxRunRegex = 30000
 
 func parseShardSpec(s string) ([]shardSpec, error) {
 	var out []shardSpec
@@ -224,12 +220,8 @@ func buildJobs(pkgs []string, names map[string][]string, failed map[string]bool,
 		slugs[slug] = p
 		bins, load := partition(names[p], k, timings[p])
 		for i, b := range bins {
-			re := runRegex(b)
-			if runtime.GOOS == "windows" && len(re) > windowsMaxRunRegex {
-				return nil, fmt.Errorf("%s shard %d: -run pattern is %d bytes, too long for a Windows command line; raise K", p, i, len(re))
-			}
 			jobs = append(jobs, job{
-				Name: fmt.Sprintf("%s.%d", slug, i), Packages: []string{p}, Run: re,
+				Name: fmt.Sprintf("%s.%d", slug, i), Packages: []string{p}, Run: runRegex(b),
 				Expected: map[string][]string{p: b}, Weight: load[i], Tests: len(b),
 			})
 		}

@@ -28,6 +28,9 @@ func TestMain(m *testing.M) {
 
 func fixtureDir(t *testing.T) string {
 	t.Helper()
+	if unsupportedOS(runtime.GOOS) != nil {
+		t.Skip("the runner refuses this OS")
+	}
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go command not on PATH")
 	}
@@ -159,9 +162,6 @@ func TestFixtureHangingListIsBounded(t *testing.T) {
 // A list run that loses a package (for example killed partway) must not
 // shrink the inventory into a pass.
 func TestFixtureTruncatedListFailsTheRun(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("uses a POSIX shell wrapper for go")
-	}
 	fixtureEnv(t)
 	realGo, err := exec.LookPath("go")
 	if err != nil {
@@ -192,6 +192,17 @@ func TestOutInsideModuleIsRefused(t *testing.T) {
 
 // A failed run into a reused -out must not leave the previous run's passing
 // summary and shards behind for `parity` or a reader to pick up.
+func TestWindowsIsRefused(t *testing.T) {
+	if unsupportedOS("windows") == nil {
+		t.Error("windows: want a refusal")
+	}
+	for _, goos := range []string{"darwin", "linux"} {
+		if err := unsupportedOS(goos); err != nil {
+			t.Errorf("%s: %v", goos, err)
+		}
+	}
+}
+
 func TestNonEmptyOutIsRefused(t *testing.T) {
 	cfg := fixtureConfig(t)
 	stale := write(t, cfg.out, "summary.json", `{"all_passed":true}`)
@@ -319,9 +330,6 @@ func TestFixtureInterruptReportsIncomplete(t *testing.T) {
 }
 
 func TestSIGINTKillsChildrenAndExitsIncomplete(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("no SIGINT delivery to another process on Windows")
-	}
 	dir := fixtureDir(t)
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	out := t.TempDir()

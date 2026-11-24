@@ -48,12 +48,24 @@ func isolatedEnv(dir string) []string {
 	return append(os.Environ(), "TMPDIR="+dir, "TMP="+dir, "TEMP="+dir, "GOTMPDIR="+filepath.Join(dir, "go"))
 }
 
+// Killing a whole go test process tree on timeout or Ctrl-C has only been
+// verified on macOS and Linux.
+func unsupportedOS(goos string) error {
+	if goos == "windows" {
+		return errors.New("Windows is not supported: ending a go test process tree on timeout or interrupt is unverified there; run go test ./... instead")
+	}
+	return nil
+}
+
 func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error) {
 	start := time.Now()
 	sum := summary{
 		Schema: summarySchema, Patterns: cfg.patterns, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 		GoFlags: goEnv(cfg.dir, "GOFLAGS"), CGOEnabled: goEnv(cfg.dir, "CGO_ENABLED"),
 		Timeout: cfg.timeout.String(), JobTimeout: cfg.jobTimeout.String(), Timings: cfg.timings,
+	}
+	if err := unsupportedOS(runtime.GOOS); err != nil {
+		return sum, err
 	}
 	out := cfg.out
 	var err error
