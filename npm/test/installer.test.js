@@ -14,6 +14,10 @@ const execFile = promisify(require('node:child_process').execFile);
 const npm = (args, options) => process.env.npm_execpath
   ? execFile(process.execPath, [process.env.npm_execpath, ...args], options)
   : execFile('npm', args, options);
+// cmd.exe runs the .cmd shim on Windows; quote each word so paths and arguments with spaces survive.
+const runBin = (command, args, options = {}) => process.platform === 'win32'
+  ? spawnSync([command, ...args].map(word => `"${word}"`).join(' '), { shell: true, encoding: 'utf8', ...options })
+  : spawnSync(command, args, { encoding: 'utf8', ...options });
 const { assetFor, install, PLATFORMS } = require('../lib/installer');
 
 const version = require('../package.json').version;
@@ -115,9 +119,7 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   const native = path.join(moduleDir, 'bin', 'native', process.platform === 'win32' ? 'codegraph.exe' : 'codegraph');
   assert.deepEqual(fs.readFileSync(native), binaryBytes);
   const command = process.platform === 'win32' ? path.join(prefix, 'codegraph.cmd') : path.join(prefix, 'bin', 'codegraph');
-  const invoke = (args, options = {}) => process.platform === 'win32'
-    ? spawnSync(command, args, { shell: true, encoding: 'utf8', ...options })
-    : spawnSync(command, args, { encoding: 'utf8', ...options });
+  const invoke = (args, options) => runBin(command, args, options);
   const versionResult = invoke(['--version']);
   assert.equal(versionResult.status, 0, versionResult.stderr);
   assert.equal(versionResult.stdout.trim(), `codegraph ${version}`);
@@ -133,9 +135,7 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   const ignoredPrefix = path.join(work, 'ignore scripts prefix');
   await npm(['install', '--global', '--ignore-scripts', '--prefix', ignoredPrefix, archive], { cwd: work, encoding: 'utf8' });
   const ignoredCommand = process.platform === 'win32' ? path.join(ignoredPrefix, 'codegraph.cmd') : path.join(ignoredPrefix, 'bin', 'codegraph');
-  const ignored = process.platform === 'win32'
-    ? spawnSync(ignoredCommand, ['--version'], { shell: true, encoding: 'utf8' })
-    : spawnSync(ignoredCommand, ['--version'], { encoding: 'utf8' });
+  const ignored = runBin(ignoredCommand, ['--version']);
   assert.notEqual(ignored.status, 0);
   assert.match(ignored.stderr, /Reinstall with npm scripts enabled/);
 
