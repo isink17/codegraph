@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
@@ -10505,8 +10508,8 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 // FindDeadCodeResult is FindDeadCode with the languages it skipped. A missing
 // caller is evidence only where the persisted graph records callers from every
 // file, so only symbols of such languages are candidates. Every other language
-// is returned in Skipped, and a symbol whose name an unbound reference in such a
-// language's file spells is withheld too: that file may be its caller.
+// is returned in Skipped, and a file of such a language may still use a
+// candidate: see skippedLanguageUses for what withholds one.
 func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, offset int) (DeadCodeResult, error) {
 	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
 	if graphErr != nil {
@@ -10544,18 +10547,15 @@ func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, off
 	}
 	inCallCapable := placeholders(len(callCapable))
 	args := append([]any{repoID, repoID}, callCapable...)
-	unboundUseGuard := ""
+	skippedUseGuard := ""
 	if len(result.Skipped) > 0 {
-		// The last dot-separated segment of the reference (`utils.format` ->
-		// `format`); SQLite has no reverse instr.
-		unboundUseGuard = `AND s.name NOT IN (
-		      SELECT replace(r.name, rtrim(r.name, replace(r.name, '.', '')), '')
-		      FROM references_tbl r
-		      JOIN files rf ON rf.id = r.file_id AND rf.is_deleted = 0
-		      WHERE r.repo_id = ? AND rf.language NOT IN (` + inCallCapable + `)
-		  )`
-		args = append(args, repoID)
-		args = append(args, callCapable...)
+		names, files, err := s.skippedLanguageUses(ctx, repoID, result.Skipped, callCapable)
+		if err != nil {
+			return DeadCodeResult{}, err
+		}
+		skippedUseGuard = `AND s.name NOT IN (SELECT value FROM json_each(?))
+		  AND f.id NOT IN (SELECT value FROM json_each(?))`
+		args = append(args, names, files)
 	}
 	args = append(args, safeLimit(limit), safeOffset(offset))
 	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
@@ -10571,7 +10571,8 @@ func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, off
 		  AND f.language IN (`+inCallCapable+`)
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
 		  -- A Lua, Scala or Dart local function is not dead merely because no call
-		  -- to it was proven (localFunctionSQL).
+		  -- to it was proven (localFunctionSQL). Their tree-sitter profiles are
+		  -- skipped whole today; this stays for any profile that is not.
 		  AND NOT `+localFunctionSQL("s.")+`
 		  -- Classification, not just the page, runs on the active graph: a use
 		  -- recorded in a soft-deleted file is not a use the reader can see, so
@@ -10590,7 +10591,7 @@ func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, off
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
-		  `+unboundUseGuard+`
+		  `+skippedUseGuard+`
 		ORDER BY f.path ASC, s.start_line ASC,
 		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
@@ -10619,6 +10620,112 @@ func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, off
 		})
 	}
 	return result, rows.Err()
+}
+
+// skippedLanguageUses returns, as JSON arrays, the names and the file IDs the
+// files of skipped languages may use. A name is every identifier segment of a
+// reference those files hold (`demo.Util.helper`, `M:help`), since the
+// reference may name the type as well as the member. A file is one a relative
+// import of theirs resolves to (`./util` -> util.ts or util/index.ts): Svelte
+// markup and `new Box()` leave no reference, so the import is the only trace of
+// the use. Both over-approximate on purpose; a withheld symbol is not a claim.
+func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped []DeadCodeSkippedLanguage, callCapable []any) (string, string, error) {
+	q := s.parserSemanticQueryer(ctx)
+	languages := make([]any, 0, len(skipped)+1)
+	languages = append(languages, repoID)
+	for _, l := range skipped {
+		languages = append(languages, l.Language)
+	}
+	inSkipped := placeholders(len(skipped))
+
+	nameSet := map[string]bool{}
+	rows, err := q.QueryContext(ctx, `
+		SELECT DISTINCT r.name
+		FROM files rf JOIN references_tbl r ON r.file_id = rf.id
+		WHERE rf.repo_id = ? AND rf.is_deleted = 0 AND rf.language IN (`+inSkipped+`)
+	`, languages...)
+	if err != nil {
+		return "", "", err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return "", "", err
+		}
+		for _, segment := range strings.FieldsFunc(name, func(r rune) bool {
+			return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}) {
+			nameSet[segment] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", "", err
+	}
+
+	targets := map[string]bool{}
+	rows, err = q.QueryContext(ctx, `
+		SELECT DISTINCT rf.path, fi.import_path
+		FROM files rf JOIN file_imports fi ON fi.file_id = rf.id
+		WHERE rf.repo_id = ? AND rf.is_deleted = 0 AND rf.language IN (`+inSkipped+`)
+	`, languages...)
+	if err != nil {
+		return "", "", err
+	}
+	for rows.Next() {
+		var importer, specifier string
+		if err := rows.Scan(&importer, &specifier); err != nil {
+			rows.Close()
+			return "", "", err
+		}
+		if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
+			targets[resolved] = true
+			targets[strings.TrimSuffix(resolved, path.Ext(resolved))] = true
+			targets[resolved+"/index"] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", "", err
+	}
+	fileIDs := []int64{}
+	if len(targets) > 0 {
+		rows, err = q.QueryContext(ctx, `
+			SELECT id, path FROM files
+			WHERE repo_id = ? AND is_deleted = 0 AND language IN (`+placeholders(len(callCapable))+`)
+		`, append([]any{repoID}, callCapable...)...)
+		if err != nil {
+			return "", "", err
+		}
+		for rows.Next() {
+			var id int64
+			var p string
+			if err := rows.Scan(&id, &p); err != nil {
+				rows.Close()
+				return "", "", err
+			}
+			if targets[p] || targets[strings.TrimSuffix(p, path.Ext(p))] {
+				fileIDs = append(fileIDs, id)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return "", "", err
+		}
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	namesJSON, err := json.Marshal(names)
+	if err != nil {
+		return "", "", err
+	}
+	filesJSON, err := json.Marshal(fileIDs)
+	if err != nil {
+		return "", "", err
+	}
+	return string(namesJSON), string(filesJSON), nil
 }
 
 // --- Embedding methods ---

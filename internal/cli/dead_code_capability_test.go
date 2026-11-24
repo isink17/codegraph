@@ -18,12 +18,14 @@ import (
 // production adapters build no call graph in one build mode or both: Java and
 // TypeScript are symbols-only without cgo, Svelte and Solidity have no call
 // graph with cgo and no parser without it. Every function except unusedGo,
-// unusedTs, Run and size has a caller in source.
+// unusedTs, Run and size has a caller in source, and the Svelte script
+// constructs Box.
 var deadCodeFixtureFiles = map[string]string{
 	"lib/lib.go": "package lib\n\nfunc Helper(n int) int { return n * 2 }\n\nfunc Run() int { return Helper(1) }\n\nfunc unusedGo() int { return 0 }\n",
 	"web/util.ts": "export function formatName(n: string): string { return n.trim(); }\n" +
-		"export function unusedTs(): number { return 1; }\n",
-	"web/App.svelte": "<script lang=\"ts\">\n  import { formatName } from './util';\n" +
+		"export class Box { size(): number { return 1; } }\n",
+	"web/other.ts": "export function unusedTs(): number { return 1; }\n",
+	"web/App.svelte": "<script lang=\"ts\">\n  import { formatName, Box } from './util';\n  const b = new Box();\n" +
 		"  function greet(name: string): string { return formatName(name); }\n" +
 		"  function shout(): string { return greet(\"x\").toUpperCase(); }\n  const out = shout();\n</script>\n\n<h1>{out}</h1>\n",
 	"contracts/Token.sol": "pragma solidity ^0.8.0;\n\ncontract Token {\n" +
@@ -126,7 +128,7 @@ func TestFindDeadCodeProductionRegistryNeverDeclaresUnsupportedLanguagesDead(t *
 		}
 		names = append(names, item.Name)
 	}
-	for _, called := range []string{"Helper", "helper", "_move", "greet", "shout", "formatName"} {
+	for _, called := range []string{"Helper", "helper", "_move", "greet", "shout", "formatName", "Box"} {
 		if slices.Contains(names, called) {
 			t.Fatalf("called function %s declared dead: %v", called, names)
 		}

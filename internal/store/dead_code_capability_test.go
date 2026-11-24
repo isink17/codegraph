@@ -222,3 +222,51 @@ func markFilesCallCapable(t *testing.T, s *Store, repoID int64) {
 		t.Fatal(err)
 	}
 }
+
+func seedDeadCodeImport(t *testing.T, s *Store, repoID, fileID int64, importPath string) {
+	t.Helper()
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO file_imports(repo_id, file_id, import_path) VALUES(?, ?, ?)`, repoID, fileID, importPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reference may name the type as well as the member (`Store.create`,
+// `demo.Util.helper`, Lua `M:help`), so every identifier segment withholds.
+// A use that leaves no reference at all (Svelte markup, `new Box()`) leaves
+// the relative import, which withholds every symbol of the file it resolves to.
+func TestFindDeadCodeWithholdsQualifiedAndImportedUsesFromSkippedLanguages(t *testing.T) {
+	ctx := context.Background()
+	s, repo := openBudgetStore(t)
+	ts := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"web/store.ts", "typescript", "treesitter:typescript:v2", true})
+	seedDeadCodeSymbol(t, s, repo.ID, ts, "typescript", "Store")
+	seedDeadCodeSymbol(t, s, repo.ID, ts, "typescript", "create")
+	box := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"web/box.ts", "typescript", "treesitter:typescript:v2", true})
+	seedDeadCodeSymbol(t, s, repo.ID, box, "typescript", "Box")
+	widgets := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"web/widgets/index.ts", "typescript", "treesitter:typescript:v2", true})
+	seedDeadCodeSymbol(t, s, repo.ID, widgets, "typescript", "Widget")
+	other := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"web/other.ts", "typescript", "treesitter:typescript:v2", true})
+	seedDeadCodeSymbol(t, s, repo.ID, other, "typescript", "unusedTs")
+	java := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"demo/Util.java", "java", "treesitter:java:v14", true})
+	seedDeadCodeSymbol(t, s, repo.ID, java, "java", "Util")
+	seedDeadCodeSymbol(t, s, repo.ID, java, "java", "help")
+	seedDeadCodeSymbol(t, s, repo.ID, java, "java", "unusedJava")
+
+	svelte := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"web/App.svelte", "svelte", "treesitter:svelte:v1", false})
+	seedDeadCodeReference(t, s, repo.ID, svelte, "Store.create")
+	seedDeadCodeImport(t, s, repo.ID, svelte, "./box")
+	seedDeadCodeImport(t, s, repo.ID, svelte, "./widgets")
+	seedDeadCodeImport(t, s, repo.ID, svelte, "svelte/store")
+	scala := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"s/B.scala", "scala", "treesitter:scala:v4", true})
+	seedDeadCodeReference(t, s, repo.ID, scala, "demo.Util.helper")
+	lua := seedDeadCodeFile(t, s, repo.ID, deadCodeSeedFile{"l/m.lua", "lua", "treesitter:lua:v4", true})
+	seedDeadCodeReference(t, s, repo.ID, lua, "M:help")
+
+	result, err := s.FindDeadCodeResult(ctx, repo.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := deadCodeNames(result.Items), "unusedJava,unusedTs"; got != want {
+		t.Fatalf("dead code = %s, want %s", got, want)
+	}
+}
