@@ -184,13 +184,14 @@ func (s *Server) callToolCompact(ctx context.Context, name string, raw json.RawM
 			writePresence(doc, map[string]any{"requested": multi.Requested, "found": multi.Found, "missing": multi.Missing})
 		}
 	case "find_dead_code":
-		items, err := s.deadCode(ctx, raw)
+		result, err := s.deadCode(ctx, raw)
 		if err != nil {
 			return "", err
 		}
-		if err := writeMapRows(doc, "dead_code", deadCodeColumns, items); err != nil {
+		if err := writeMapRows(doc, "dead_code", deadCodeColumns, result.Items); err != nil {
 			return "", err
 		}
+		writeSkippedLanguages(doc, result.Skipped)
 	case "list_files":
 		items, err := s.listFiles(ctx, raw)
 		if err != nil {
@@ -254,6 +255,20 @@ func writeLimitations(doc *compactfmt.Document, limitations []store.GraphLimitat
 	sec := doc.Section(limitationsSchema)
 	for _, l := range limitations {
 		sec.Row([]compactfmt.Cell{compactfmt.Str(l.Language), compactfmt.Str(l.Capability), compactfmt.Str(l.Effect)})
+	}
+}
+
+// skippedLanguagesSchema mirrors store.DeadCodeSkippedLanguage; like
+// limitations, the section is written only when a language was skipped.
+var skippedLanguagesSchema = compactfmt.Schema{Section: "skipped_languages", Columns: []string{"language", "graph_capability", "reason"}}
+
+func writeSkippedLanguages(doc *compactfmt.Document, skipped []store.DeadCodeSkippedLanguage) {
+	if len(skipped) == 0 {
+		return
+	}
+	sec := doc.Section(skippedLanguagesSchema)
+	for _, l := range skipped {
+		sec.Row([]compactfmt.Cell{compactfmt.Str(l.Language), compactfmt.Str(l.Capability), compactfmt.Str(l.Reason)})
 	}
 }
 

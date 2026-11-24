@@ -518,8 +518,16 @@ func (s *Server) handleLatestScanErrors(ctx context.Context, raw json.RawMessage
 }
 
 func (s *Server) handleDeadCode(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
-	items, err := s.deadCode(ctx, raw)
-	return wrapData("dead_code", items, err)
+	result, err := s.deadCode(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	data := map[string]any{"dead_code": result.Items}
+	// Absent rather than empty, so a call-capable graph's response is unchanged.
+	if len(result.Skipped) > 0 {
+		data["skipped_languages"] = result.Skipped
+	}
+	return map[string]any{"ok": true, "data": data}, nil
 }
 
 func (s *Server) handleListFiles(ctx context.Context, raw json.RawMessage) (map[string]any, error) {
@@ -931,12 +939,12 @@ func (s *Server) relatedTests(ctx context.Context, raw json.RawMessage) (any, er
 }
 
 // deadCode answers find_dead_code.
-func (s *Server) deadCode(ctx context.Context, raw json.RawMessage) ([]map[string]any, error) {
+func (s *Server) deadCode(ctx context.Context, raw json.RawMessage) (store.DeadCodeResult, error) {
 	req, err := decodePageRequest(raw)
 	if err != nil {
-		return nil, err
+		return store.DeadCodeResult{}, err
 	}
-	return s.query.FindDeadCode(ctx, s.repoID, req.Limit, req.Offset)
+	return s.query.FindDeadCodeResult(ctx, s.repoID, req.Limit, req.Offset)
 }
 
 // listFiles answers list_files.

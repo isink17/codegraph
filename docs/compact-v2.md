@@ -87,7 +87,7 @@ unknown format selectors are errors.
 | `find_callees` | `callees`, `presence`, `pagination`, optional `limitations` |
 | `get_impact_radius` | `symbols`, `files`, `summary`, `presence`, optional `limitations` |
 | `find_related_tests` | `tests`, `presence`, optional `limitations` |
-| `find_dead_code` | `dead_code`, optional `limitations` |
+| `find_dead_code` | `dead_code`, optional `skipped_languages`, optional `limitations` |
 | `list_files` | `files` |
 | `trace_dependencies` | `dependencies`, `presence`, optional `limitations` |
 

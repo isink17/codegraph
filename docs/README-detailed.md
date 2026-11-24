@@ -399,6 +399,18 @@ keeps stdout a path list and prints one `limitations:` line to stderr.
 change it. `codegraph doctor` reports the same four states per repository under
 `parser.graph_capability`, with a recommendation when the graph is reduced.
 
+`find_dead_code` classifies only languages whose persisted call graph records
+callers from every file. Each other indexed language is left out of `dead_code`
+and named in `data.skipped_languages` with its `graph_capability` and a `reason`:
+`no_call_edges` (symbols-only: Svelte, Solidity, and every language but Go and
+Python in a `CGO_ENABLED=0` index), `same_file_calls_only` (Dart, Lua and Scala,
+whose call edges reach only functions of the calling file),
+`mixed_parser_profiles` or `unknown_parser_provenance`. A symbol named by an
+unbound call reference in a skipped language's file is withheld too, since that
+file may call it. The key is absent when no language is skipped. A listed symbol
+is a candidate, not proof: exported API, reflection, dynamic dispatch and calls
+the resolver left unresolved are not callers in the graph.
+
 Not covered: `architecture_overview` (hub symbols are ranked by call edges),
 `cross_language_links` and `agentic_query` answers carry no `limitations`
 field; read `supported_languages` for the graph's capability.

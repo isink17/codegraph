@@ -211,6 +211,7 @@ func TestFindDeadCodeSkipsDartLocalFunctions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	markFilesCallCapable(t, s, repo.ID)
 	dead, err := s.FindDeadCode(ctx, repo.ID, 100, 0)
 	if err != nil {
 		t.Fatal(err)

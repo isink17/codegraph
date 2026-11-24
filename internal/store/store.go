@@ -10452,15 +10452,112 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	return out, rows.Err()
 }
 
+// DeadCodeSkippedLanguage is a language whose symbols FindDeadCodeResult did
+// not classify: its persisted graph capability and why that capability cannot
+// show a symbol is unused.
+type DeadCodeSkippedLanguage struct {
+	Language   string `json:"language"`
+	Capability string `json:"graph_capability"`
+	Reason     string `json:"reason"`
+}
+
+// Dead-code skip reasons.
+const (
+	DeadCodeNoCallEdges             = "no_call_edges"
+	DeadCodeSameFileCallsOnly       = "same_file_calls_only"
+	DeadCodeMixedParserProfiles     = "mixed_parser_profiles"
+	DeadCodeUnknownParserProvenance = "unknown_parser_provenance"
+)
+
+// deadCodeSkipReason is why a language's symbols cannot be classified, or ""
+// when its persisted call graph can show that a symbol has no caller.
+func deadCodeSkipReason(language LanguageCapability) string {
+	switch language.Capability {
+	case GraphCallCapable:
+		for _, profile := range language.Profiles {
+			if parser.SameFileCallsOnly(profile) {
+				return DeadCodeSameFileCallsOnly
+			}
+		}
+		return ""
+	case GraphSymbolsOnly:
+		return DeadCodeNoCallEdges
+	case GraphMixed:
+		return DeadCodeMixedParserProfiles
+	default:
+		return DeadCodeUnknownParserProvenance
+	}
+}
+
+// DeadCodeResult is one page of dead-code candidates plus the languages whose
+// symbols were not classified at all.
+type DeadCodeResult struct {
+	Items   []map[string]any
+	Skipped []DeadCodeSkippedLanguage
+}
+
 // FindDeadCode returns symbols with no incoming edges and no references — likely dead code.
 func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+	result, err := s.FindDeadCodeResult(ctx, repoID, limit, offset)
+	return result.Items, err
+}
+
+// FindDeadCodeResult is FindDeadCode with the languages it skipped. A missing
+// caller is evidence only where the persisted graph records callers from every
+// file, so only symbols of such languages are candidates. Every other language
+// is returned in Skipped, and a symbol whose name an unbound reference in such a
+// language's file spells is withheld too: that file may be its caller.
+func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, offset int) (DeadCodeResult, error) {
 	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
 	if graphErr != nil {
-		return nil, graphErr
+		return DeadCodeResult{}, graphErr
 	}
 	if graphTx != nil {
 		defer graphTx.Rollback()
 	}
+	// As in GraphLimitations: when every live file's language is classifiable,
+	// so is every language of the evidence-holding subset, and the exact
+	// population is not needed.
+	groups, err := s.liveFileParserProfileGroups(ctx, repoID)
+	if err != nil {
+		return DeadCodeResult{}, err
+	}
+	capability := ClassifyGraphCapability(groups)
+	if slices.ContainsFunc(capability.Languages, func(l LanguageCapability) bool { return deadCodeSkipReason(l) != "" }) {
+		if groups, err = s.FileParserProfileGroups(ctx, repoID); err != nil {
+			return DeadCodeResult{}, err
+		}
+		capability = ClassifyGraphCapability(groups)
+	}
+	var result DeadCodeResult
+	var callCapable []any
+	for _, language := range capability.Languages {
+		reason := deadCodeSkipReason(language)
+		if reason == "" {
+			callCapable = append(callCapable, language.Language)
+			continue
+		}
+		result.Skipped = append(result.Skipped, DeadCodeSkippedLanguage{Language: language.Language, Capability: language.Capability, Reason: reason})
+	}
+	if len(callCapable) == 0 {
+		return result, nil
+	}
+	inCallCapable := placeholders(len(callCapable))
+	args := append([]any{repoID, repoID}, callCapable...)
+	unboundUseGuard := ""
+	if len(result.Skipped) > 0 {
+		// The last dot-separated segment of the reference (`utils.format` ->
+		// `format`); SQLite has no reverse instr.
+		unboundUseGuard = `AND s.name NOT IN (
+		      SELECT replace(r.name, rtrim(r.name, replace(r.name, '.', '')), '')
+		      FROM references_tbl r
+		      JOIN files rf ON rf.id = r.file_id AND rf.is_deleted = 0
+		      WHERE r.repo_id = ? AND rf.language NOT IN (` + inCallCapable + `)
+		  )`
+		args = append(args, repoID)
+		args = append(args, callCapable...)
+	}
+	args = append(args, safeLimit(limit), safeOffset(offset))
 	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
 		       s.start_line, s.start_col, s.end_line, s.end_col
@@ -10471,6 +10568,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		-- scanning every repo's files, which is also what makes the (f.path,
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
+		  AND f.language IN (`+inCallCapable+`)
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
 		  -- A Lua, Scala or Dart local function is not dead merely because no call
 		  -- to it was proven (localFunctionSQL).
@@ -10492,25 +10590,25 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
+		  `+unboundUseGuard+`
 		ORDER BY f.path ASC, s.start_line ASC,
 		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ? OFFSET ?
-	`, repoID, repoID, safeLimit(limit), safeOffset(offset))
+	`, args...)
 	if err != nil {
-		return nil, err
+		return DeadCodeResult{}, err
 	}
 	defer rows.Close()
 
-	var out []map[string]any
 	for rows.Next() {
 		var id int64
 		var qualifiedName, kind, name, path, language string
 		var startLine, startCol, endLine, endCol int
 		if err := rows.Scan(&id, &qualifiedName, &kind, &name, &path, &language, &startLine, &startCol, &endLine, &endCol); err != nil {
-			return nil, err
+			return DeadCodeResult{}, err
 		}
-		out = append(out, map[string]any{
+		result.Items = append(result.Items, map[string]any{
 			"symbol":     qualifiedName,
 			"kind":       kind,
 			"name":       name,
@@ -10520,7 +10618,7 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 			"end_line":   endLine,
 		})
 	}
-	return out, rows.Err()
+	return result, rows.Err()
 }
 
 // --- Embedding methods ---

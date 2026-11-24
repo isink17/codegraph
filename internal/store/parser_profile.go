@@ -128,7 +128,7 @@ const FileParserOwnedEvidencePredicate = `(
 // The population is FileParserOwnedEvidencePredicate; see it for what counts as
 // parser-owned evidence and why.
 func (s *Store) FileParserProfileGroups(ctx context.Context, repoID int64) ([]FileParserProfileGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT f.language, f.parser_profile, f.parser_call_edges, COUNT(*)
 		FROM files f
 		WHERE f.repo_id = ? AND f.is_deleted = 0

@@ -191,3 +191,14 @@ func TestLanguageCapabilitiesAreSortedAndExplicit(t *testing.T) {
 		t.Fatalf("Capabilities() exposed mutable registry state: %+v", again)
 	}
 }
+
+func TestSameFileCallsOnly(t *testing.T) {
+	for id, want := range map[string]bool{
+		"treesitter:dart:v3": true, "treesitter:lua:v4": true, "treesitter:scala:v4": true, "treesitter:scala:v9": true,
+		"treesitter:java:v14": false, "heuristic:scala:v1": false, "go-ast:go:v6": false, "treesitter": false, "": false,
+	} {
+		if got := SameFileCallsOnly(id); got != want {
+			t.Errorf("SameFileCallsOnly(%q) = %v, want %v", id, got, want)
+		}
+	}
+}

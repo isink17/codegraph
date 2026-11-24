@@ -183,6 +183,7 @@ func TestActiveSymbolDirectOutputsExcludeDeletedFiles(t *testing.T) {
 	t.Run("FindDeadCode", func(t *testing.T) {
 		// Neither symbol has an incoming edge or a reference, so both are
 		// dead-code candidates and the deleted one sorts first by path.
+		markFilesCallCapable(t, s, repoID)
 		got := must(s.FindDeadCode(ctx, repoID, 10, 0))
 		if len(got) != 1 || got[0]["file"] != "live.go" {
 			t.Fatalf("FindDeadCode = %v, want only live.go", got)
