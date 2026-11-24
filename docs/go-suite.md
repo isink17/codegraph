@@ -128,11 +128,20 @@ reported exactly once with the same action. A `t.TempDir` path embedded in a
 subtest name is normalized, because each process has a different temp root.
 
 Hardware: sharding helps when cores are idle. With the default
-`store=3, indexer=3, diff=2` it runs nine processes at once; on an 11-core
-Apple M3 Pro that roughly halved wall time for about 40-50 % more total CPU
-(measurements below). On 4 cores or fewer, expect little gain, since the
-suite's total CPU work then exceeds what the cores can run in parallel. Do not
-run it beside another full suite on the same machine.
+`store=3, indexer=3, diff=2` it runs nine processes at once. Measured on an
+Apple M3 Pro (11 cores, 18 GiB), Go 1.26.1, CGO, four interleaved pairs on a
+shared, not idle, machine:
+
+| | wall (mean ± stdev) | CPU user+sys | peak RSS, whole process tree |
+|---|---|---|---|
+| `run.sh` | 204 ± 15 s (192-222) | 601 s | 2.1 GiB |
+| `shardsuite -timings` | 113 ± 6 s (107-120) | 833 s | 3.8 GiB |
+
+That is 1.75-1.85× faster per pair for about 40 % more CPU and almost twice
+the memory, with the same 7,778 test identities in every pair. Plan for at
+least 8 cores and about 4 GiB of free memory. On 4 cores or fewer, expect little
+gain, since the suite's total CPU work then exceeds what the cores can run in
+parallel. Do not run it beside another full suite on the same machine.
 
 `CGO_ENABLED=0`: the list and the run both honor it, so the tree-sitter
 adapters that need cgo are compiled out of both and the inventory matches
