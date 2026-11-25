@@ -102,9 +102,13 @@ func BenchmarkRustCrateUpdate(b *testing.B) {
 	}
 	const target = "src/m1.rs"
 	original := rustBenchModule(1, modules, calls, "")
+	// The target's content and the edit counters outlive each sub-benchmark
+	// run, so with -count > 1 every edit still differs from what is on disk.
+	current, touches, added := original, 0, 0
 	edit := func(b *testing.B, content string) {
 		b.Helper()
 		b.StopTimer()
+		current = content
 		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(target)), []byte(content), 0o644); err != nil {
 			b.Fatal(err)
 		}
@@ -128,34 +132,32 @@ func BenchmarkRustCrateUpdate(b *testing.B) {
 	// A comment-only edit: the file is reparsed, nothing it declares or
 	// calls changes.
 	b.Run("one-file-touch", func(b *testing.B) {
-		i := 0
 		for b.Loop() {
-			i++
-			edit(b, original+fmt.Sprintf("// %d\n", i))
+			touches++
+			edit(b, original+fmt.Sprintf("// %d\n", touches))
 		}
 	})
 	b.Run("one-file-decl-added", func(b *testing.B) {
-		i := 0
 		for b.Loop() {
-			i++
-			edit(b, original+fmt.Sprintf("pub fn added%d() {}\n", i))
+			added++
+			edit(b, original+fmt.Sprintf("pub fn added%d() {}\n", added))
 		}
 	})
 	// Alternates the import that binds m2::f() between crate::m2 and an
 	// alias of crate::m7, so the file's qualified call changes target.
 	b.Run("one-file-import-rebind", func(b *testing.B) {
 		rebound := strings.Replace(original, "use crate::m2;", "use crate::m7 as m2;", 1)
-		i := 0
 		for b.Loop() {
-			i++
-			if i%2 == 1 {
-				edit(b, rebound)
-			} else {
+			if current == rebound {
 				edit(b, original)
+			} else {
+				edit(b, rebound)
 			}
 		}
 	})
-	edit(b, original)
+	if current != original {
+		edit(b, original)
+	}
 	// A resolver policy bump re-decides every Rust edge of the unchanged crate.
 	b.Run("policy-upgrade", func(b *testing.B) {
 		for b.Loop() {
