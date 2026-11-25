@@ -113,6 +113,57 @@ const rubyBareCallSource = `class Widget
     helper # local
   end
 
+  def quoted_capture(s)
+    /(?'helper'\d+)/ =~ s
+    helper # local
+  end
+
+  def unicode_capture(s)
+    /(?<名前>\d+)/ =~ s
+    名前 # local
+  end
+
+  def percent_regex_capture(s)
+    %r{(?'helper'a)} =~ s
+    helper # local
+  end
+
+  def lookbehind_is_not_a_capture(s)
+    /(?<=a)(?<!b)x/ =~ s
+    helper # call
+  end
+
+  def string_key_pattern(value)
+    case value
+    in {"helper":}
+    end
+    helper # local
+  end
+
+  def single_quoted_key_pattern(value)
+    case value
+    in {'helper':}
+    end
+    helper # local
+  end
+
+  def nested_string_key_pattern(value)
+    case value
+    in [{"helper":}]
+    end
+    helper # local
+  end
+
+  def rightward_string_key(value)
+    value => {"helper":}
+    helper # local
+  end
+
+  def boolean_pattern_with_value(value)
+    value in {"helper": Integer}
+    helper # withheld
+  end
+
   def lambda_param
     ->(helper) { helper } # local
   end
@@ -217,7 +268,7 @@ func TestRubyBareIdentifierCallsFollowLocalVariableRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	watched := map[string]bool{"helper": true, "self.helper": true, "name": true, "it": true}
+	watched := map[string]bool{"helper": true, "self.helper": true, "name": true, "it": true, "名前": true}
 	edges := map[int]string{}
 	for _, e := range pf.Edges {
 		if watched[e.DstName] {

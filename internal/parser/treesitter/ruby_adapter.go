@@ -3,6 +3,7 @@
 package treesitter
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"regexp"
@@ -634,15 +635,17 @@ func rubyExtractBareCalls(def *sitter.Node, content []byte, pf *graph.ParsedFile
 					declared[name] = true
 				}
 			case "regex":
-				// `/(?<name>..)/ =~ s` declares `name`; any regex naming a group
-				// withholds it.
+				// `/(?<name>..)/ =~ s` and `/(?'name'..)/ =~ s` declare `name`; any
+				// regex naming a group withholds it.
 				for _, m := range rubyNamedCapture.FindAllSubmatch(content[child.StartByte():child.EndByte()], -1) {
-					declared[string(m[1])] = true
+					declared[string(m[1])+string(m[2])] = true
 				}
-			case "hash_key_symbol":
-				// `in {name:}` binds `name` without an identifier node.
-				if node.Type() == "keyword_pattern" {
-					declared[nodeText(child, content)] = true
+			}
+			if field == "pattern" && rubyPatternParents[node.Type()] {
+				// A pattern binds names in forms with no identifier node
+				// (`in {"name":}`), so every word it spells is withheld.
+				for _, word := range rubyPatternWord.FindAll(content[child.StartByte():child.EndByte()], -1) {
+					declared[string(word)] = true
 				}
 			}
 			walk(child, gated)
@@ -667,8 +670,12 @@ func rubyExtractBareCalls(def *sitter.Node, content []byte, pf *graph.ParsedFile
 }
 
 var (
-	rubyNamedCapture  = regexp.MustCompile(`\(\?<([A-Za-z_]\w*)>`)
-	rubyNumberedParam = regexp.MustCompile(`^_[1-9]$`)
+	rubyNamedCapture = regexp.MustCompile(`\(\?(?:<([^>=!][^>]*)>|'([^']+)')`)
+	rubyPatternWord  = regexp.MustCompile(`[\p{L}_][\p{L}\p{N}_]*`)
+	// in_clause covers `case ... in`; match_pattern and test_pattern are
+	// `value => pattern` and `value in pattern`.
+	rubyPatternParents = map[string]bool{"in_clause": true, "match_pattern": true, "test_pattern": true}
+	rubyNumberedParam  = regexp.MustCompile(`^_[1-9]$`)
 	// The grammar leaves these keywords as identifiers in some positions.
 	rubyPseudoVariables = map[string]bool{"__FILE__": true, "__LINE__": true, "__ENCODING__": true}
 )
@@ -727,7 +734,7 @@ func rubyBareRead(parent *sitter.Node, field string) bool {
 // without calling it.
 func rubyInsideDefined(id, def *sitter.Node, content []byte) bool {
 	for node := id.Parent(); node != nil && node != def; node = node.Parent() {
-		if node.Type() == "unary" && strings.HasPrefix(nodeText(node, content), "defined?") {
+		if node.Type() == "unary" && bytes.HasPrefix(content[node.StartByte():], []byte("defined?")) {
 			return true
 		}
 	}
