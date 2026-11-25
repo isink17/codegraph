@@ -298,6 +298,11 @@ func TestImportTargetsMatch(t *testing.T) {
 		{"src/routes/+page.svelte", "svelte/store", []int64{}},
 		{"src/routes/+page.svelte", "$", []int64{}},
 		{"src/routes/+page.svelte", " ", nil},
+		{"scala/app/Main.scala", "routes.util", []int64{4}},
+		{"scala/app/Main.scala", "web.a._", []int64{5}},
+		{"scala/app/Main.scala", "web._", []int64{}},
+		{"scala/app/Main.scala", "lib.*", []int64{0, 1}},
+		{"scala/app/Main.scala", "scala.collection.mutable", []int64{}},
 	} {
 		if got := targets.match(c.importer, c.specifier); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("match(%q, %q) = %v, want %v", c.importer, c.specifier, got, c.want)

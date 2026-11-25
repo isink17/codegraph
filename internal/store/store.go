@@ -10654,9 +10654,7 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 			rows.Close()
 			return "", "", err
 		}
-		for _, segment := range strings.FieldsFunc(name, func(r rune) bool {
-			return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
-		}) {
+		for _, segment := range identifierSegments(name) {
 			nameSet[segment] = true
 		}
 	}
@@ -10680,6 +10678,14 @@ func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped [
 			return "", "", err
 		}
 		imports = append(imports, e)
+		// A module-path import (`demo.Widget`, `demo.{Base, Listener => L}`)
+		// names the type it brings in; `new Widget()` and `extends Base` leave
+		// no reference behind.
+		if !strings.ContainsAny(e[1], "/\\\"'") {
+			for _, segment := range identifierSegments(e[1]) {
+				nameSet[segment] = true
+			}
+		}
 	}
 	if err := rows.Close(); err != nil {
 		return "", "", err
@@ -10782,29 +10788,28 @@ func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callC
 
 // importTargets answers which files a specifier may name, from indexes built
 // once per call, so the cost grows with imports plus files, not their product.
-// A relative or root path names the file with or without its extension, or the
-// directory's index. An alias (`$lib/fmt`, `@/x`, `~/x`, `#x/y`) cannot be
-// resolved without the bundler config, so it names every file whose path,
-// extension or not, ends in the rest of the specifier, with the alias name
-// kept when it has one (`$lib/fmt.js` -> `.../lib/fmt`).
+//   - A relative or root path names the file with or without its extension, or
+//     the directory's index.
+//   - An alias (`$lib/fmt`, `@/x`, `~/x`, `#x/y`) cannot be resolved without the
+//     bundler config, so it names every file whose path, extension or not, ends
+//     in the rest of the specifier, with the alias name kept when it has one
+//     (`$lib/fmt.js` -> `.../lib/fmt`), or that directory's index.
+//   - A module path (`demo.Widget`) names every file whose path ends in
+//     `demo/Widget`; a wildcard (`demo._`, `demo.*`) every file in a directory
+//     whose path ends in `demo`.
 type importTargets struct {
 	byPath, byStem map[string][]int64
-	// byBase keys a stem by its last segment; byIndexDir keys an `.../index`
-	// stem by the last segment of its directory.
-	byBase, byIndexDir map[string][]importTarget
-	memo               map[[2]string][]int64
-	probes             int
-}
-
-type importTarget struct {
-	id   int64
-	stem string
+	// bySuffix and byDirSuffix key a file by every segment-aligned suffix of
+	// its stem and of its directory.
+	bySuffix, byDirSuffix map[string][]int64
+	memo                  map[[2]string][]int64
+	probes                int
 }
 
 func newImportTargets() *importTargets {
 	return &importTargets{
 		byPath: map[string][]int64{}, byStem: map[string][]int64{},
-		byBase: map[string][]importTarget{}, byIndexDir: map[string][]importTarget{},
+		bySuffix: map[string][]int64{}, byDirSuffix: map[string][]int64{},
 		memo: map[[2]string][]int64{},
 	}
 }
@@ -10813,10 +10818,20 @@ func (t *importTargets) add(id int64, p string) {
 	stem := strings.TrimSuffix(p, path.Ext(p))
 	t.byPath[p] = append(t.byPath[p], id)
 	t.byStem[stem] = append(t.byStem[stem], id)
-	t.byBase[path.Base(stem)] = append(t.byBase[path.Base(stem)], importTarget{id, stem})
-	if dir, base := path.Split(stem); base == "index" && dir != "" {
-		key := path.Base(dir)
-		t.byIndexDir[key] = append(t.byIndexDir[key], importTarget{id, stem})
+	addSuffixes(t.bySuffix, stem, id)
+	if dir := path.Dir(stem); dir != "." {
+		addSuffixes(t.byDirSuffix, dir, id)
+	}
+}
+
+func addSuffixes(index map[string][]int64, p string, id int64) {
+	for i := 0; ; {
+		index[p[i:]] = append(index[p[i:]], id)
+		next := strings.IndexByte(p[i:], '/')
+		if next < 0 {
+			return
+		}
+		i += next + 1
 	}
 }
 
@@ -10829,35 +10844,34 @@ func (t *importTargets) match(importer, specifier string) []int64 {
 		return out
 	}
 	found := map[int64]bool{}
-	if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
-		for _, k := range []string{resolved, strings.TrimSuffix(resolved, path.Ext(resolved)), resolved + "/index"} {
-			for _, id := range t.byPath[k] {
-				found[id] = true
-			}
-			for _, id := range t.byStem[k] {
-				found[id] = true
-			}
+	collect := func(ids []int64) {
+		for _, id := range ids {
+			t.probes++
+			found[id] = true
 		}
 	}
-	if strings.ContainsAny(specifier[:1], "$@~#") {
+	if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
+		for _, k := range []string{resolved, strings.TrimSuffix(resolved, path.Ext(resolved)), resolved + "/index"} {
+			collect(t.byPath[k])
+			collect(t.byStem[k])
+		}
+	}
+	switch {
+	case strings.ContainsAny(specifier[:1], "$@~#"):
 		first, rest, _ := strings.Cut(specifier, "/")
 		suffix := path.Join(strings.TrimLeft(first, "$@~#"), rest)
 		for _, sfx := range []string{suffix, strings.TrimSuffix(suffix, path.Ext(suffix))} {
-			if sfx == "" || sfx == "." {
-				continue
+			if sfx != "" && sfx != "." {
+				collect(t.bySuffix[sfx])
+				collect(t.bySuffix[sfx+"/index"])
 			}
-			for _, f := range t.byBase[path.Base(sfx)] {
-				t.probes++
-				if f.stem == sfx || strings.HasSuffix(f.stem, "/"+sfx) {
-					found[f.id] = true
-				}
-			}
-			for _, f := range t.byIndexDir[path.Base(sfx)] {
-				t.probes++
-				if f.stem == sfx+"/index" || strings.HasSuffix(f.stem, "/"+sfx+"/index") {
-					found[f.id] = true
-				}
-			}
+		}
+	case !strings.ContainsAny(specifier, "/\\\"' ") && strings.Contains(specifier, "."):
+		segments := strings.Split(specifier, ".")
+		if last := segments[len(segments)-1]; last == "_" || last == "*" {
+			collect(t.byDirSuffix[strings.Join(segments[:len(segments)-1], "/")])
+		} else {
+			collect(t.bySuffix[strings.Join(segments, "/")])
 		}
 	}
 	out := make([]int64, 0, len(found))
@@ -10867,6 +10881,14 @@ func (t *importTargets) match(importer, specifier string) []int64 {
 	slices.Sort(out)
 	t.memo[key] = out
 	return out
+}
+
+// identifierSegments splits a reference or module path into the identifiers
+// it spells (`demo.Util.helper`, `M:help`, `a::b`).
+func identifierSegments(name string) []string {
+	return strings.FieldsFunc(name, func(r rune) bool {
+		return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 // --- Embedding methods ---

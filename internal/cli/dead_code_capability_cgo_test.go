@@ -171,3 +171,26 @@ func TestFindDeadCodeWithholdsSvelteKitAliasAndBarrelImports(t *testing.T) {
 		t.Fatalf("dead_code = %v, want [unusedTs]", names)
 	}
 }
+
+// Scala records no reference for `new Widget()`, `extends Base` or a type
+// annotation, so a Java type it uses that way is traced only by the import:
+// explicit, selector or wildcard.
+func TestFindDeadCodeWithholdsJavaTypesScalaImports(t *testing.T) {
+	answer, _ := serveDeadCode(t, writeDeadCodeFixture(t, map[string]string{
+		"java/one/Widget.java":   "package one;\n\npublic class Widget {\n    public int compute() { return 1; }\n}\n",
+		"java/two/Base.java":     "package two;\n\npublic abstract class Base {\n    public abstract int run();\n}\n",
+		"java/two/Listener.java": "package two;\n\npublic interface Listener {\n    void onEvent(String e);\n}\n",
+		"java/three/Config.java": "package three;\n\npublic class Config {\n    public Config() {}\n}\n",
+		"java/other/Lonely.java": "package other;\n\npublic class Lonely {\n    public int nothing() { return 0; }\n}\n",
+		"scala/app/Main.scala":   "package app\n\nimport one.Widget\n\nobject Main {\n  def main(args: Array[String]): Unit = {\n    val w = new Widget()\n  }\n}\n",
+		"scala/app/Sel.scala":    "package app\n\nimport two.{Base, Listener => L}\n\nclass Sel extends Base with L {\n  override def run(): Int = 1\n  override def onEvent(e: String): Unit = ()\n}\n",
+		"scala/app/Wild.scala":   "package app\n\nimport three._\n\nclass Wild {\n  val cfg: Config = new Config()\n}\n",
+	}))
+	var names []string
+	for _, item := range answer.Data.DeadCode {
+		names = append(names, item.Language+":"+item.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"java:Lonely", "java:nothing"}) {
+		t.Fatalf("dead_code = %v, want only the unimported Lonely", names)
+	}
+}

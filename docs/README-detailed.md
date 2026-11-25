@@ -411,9 +411,13 @@ any identifier segment of a reference in such a file names it (`Store.create`
 withholds `Store` and `create`), or when it is declared in a file such a file
 imports. A relative import covers `util.ts` and `util/index.ts`; an alias such
 as `$lib/fmt.js` or `@/x`, which needs bundler config to resolve, covers every
-file whose path, without its extension, ends in `lib/fmt` or `x`; and
-re-exports from an imported file (`export * from './more'`) are followed. Not
-followed: an alias whose target directory has another name, bare `baseUrl` or
+file whose path, without its extension, ends in `lib/fmt` or `x`; a module
+path such as Scala's `import demo.Widget` covers files ending in `demo/Widget`
+and withholds the name `Widget`, and a wildcard `demo._` covers every file in a
+directory ending in `demo`; and re-exports from an imported file
+(`export * from './more'`) are followed. A withheld name applies to every
+classified language, so a Svelte call to `JSON.parse` also withholds a Go
+`parse`. Not followed: an alias whose target directory has another name, bare `baseUrl` or
 workspace-package specifiers, and a barrel that imports a name and exports it
 in a separate statement. The key is absent when no language is skipped. A listed symbol
 is a candidate, not proof: exported API, reflection, dynamic dispatch and calls
