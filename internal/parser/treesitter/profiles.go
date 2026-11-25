@@ -220,6 +220,11 @@ func (a *RustAdapter) Profile() parser.Profile {
 	return parser.NewProfile("rust", "treesitter:rust:v6", true)
 }
 
+// Ruby v7 emits an argument-less bare identifier inside a method as an
+// implicit-receiver call when the method declares no local of that name.
+// Unchanged bytes now persist new call edges and references, so every Ruby
+// file has to reach the parser again.
+//
 // Ruby v6 records a `def` passed as the only argument of a visibility modifier
 // (`private def run`, `private_class_method def self.build`, `module_function
 // def tool`) as the method it defines, with its body's calls, and no longer
@@ -246,7 +251,7 @@ func (a *RustAdapter) Profile() parser.Profile {
 // otherwise a repository indexed under v2 would keep edges this parser refuses
 // to emit and never reparse.
 func (a *RubyAdapter) Profile() parser.Profile {
-	return parser.NewProfile("ruby", "treesitter:ruby:v6", true)
+	return parser.NewProfile("ruby", "treesitter:ruby:v7", true)
 }
 func (a *SwiftAdapter) Profile() parser.Profile {
 	return parser.NewProfile("swift", "treesitter:swift:v7", true)

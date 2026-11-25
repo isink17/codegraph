@@ -5,6 +5,7 @@ package treesitter
 import (
 	"context"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -565,6 +566,172 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		evidence := rubyCallEvidence(receiver, rubyCallOperator(receiver, methodNode, content))
 		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1, Col: int(call.StartPoint().Column) + 1})
 	}
+	if root.HasError() {
+		return
+	}
+	defs := append(findDescendants(root, "method"), findDescendants(root, "singleton_method")...)
+	for _, def := range defs {
+		if rubyMisparsedDefinition(def, content) {
+			return
+		}
+	}
+	for _, def := range defs {
+		if recorded[nodeRange(def)] {
+			rubyExtractBareCalls(def, content, pf)
+		}
+	}
+}
+
+// rubyMisparsedDefinition reports a `def` the grammar read without its
+// parameter list: `def !=(obj)` parses as an endless `def !` whose body is
+// `(obj)`, and the rest of the file loses its nesting with no error node. Such
+// a file's scopes cannot be trusted, like a file with a syntax error, so none
+// of its bare identifiers is a call.
+func rubyMisparsedDefinition(def *sitter.Node, content []byte) bool {
+	name := childByFieldName(def, "name")
+	if name == nil || childByFieldName(def, "parameters") != nil {
+		return false
+	}
+	end := int(name.EndByte())
+	if name.Type() == "operator" && end < len(content) && content[end] == '=' {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimLeft(string(content[end:min(len(content), end+64)]), " \t"), "(")
+}
+
+// rubyExtractBareCalls emits the argument-less bare identifiers of one recorded
+// method that Ruby parses as calls. The grammar gives `helper` the same node
+// whether it reads a local or calls a method; Ruby decides at parse time, and a
+// name is a local only after an assignment or parameter in the same scope
+// declares it. A `def` is a scope gate, so any name the method declares
+// anywhere -- including in a block, or after the read -- is withheld rather than
+// ordered, and an identifier in a position not known to be a plain read
+// counts as a declaration. Both only lose calls, never invent one.
+func rubyExtractBareCalls(def *sitter.Node, content []byte, pf *graph.ParsedFile) {
+	declared := make(map[string]bool)
+	var reads []*sitter.Node
+	var walk func(node *sitter.Node, gated bool)
+	walk = func(node *sitter.Node, gated bool) {
+		for i := range int(node.ChildCount()) {
+			child := node.Child(i)
+			field := node.FieldNameForChild(i)
+			switch child.Type() {
+			case "method", "singleton_method", "class", "module", "singleton_class":
+				// A nested scope reads nothing of this method's, but parts of it
+				// (`class << x = {}`) run in this scope, so it still declares.
+				walk(child, true)
+				continue
+			case "identifier":
+				name := nodeText(child, content)
+				switch {
+				case node == def && (field == "name" || field == "object"):
+				case rubyNonBindingName(node.Type(), field):
+				case rubyBareRead(node, field) && !rubyInsideDefined(child, def, content):
+					if !gated {
+						reads = append(reads, child)
+					}
+				default:
+					declared[name] = true
+				}
+			case "regex":
+				// `/(?<name>..)/ =~ s` declares `name`; any regex naming a group
+				// withholds it.
+				for _, m := range rubyNamedCapture.FindAllSubmatch(content[child.StartByte():child.EndByte()], -1) {
+					declared[string(m[1])] = true
+				}
+			case "hash_key_symbol":
+				// `in {name:}` binds `name` without an identifier node.
+				if node.Type() == "keyword_pattern" {
+					declared[nodeText(child, content)] = true
+				}
+			}
+			walk(child, gated)
+		}
+	}
+	walk(def, false)
+	for _, id := range reads {
+		name := nodeText(id, content)
+		// `it` and `_1`..`_9` are a block's implicit parameters.
+		if declared[name] || name == "it" || rubyNumberedParam.MatchString(name) || rubyPseudoVariables[name] {
+			continue
+		}
+		if rubyBlockLocalDefinition(id) || rubyRebindsSelf(id, content) {
+			continue
+		}
+		rng := nodeRange(id)
+		rng.StartCol = int(id.StartPoint().Column) + 1
+		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
+		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: "ruby:implicit_receiver",
+			Line: int(id.StartPoint().Row) + 1, Col: int(id.StartPoint().Column) + 1})
+	}
+}
+
+var (
+	rubyNamedCapture  = regexp.MustCompile(`\(\?<([A-Za-z_]\w*)>`)
+	rubyNumberedParam = regexp.MustCompile(`^_[1-9]$`)
+	// The grammar leaves these keywords as identifiers in some positions.
+	rubyPseudoVariables = map[string]bool{"__FILE__": true, "__LINE__": true, "__ENCODING__": true}
+)
+
+// rubyNonBindingName reports identifiers that name a method rather than read or
+// declare a local: the method of a call, and the operands of alias and undef.
+func rubyNonBindingName(parent, field string) bool {
+	return (parent == "call" && field == "method") || parent == "alias" || parent == "undef"
+}
+
+// rubyBareStatementParents hold statements or expressions in every child slot.
+var rubyBareStatementParents = map[string]bool{
+	"body_statement": true, "block_body": true, "then": true, "else": true, "do": true,
+	"ensure": true, "begin": true, "parenthesized_statements": true, "interpolation": true,
+	"argument_list": true, "array": true, "element_reference": true, "right_assignment_list": true,
+	"splat_argument": true, "hash_splat_argument": true, "block_argument": true,
+}
+
+// rubyBareReadFields are the expression slots of nodes whose other slots may
+// name or declare something.
+var rubyBareReadFields = map[string]map[string]bool{
+	"binary":              {"left": true, "right": true},
+	"unary":               {"operand": true},
+	"conditional":         {"condition": true, "consequence": true, "alternative": true},
+	"if":                  {"condition": true},
+	"unless":              {"condition": true},
+	"while":               {"condition": true},
+	"until":               {"condition": true},
+	"elsif":               {"condition": true},
+	"if_modifier":         {"body": true, "condition": true},
+	"unless_modifier":     {"body": true, "condition": true},
+	"while_modifier":      {"body": true, "condition": true},
+	"until_modifier":      {"body": true, "condition": true},
+	"rescue_modifier":     {"body": true, "handler": true},
+	"assignment":          {"right": true},
+	"operator_assignment": {"right": true},
+	"call":                {"receiver": true},
+	"pair":                {"key": true, "value": true},
+	"range":               {"begin": true, "end": true},
+	"case":                {"value": true},
+	"element_reference":   {"object": true},
+	"method":              {"body": true},
+	"optional_parameter":  {"value": true},
+	"keyword_parameter":   {"value": true},
+	"singleton_method":    {"body": true},
+}
+
+func rubyBareRead(parent *sitter.Node, field string) bool {
+	if rubyBareStatementParents[parent.Type()] && field == "" {
+		return true
+	}
+	return rubyBareReadFields[parent.Type()][field]
+}
+
+// rubyInsideDefined reports an operand of `defined?`, which names its operand
+// without calling it.
+func rubyInsideDefined(id, def *sitter.Node, content []byte) bool {
+	for node := id.Parent(); node != nil && node != def; node = node.Parent() {
+		if node.Type() == "unary" && strings.HasPrefix(nodeText(node, content), "defined?") {
+			return true
+		}
+	}
+	return false
 }
 
 func rubyLinkTests(pf *graph.ParsedFile) {
