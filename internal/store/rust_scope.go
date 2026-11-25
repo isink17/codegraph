@@ -31,6 +31,29 @@ type rustScopeModule struct {
 	inline                            bool
 }
 
+// rustExternalModuleStem is the source stem rustc reads for an out-of-line
+// `mod name;`: the declaring file's module directory (external_path), one
+// directory per inline module around the declaration, then the name. It is
+// false when an inline module on that path has no declaration row: an
+// attribute on it (#[path], cfg, an attribute macro) may move or remove it, so
+// the child is left unlinked rather than matched to another crate-local file.
+func rustExternalModuleStem(m rustScopeModule, file rustScopeFile, inlineDecls map[rustValueKey]bool) (string, bool) {
+	below, ok := strings.CutPrefix(m.owner, file.module)
+	if !ok || (below != "" && !strings.HasPrefix(below, "::")) {
+		return "", false
+	}
+	parts := []string{path.Dir(file.path), path.Dir(m.external)}
+	owner := file.module
+	for _, inline := range strings.Split(below, "::")[1:] {
+		if !inlineDecls[rustValueKey{file: m.file, owner: owner, name: inline}] {
+			return "", false
+		}
+		owner += "::" + inline
+		parts = append(parts, inline)
+	}
+	return path.Join(append(parts, path.Base(m.external))...), true
+}
+
 // rustValueItems is what the parser recorded in module scopes that binds no
 // symbol: declared value names (const, static, extern-block items) and
 // modules holding an item macro invocation, whose expansion is unread and so
@@ -621,6 +644,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}); err != nil {
 		return nil, err
 	}
+	inlineDecls := map[rustValueKey]bool{}
+	for _, m := range decls {
+		if m.inline {
+			inlineDecls[rustValueKey{file: m.file, owner: m.owner, name: m.name}] = true
+		}
+	}
 	for changed := true; changed; {
 		changed = false
 		for _, m := range decls {
@@ -637,12 +666,14 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 				}
 				continue
 			}
-			// external_path is the candidate stem relative to the declaring
-			// file's directory. Joining it to that file's stored path names the
-			// two spellings Rust accepts, and both are compared to files.path
-			// bytes exactly: a '/' is the only separator and a backslash is
-			// filename data, so no suffix or separator folding may enter here.
-			stem := path.Join(path.Dir(files[m.file].path), m.external)
+			// The stem joins the declaring file's stored path, so both spellings
+			// Rust accepts are compared to files.path bytes exactly: a '/' is the
+			// only separator and a backslash is filename data, so no suffix or
+			// separator folding may enter here.
+			stem, ok := rustExternalModuleStem(m, files[m.file], inlineDecls)
+			if !ok {
+				continue
+			}
 			matches := []int64{}
 			for _, candidate := range [2]string{stem + ".rs", stem + "/mod.rs"} {
 				if id, ok := fileByPath[candidate]; ok {

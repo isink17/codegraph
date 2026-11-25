@@ -63,6 +63,9 @@ var resolverPolicyRegistry = map[string]int{
 	// updates that did not track the helper name in ordinary-lambda evidence.
 	// Rust's 2 follows an explicit `use` of a qualified call's first segment
 	// (`use crate::a; a::f()`); epoch 1 left every such call unresolved.
+	// Rust's 3 reads a `mod name;` inside an inline module from that inline
+	// module's directory; epoch 2 may bind a call through it to a same-named
+	// module file outside it (src/sub.rs for `mod m { mod sub; }`).
 	"cpp":        1,
 	"csharp":     4,
 	"dart":       1,
@@ -75,7 +78,7 @@ var resolverPolicyRegistry = map[string]int{
 	"php":        1,
 	"python":     1,
 	"ruby":       1,
-	"rust":       2,
+	"rust":       3,
 	"swift":      1,
 	"typescript": 1,
 }
