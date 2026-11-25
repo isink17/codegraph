@@ -522,21 +522,6 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	if stats != nil {
 		stats.AffectedModules = len(files)
 	}
-	symbols := map[int64]rustScopeSymbol{}
-	var byQ map[string][]rustScopeSymbol
-	if err := sqliteBatchedQuery(ctx, tx,
-		`SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE s.repo_id=? AND s.language='rust'`,
-		scopeClause, []any{repoID}, scopedFiles, filtered,
-		func(rows *sql.Rows) error {
-			var s rustScopeSymbol
-			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qualified, &s.container, &s.visibility, &s.kind); err != nil {
-				return err
-			}
-			symbols[s.id] = s
-			return nil
-		}); err != nil {
-		return nil, err
-	}
 	imports := []rustScopeImport{}
 	if err := sqliteBatchedQuery(ctx, tx,
 		`SELECT i.file_id,i.owner_module,i.source_specifier,i.local_name,i.wildcard,i.is_reexport FROM scope_import_evidence i JOIN files f ON f.id=i.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE i.repo_id=? AND i.language='rust'`,
@@ -600,27 +585,6 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		}); err != nil {
 		return nil, err
 	}
-	valueItems := rustValueItems{decl: map[rustValueKey]bool{}, macro: map[rustValueKey]bool{}, unproven: map[rustValueKey]bool{}}
-	if err := sqliteBatchedQuery(ctx, tx,
-		`SELECT v.file_id,v.owner_module,v.name,v.kind FROM rust_value_item_evidence v JOIN files f ON f.id=v.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE v.repo_id=?`,
-		scopeClause, []any{repoID}, scopedFiles, filtered,
-		func(rows *sql.Rows) error {
-			var file int64
-			var owner, name, kind string
-			if err := rows.Scan(&file, &owner, &name, &kind); err != nil {
-				return err
-			}
-			if kind == graph.RustValueItemMacro {
-				valueItems.macro[rustValueKey{file: file, owner: owner}] = true
-			} else if kind == graph.RustValueItemUnproven {
-				valueItems.unproven[rustValueKey{file: file, name: name}] = true
-			} else {
-				valueItems.decl[rustValueKey{file: file, owner: owner, name: name}] = true
-			}
-			return nil
-		}); err != nil {
-		return nil, err
-	}
 	for changed := true; changed; {
 		changed = false
 		for _, m := range decls {
@@ -672,18 +636,80 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	}
 	// Persist over every loaded file, not only the ones with a proven root: a
 	// file that lost its membership must have its cached crate_root cleared, or
-	// the next incremental run would still see it in the crate.
+	// the next incremental run would still see it in the crate. A row already
+	// holding its recomputed value is left alone.
 	persistIDs := make([]int64, 0, len(files))
-	for id := range files {
-		persistIDs = append(persistIDs, id)
+	for id, f := range files {
+		if f.root != rootOfFile[id] {
+			persistIDs = append(persistIDs, id)
+		}
 	}
 	slices.Sort(persistIDs)
 	if err := updateRustCrateRoots(ctx, tx, repoID, persistIDs, rootOfFile); err != nil {
 		return nil, err
 	}
+	// A membership-only pass selects no edge: nothing below can change the
+	// database or the result.
+	if only != nil && len(only) == 0 {
+		return map[int64]struct{}{}, nil
+	}
+	symbols := map[int64]rustScopeSymbol{}
+	var byQ map[string][]rustScopeSymbol
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT s.id,s.file_id,s.name,s.qualified_name,s.container_name,s.visibility,s.kind FROM symbols s JOIN files f ON f.id=s.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE s.repo_id=? AND s.language='rust'`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var s rustScopeSymbol
+			if err := rows.Scan(&s.id, &s.file, &s.name, &s.qualified, &s.container, &s.visibility, &s.kind); err != nil {
+				return err
+			}
+			symbols[s.id] = s
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	valueItems := rustValueItems{decl: map[rustValueKey]bool{}, macro: map[rustValueKey]bool{}, unproven: map[rustValueKey]bool{}}
+	if err := sqliteBatchedQuery(ctx, tx,
+		`SELECT v.file_id,v.owner_module,v.name,v.kind FROM rust_value_item_evidence v JOIN files f ON f.id=v.file_id JOIN file_scope_evidence e ON e.file_id=f.id AND e.repo_id=f.repo_id WHERE v.repo_id=?`,
+		scopeClause, []any{repoID}, scopedFiles, filtered,
+		func(rows *sql.Rows) error {
+			var file int64
+			var owner, name, kind string
+			if err := rows.Scan(&file, &owner, &name, &kind); err != nil {
+				return err
+			}
+			if kind == graph.RustValueItemMacro {
+				valueItems.macro[rustValueKey{file: file, owner: owner}] = true
+			} else if kind == graph.RustValueItemUnproven {
+				valueItems.unproven[rustValueKey{file: file, name: name}] = true
+			} else {
+				valueItems.decl[rustValueKey{file: file, owner: owner, name: name}] = true
+			}
+			return nil
+		}); err != nil {
+		return nil, err
+	}
 	for id, f := range files {
 		f.root = rootOfFile[id]
 		files[id] = f
+	}
+	// fileViews lists, per file, the module keys the file alone holds as a file
+	// module: the lookup views its symbols and value items are re-homed under.
+	fileViews := map[int64][]string{}
+	for key, members := range moduleFiles {
+		if len(members) == 1 && !inlineModules[key] {
+			fileViews[members[0]] = append(fileViews[members[0]], key)
+		}
+	}
+	type rustDeclKey struct{ owner, name string }
+	declsBy := map[rustDeclKey][]rustScopeModule{}
+	for _, m := range decls {
+		k := rustDeclKey{m.owner, m.name}
+		declsBy[k] = append(declsBy[k], m)
+	}
+	importsByOwner := map[string][]rustScopeImport{}
+	for _, im := range imports {
+		importsByOwner[im.owner] = append(importsByOwner[im.owner], im)
 	}
 	// Parser paths are provisional for files that can also be bin roots (for
 	// example src/bin/util.rs). The declaration graph is authoritative. A file
@@ -726,9 +752,9 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		own := candidateModule(original)
 		below, inFile := strings.CutPrefix(own, files[original.file].module)
 		inFile = inFile && (below == "" || strings.HasPrefix(below, "::"))
-		for key, members := range moduleFiles {
+		for _, key := range fileViews[original.file] {
 			sep := strings.IndexByte(key, 0)
-			if sep < 0 || len(members) != 1 || members[0] != original.file || inlineModules[key] || !inFile {
+			if sep < 0 || !inFile {
 				continue
 			}
 			module := key[sep+1:]
@@ -763,8 +789,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		if !inFile || (below != "" && !strings.HasPrefix(below, "::")) {
 			return
 		}
-		for key, members := range moduleFiles {
-			if sep := strings.IndexByte(key, 0); sep >= 0 && len(members) == 1 && members[0] == file && !inlineModules[key] {
+		for _, key := range fileViews[file] {
+			if sep := strings.IndexByte(key, 0); sep >= 0 {
 				into[rustModuleView{key[:sep], key[sep+1:] + below, name}] = true
 			}
 		}
@@ -815,8 +841,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 	// owner, in the caller's crate: what a path's first segment, resolved in
 	// the type namespace, finds before any glob.
 	ownTypeItem := func(owner, name string, caller rustScopeFile) bool {
-		for _, m := range decls {
-			if m.owner == owner && m.name == name && rootOfFile[m.file] != "" && rootOfFile[m.file] == rootOfFile[caller.id] {
+		for _, m := range declsBy[rustDeclKey{owner, name}] {
+			if rootOfFile[m.file] != "" && rootOfFile[m.file] == rootOfFile[caller.id] {
 				return true
 			}
 		}
@@ -934,8 +960,8 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 			return false
 		}
 		parent, name := p[:i], p[i+2:]
-		for _, m := range decls {
-			if m.owner != parent || m.name != name || rootOfFile[m.file] != root {
+		for _, m := range declsBy[rustDeclKey{parent, name}] {
+			if rootOfFile[m.file] != root {
 				continue
 			}
 			switch m.visibility {
@@ -978,12 +1004,12 @@ func resolveRustModuleScopeWithStats(ctx context.Context, tx *sql.Tx, repoID int
 		for _, c := range out {
 			own = own || (rootOfFile[c.file] == root && (c.kind == "function" || c.kind == "struct"))
 		}
-		for _, im := range imports {
-			own = own || (im.owner == module && !im.glob && im.local == name && rootOfFile[im.file] == root)
+		for _, im := range importsByOwner[module] {
+			own = own || (!im.glob && im.local == name && rootOfFile[im.file] == root)
 		}
 		own = own || shadowsGlobs(root, module, name)
-		for _, im := range imports {
-			if im.owner != module || !im.reexport || rootOfFile[im.file] != root {
+		for _, im := range importsByOwner[module] {
+			if !im.reexport || rootOfFile[im.file] != root {
 				continue
 			}
 			var reached []rustScopeSymbol
