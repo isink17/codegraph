@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -240,4 +242,47 @@ func liveProbeState(p scanLockProbe) string {
 		return freshnessUnknown
 	}
 	return LiveWatcherNone
+}
+
+// ErrWatcherActive reports a watcher running on a database that a caller
+// would otherwise replace.
+var ErrWatcherActive = errors.New("a codegraph watch process is running on this database")
+
+// WatcherActive reports whether a watcher of any repository holds its locks
+// beside the database at dbPath. A watcher keeps its open database for its
+// whole run, so replacing the file under it would leave it writing to the old
+// one. It never creates a lock file; a lock it cannot probe counts as held.
+func WatcherActive(dbPath string) (bool, error) {
+	dir, base := filepath.Split(dbPath)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("list watcher locks: %w", err)
+	}
+	scanLockProbeMu.Lock()
+	defer scanLockProbeMu.Unlock()
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, base+".watch-") {
+			continue
+		}
+		var probe scanLockProbe
+		switch {
+		case strings.HasSuffix(name, ".live.lock"):
+			probe = probeLock(filepath.Join(dir, name), false, 1)
+		case strings.HasSuffix(name, ".lock"):
+			probe = probeLock(filepath.Join(dir, name), true, scanLockProbeAttempts)
+		default:
+			continue
+		}
+		if probe == scanLockHeld || probe == scanLockError {
+			return true, nil
+		}
+	}
+	return false, nil
 }
