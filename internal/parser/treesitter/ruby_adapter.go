@@ -3,8 +3,10 @@
 package treesitter
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -467,25 +469,6 @@ func rubyAssignmentTarget(call *sitter.Node) bool {
 	return false
 }
 
-// rubyBlockLocalDefinition reports whether a call sits inside a `def` that is
-// itself inside a block (`Class.new do def run; end end`). rubyExtractSymbols
-// walks direct children only, so such a `def` is never a symbol and its body
-// would otherwise be attributed to the enclosing method -- binding its calls to
-// the enclosing container's members. Ruby's runtime owner there is the object
-// the block builds, which is not syntax-proven, so fail closed.
-func rubyBlockLocalDefinition(call *sitter.Node) bool {
-	def := call.Parent()
-	for def != nil && def.Type() != "method" && def.Type() != "singleton_method" {
-		def = def.Parent()
-	}
-	for node := def; node != nil; node = node.Parent() {
-		if node.Type() == "block" || node.Type() == "do_block" {
-			return true
-		}
-	}
-	return false
-}
-
 // rubySelfRebindingMethods take a block whose `self` is some other object, so a
 // receiver-less call inside one is not the lexical self the parser can see.
 var rubySelfRebindingMethods = map[string]struct{}{
@@ -501,39 +484,31 @@ var rubySelfRebindingConstants = map[string]struct{}{
 	"Class": {}, "Module": {}, "Struct": {}, "Data": {},
 }
 
-// rubyRebindsSelf reports whether a call sits inside a block that rebinds
-// `self`. `other.instance_eval { run() }` calls `run` on `other`, not on the
-// enclosing method's receiver, and which object that is cannot be proven from
-// syntax -- so no receiver evidence is emitted for it at all. Ordinary blocks
-// (`each`, `map`, a lambda) keep the enclosing lexical self and are unaffected.
-func rubyRebindsSelf(call *sitter.Node, content []byte) bool {
-	for node := call.Parent(); node != nil; node = node.Parent() {
-		if node.Type() != "block" && node.Type() != "do_block" {
-			continue
-		}
-		parent := node.Parent()
-		if parent == nil || parent.Type() != "call" {
-			continue
-		}
-		method := nodeText(childByFieldName(parent, "method"), content)
-		if _, ok := rubySelfRebindingMethods[method]; ok {
-			return true
-		}
-		// `Class.new do ... end` class_evals its block, so `self` there is the
-		// anonymous class. `new` alone is far too broad a name to key on, so
-		// this is restricted to the constants that actually do it.
-		if method != "new" && method != "define" {
-			continue
-		}
-		receiver := childByFieldName(parent, "receiver")
-		if receiver == nil || receiver.Type() != "constant" {
-			continue
-		}
-		if _, ok := rubySelfRebindingConstants[nodeText(receiver, content)]; ok {
-			return true
-		}
+// rubyBlockRebindsSelf reports whether a block whose parent is this node runs
+// with some other `self`. `other.instance_eval { run() }` calls `run` on
+// `other`, not on the enclosing method's receiver, and which object that is
+// cannot be proven from syntax -- so no receiver evidence is emitted inside it.
+// Ordinary blocks (`each`, `map`, a lambda) keep the enclosing lexical self.
+func rubyBlockRebindsSelf(parent *sitter.Node, content []byte) bool {
+	if parent.Type() != "call" {
+		return false
 	}
-	return false
+	method := nodeText(childByFieldName(parent, "method"), content)
+	if _, ok := rubySelfRebindingMethods[method]; ok {
+		return true
+	}
+	// `Class.new do ... end` class_evals its block, so `self` there is the
+	// anonymous class. `new` alone is far too broad a name to key on, so
+	// this is restricted to the constants that actually do it.
+	if method != "new" && method != "define" {
+		return false
+	}
+	receiver := childByFieldName(parent, "receiver")
+	if receiver == nil || receiver.Type() != "constant" {
+		return false
+	}
+	_, ok := rubySelfRebindingConstants[nodeText(receiver, content)]
+	return ok
 }
 
 func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
@@ -543,7 +518,9 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 			recorded[sym.Range] = true
 		}
 	}
-	for _, call := range findDescendants(root, "call") {
+	calls, scopes, misparsed := rubyScanCalls(root, recorded, content)
+	for _, site := range calls {
+		call := site.node
 		methodNode := childByFieldName(call, "method")
 		method := nodeText(methodNode, content)
 		if method == "" || method == "require" || method == "require_relative" {
@@ -559,12 +536,254 @@ func rubyExtractCalls(root *sitter.Node, content []byte, pf *graph.ParsedFile) {
 		rng := nodeRange(call)
 		rng.StartCol = int(call.StartPoint().Column) + 1
 		pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
-		if rubyAssignmentTarget(call) || rubyBlockLocalDefinition(call) || rubyRebindsSelf(call, content) || rubyRecordedWrapper(call, recorded) {
+		if rubyAssignmentTarget(call) || site.defInBlock || site.rebinds || rubyRecordedWrapper(call, recorded) {
 			continue
 		}
 		evidence := rubyCallEvidence(receiver, rubyCallOperator(receiver, methodNode, content))
 		pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: evidence, Line: int(call.StartPoint().Row) + 1, Col: int(call.StartPoint().Column) + 1})
 	}
+	if !root.HasError() && !misparsed {
+		rubyEmitBareCalls(scopes, content, pf)
+	}
+}
+
+// rubyMisparsedDefinition reports a `def` the grammar read without its
+// parameter list: `def !=(obj)` parses as an endless `def !` whose body is
+// `(obj)`, and the rest of the file loses its nesting with no error node. Such
+// a file's scopes cannot be trusted, like a file with a syntax error, so none
+// of its bare identifiers is a call.
+func rubyMisparsedDefinition(def *sitter.Node, content []byte) bool {
+	name := childByFieldName(def, "name")
+	if name == nil || childByFieldName(def, "parameters") != nil {
+		return false
+	}
+	end := int(name.EndByte())
+	if name.Type() == "operator" && end < len(content) && content[end] == '=' {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimLeft(string(content[end:min(len(content), end+64)]), " \t"), "(")
+}
+
+// rubyCallSite is a call node with the ancestor facts that withhold its edge.
+type rubyCallSite struct {
+	node *sitter.Node
+	// defInBlock: the call sits in a `def` that is itself inside a block
+	// (`Class.new do def run; end end`). rubyExtractSymbols walks direct
+	// children only, so that `def` is never a symbol and its body would be
+	// attributed to the enclosing method; its runtime owner is the object the
+	// block builds, which is not syntax-proven, so fail closed.
+	defInBlock bool
+	// rebinds: the call sits in a block that rebinds `self`.
+	rebinds bool
+}
+
+// rubyBareScope is one recorded method being scanned for bare-identifier calls.
+type rubyBareScope struct {
+	def      *sitter.Node
+	declared map[string]bool
+	reads    []*sitter.Node
+	// gated counts the nested scopes (`def`, `class`, `module`, `class << x`)
+	// between the walk and def: they still declare names here but read none.
+	gated int
+	// defined counts enclosing `defined?` operands below def.
+	defined int
+	// inBlock reports a def inside a block (`Class.new do def run; end end`),
+	// whose owner is not syntax-proven.
+	inBlock bool
+}
+
+// rubyScanCalls collects every call node in source order, and the
+// argument-less bare identifiers of recorded methods that Ruby parses as calls.
+// The grammar gives `helper` the same node whether it reads a local or calls a
+// method; Ruby decides at parse time, and a name is a local only after an
+// assignment or parameter in the same scope declares it. A `def` is a scope
+// gate, so any name the method declares anywhere -- including in a block, or
+// after the read -- is withheld rather than ordered, and an identifier in a
+// position not known to be a plain read counts as a declaration. Both only lose
+// calls, never invent one.
+//
+// One top-down walk carries the ancestor facts each node needs; tree-sitter's
+// parent lookup descends from the root, so walking up per node is quadratic.
+func rubyScanCalls(root *sitter.Node, recorded map[graph.Position]bool, content []byte) (calls []rubyCallSite, scopes []*rubyBareScope, misparsed bool) {
+	var open []*rubyBareScope
+	var walk func(node *sitter.Node, inBlock, rebinds, defInBlock bool)
+	walk = func(node *sitter.Node, inBlock, rebinds, defInBlock bool) {
+		for i := range int(node.ChildCount()) {
+			child := node.Child(i)
+			field := node.FieldNameForChild(i)
+			childBlock, childRebinds := inBlock, rebinds
+			switch kind := child.Type(); kind {
+			case "method", "singleton_method", "class", "module", "singleton_class":
+				// A nested scope reads nothing of the enclosing method's, but
+				// parts of it (`class << x = {}`) run in that scope, so it still
+				// declares.
+				if (kind == "method" || kind == "singleton_method") && rubyMisparsedDefinition(child, content) {
+					misparsed = true
+				}
+				for _, sc := range open {
+					sc.gated++
+				}
+				pushed := false
+				if (kind == "method" || kind == "singleton_method") && recorded[nodeRange(child)] {
+					sc := &rubyBareScope{def: child, declared: make(map[string]bool), inBlock: inBlock}
+					scopes = append(scopes, sc)
+					open = append(open, sc)
+					pushed = true
+				}
+				childDefInBlock := defInBlock
+				if kind == "method" || kind == "singleton_method" {
+					childDefInBlock = inBlock
+				}
+				walk(child, inBlock, rebinds, childDefInBlock)
+				if pushed {
+					open = open[:len(open)-1]
+				}
+				for _, sc := range open {
+					sc.gated--
+				}
+				continue
+			case "identifier":
+				if len(open) == 0 {
+					break
+				}
+				name := nodeText(child, content)
+				nonBinding := rubyNonBindingName(node.Type(), field)
+				read := rubyBareRead(node, field)
+				for _, sc := range open {
+					switch {
+					case node == sc.def && (field == "name" || field == "object"):
+					case nonBinding:
+					case read && sc.defined == 0:
+						if sc.gated == 0 && !rebinds {
+							sc.reads = append(sc.reads, child)
+						}
+					default:
+						sc.declared[name] = true
+					}
+				}
+			case "regex":
+				// `/(?<name>..)/ =~ s` and `/(?'name'..)/ =~ s` declare `name`; any
+				// regex naming a group withholds it.
+				for _, m := range rubyNamedCapture.FindAllSubmatch(content[child.StartByte():child.EndByte()], -1) {
+					for _, sc := range open {
+						sc.declared[string(m[1])+string(m[2])] = true
+					}
+				}
+			case "call":
+				calls = append(calls, rubyCallSite{node: child, defInBlock: defInBlock, rebinds: rebinds})
+			case "block", "do_block":
+				childBlock = true
+				childRebinds = rebinds || rubyBlockRebindsSelf(node, content)
+			}
+			if field == "pattern" && rubyPatternParents[node.Type()] && len(open) > 0 {
+				// A pattern binds names in forms with no identifier node
+				// (`in {"name":}`), so every word it spells is withheld.
+				for _, word := range rubyPatternWord.FindAll(content[child.StartByte():child.EndByte()], -1) {
+					for _, sc := range open {
+						sc.declared[string(word)] = true
+					}
+				}
+			}
+			isDefined := child.Type() == "unary" && bytes.HasPrefix(content[child.StartByte():], []byte("defined?"))
+			if isDefined {
+				for _, sc := range open {
+					sc.defined++
+				}
+			}
+			walk(child, childBlock, childRebinds, defInBlock)
+			if isDefined {
+				for _, sc := range open {
+					sc.defined--
+				}
+			}
+		}
+	}
+	walk(root, false, false, false)
+	return calls, scopes, misparsed
+}
+
+func rubyEmitBareCalls(scopes []*rubyBareScope, content []byte, pf *graph.ParsedFile) {
+	// Methods first, then singleton methods, each in source order.
+	for _, kind := range []string{"method", "singleton_method"} {
+		for _, sc := range scopes {
+			if sc.def.Type() != kind || sc.inBlock {
+				continue
+			}
+			for _, id := range sc.reads {
+				name := nodeText(id, content)
+				// `it` and `_1`..`_9` are a block's implicit parameters.
+				if sc.declared[name] || name == "it" || rubyNumberedParam.MatchString(name) || rubyPseudoVariables[name] {
+					continue
+				}
+				rng := nodeRange(id)
+				rng.StartCol = int(id.StartPoint().Column) + 1
+				pf.References = append(pf.References, graph.Reference{Kind: "call", Name: name, QualifiedName: name, Range: rng})
+				pf.Edges = append(pf.Edges, graph.Edge{DstName: name, Kind: "calls", Evidence: "ruby:implicit_receiver",
+					Line: int(id.StartPoint().Row) + 1, Col: int(id.StartPoint().Column) + 1})
+			}
+		}
+	}
+}
+
+var (
+	rubyNamedCapture = regexp.MustCompile(`\(\?(?:<([^>=!][^>]*)>|'([^']+)')`)
+	rubyPatternWord  = regexp.MustCompile(`[\p{L}_][\p{L}\p{N}_]*`)
+	// in_clause covers `case ... in`; match_pattern and test_pattern are
+	// `value => pattern` and `value in pattern`.
+	rubyPatternParents = map[string]bool{"in_clause": true, "match_pattern": true, "test_pattern": true}
+	rubyNumberedParam  = regexp.MustCompile(`^_[1-9]$`)
+	// The grammar leaves these keywords as identifiers in some positions.
+	rubyPseudoVariables = map[string]bool{"__FILE__": true, "__LINE__": true, "__ENCODING__": true}
+)
+
+// rubyNonBindingName reports identifiers that name a method rather than read or
+// declare a local: the method of a call, and the operands of alias and undef.
+func rubyNonBindingName(parent, field string) bool {
+	return (parent == "call" && field == "method") || parent == "alias" || parent == "undef"
+}
+
+// rubyBareStatementParents hold statements or expressions in every child slot.
+var rubyBareStatementParents = map[string]bool{
+	"body_statement": true, "block_body": true, "then": true, "else": true, "do": true,
+	"ensure": true, "begin": true, "parenthesized_statements": true, "interpolation": true,
+	"argument_list": true, "array": true, "element_reference": true, "right_assignment_list": true,
+	"splat_argument": true, "hash_splat_argument": true, "block_argument": true,
+}
+
+// rubyBareReadFields are the expression slots of nodes whose other slots may
+// name or declare something.
+var rubyBareReadFields = map[string]map[string]bool{
+	"binary":              {"left": true, "right": true},
+	"unary":               {"operand": true},
+	"conditional":         {"condition": true, "consequence": true, "alternative": true},
+	"if":                  {"condition": true},
+	"unless":              {"condition": true},
+	"while":               {"condition": true},
+	"until":               {"condition": true},
+	"elsif":               {"condition": true},
+	"if_modifier":         {"body": true, "condition": true},
+	"unless_modifier":     {"body": true, "condition": true},
+	"while_modifier":      {"body": true, "condition": true},
+	"until_modifier":      {"body": true, "condition": true},
+	"rescue_modifier":     {"body": true, "handler": true},
+	"assignment":          {"right": true},
+	"operator_assignment": {"right": true},
+	"call":                {"receiver": true},
+	"pair":                {"key": true, "value": true},
+	"range":               {"begin": true, "end": true},
+	"case":                {"value": true},
+	"element_reference":   {"object": true},
+	"method":              {"body": true},
+	"optional_parameter":  {"value": true},
+	"keyword_parameter":   {"value": true},
+	"singleton_method":    {"body": true},
+}
+
+func rubyBareRead(parent *sitter.Node, field string) bool {
+	if rubyBareStatementParents[parent.Type()] && field == "" {
+		return true
+	}
+	return rubyBareReadFields[parent.Type()][field]
 }
 
 func rubyLinkTests(pf *graph.ParsedFile) {

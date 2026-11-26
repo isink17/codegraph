@@ -155,8 +155,8 @@ def run; end
 	}
 }
 
-func TestRubyProfileV6(t *testing.T) {
-	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v6" || !got.EmitsCallEdges {
+func TestRubyProfileV7(t *testing.T) {
+	if got := NewRuby().Profile(); got.ID != "treesitter:ruby:v7" || !got.EmitsCallEdges {
 		t.Fatalf("profile=%+v", got)
 	}
 }
