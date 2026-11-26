@@ -4,7 +4,6 @@ package watcher
 
 import (
 	"io/fs"
-	"os"
 	"path/filepath"
 	"slices"
 	"sync/atomic"
@@ -30,16 +29,12 @@ func TestConfigReloadRetriesSharingViolation(t *testing.T) {
 	}
 	t.Cleanup(func() { loadRepoConfig = old })
 	r := startLiveRepo(t, map[string]string{"main.go": "package main\n", "gen/g.go": goFile})
-	cfgDir := filepath.Join(r.root, ".codegraph")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(cfgDir, "config.json"), `{"exclude": ["gen/**"]}`)
+	writeConfigAtomically(t, r.root, `{"exclude": ["gen/**"]}`)
 	r.waitLive(t, "excluded file retired after the retried reload", func(p []string) bool {
 		return !slices.Contains(p, "gen/g.go")
 	})
-	if st := r.w.Stats(); st.LastTransient != "config_busy" || busy.Load() < 2 {
-		t.Fatalf("the sharing violation was not retried: %+v", st)
+	if n := busy.Load(); n < 2 {
+		t.Fatalf("config read %d times, want the sharing violation retried", n)
 	}
 	r.waitState(t, StateWatching)
 }

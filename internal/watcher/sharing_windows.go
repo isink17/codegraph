@@ -8,6 +8,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func isSharingViolation(err error) bool {
+func sharingViolation(err error) bool {
 	return errors.Is(err, windows.ERROR_SHARING_VIOLATION)
 }

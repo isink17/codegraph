@@ -200,12 +200,16 @@ func transientKind(err error) (string, bool) {
 	return "", false
 }
 
-// configLoadTransient is transientKind for a repository config read. On
-// Windows the read also fails with a sharing violation while a writer's
-// atomic save (a rename onto config.json) is still in flight; the file is
-// complete once the rename returns, so the read is retried.
+// configLoadTransient is transientKind for work that reads the repository
+// config: a reload, or a flush whose indexer reads it. On Windows that read
+// also fails with a sharing violation while a writer's atomic save (a rename
+// onto config.json) is still in flight; the file is complete once the rename
+// returns, so the read is retried. A sharing violation on any other file keeps
+// transientKind's answer.
 func configLoadTransient(err error) (string, bool) {
-	if isSharingViolation(err) {
+	var pathErr *fs.PathError
+	if isSharingViolation(err) && errors.As(err, &pathErr) &&
+		filepath.Base(pathErr.Path) == "config.json" && filepath.Base(filepath.Dir(pathErr.Path)) == config.RepoArtifactsDir {
 		return "config_busy", true
 	}
 	return transientKind(err)
@@ -615,7 +619,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		if pauseForConfig(err) {
 			forceFullScan.Store(true)
 		} else {
-			kind, ok := transientKind(err)
+			kind, ok := configLoadTransient(err)
 			if !ok {
 				return err
 			}
@@ -705,7 +709,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					}
 					continue
 				}
-				if kind, ok := transientKind(err); ok && loopCtx.Err() == nil {
+				if kind, ok := configLoadTransient(err); ok && loopCtx.Err() == nil {
 					// Claimed paths stay in the dirty queue and the next claim
 					// takes them again; the retry is a full pass because the
 					// failed one may have left the graph partly written.
@@ -764,7 +768,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 				err = resetWatcher(true)
 			}
 			if err != nil {
-				kind, ok := transientKind(err)
+				kind, ok := configLoadTransient(err)
 				if !ok {
 					return fmt.Errorf("recover watcher: %w", err)
 				}
@@ -1087,3 +1091,6 @@ func queueFailure() error {
 
 // loadRepoConfig reads the repository config on reload; tests replace it.
 var loadRepoConfig = config.LoadRepo
+
+// isSharingViolation reports a Windows sharing violation; tests replace it.
+var isSharingViolation = sharingViolation

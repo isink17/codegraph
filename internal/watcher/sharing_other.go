@@ -2,4 +2,4 @@
 
 package watcher
 
-func isSharingViolation(error) bool { return false }
+func sharingViolation(error) bool { return false }
