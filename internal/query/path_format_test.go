@@ -201,7 +201,9 @@ func serviceRepositoryCalls() []serviceCall {
 		{"SemanticSearch", "SemanticSearch", func(ctx context.Context, s *Service, r int64) (any, error) {
 			return s.SemanticSearch(ctx, r, "thing", 10, 0)
 		}},
-		{"FindDeadCode", "FindDeadCode", func(ctx context.Context, s *Service, r int64) (any, error) { return s.FindDeadCode(ctx, r, 10, 0) }},
+		{"FindDeadCodeResult", "FindDeadCodeResult", func(ctx context.Context, s *Service, r int64) (any, error) {
+			return s.FindDeadCodeResult(ctx, r, 10, 0)
+		}},
 		{"ListFiles", "ListFiles", func(ctx context.Context, s *Service, r int64) (any, error) { return s.ListFiles(ctx, r, "", 10, 0) }},
 		{"GraphSnapshot", "GraphSnapshot", func(ctx context.Context, s *Service, r int64) (any, error) {
 			symbols, edges, err := s.GraphSnapshot(ctx, r, "", 1)

@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/isink17/codegraph/internal/githistory"
 	"github.com/isink17/codegraph/internal/graph"
@@ -10452,15 +10455,109 @@ func (s *Store) ListFiles(ctx context.Context, repoID int64, pathFilter string, 
 	return out, rows.Err()
 }
 
+// DeadCodeSkippedLanguage is a language whose symbols FindDeadCodeResult did
+// not classify: its persisted graph capability and why that capability cannot
+// show a symbol is unused.
+type DeadCodeSkippedLanguage struct {
+	Language   string `json:"language"`
+	Capability string `json:"graph_capability"`
+	Reason     string `json:"reason"`
+}
+
+// Dead-code skip reasons.
+const (
+	DeadCodeNoCallEdges             = "no_call_edges"
+	DeadCodeSameFileCallsOnly       = "same_file_calls_only"
+	DeadCodeMixedParserProfiles     = "mixed_parser_profiles"
+	DeadCodeUnknownParserProvenance = "unknown_parser_provenance"
+)
+
+// deadCodeSkipReason is why a language's symbols cannot be classified, or ""
+// when its persisted call graph can show that a symbol has no caller.
+func deadCodeSkipReason(language LanguageCapability) string {
+	switch language.Capability {
+	case GraphCallCapable:
+		for _, profile := range language.Profiles {
+			if parser.SameFileCallsOnly(profile) {
+				return DeadCodeSameFileCallsOnly
+			}
+		}
+		return ""
+	case GraphSymbolsOnly:
+		return DeadCodeNoCallEdges
+	case GraphMixed:
+		return DeadCodeMixedParserProfiles
+	default:
+		return DeadCodeUnknownParserProvenance
+	}
+}
+
+// DeadCodeResult is one page of dead-code candidates plus the languages whose
+// symbols were not classified at all.
+type DeadCodeResult struct {
+	Items   []map[string]any
+	Skipped []DeadCodeSkippedLanguage
+}
+
 // FindDeadCode returns symbols with no incoming edges and no references — likely dead code.
 func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+	result, err := s.FindDeadCodeResult(ctx, repoID, limit, offset)
+	return result.Items, err
+}
+
+// FindDeadCodeResult is FindDeadCode with the languages it skipped. A missing
+// caller is evidence only where the persisted graph records callers from every
+// file, so only symbols of such languages are candidates. Every other language
+// is returned in Skipped, and a file of such a language may still use a
+// candidate: see skippedLanguageUses for what withholds one.
+func (s *Store) FindDeadCodeResult(ctx context.Context, repoID int64, limit, offset int) (DeadCodeResult, error) {
 	ctx, graphTx, graphErr := s.beginParserSemanticGraphRead(ctx, repoID)
 	if graphErr != nil {
-		return nil, graphErr
+		return DeadCodeResult{}, graphErr
 	}
 	if graphTx != nil {
 		defer graphTx.Rollback()
 	}
+	// As in GraphLimitations: when every live file's language is classifiable,
+	// so is every language of the evidence-holding subset, and the exact
+	// population is not needed.
+	groups, err := s.liveFileParserProfileGroups(ctx, repoID)
+	if err != nil {
+		return DeadCodeResult{}, err
+	}
+	capability := ClassifyGraphCapability(groups)
+	if slices.ContainsFunc(capability.Languages, func(l LanguageCapability) bool { return deadCodeSkipReason(l) != "" }) {
+		if groups, err = s.FileParserProfileGroups(ctx, repoID); err != nil {
+			return DeadCodeResult{}, err
+		}
+		capability = ClassifyGraphCapability(groups)
+	}
+	var result DeadCodeResult
+	var callCapable []any
+	for _, language := range capability.Languages {
+		reason := deadCodeSkipReason(language)
+		if reason == "" {
+			callCapable = append(callCapable, language.Language)
+			continue
+		}
+		result.Skipped = append(result.Skipped, DeadCodeSkippedLanguage{Language: language.Language, Capability: language.Capability, Reason: reason})
+	}
+	if len(callCapable) == 0 {
+		return result, nil
+	}
+	inCallCapable := placeholders(len(callCapable))
+	args := append([]any{repoID, repoID}, callCapable...)
+	skippedUseGuard := ""
+	if len(result.Skipped) > 0 {
+		names, files, err := s.skippedLanguageUses(ctx, repoID, result.Skipped, callCapable)
+		if err != nil {
+			return DeadCodeResult{}, err
+		}
+		skippedUseGuard = `AND s.name NOT IN (SELECT value FROM json_each(?))
+		  AND f.id NOT IN (SELECT value FROM json_each(?))`
+		args = append(args, names, files)
+	}
+	args = append(args, safeLimit(limit), safeOffset(offset))
 	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
 		SELECT s.id, s.qualified_name, s.kind, s.name, f.path, f.language,
 		       s.start_line, s.start_col, s.end_line, s.end_col
@@ -10471,9 +10568,11 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		-- scanning every repo's files, which is also what makes the (f.path,
 		-- s.start_line) ordering come out of the indexes rather than a sort.
 		WHERE s.repo_id = ? AND f.repo_id = ?
+		  AND f.language IN (`+inCallCapable+`)
 		  AND s.kind IN ('function', 'method', 'type', 'class', 'struct', 'interface')
 		  -- A Lua, Scala or Dart local function is not dead merely because no call
-		  -- to it was proven (localFunctionSQL).
+		  -- to it was proven (localFunctionSQL). Their tree-sitter profiles are
+		  -- skipped whole today; this stays for any profile that is not.
 		  AND NOT `+localFunctionSQL("s.")+`
 		  -- Classification, not just the page, runs on the active graph: a use
 		  -- recorded in a soft-deleted file is not a use the reader can see, so
@@ -10492,25 +10591,25 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 		  AND s.name NOT LIKE 'Test%'
 		  AND s.name NOT LIKE 'Benchmark%'
 		  AND s.name NOT LIKE 'Example%'
+		  `+skippedUseGuard+`
 		ORDER BY f.path ASC, s.start_line ASC,
 		         s.start_col ASC, s.qualified_name ASC, s.kind ASC, s.name ASC,
 		         s.end_line ASC, s.end_col ASC, s.stable_key ASC
 		LIMIT ? OFFSET ?
-	`, repoID, repoID, safeLimit(limit), safeOffset(offset))
+	`, args...)
 	if err != nil {
-		return nil, err
+		return DeadCodeResult{}, err
 	}
 	defer rows.Close()
 
-	var out []map[string]any
 	for rows.Next() {
 		var id int64
 		var qualifiedName, kind, name, path, language string
 		var startLine, startCol, endLine, endCol int
 		if err := rows.Scan(&id, &qualifiedName, &kind, &name, &path, &language, &startLine, &startCol, &endLine, &endCol); err != nil {
-			return nil, err
+			return DeadCodeResult{}, err
 		}
-		out = append(out, map[string]any{
+		result.Items = append(result.Items, map[string]any{
 			"symbol":     qualifiedName,
 			"kind":       kind,
 			"name":       name,
@@ -10520,7 +10619,276 @@ func (s *Store) FindDeadCode(ctx context.Context, repoID int64, limit, offset in
 			"end_line":   endLine,
 		})
 	}
-	return out, rows.Err()
+	return result, rows.Err()
+}
+
+// skippedLanguageUses returns, as JSON arrays, the names and the file IDs the
+// files of skipped languages may use. A name is every identifier segment of a
+// reference those files hold (`demo.Util.helper`, `M:help`), since the
+// reference may name the type as well as the member. A file is one an import of
+// theirs may load, directly or through re-exports (importedClassifiedFiles):
+// Svelte markup and `new Box()` leave no reference, so the import is the only
+// trace of the use. Both over-approximate on purpose; a withheld symbol is not
+// a claim.
+func (s *Store) skippedLanguageUses(ctx context.Context, repoID int64, skipped []DeadCodeSkippedLanguage, callCapable []any) (string, string, error) {
+	q := s.parserSemanticQueryer(ctx)
+	languages := make([]any, 0, len(skipped)+1)
+	languages = append(languages, repoID)
+	for _, l := range skipped {
+		languages = append(languages, l.Language)
+	}
+	inSkipped := placeholders(len(skipped))
+
+	nameSet := map[string]bool{}
+	rows, err := q.QueryContext(ctx, `
+		SELECT DISTINCT r.name
+		FROM files rf JOIN references_tbl r ON r.file_id = rf.id
+		WHERE rf.repo_id = ? AND rf.is_deleted = 0 AND rf.language IN (`+inSkipped+`)
+	`, languages...)
+	if err != nil {
+		return "", "", err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return "", "", err
+		}
+		for _, segment := range identifierSegments(name) {
+			nameSet[segment] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", "", err
+	}
+
+	var imports [][2]string
+	rows, err = q.QueryContext(ctx, `
+		SELECT DISTINCT rf.path, fi.import_path
+		FROM files rf JOIN file_imports fi ON fi.file_id = rf.id
+		WHERE rf.repo_id = ? AND rf.is_deleted = 0 AND rf.language IN (`+inSkipped+`)
+	`, languages...)
+	if err != nil {
+		return "", "", err
+	}
+	for rows.Next() {
+		var e [2]string
+		if err := rows.Scan(&e[0], &e[1]); err != nil {
+			rows.Close()
+			return "", "", err
+		}
+		imports = append(imports, e)
+		// A module-path import (`demo.Widget`, `demo.{Base, Listener => L}`)
+		// names the type it brings in; `new Widget()` and `extends Base` leave
+		// no reference behind.
+		if !strings.ContainsAny(e[1], "/\\\"'") {
+			for _, segment := range identifierSegments(e[1]) {
+				nameSet[segment] = true
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", "", err
+	}
+	fileIDs := []int64{}
+	if len(imports) > 0 {
+		if fileIDs, err = s.importedClassifiedFiles(ctx, repoID, callCapable, imports); err != nil {
+			return "", "", err
+		}
+	}
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	namesJSON, err := json.Marshal(names)
+	if err != nil {
+		return "", "", err
+	}
+	filesJSON, err := json.Marshal(fileIDs)
+	if err != nil {
+		return "", "", err
+	}
+	return string(namesJSON), string(filesJSON), nil
+}
+
+// importedClassifiedFiles returns the files of classified languages that the
+// given (importer path, specifier) pairs may load, plus every file those reach
+// through re-exports (`export * from './more'` in a barrel index); see
+// importTargets for how a specifier names files.
+func (s *Store) importedClassifiedFiles(ctx context.Context, repoID int64, callCapable []any, imports [][2]string) ([]int64, error) {
+	q := s.parserSemanticQueryer(ctx)
+	targets := newImportTargets()
+	rows, err := q.QueryContext(ctx, `
+		SELECT id, path FROM files
+		WHERE repo_id = ? AND is_deleted = 0 AND language IN (`+placeholders(len(callCapable))+`)
+		ORDER BY id
+	`, append([]any{repoID}, callCapable...)...)
+	if err != nil {
+		return nil, err
+	}
+	pathOf := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		targets.add(id, p)
+		pathOf[id] = p
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	reexports := map[int64][]string{}
+	rows, err = q.QueryContext(ctx, `
+		SELECT file_id, source_specifier FROM scope_import_evidence
+		WHERE repo_id = ? AND is_reexport = 1 AND source_specifier <> ''
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id int64
+		var specifier string
+		if err := rows.Scan(&id, &specifier); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		reexports[id] = append(reexports[id], specifier)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	seen := map[int64]bool{}
+	var queue []int64
+	for _, e := range imports {
+		queue = append(queue, targets.match(e[0], e[1])...)
+	}
+	// Never nil: json_each('null') yields one NULL row, and NOT IN over a NULL
+	// withholds everything.
+	out := []int64{}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		for _, specifier := range reexports[id] {
+			queue = append(queue, targets.match(pathOf[id], specifier)...)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// importTargets answers which files a specifier may name, from indexes built
+// once per call, so the cost grows with imports plus files, not their product.
+//   - A relative or root path names the file with or without its extension, or
+//     the directory's index.
+//   - An alias (`$lib/fmt`, `@/x`, `~/x`, `#x/y`) cannot be resolved without the
+//     bundler config, so it names every file whose path, extension or not, ends
+//     in the rest of the specifier, with the alias name kept when it has one
+//     (`$lib/fmt.js` -> `.../lib/fmt`), or that directory's index.
+//   - A module path (`demo.Widget`) names every file whose path ends in
+//     `demo/Widget`; a wildcard (`demo._`, `demo.*`) every file in a directory
+//     whose path ends in `demo`.
+type importTargets struct {
+	byPath, byStem map[string][]int64
+	// bySuffix and byDirSuffix key a file by every segment-aligned suffix of
+	// its stem and of its directory.
+	bySuffix, byDirSuffix map[string][]int64
+	memo                  map[[2]string][]int64
+	probes                int
+}
+
+func newImportTargets() *importTargets {
+	return &importTargets{
+		byPath: map[string][]int64{}, byStem: map[string][]int64{},
+		bySuffix: map[string][]int64{}, byDirSuffix: map[string][]int64{},
+		memo: map[[2]string][]int64{},
+	}
+}
+
+func (t *importTargets) add(id int64, p string) {
+	stem := strings.TrimSuffix(p, path.Ext(p))
+	t.byPath[p] = append(t.byPath[p], id)
+	t.byStem[stem] = append(t.byStem[stem], id)
+	addSuffixes(t.bySuffix, stem, id)
+	if dir := path.Dir(stem); dir != "." {
+		addSuffixes(t.byDirSuffix, dir, id)
+	}
+}
+
+func addSuffixes(index map[string][]int64, p string, id int64) {
+	for i := 0; ; {
+		index[p[i:]] = append(index[p[i:]], id)
+		next := strings.IndexByte(p[i:], '/')
+		if next < 0 {
+			return
+		}
+		i += next + 1
+	}
+}
+
+func (t *importTargets) match(importer, specifier string) []int64 {
+	if strings.TrimSpace(specifier) == "" {
+		return nil
+	}
+	key := [2]string{path.Dir(importer), specifier}
+	if out, ok := t.memo[key]; ok {
+		return out
+	}
+	found := map[int64]bool{}
+	collect := func(ids []int64) {
+		for _, id := range ids {
+			t.probes++
+			found[id] = true
+		}
+	}
+	if resolved, ok := resolveImportSpecifierPath(importer, specifier); ok {
+		for _, k := range []string{resolved, strings.TrimSuffix(resolved, path.Ext(resolved)), resolved + "/index"} {
+			collect(t.byPath[k])
+			collect(t.byStem[k])
+		}
+	}
+	switch {
+	case strings.ContainsAny(specifier[:1], "$@~#"):
+		first, rest, _ := strings.Cut(specifier, "/")
+		suffix := path.Join(strings.TrimLeft(first, "$@~#"), rest)
+		for _, sfx := range []string{suffix, strings.TrimSuffix(suffix, path.Ext(suffix))} {
+			if sfx != "" && sfx != "." {
+				collect(t.bySuffix[sfx])
+				collect(t.bySuffix[sfx+"/index"])
+			}
+		}
+	case !strings.ContainsAny(specifier, "/\\\"' ") && strings.Contains(specifier, "."):
+		segments := strings.Split(specifier, ".")
+		if last := segments[len(segments)-1]; last == "_" || last == "*" {
+			collect(t.byDirSuffix[strings.Join(segments[:len(segments)-1], "/")])
+		} else {
+			collect(t.bySuffix[strings.Join(segments, "/")])
+		}
+	}
+	out := make([]int64, 0, len(found))
+	for id := range found {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	t.memo[key] = out
+	return out
+}
+
+// identifierSegments splits a reference or module path into the identifiers
+// it spells (`demo.Util.helper`, `M:help`, `a::b`).
+func identifierSegments(name string) []string {
+	return strings.FieldsFunc(name, func(r rune) bool {
+		return r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 // --- Embedding methods ---

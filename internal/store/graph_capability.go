@@ -177,31 +177,8 @@ func (s *Store) GraphCapability(ctx context.Context, repoID int64) (GraphCapabil
 // therefore answers from one cheap grouped scan of `files`; only a graph that
 // may need disclosure pays for the exact population.
 func (s *Store) GraphLimitations(ctx context.Context, repoID int64) ([]GraphLimitation, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT language, parser_profile, parser_call_edges, COUNT(*)
-		FROM files
-		WHERE repo_id = ? AND is_deleted = 0
-		GROUP BY language, parser_profile, parser_call_edges
-	`, repoID)
+	all, err := s.liveFileParserProfileGroups(ctx, repoID)
 	if err != nil {
-		return nil, err
-	}
-	var all []FileParserProfileGroup
-	for rows.Next() {
-		var group FileParserProfileGroup
-		var callEdges int
-		if err := rows.Scan(&group.Language, &group.Profile, &callEdges, &group.Files); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		group.CallEdges = callEdges != 0
-		all = append(all, group)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	if len(ClassifyGraphCapability(all).Limitations()) == 0 {
@@ -212,4 +189,31 @@ func (s *Store) GraphLimitations(ctx context.Context, repoID int64) ([]GraphLimi
 		return nil, err
 	}
 	return exact.Limitations(), nil
+}
+
+// liveFileParserProfileGroups groups every live file, without the evidence
+// predicate: the cheap superset GraphLimitations and FindDeadCodeResult check
+// before paying for the exact population.
+func (s *Store) liveFileParserProfileGroups(ctx context.Context, repoID int64) ([]FileParserProfileGroup, error) {
+	rows, err := s.parserSemanticQueryer(ctx).QueryContext(ctx, `
+		SELECT language, parser_profile, parser_call_edges, COUNT(*)
+		FROM files
+		WHERE repo_id = ? AND is_deleted = 0
+		GROUP BY language, parser_profile, parser_call_edges
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var all []FileParserProfileGroup
+	for rows.Next() {
+		var group FileParserProfileGroup
+		var callEdges int
+		if err := rows.Scan(&group.Language, &group.Profile, &callEdges, &group.Files); err != nil {
+			return nil, err
+		}
+		group.CallEdges = callEdges != 0
+		all = append(all, group)
+	}
+	return all, rows.Err()
 }

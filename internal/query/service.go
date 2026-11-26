@@ -239,11 +239,11 @@ func (s *Service) semanticSearch(ctx context.Context, repoID int64, query string
 	return s.store.SemanticSearch(ctx, repoID, query, limit, offset)
 }
 
-func (s *Service) FindDeadCode(ctx context.Context, repoID int64, limit, offset int) ([]map[string]any, error) {
+func (s *Service) FindDeadCodeResult(ctx context.Context, repoID int64, limit, offset int) (store.DeadCodeResult, error) {
 	if err := s.requirePaths(ctx, repoID); err != nil {
-		return nil, err
+		return store.DeadCodeResult{}, err
 	}
-	return s.store.FindDeadCode(ctx, repoID, limit, offset)
+	return s.store.FindDeadCodeResult(ctx, repoID, limit, offset)
 }
 
 func (s *Service) ListFiles(ctx context.Context, repoID int64, pathFilter string, limit, offset int) ([]map[string]any, error) {

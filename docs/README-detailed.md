@@ -399,6 +399,30 @@ keeps stdout a path list and prints one `limitations:` line to stderr.
 change it. `codegraph doctor` reports the same four states per repository under
 `parser.graph_capability`, with a recommendation when the graph is reduced.
 
+`find_dead_code` classifies only languages whose persisted call graph records
+callers from every file. Each other indexed language is left out of `dead_code`
+and named in `data.skipped_languages` with its `graph_capability` and a `reason`:
+`no_call_edges` (symbols-only: Svelte, Solidity, and every language but Go and
+Python in a `CGO_ENABLED=0` index), `same_file_calls_only` (Dart, Lua, Scala and Swift,
+whose calls bind only to functions of the calling file),
+`mixed_parser_profiles` or `unknown_parser_provenance`. A skipped language's file
+may still use a symbol of a classified one, so a symbol is also withheld when
+any identifier segment of a reference in such a file names it (`Store.create`
+withholds `Store` and `create`), or when it is declared in a file such a file
+imports. A relative import covers `util.ts` and `util/index.ts`; an alias such
+as `$lib/fmt.js` or `@/x`, which needs bundler config to resolve, covers every
+file whose path, without its extension, ends in `lib/fmt` or `x`; a module
+path such as Scala's `import demo.Widget` covers files ending in `demo/Widget`
+and withholds the name `Widget`, and a wildcard `demo._` covers every file in a
+directory ending in `demo`; and re-exports from an imported file
+(`export * from './more'`) are followed. A withheld name applies to every
+classified language, so a Svelte call to `JSON.parse` also withholds a Go
+`parse`. Not followed: an alias whose target directory has another name, bare `baseUrl` or
+workspace-package specifiers, and a barrel that imports a name and exports it
+in a separate statement. The key is absent when no language is skipped. A listed symbol
+is a candidate, not proof: exported API, reflection, dynamic dispatch and calls
+the resolver left unresolved are not callers in the graph.
+
 Not covered: `architecture_overview` (hub symbols are ranked by call edges),
 `cross_language_links` and `agentic_query` answers carry no `limitations`
 field; read `supported_languages` for the graph's capability.

@@ -124,6 +124,7 @@ func TestArchitectureAndDeadCodeUseSemanticPageOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	markFilesCallCapable(t, deadStore, deadRepoID)
 	var pages []string
 	for offset := 0; offset < 3; offset++ {
 		rows, err := deadStore.FindDeadCode(ctx, deadRepoID, 1, offset)
@@ -397,6 +398,7 @@ func TestFindDeadCodePreservesLogicalPathOrderAndIdentity(t *testing.T) {
 		}
 	}
 
+	markFilesCallCapable(t, s, repoID)
 	want := []string{"a0.go", `a\foo.go`}
 	rows, err := s.FindDeadCode(ctx, repoID, 10, 0)
 	if err != nil {
