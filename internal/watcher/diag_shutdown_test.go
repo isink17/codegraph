@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -44,7 +45,20 @@ func diagCloseStore(t *testing.T, s *store.Store, dbPath string) {
 	}
 	t.Logf("DIAG close test=%s inuse_before=%d open_before=%d inuse_after=%d open_after=%d close_err=%v release_ms=%d first_probe_err=%v final_probe_err=%v",
 		t.Name(), before.InUse, before.OpenConnections, after.InUse, after.OpenConnections, closeErr, releasedMS, firstErr, probeErr)
+	if firstErr == nil {
+		if entries, err := os.ReadDir(filepath.Dir(dbPath)); err == nil {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Logf("DIAG okdir test=%s entries=%s", t.Name(), strings.Join(names, ","))
+		}
+	}
 	if firstErr != nil {
+		if exe := os.Getenv("DIAG_HANDLE_EXE"); exe != "" {
+			out, err := exec.Command(exe, "-accepteula", "-nobanner", "-a", filepath.Dir(dbPath)).CombinedOutput()
+			t.Logf("DIAG handles test=%s self_pid=%d err=%v\n%s", t.Name(), os.Getpid(), err, out)
+		}
 		var names []string
 		if entries, err := os.ReadDir(filepath.Dir(dbPath)); err == nil {
 			for _, e := range entries {

@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        defender: [default, temp-excluded]
+        defender: [default]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -44,6 +44,13 @@ jobs:
         run: |
           Add-MpPreference -ExclusionPath $env:RUNNER_TEMP
           (Get-MpPreference).ExclusionPath
+
+      - name: Fetch Sysinternals handle
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://download.sysinternals.com/files/Handle.zip -OutFile $env:RUNNER_TEMP\handle.zip
+          Expand-Archive $env:RUNNER_TEMP\handle.zip -DestinationPath $env:RUNNER_TEMP\handle
+          "DIAG_HANDLE_EXE=$env:RUNNER_TEMP\handle\handle64.exe" >> $env:GITHUB_ENV
 
       - name: Stress the watcher package
         shell: bash
