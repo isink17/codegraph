@@ -108,7 +108,9 @@ func TestWatcherStopsAtOnceOnInvalidConfigValue(t *testing.T) {
 		if !ok || typeErr.Struct != "RepoConfig" || typeErr.Field != "exclude" {
 			t.Fatalf("err = %v, want the invalid exclude value", err)
 		}
-		if st := r.w.Stats(); st.TransientErrors != 0 {
+		// On Windows a read can meet the rename still in flight and is retried
+		// as config_busy; the invalid value itself is never retried.
+		if st := r.w.Stats(); st.TransientErrors != 0 && st.LastTransient != "config_busy" {
 			t.Fatalf("invalid config value was retried: %+v", st)
 		}
 	case <-time.After(5 * time.Second):

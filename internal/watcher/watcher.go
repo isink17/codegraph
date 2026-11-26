@@ -200,6 +200,17 @@ func transientKind(err error) (string, bool) {
 	return "", false
 }
 
+// configLoadTransient is transientKind for a repository config read. On
+// Windows the read also fails with a sharing violation while a writer's
+// atomic save (a rename onto config.json) is still in flight; the file is
+// complete once the rename returns, so the read is retried.
+func configLoadTransient(err error) (string, bool) {
+	if isSharingViolation(err) {
+		return "config_busy", true
+	}
+	return transientKind(err)
+}
+
 type WatchStats struct {
 	EventsSeen         int64 `json:"events_seen"`
 	EventsIgnored      int64 `json:"events_ignored"`
@@ -230,7 +241,7 @@ type WatchStats struct {
 	// the last failure or start.
 	State string `json:"state"`
 	// TransientErrors counts retryable failures; LastTransient names the
-	// latest (enospc, emfile, enfile, sqlite_busy).
+	// latest (enospc, emfile, enfile, sqlite_busy, config_busy).
 	TransientErrors int64  `json:"transient_errors,omitempty"`
 	LastTransient   string `json:"last_transient,omitempty"`
 	// Recoveries counts re-registrations of the watch tree after a failure.
@@ -735,9 +746,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			recoverAt, recoverTimer = nil, nil
 			// The configuration is read again too: a change to it may have
 			// raised no event while the tree was unregistered.
-			nextCfg, err := config.LoadRepo(repoRoot)
+			nextCfg, err := loadRepoConfig(repoRoot)
 			if err != nil {
-				if _, ok := transientKind(err); !ok {
+				if _, ok := configLoadTransient(err); !ok {
 					if errors.Is(err, config.ErrMalformedRepoConfig) {
 						configRetries++
 						if configRetries < maxConfigRetries && pauseForConfig(err) {
@@ -811,9 +822,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			}
 			if configChanged {
 				w.eventsIgnored.Add(1)
-				nextCfg, loadErr := config.LoadRepo(repoRoot)
+				nextCfg, loadErr := loadRepoConfig(repoRoot)
 				if loadErr != nil {
-					if kind, ok := transientKind(loadErr); ok {
+					if kind, ok := configLoadTransient(loadErr); ok {
 						degradeRegistration(kind)
 						continue
 					}
@@ -1073,3 +1084,6 @@ func queueFailure() error {
 	}
 	return nil
 }
+
+// loadRepoConfig reads the repository config on reload; tests replace it.
+var loadRepoConfig = config.LoadRepo
