@@ -10,6 +10,14 @@ const { spawnSync } = require('node:child_process');
 const { after, test } = require('node:test');
 const { promisify } = require('node:util');
 const execFile = promisify(require('node:child_process').execFile);
+// Run npm through node: Windows cannot spawn npm.cmd without a shell, and a shell would split paths with spaces.
+const npm = (args, options) => process.env.npm_execpath
+  ? execFile(process.execPath, [process.env.npm_execpath, ...args], options)
+  : execFile('npm', args, options);
+// cmd.exe runs the .cmd shim on Windows; quote each word so paths and arguments with spaces survive.
+const runBin = (command, args, options = {}) => process.platform === 'win32'
+  ? spawnSync([command, ...args].map(word => `"${word}"`).join(' '), { shell: true, encoding: 'utf8', ...options })
+  : spawnSync(command, args, { encoding: 'utf8', ...options });
 const { assetFor, install, PLATFORMS } = require('../lib/installer');
 
 const version = require('../package.json').version;
@@ -90,7 +98,7 @@ test('declares public scoped-package publication access', () => {
 test('packs, globally installs and invokes the tarball wrapper', async t => {
   const work = tempPackage();
   t.after(() => fs.rmSync(work, { recursive: true, force: true }));
-  const pack = await execFile('npm', ['pack', '--json', '--pack-destination', work], { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' });
+  const pack = await npm(['pack', '--json', '--pack-destination', work], { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' });
   const metadata = JSON.parse(pack.stdout)[0];
   const files = metadata.files.map(file => file.path);
   assert(files.includes('bin/codegraph.js'));
@@ -100,7 +108,7 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   assert(metadata.size < 100_000, `unexpected tarball size: ${metadata.size}`);
   const archive = path.join(work, metadata.filename);
   const prefix = path.join(work, 'global prefix with spaces');
-  await execFile('npm', ['install', '--global', '--prefix', prefix, archive], {
+  await npm(['install', '--global', '--prefix', prefix, archive], {
     cwd: work,
     encoding: 'utf8',
     env: { ...process.env, CODEGRAPH_NPM_TEST_MODE: '1', CODEGRAPH_NPM_TEST_RELEASE_BASE_URL: await base() },
@@ -111,9 +119,7 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   const native = path.join(moduleDir, 'bin', 'native', process.platform === 'win32' ? 'codegraph.exe' : 'codegraph');
   assert.deepEqual(fs.readFileSync(native), binaryBytes);
   const command = process.platform === 'win32' ? path.join(prefix, 'codegraph.cmd') : path.join(prefix, 'bin', 'codegraph');
-  const invoke = (args, options = {}) => process.platform === 'win32'
-    ? spawnSync(command, args, { shell: true, encoding: 'utf8', ...options })
-    : spawnSync(command, args, { encoding: 'utf8', ...options });
+  const invoke = (args, options) => runBin(command, args, options);
   const versionResult = invoke(['--version']);
   assert.equal(versionResult.status, 0, versionResult.stderr);
   assert.equal(versionResult.stdout.trim(), `codegraph ${version}`);
@@ -127,11 +133,9 @@ test('packs, globally installs and invokes the tarball wrapper', async t => {
   assert.equal(failure.status, 23);
 
   const ignoredPrefix = path.join(work, 'ignore scripts prefix');
-  await execFile('npm', ['install', '--global', '--ignore-scripts', '--prefix', ignoredPrefix, archive], { cwd: work, encoding: 'utf8' });
+  await npm(['install', '--global', '--ignore-scripts', '--prefix', ignoredPrefix, archive], { cwd: work, encoding: 'utf8' });
   const ignoredCommand = process.platform === 'win32' ? path.join(ignoredPrefix, 'codegraph.cmd') : path.join(ignoredPrefix, 'bin', 'codegraph');
-  const ignored = process.platform === 'win32'
-    ? spawnSync(ignoredCommand, ['--version'], { shell: true, encoding: 'utf8' })
-    : spawnSync(ignoredCommand, ['--version'], { encoding: 'utf8' });
+  const ignored = runBin(ignoredCommand, ['--version']);
   assert.notEqual(ignored.status, 0);
   assert.match(ignored.stderr, /Reinstall with npm scripts enabled/);
 

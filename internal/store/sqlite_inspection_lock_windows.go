@@ -17,7 +17,10 @@ func isTransientSQLiteInspectionLock(err error) bool {
 	if errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
 		return true
 	}
+	// Opening a journal or WAL that another connection is deleting fails with
+	// access denied until the delete completes.
 	var pathErr *os.PathError
 	return errors.Is(err, windows.ERROR_ACCESS_DENIED) &&
-		errors.As(err, &pathErr) && pathErr.Op == "open" && strings.HasSuffix(pathErr.Path, "-journal")
+		errors.As(err, &pathErr) && pathErr.Op == "open" &&
+		(strings.HasSuffix(pathErr.Path, "-journal") || strings.HasSuffix(pathErr.Path, "-wal"))
 }
