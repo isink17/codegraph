@@ -18,7 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest]
+        trace: ["1", "0"]
+        rep: [1, 2]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -57,19 +59,21 @@ jobs:
 
       - name: Stress the watcher package
         shell: bash
+        env:
+          DIAG_TRACE: ${{ matrix.trace }}
         run: |
           set +e
           go version
-          go test -json -count="$COUNT" -timeout 35m ./internal/watcher > watcher-${{ matrix.os }}.json
+          go test -json -count="$COUNT" -timeout 35m ./internal/watcher > watcher-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}.json
           status=$?
-          go test -count=3 -run TestCancelledQueryLeavesNoStatement -v ./internal/diagsqlite 2>&1 | tee driver-repro-${{ matrix.os }}.txt | grep -E 'iteration|left a native|^(ok|FAIL|---)' | head -12 | tee -a "$GITHUB_STEP_SUMMARY"
-          python .github/scripts/diag-watcher-summary.py watcher-${{ matrix.os }}.json | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -count=3 -run TestCancelledQueryLeavesNoStatement -v ./internal/diagsqlite 2>&1 | tee driver-repro-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}.txt | grep -E 'iteration|left a native|^(ok|FAIL|---)' | head -12 | tee -a "$GITHUB_STEP_SUMMARY"
+          python .github/scripts/diag-watcher-summary.py watcher-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}.json | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status
 
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: watcher-${{ matrix.os }}
+          name: watcher-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}
           path: |
-            watcher-${{ matrix.os }}.json
-            driver-repro-${{ matrix.os }}.txt
+            watcher-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}.json
+            driver-repro-${{ matrix.os }}-trace${{ matrix.trace }}-rep${{ matrix.rep }}.txt

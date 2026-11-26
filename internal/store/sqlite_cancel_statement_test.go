@@ -68,6 +68,9 @@ func TestCancelledQueryFinalizesItsStatement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	if dc, ok := c.(*diagConn); ok { // diagnosis branch: trace wrapper
+		c = dc.inner
+	}
 	db := uintptr(reflect.ValueOf(c).Elem().FieldByName("db").Uint())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
