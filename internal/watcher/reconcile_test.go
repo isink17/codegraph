@@ -69,7 +69,7 @@ func startLiveRepoDebounce(t *testing.T, files map[string]string, debounce time.
 		t.Fatal(err)
 	}
 	r := &liveRepo{root: root, dbPath: dbPath, s: s, repoID: repo.ID}
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { diagCloseStore(t, s, dbPath) })
 	r.start(t, idx, debounce)
 	return r
 }
@@ -84,8 +84,10 @@ func (r *liveRepo) start(t *testing.T, idx *indexer.Indexer, debounce time.Durat
 	w, done := r.w, r.done
 	go func() { done <- w.RunWithReady(runCtx, r.root, r.repoID, debounce, func() { close(ready) }) }()
 	t.Cleanup(func() {
+		stopStart := time.Now()
 		cancel()
-		<-done
+		err := <-done
+		t.Logf("DIAG watcher_stop test=%s stop_ms=%d err=%v", t.Name(), time.Since(stopStart).Milliseconds(), err)
 	})
 	select {
 	case <-ready:

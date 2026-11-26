@@ -1,0 +1,62 @@
+# Diagnosis branch only, never merged: repeats the watcher package on the
+# standard windows-latest runner with store-close instrumentation.
+name: diag-watcher-windows
+
+on:
+  push:
+    branches:
+      - diag/watcher-overflow-windows
+
+permissions:
+  contents: read
+
+env:
+  COUNT: "20"
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        defender: [default, temp-excluded]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Use the runner temp volume
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+
+      - name: Defender state
+        shell: pwsh
+        continue-on-error: true
+        run: Get-MpComputerStatus | Select-Object AMRunningMode,RealTimeProtectionEnabled,OnAccessProtectionEnabled | Format-List
+
+      - name: Exclude the temp volume from Defender
+        if: matrix.defender == 'temp-excluded'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:RUNNER_TEMP
+          (Get-MpPreference).ExclusionPath
+
+      - name: Stress the watcher package
+        shell: bash
+        run: |
+          set +e
+          go version
+          go test -json -count="$COUNT" -timeout 35m ./internal/watcher > watcher-${{ matrix.defender }}.json
+          status=$?
+          python .github/scripts/diag-watcher-summary.py watcher-${{ matrix.defender }}.json | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: watcher-${{ matrix.defender }}
+          path: watcher-${{ matrix.defender }}.json
