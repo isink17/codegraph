@@ -40,16 +40,26 @@ func (a *RustAdapter) Parse(ctx context.Context, path string, content []byte) (g
 	}
 
 	attrs := rustAttrScope(root, content)
-	rustExtractImports(root, module, content, attrs, &pf)
+	// A file under an inner #![cfg] is read like an item under #[cfg]: none of
+	// its imports, child modules or items is proven, and no call in it binds.
+	gated := rustItemAttrKind(root, content, attrs) == rustAttrRewrite
+	rustExtractImports(root, module, content, attrs, gated, &pf)
 	rustExtractSymbols(root, module, "", path, content, attrs, &pf)
-	rustExtractCalls(root, content, attrs, &pf)
+	if gated {
+		pf.Scope.Modules = nil
+		rustAddAttrEvidence(root, module, "", content, attrs, &pf)
+	}
+	rustExtractCalls(root, content, attrs, gated, &pf)
 	linkTestsGeneric(module, &pf, func(target string) string {
 		return "func:rust:" + testTargetModule(module, "_test") + ":" + target
 	})
 	return pf, nil
 }
 
-func rustExtractImports(root *sitter.Node, module string, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
+// rustExtractImports records each `use` as a file import. Under a gated module
+// or file (cfg or an attribute macro), a `use` still names what the code
+// depends on, but it is not proven scope evidence and binds no call.
+func rustExtractImports(root *sitter.Node, module string, content []byte, attrs rustAttrs, gated bool, pf *graph.ParsedFile) {
 	for i := range int(root.ChildCount()) {
 		child := root.Child(i)
 		// An attribute macro may rewrite or drop a `use`: its import is not
@@ -57,13 +67,15 @@ func rustExtractImports(root *sitter.Node, module string, content []byte, attrs 
 		if child.Type() == "use_declaration" && !child.HasError() && rustItemAttrKind(child, content, attrs) == rustAttrNeutral {
 			if arg := childByFieldName(child, "argument"); arg != nil {
 				pf.Imports = append(pf.Imports, nodeText(arg, content))
-				rustUseTree(arg, "", rustVisibility(child, content) == "public", module, content, &pf.Scope.Imports)
+				if !gated {
+					rustUseTree(arg, "", rustVisibility(child, content) == "public", module, content, &pf.Scope.Imports)
+				}
 			}
 		}
 		if child.Type() == "mod_item" {
 			if name := childByFieldName(child, "name"); name != nil {
 				if body := childByFieldName(child, "body"); body != nil {
-					rustExtractImports(body, module+"::"+nodeText(name, content), content, attrs, pf)
+					rustExtractImports(body, module+"::"+nodeText(name, content), content, attrs, gated || rustItemAttrKind(child, content, attrs) == rustAttrRewrite, pf)
 				}
 			}
 		}
@@ -385,7 +397,7 @@ func rustVisibility(node *sitter.Node, content []byte) string {
 	return "private"
 }
 
-func rustExtractCalls(root *sitter.Node, content []byte, attrs rustAttrs, pf *graph.ParsedFile) {
+func rustExtractCalls(root *sitter.Node, content []byte, attrs rustAttrs, gated bool, pf *graph.ParsedFile) {
 	for _, call := range findDescendants(root, "call_expression") {
 		fnNode := childByFieldName(call, "function")
 		if fnNode == nil {
@@ -397,7 +409,7 @@ func rustExtractCalls(root *sitter.Node, content []byte, attrs rustAttrs, pf *gr
 		}
 		line := int(call.StartPoint().Row) + 1
 		evidence := name
-		if rustCallShadowed(call, name, content, attrs) {
+		if gated || rustCallShadowed(call, name, content, attrs) {
 			evidence = graph.RustCallBlockScopeEvidence
 		}
 		pf.Edges = append(pf.Edges, graph.Edge{
@@ -456,7 +468,7 @@ func rustCallShadowed(call *sitter.Node, name string, content []byte, attrs rust
 		case "function_item", "impl_item", "trait_item", "mod_item":
 			// An attribute macro on an enclosing item may rewrite the whole
 			// body, `crate::` paths included, so none of its original calls is
-			// proven to bind what it names.
+			// proven to bind what it names. A cfg, outer or inner, may remove it.
 			if rustItemAttrKind(node, content, attrs) == rustAttrRewrite {
 				return true
 			}

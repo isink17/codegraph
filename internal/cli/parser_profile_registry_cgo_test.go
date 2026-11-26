@@ -43,7 +43,7 @@ func TestCgoRegistryProfiles(t *testing.T) {
 			want = "treesitter:ruby:v6"
 		}
 		if lang.Language == "rust" {
-			want = "treesitter:rust:v6"
+			want = "treesitter:rust:v7"
 		}
 		if lang.Language == "typescript" {
 			want = "treesitter:typescript:v2"

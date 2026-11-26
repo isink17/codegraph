@@ -87,6 +87,8 @@ These stay unresolved:
 
 Macro invocations produce no call edges. `#[path]`, `cfg` and Cargo manifests are not read.
 
+No cfg predicate is evaluated, so code a cfg may remove binds no call. An item under `#[cfg]` or another unproven attribute, and a file, inline module, function, impl or trait body under an inner `#![cfg]` or a `#![cfg_attr]` that may expand to a cfg, is unproven. Calls into it, out of it, and through its imports and re-exports stay unresolved, even where caller and target share the same cfg; so do calls into a module file it declares. Its `use` declarations are still recorded as file imports. A cfg on a statement or block inside a function gates only the call site, not the caller or target, so such a call still binds. Other inner attributes, such as `#![cfg_attr(not(feature = "std"), no_std)]` or `#![allow]`, change nothing.
+
 An incremental update maps changed files to the crates they affect, clears every Rust binding in those crates, and re-decides all of their edges. Tests pin the result to a fresh index across added and removed `use`, `mod` and `pub use` declarations, aliases, renames, moves and visibility changes.
 
 ## C and C++
