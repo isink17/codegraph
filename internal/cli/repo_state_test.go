@@ -306,6 +306,13 @@ func assertInactive(t *testing.T, res serveResult, err error, want string) {
 			continue
 		}
 		text, isErr := res.toolText(t, id)
+		// Match the decoded message: JSON escapes the backslashes of a Windows path.
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal([]byte(text), &body) == nil && body.Error != "" {
+			text = body.Error
+		}
 		if !isErr || !strings.Contains(text, "no active repository") || !strings.Contains(text, want) {
 			t.Errorf("call %v = %q (error %v), want no active repository / %q", id, text, isErr, want)
 		}

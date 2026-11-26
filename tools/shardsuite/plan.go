@@ -26,6 +26,8 @@ type config struct {
 	jobTimeout time.Duration
 	// listTimeout bounds the list step; it defaults to jobTimeout.
 	listTimeout time.Duration
+	// jobs bounds the go test processes running at once, and is each one's -p.
+	jobs int
 }
 
 type shardSpec struct {
@@ -36,12 +38,13 @@ type shardSpec struct {
 // job is one `go test` process: either a shard of one package (Run set) or
 // every remaining package in a single ordinary run.
 type job struct {
-	Name     string              `json:"name"`
-	Packages []string            `json:"packages"`
-	Run      string              `json:"-"`
-	Expected map[string][]string `json:"-"`
-	Weight   float64             `json:"estimated_seconds,omitempty"`
-	Tests    int                 `json:"tests_assigned"`
+	Name       string              `json:"name"`
+	Packages   []string            `json:"packages"`
+	Run        string              `json:"-"`
+	Expected   map[string][]string `json:"-"`
+	Weight     float64             `json:"estimated_seconds,omitempty"`
+	Tests      int                 `json:"tests_assigned"`
+	JobTimeout string              `json:"job_timeout,omitempty"`
 }
 
 func parseShardSpec(s string) ([]shardSpec, error) {
@@ -306,28 +309,32 @@ func eventFiles(path string) ([]string, error) {
 	return shardEventFiles(path)
 }
 
-// shardEventFiles takes the jobs from OUT/plan.json when it exists, so stale
-// shard directories from an earlier run into the same OUT are not counted.
+// shardEventFiles takes the jobs from OUT/plan.json, and only when the plan
+// carries the run ID OUT/owner.json was claimed with, so no file of another
+// run is ever read as this one's.
 func shardEventFiles(out string) ([]string, error) {
-	if b, err := os.ReadFile(filepath.Join(out, "plan.json")); err == nil {
-		var plan struct{ Jobs []struct{ Name string } }
-		if err := json.Unmarshal(b, &plan); err != nil {
-			return nil, fmt.Errorf("%s/plan.json: %w", out, err)
-		}
-		var files []string
-		for _, j := range plan.Jobs {
-			files = append(files, filepath.Join(out, "shards", j.Name, "events.jsonl"))
-		}
-		return files, nil
-	}
-	files, err := filepath.Glob(filepath.Join(out, "shards", "*", "events.jsonl"))
+	o, err := readOwner(out)
 	if err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no shards/*/events.jsonl under %s", out)
+	b, err := os.ReadFile(filepath.Join(out, "plan.json"))
+	if err != nil {
+		return nil, fmt.Errorf("%s: the run stopped before it planned its jobs: %w", out, err)
 	}
-	sort.Strings(files)
+	var plan struct {
+		RunID string `json:"run_id"`
+		Jobs  []struct{ Name string }
+	}
+	if err := json.Unmarshal(b, &plan); err != nil {
+		return nil, fmt.Errorf("%s/plan.json: %w", out, err)
+	}
+	if plan.RunID != o.RunID {
+		return nil, fmt.Errorf("%s/plan.json is from run %q, but the directory belongs to run %q", out, plan.RunID, o.RunID)
+	}
+	var files []string
+	for _, j := range plan.Jobs {
+		files = append(files, filepath.Join(out, "shards", j.Name, "events.jsonl"))
+	}
 	return files, nil
 }
 
