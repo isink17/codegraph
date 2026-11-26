@@ -73,6 +73,11 @@ func TestCancelledQueryFinalizesItsStatement(t *testing.T) {
 	}
 	defer c.Close()
 	db := uintptr(reflect.ValueOf(c).Elem().FieldByName("db").Uint())
+	tls := libc.NewTLS()
+	defer tls.Close()
+	if sqlite3.Xsqlite3_next_stmt(tls, db, 0) != 0 {
+		t.Fatal("a statement is unfinalized before the query runs")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cancelMidRowMu.Lock()
@@ -90,8 +95,6 @@ func TestCancelledQueryFinalizesItsStatement(t *testing.T) {
 	if !hit || ctx.Err() == nil {
 		t.Fatalf("the function never saw the driver interrupt the query: %v", qerr)
 	}
-	tls := libc.NewTLS()
-	defer tls.Close()
 	if sqlite3.Xsqlite3_next_stmt(tls, db, 0) != 0 {
 		t.Fatalf("cancelled query returned %v and left its statement unfinalized", qerr)
 	}

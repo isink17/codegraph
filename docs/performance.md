@@ -20,9 +20,14 @@ Raw samples: [benchmarks/v2.0.0-baseline/](benchmarks/v2.0.0-baseline/)
 | Go | go1.26.1 darwin/arm64 |
 | CodeGraph | `v2.0.0-dev+83828b8`: `v2.0` at `83828b8` plus the `bench-queries` target-selection fix committed with this page (the fix touches no index or update path) |
 | Build | release shape from `.github/scripts/build-release-asset.sh`: `CGO_ENABLED=1 go build -ldflags "-X github.com/isink17/codegraph/internal/version.Version=<v>" ./cmd/codegraph`, no `-trimpath` |
-| SQLite | `modernc.org/sqlite` v1.40.1 (pure Go, the only driver; CGO only enables the tree-sitter parsers) |
+| SQLite | `modernc.org/sqlite` v1.39.1 (pure Go, the only driver; CGO only enables the tree-sitter parsers) |
 | Settings | default config, default DB performance profile, Git history enrichment on (default), no embeddings, `CODEGRAPH_HOME` isolated, `CODEGRAPH_NO_UPDATE_CHECK=1` |
 | Load | interactive desktop, not idle: load average 2.5 to 3.5 throughout (IDE, media player, browser) |
+
+The table records the environment of these measurements. Current builds use `modernc.org/sqlite`
+v1.40.1. It adds the fix that closes the result of a query cancelled after its first row, plus an
+opt-in hook API CodeGraph does not use; the SQLite library itself (3.50.4) is identical. The
+baseline was not re-measured.
 
 ## Corpora
 
