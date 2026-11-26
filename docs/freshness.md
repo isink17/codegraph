@@ -313,6 +313,9 @@ after the latest failure completes with the tree registered. Every other
 error stops the watcher with that error: an unreadable or invalid repository
 config after a change, a closed or corrupt database, a missing or unreadable
 repository root, a refused parser downgrade, cancellation.
+Retrying `scan_active` does not make `index --rebuild` safe under a running
+watcher: the rebuild replaces the database file, and the watcher keeps using
+the one it opened. Stop `watch` before a rebuild.
 
 A repository config that is not valid JSON, as a file caught mid-write reads,
 is the one config error that is retried, whichever reads it first: an event,
