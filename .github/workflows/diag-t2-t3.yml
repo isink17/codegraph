@@ -11,54 +11,12 @@ permissions:
   contents: read
 
 jobs:
-  t2-fix:
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [fix, reverted]
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          ref: bef1e2c7fa29e0ddb98752c9dfd2b023dbfc8a0b
-          path: src
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: src/go.mod
-          cache-dependency-path: src/go.sum
-      - name: Use the runner temp volume
-        shell: pwsh
-        run: |
-          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-      - name: Revert the classification (control)
-        if: matrix.variant == 'reverted'
-        shell: bash
-        working-directory: src
-        run: |
-          sed -i 's/configLoadTransient(err); !ok/transientKind(err); !ok/; s/configLoadTransient(loadErr); ok/transientKind(loadErr); ok/' internal/watcher/watcher.go
-          grep -c 'configLoadTransient(' internal/watcher/watcher.go || true
-      - name: Repeat the config tests
-        shell: bash
-        working-directory: src
-        run: |
-          set +e
-          go test -json -count=60 -timeout 25m -run '^(TestWatcherStopsAtOnceOnInvalidConfigValue|TestConfigReloadRetriesSharingViolation|TestConfigBusyIsWindowsOnly)$' ./internal/watcher > ../out.json
-          echo "go test exit $?"
-          cd .. && python .github/scripts/diag-t2t3-summary.py out.json | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: t2-fix-${{ matrix.variant }}
-          path: out.json
-
   package:
     strategy:
       fail-fast: false
       matrix:
-        ref: [9267a724146d7839ef679c11d48895c315a04e4c, bef1e2c7fa29e0ddb98752c9dfd2b023dbfc8a0b]
+        ref: [f4f5f96b5d5daa45ea57c9cf1fd6c9c028949294]
+        rep: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -87,5 +45,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: package-${{ matrix.ref }}
+          name: package-${{ matrix.ref }}-rep${{ matrix.rep }}
           path: out.json
