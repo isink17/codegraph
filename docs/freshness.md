@@ -301,7 +301,10 @@ as a full scan, so after every commit freshness reads `stale_known` with
 | `recovering` | A retryable failure left registration or queued work unverified. |
 
 Retryable failures are the OS running out of watches or descriptors
-(`ENOSPC`, `EMFILE`, `ENFILE`) and SQLite reporting busy or locked. On one the
+(`ENOSPC`, `EMFILE`, `ENFILE`), SQLite reporting busy or locked, and, on
+Windows, a read of `.codegraph/config.json` (by a reload, a recovery or a
+flush) refused with a sharing violation while a rename onto the file is still
+in flight (`config_busy`). On one the
 watcher records `reconcile_pending`, keeps every claimed path in the dirty
 queue, and retries after a delay that doubles from 250 ms to 30 s. A failed
 registration is retried by re-registering the whole tree (the old watches are

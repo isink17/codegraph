@@ -200,6 +200,21 @@ func transientKind(err error) (string, bool) {
 	return "", false
 }
 
+// configLoadTransient is transientKind for work that reads the repository
+// config: a reload, or a flush whose indexer reads it. On Windows that read
+// also fails with a sharing violation while a writer's atomic save (a rename
+// onto config.json) is still in flight; the file is complete once the rename
+// returns, so the read is retried. A sharing violation on any other file keeps
+// transientKind's answer.
+func configLoadTransient(err error) (string, bool) {
+	var pathErr *fs.PathError
+	if isSharingViolation(err) && errors.As(err, &pathErr) &&
+		filepath.Base(pathErr.Path) == "config.json" && filepath.Base(filepath.Dir(pathErr.Path)) == config.RepoArtifactsDir {
+		return "config_busy", true
+	}
+	return transientKind(err)
+}
+
 type WatchStats struct {
 	EventsSeen         int64 `json:"events_seen"`
 	EventsIgnored      int64 `json:"events_ignored"`
@@ -230,7 +245,7 @@ type WatchStats struct {
 	// the last failure or start.
 	State string `json:"state"`
 	// TransientErrors counts retryable failures; LastTransient names the
-	// latest (enospc, emfile, enfile, sqlite_busy).
+	// latest (enospc, emfile, enfile, sqlite_busy, config_busy).
 	TransientErrors int64  `json:"transient_errors,omitempty"`
 	LastTransient   string `json:"last_transient,omitempty"`
 	// Recoveries counts re-registrations of the watch tree after a failure.
@@ -604,7 +619,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 		if pauseForConfig(err) {
 			forceFullScan.Store(true)
 		} else {
-			kind, ok := transientKind(err)
+			kind, ok := configLoadTransient(err)
 			if !ok {
 				return err
 			}
@@ -694,7 +709,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 					}
 					continue
 				}
-				if kind, ok := transientKind(err); ok && loopCtx.Err() == nil {
+				if kind, ok := configLoadTransient(err); ok && loopCtx.Err() == nil {
 					// Claimed paths stay in the dirty queue and the next claim
 					// takes them again; the retry is a full pass because the
 					// failed one may have left the graph partly written.
@@ -735,9 +750,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			recoverAt, recoverTimer = nil, nil
 			// The configuration is read again too: a change to it may have
 			// raised no event while the tree was unregistered.
-			nextCfg, err := config.LoadRepo(repoRoot)
+			nextCfg, err := loadRepoConfig(repoRoot)
 			if err != nil {
-				if _, ok := transientKind(err); !ok {
+				if _, ok := configLoadTransient(err); !ok {
 					if errors.Is(err, config.ErrMalformedRepoConfig) {
 						configRetries++
 						if configRetries < maxConfigRetries && pauseForConfig(err) {
@@ -753,7 +768,7 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 				err = resetWatcher(true)
 			}
 			if err != nil {
-				kind, ok := transientKind(err)
+				kind, ok := configLoadTransient(err)
 				if !ok {
 					return fmt.Errorf("recover watcher: %w", err)
 				}
@@ -811,9 +826,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			}
 			if configChanged {
 				w.eventsIgnored.Add(1)
-				nextCfg, loadErr := config.LoadRepo(repoRoot)
+				nextCfg, loadErr := loadRepoConfig(repoRoot)
 				if loadErr != nil {
-					if kind, ok := transientKind(loadErr); ok {
+					if kind, ok := configLoadTransient(loadErr); ok {
 						degradeRegistration(kind)
 						continue
 					}
@@ -1073,3 +1088,9 @@ func queueFailure() error {
 	}
 	return nil
 }
+
+// loadRepoConfig reads the repository config on reload; tests replace it.
+var loadRepoConfig = config.LoadRepo
+
+// isSharingViolation reports a Windows sharing violation; tests replace it.
+var isSharingViolation = sharingViolation
