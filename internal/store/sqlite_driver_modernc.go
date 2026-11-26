@@ -6,7 +6,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const sqliteDriverName = "sqlite"
+const sqliteDriverName = diagDriverName
 
 // A deferred transaction that reads before it writes cannot wait for another
 // connection's write lock: SQLite fails the upgrade with SQLITE_BUSY without

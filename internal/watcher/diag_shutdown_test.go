@@ -43,6 +43,12 @@ func diagCloseStore(t *testing.T, s *store.Store, dbPath string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	key := filepath.Base(filepath.Dir(filepath.Dir(dbPath)))
+	opened, open, zombies, details := store.DiagSQLiteReport(key)
+	t.Logf("DIAG sqlite test=%s opened=%d open=%d zombies=%d locked=%t fds_after=%d", t.Name(), opened, open, zombies, firstErr != nil, diagOpenFDs(dbPath))
+	for _, d := range details {
+		t.Logf("DIAG sqlite-detail test=%s %s", t.Name(), d)
+	}
 	t.Logf("DIAG close test=%s inuse_before=%d open_before=%d inuse_after=%d open_after=%d close_err=%v release_ms=%d first_probe_err=%v final_probe_err=%v",
 		t.Name(), before.InUse, before.OpenConnections, after.InUse, after.OpenConnections, closeErr, releasedMS, firstErr, probeErr)
 	if firstErr == nil {
@@ -68,4 +74,24 @@ func diagCloseStore(t *testing.T, s *store.Store, dbPath string) {
 		t.Logf("DIAG dir test=%s entries=%s", t.Name(), strings.Join(names, ","))
 		t.Logf("DIAG goroutines test=%s at first failed probe:\n%s", t.Name(), stacks)
 	}
+}
+
+// diagOpenFDs counts this process's descriptors on the database and its
+// -wal/-shm files (Linux only; -1 elsewhere).
+func diagOpenFDs(dbPath string) int {
+	if runtime.GOOS != "linux" {
+		return -1
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	n := 0
+	for _, e := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+		if err == nil && (target == dbPath || target == dbPath+"-wal" || target == dbPath+"-shm") {
+			n++
+		}
+	}
+	return n
 }

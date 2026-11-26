@@ -18,8 +18,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        defender: [default]
-    runs-on: windows-latest
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -28,24 +28,27 @@ jobs:
           go-version-file: go.mod
 
       - name: Use the runner temp volume
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
           "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
 
       - name: Defender state
+        if: runner.os == 'Windows'
         shell: pwsh
         continue-on-error: true
         run: Get-MpComputerStatus | Select-Object AMRunningMode,RealTimeProtectionEnabled,OnAccessProtectionEnabled | Format-List
 
       - name: Exclude the temp volume from Defender
-        if: matrix.defender == 'temp-excluded'
+        if: false
         shell: pwsh
         run: |
           Add-MpPreference -ExclusionPath $env:RUNNER_TEMP
           (Get-MpPreference).ExclusionPath
 
       - name: Fetch Sysinternals handle
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri https://download.sysinternals.com/files/Handle.zip -OutFile $env:RUNNER_TEMP\handle.zip
@@ -57,13 +60,16 @@ jobs:
         run: |
           set +e
           go version
-          go test -json -count="$COUNT" -timeout 35m ./internal/watcher > watcher-${{ matrix.defender }}.json
+          go test -json -count="$COUNT" -timeout 35m ./internal/watcher > watcher-${{ matrix.os }}.json
           status=$?
-          python .github/scripts/diag-watcher-summary.py watcher-${{ matrix.defender }}.json | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -count=3 -run TestCancelledQueryLeavesNoStatement -v ./internal/diagsqlite 2>&1 | tee driver-repro-${{ matrix.os }}.txt | grep -E 'iteration|left a native|^(ok|FAIL|---)' | head -12 | tee -a "$GITHUB_STEP_SUMMARY"
+          python .github/scripts/diag-watcher-summary.py watcher-${{ matrix.os }}.json | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status
 
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: watcher-${{ matrix.defender }}
-          path: watcher-${{ matrix.defender }}.json
+          name: watcher-${{ matrix.os }}
+          path: |
+            watcher-${{ matrix.os }}.json
+            driver-repro-${{ matrix.os }}.txt
