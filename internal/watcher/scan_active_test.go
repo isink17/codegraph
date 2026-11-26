@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -115,5 +116,41 @@ func TestDegradedWatcherKeepsPendingWhenFlushMeetsActiveScan(t *testing.T) {
 	}
 	if f.Verdict == "consistent_with_last_scan" || !slices.Contains(f.Reasons, "reconcile_pending") {
 		t.Fatalf("degraded watcher read as consistent after an external scan: verdict %s reasons %v", f.Verdict, f.Reasons)
+	}
+}
+
+// Cancelling a watcher that is waiting to retry a flush refused by an active
+// scan ends it at once; it does not keep retrying while the scan holds the lock.
+func TestWatcherStopsOnCancelWhileRetryingActiveScan(t *testing.T) {
+	base, maxDelay := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Hour, time.Hour
+	t.Cleanup(func() { retryBaseDelay, retryMaxDelay = base, maxDelay })
+	r := startLiveRepo(t, map[string]string{"main.go": "package main\n"})
+	r.waitState(t, StateWatching)
+	other, err := store.Open(r.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	release, err := other.AcquireRepositoryScan(context.Background(), r.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(release)
+	writeFile(t, filepath.Join(r.root, "b.go"), goFile)
+	r.waitTransient(t, "scan_active")
+	attempts := r.w.Stats().TransientErrors
+	r.cancel()
+	select {
+	case err := <-r.done:
+		r.done <- err
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled watcher returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled watcher still running while the scan holds the lock")
+	}
+	if got := r.w.Stats().TransientErrors; got != attempts {
+		t.Fatalf("transient errors grew from %d to %d after cancel", attempts, got)
 	}
 }
