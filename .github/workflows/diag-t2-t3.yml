@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ref: [f4f5f96b5d5daa45ea57c9cf1fd6c9c028949294]
+        ref: [b86e2646be541a01e71e7dbe1cf6b473204f7562]
         rep: [1, 2, 3]
     runs-on: windows-latest
     timeout-minutes: 45
