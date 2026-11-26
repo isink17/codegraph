@@ -835,9 +835,11 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 		}
 		defer release()
 		for _, path := range paths {
-			if live, err := store.WatcherActive(path); err != nil {
+			live, err := store.WatcherActive(path)
+			if err != nil {
 				return err
-			} else if live {
+			}
+			if live {
 				return fmt.Errorf("rebuild refused: %w; stop `codegraph watch` for this repository and retry", store.ErrWatcherActive)
 			}
 		}

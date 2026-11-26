@@ -245,8 +245,8 @@ func liveProbeState(p scanLockProbe) string {
 }
 
 // ErrWatcherActive reports a watcher running on a database that a caller
-// would otherwise replace.
-var ErrWatcherActive = errors.New("a codegraph watch process is running on this database")
+// would otherwise replace, or a watcher lock that could not be probed.
+var ErrWatcherActive = errors.New("a codegraph watch process is running on this database, or its lock files could not be checked")
 
 // WatcherActive reports whether a watcher of any repository holds its locks
 // beside the database at dbPath. A watcher keeps its open database for its
