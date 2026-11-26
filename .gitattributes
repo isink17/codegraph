@@ -9,3 +9,8 @@ tools/benchharness/testdata/** text eol=lf
 
 # Patches applied verbatim by the corpus run; their context lines keep the source whitespace.
 scripts/change-risk-corpus/patches/*.patch -whitespace
+
+# Byte-pinned by tests (SHA-256 or exact-byte goldens); keep the committed bytes on every platform.
+internal/mcp/testdata/compact_compat/** -text
+internal/parser/treesitter/soliditygrammar/** -text
+internal/parser/treesitter/svelte/fixtures/** -text
