@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -42,7 +43,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.timings, "timings", "", "events.jsonl of an earlier run, used to balance shards by test time")
 	fs.StringVar(&cfg.baseline, "baseline", "", "events.jsonl of an unsharded run (scripts/go-suite/run.sh) to compare test identities against")
 	fs.DurationVar(&cfg.timeout, "timeout", 20*time.Minute, "go test -timeout for every test binary")
-	fs.DurationVar(&cfg.jobTimeout, "job-timeout", 0, "wall-clock limit per process before it is killed (default: -timeout + 5m)")
+	fs.DurationVar(&cfg.jobTimeout, "job-timeout", 0, "wall-clock limit per go test process, all its packages together, before it is killed (default: (-timeout + 1m) x ceil(packages / -jobs) + 5m)")
+	fs.IntVar(&cfg.jobs, "jobs", runtime.GOMAXPROCS(0), "maximum go test processes at once, also passed to each as -p")
 	fs.StringVar(&cfg.dir, "C", ".", "module directory to run in")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -52,8 +54,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "shardsuite:", err)
 		return 2
 	}
-	if cfg.jobTimeout == 0 {
-		cfg.jobTimeout = cfg.timeout + 5*time.Minute
+	if cfg.jobs < 1 || cfg.timeout <= 0 || cfg.jobTimeout < 0 {
+		fmt.Fprintln(stderr, "shardsuite: -jobs must be at least 1, -timeout positive and -job-timeout not negative")
+		return 2
 	}
 	cfg.patterns = fs.Args()
 	if len(cfg.patterns) == 0 {
