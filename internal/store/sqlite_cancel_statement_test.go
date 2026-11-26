@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	cancelMidRowMu sync.Mutex
-	cancelMidRow   context.CancelFunc
-	cancelMidRowDB uintptr
+	cancelMidRowMu  sync.Mutex
+	cancelMidRow    context.CancelFunc
+	cancelMidRowDB  uintptr
+	cancelMidRowHit bool
 )
 
 func init() {
@@ -40,6 +41,9 @@ func init() {
 			}
 			time.Sleep(time.Millisecond)
 		}
+		cancelMidRowMu.Lock()
+		cancelMidRowHit = true
+		cancelMidRowMu.Unlock()
 		return int64(1), nil
 	})
 }
@@ -72,14 +76,19 @@ func TestCancelledQueryFinalizesItsStatement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cancelMidRowMu.Lock()
-	cancelMidRow, cancelMidRowDB = cancel, db
+	cancelMidRow, cancelMidRowDB, cancelMidRowHit = cancel, db, false
 	cancelMidRowMu.Unlock()
 	rows, qerr := c.(driver.QueryerContext).QueryContext(ctx, "SELECT codegraph_test_cancel_mid_row()", nil)
 	if rows != nil {
 		rows.Close()
 	}
-	if ctx.Err() == nil {
-		t.Fatal("the query did not run the cancelling function")
+	cancelMidRowMu.Lock()
+	hit := cancelMidRowHit
+	cancelMidRowMu.Unlock()
+	// Without the interrupt the row never reaches a cancelled context, and the
+	// test would prove nothing.
+	if !hit || ctx.Err() == nil {
+		t.Fatalf("the function never saw the driver interrupt the query: %v", qerr)
 	}
 	tls := libc.NewTLS()
 	defer tls.Close()
