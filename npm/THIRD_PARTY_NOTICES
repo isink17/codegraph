@@ -1971,8 +1971,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ================================================================================
 Component: modernc.org/sqlite
 Go module: modernc.org/sqlite
-Upstream: https://pkg.go.dev/modernc.org/sqlite@v1.39.1
-Revision: v1.39.1
+Upstream: https://pkg.go.dev/modernc.org/sqlite@v1.40.1
+Revision: v1.40.1
 License: BSD-3-Clause (SQLite: public domain)
 Copyright: Copyright (c) 2017 The Sqlite Authors. All rights reserved.
 Notes: Contains SQLite translated to Go; SQLite is in the public domain (SQLITE-LICENSE).

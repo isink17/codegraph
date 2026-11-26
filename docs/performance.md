@@ -24,6 +24,11 @@ Raw samples: [benchmarks/v2.0.0-baseline/](benchmarks/v2.0.0-baseline/)
 | Settings | default config, default DB performance profile, Git history enrichment on (default), no embeddings, `CODEGRAPH_HOME` isolated, `CODEGRAPH_NO_UPDATE_CHECK=1` |
 | Load | interactive desktop, not idle: load average 2.5 to 3.5 throughout (IDE, media player, browser) |
 
+The table records the environment of these measurements. Current builds use `modernc.org/sqlite`
+v1.40.1. It adds the fix that closes the result of a query cancelled after its first row, plus an
+opt-in hook API CodeGraph does not use; the SQLite library itself (3.50.4) is identical. The
+baseline was not re-measured.
+
 ## Corpora
 
 | Corpus | Pin | Files indexed | Symbols | References | Edges | DB size |
