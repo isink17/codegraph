@@ -515,6 +515,26 @@ func readPID(path string) int {
 	return 0
 }
 
+// onFile runs fn once path has content, unless ctx ends first. The poller is
+// joined before the test ends, so a skipped or failed test leaves none behind.
+func onFile(t *testing.T, ctx context.Context, path string, fn func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+				fn()
+				return
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}()
+	t.Cleanup(func() { <-done })
+}
+
 func waitForPID(t *testing.T, path string) int {
 	t.Helper()
 	pid := readPID(path)
@@ -554,13 +574,10 @@ func TestFixtureJobTimeoutKillsTheTestBinary(t *testing.T) {
 func TestFixtureInterruptReportsIncomplete(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	fixtureEnv(t, "FIXTURE_HANG", "1", "FIXTURE_PIDFILE", pidFile)
+	cfg := fixtureConfig(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		readPID(pidFile)
-		cancel()
-	}()
-	cfg := fixtureConfig(t)
+	onFile(t, ctx, pidFile, cancel)
 	sum, err := runSuite(ctx, cfg, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -590,13 +607,10 @@ func TestFixtureInterruptReportsIncomplete(t *testing.T) {
 func TestFixtureInterruptLeavesQueuedJobsUnstarted(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	fixtureEnv(t, "FIXTURE_HANG", "1", "FIXTURE_PIDFILE", pidFile)
+	cfg := fixtureConfig(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		readPID(pidFile)
-		cancel()
-	}()
-	cfg := fixtureConfig(t)
+	onFile(t, ctx, pidFile, cancel)
 	// Round-robin over sorted names puts TestHang, the sixth, in a.0.
 	cfg.shards, cfg.jobs = []shardSpec{{Pattern: "./a", K: 5}}, 1
 	sum, err := runSuite(ctx, cfg, io.Discard)
@@ -754,5 +768,82 @@ func TestTestArgsPassJobsAsP(t *testing.T) {
 	got := strings.Join(testArgs(config{jobs: 3, timeout: time.Minute}, job{Packages: []string{"./a"}, Run: "^(TestA)$"}), " ")
 	if got != "test -json -count=1 -p 3 -timeout 1m0s -run ^(TestA)$ ./a" {
 		t.Error(got)
+	}
+}
+
+// An interrupt during the test listing writes its summary only while -out
+// still belongs to the run, as at the end of a run.
+func TestInterruptWhileListingChecksOwner(t *testing.T) {
+	fixtureEnv(t)
+	cfg := fixtureConfig(t)
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go command not on PATH")
+	}
+	cfg.out = filepath.Join(t.TempDir(), "out")
+	marker := filepath.Join(t.TempDir(), "listing")
+	bin := t.TempDir()
+	wrapper := "#!/bin/sh\ncase \" $* \" in *\" -list \"*) echo up > \"" + marker + "\"; exec sleep 60 ;; esac\nexec \"" + realGo + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var replaceErr error
+	onFile(t, ctx, marker, func() {
+		if replaceErr = os.Rename(cfg.out, cfg.out+".claimed"); replaceErr == nil {
+			replaceErr = os.MkdirAll(cfg.out, 0o755)
+		}
+		if replaceErr == nil {
+			replaceErr = os.WriteFile(filepath.Join(cfg.out, ownerFile), []byte(`{"run_id":"foreign","pid":1,"host":"h","started":"s"}`), 0o644)
+		}
+		cancel()
+	})
+	_, err = runSuite(ctx, cfg, io.Discard)
+	cancel()
+	if replaceErr != nil {
+		t.Fatal(replaceErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not this run") {
+		t.Fatalf("got %v", err)
+	}
+	for _, dir := range []string{cfg.out, cfg.out + ".claimed"} {
+		if fileExists(filepath.Join(dir, "summary.json")) {
+			t.Errorf("summary.json written in %s", dir)
+		}
+	}
+}
+
+// A job whose second log cannot be created closes the first one; neither
+// order may leak a handle (on Windows it would block removing -out).
+func TestRunJobClosesLogsWhenOneCannotBeCreated(t *testing.T) {
+	for _, blocked := range []string{"events.jsonl", "stderr.log"} {
+		t.Run(blocked, func(t *testing.T) {
+			var opened []*os.File
+			old := createLog
+			createLog = func(name string) (*os.File, error) {
+				f, err := old(name)
+				if err == nil {
+					opened = append(opened, f)
+				}
+				return f, err
+			}
+			t.Cleanup(func() { createLog = old })
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, blocked), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config{dir: t.TempDir(), timeout: time.Minute, jobs: 1}
+			r := runJob(context.Background(), cfg, dir, job{Name: "j", Packages: []string{"./x"}})
+			if r.Result != resIncomplete || !strings.Contains(r.Reason, blocked) {
+				t.Fatalf("result %+v", r)
+			}
+			for _, f := range opened {
+				if err := f.Close(); !errors.Is(err, os.ErrClosed) {
+					t.Errorf("%s left open (close: %v)", f.Name(), err)
+				}
+			}
+		})
 	}
 }

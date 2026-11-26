@@ -131,6 +131,9 @@ func runSuite(ctx context.Context, cfg config, stdout io.Writer) (summary, error
 	listErrLog.Close()
 	if ctx.Err() != nil {
 		sum.Interrupted = true
+		if err := checkOwner(out, own.RunID); err != nil {
+			return sum, err
+		}
 		_ = writeJSON(filepath.Join(out, "summary.json"), sum)
 		fmt.Fprintf(stdout, "shardsuite: INCOMPLETE (interrupted while listing tests) out=%s\n", out)
 		return sum, nil
@@ -272,9 +275,13 @@ func runJob(ctx context.Context, cfg config, dir string, j job) jobResult {
 	cmd.Cancel = func() error { return killTree(cmd) }
 	cmd.WaitDelay = 10 * time.Second
 	evPath := filepath.Join(dir, "events.jsonl")
-	ev, err1 := os.Create(evPath)
-	se, err2 := os.Create(filepath.Join(dir, "stderr.log"))
-	if err := errors.Join(err1, err2); err != nil {
+	ev, err := createLog(evPath)
+	if err != nil {
+		return jobResult{job: j, Result: resIncomplete, Reason: err.Error(), Exit: -1}
+	}
+	se, err := createLog(filepath.Join(dir, "stderr.log"))
+	if err != nil {
+		ev.Close()
 		return jobResult{job: j, Result: resIncomplete, Reason: err.Error(), Exit: -1}
 	}
 	cmd.Stdout, cmd.Stderr = ev, se
@@ -373,6 +380,9 @@ const ownerFile = "owner.json"
 // Test hooks: called right after owner.json is created, and right after the
 // jobs ran.
 var afterOwnerCreated, afterJobs = func(string) {}, func(string) {}
+
+// createLog opens a job's log files; tests wrap it to see every handle.
+var createLog = os.Create
 
 // owner identifies the run that claimed an output directory.
 type owner struct {
