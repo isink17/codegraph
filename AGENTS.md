@@ -65,7 +65,7 @@
 ## Cross-platform compatibility
 
 CodeGraph officially supports Windows, macOS and Linux. Every implementation
-agent must consider all three; the temporary Windows CI pause does not change
+agent must consider all three; the advisory Windows CI job does not change
 that requirement. Use `path/filepath` for host-native filesystem paths and
 `path` for slash-delimited logical paths. Never assume separators, drive
 letters, UNC paths, volume roots or filename casing behave identically. Git
