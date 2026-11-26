@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -152,15 +154,48 @@ func TestEventFilesAcceptsRunAndShardDirs(t *testing.T) {
 	if f, err := eventFiles(runOut); err != nil || len(f) != 1 {
 		t.Fatalf("run.sh dir: %v %v", f, err)
 	}
-	shardOut := t.TempDir()
+	shardOut := filepath.Join(t.TempDir(), "out")
+	o, err := claimOut(shardOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, shardOut, "plan.json", `{"run_id":"`+o.RunID+`","jobs":[{"name":"a"},{"name":"b"}]}`)
 	write(t, shardOut, "shards/b/events.jsonl", passPkg)
 	write(t, shardOut, "shards/a/events.jsonl", passPkg)
+	write(t, shardOut, "shards/stale/events.jsonl", passPkg)
 	f, err := eventFiles(shardOut)
 	if err != nil || len(f) != 2 || !strings.HasSuffix(f[0], filepath.Join("a", "events.jsonl")) {
 		t.Fatalf("shard dir: %v %v", f, err)
 	}
 	if _, err := eventFiles(t.TempDir()); err == nil {
 		t.Error("empty dir: want error")
+	}
+}
+
+// Shard events count only under a plan made by the run that claimed the
+// directory; anything else is another run's or an unfinished run's output.
+func TestShardEventFilesRefusesForeignOrUnplannedOut(t *testing.T) {
+	unclaimed := t.TempDir()
+	write(t, unclaimed, "plan.json", `{"jobs":[{"name":"a"}]}`)
+	write(t, unclaimed, "shards/a/events.jsonl", passPkg)
+	unplanned := filepath.Join(t.TempDir(), "out")
+	o, err := claimOut(unplanned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(t.TempDir(), "out")
+	if _, err := claimOut(foreign); err != nil {
+		t.Fatal(err)
+	}
+	write(t, foreign, "plan.json", `{"run_id":"`+o.RunID+`","jobs":[{"name":"a"}]}`)
+	write(t, foreign, "shards/a/events.jsonl", passPkg)
+	for dir, want := range map[string]string{unclaimed: ownerFile, unplanned: "before it planned", foreign: "is from run"} {
+		if _, err := shardEventFiles(dir); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want %q", dir, err, want)
+		}
+		if code := run(context.Background(), []string{"parity", write(t, t.TempDir(), "b.jsonl", passPkg), dir}, io.Discard, io.Discard); code != 2 {
+			t.Errorf("%s: parity exit %d", dir, code)
+		}
 	}
 }
 
