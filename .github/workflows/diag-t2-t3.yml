@@ -1,0 +1,98 @@
+# Diagnosis branch only, never merged.
+# t3-ab: the original degraded-watcher test on identical source, only the
+#        SQLite driver version changed; plus the CG-154 fix branch.
+# t2:    the config sharing-violation test with reload instrumentation.
+name: diag-t2-t3
+
+on:
+  push:
+    branches:
+      - diag/t2-t3-windows
+
+permissions:
+  contents: read
+
+jobs:
+  t3-ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [ee3c43b6c679d7c163e672fdb89d32bb0e57973e, 9267a724146d7839ef679c11d48895c315a04e4c]
+        driver: [v1.39.1, v1.40.1]
+        rep: [1, 2]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+      - name: Use the runner temp volume
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+      - name: Pin the SQLite driver
+        shell: bash
+        working-directory: src
+        run: |
+          go get modernc.org/sqlite@${{ matrix.driver }}
+          go list -m modernc.org/sqlite
+      - name: Repeat the degraded-watcher test
+        shell: bash
+        working-directory: src
+        run: |
+          set +e
+          go test -json -count=40 -timeout 20m -run '^TestDegradedWatcherKeepsReconcilePendingAcrossExternalScan$' ./internal/watcher > ../t3.json
+          echo "go test exit $?"
+          cd .. && python .github/scripts/diag-t2t3-summary.py t3.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: t3-${{ matrix.ref }}-${{ matrix.driver }}-rep${{ matrix.rep }}
+          path: t3.json
+
+  t2:
+    strategy:
+      fail-fast: false
+      matrix:
+        defender: [default, temp-excluded]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Use the runner temp volume
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+      - name: Exclude the temp volume from Defender
+        if: matrix.defender == 'temp-excluded'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath $env:RUNNER_TEMP
+      - name: Fetch Sysinternals handle
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://download.sysinternals.com/files/Handle.zip -OutFile $env:RUNNER_TEMP\handle.zip
+          Expand-Archive $env:RUNNER_TEMP\handle.zip -DestinationPath $env:RUNNER_TEMP\handle
+          "DIAG_HANDLE_EXE=$env:RUNNER_TEMP\handle\handle64.exe" >> $env:GITHUB_ENV
+      - name: Repeat the config test
+        shell: bash
+        run: |
+          set +e
+          go test -json -count=60 -timeout 20m -run '^TestWatcherStopsAtOnceOnInvalidConfigValue$' ./internal/watcher > t2.json
+          echo "go test exit $?"
+          python .github/scripts/diag-t2t3-summary.py t2.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: t2-${{ matrix.defender }}
+          path: t2.json

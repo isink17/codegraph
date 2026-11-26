@@ -96,7 +96,14 @@ func TestWatcherStopsAtOnceOnInvalidConfigValue(t *testing.T) {
 	if err := tmp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(tmp.Name(), filepath.Join(cfgDir, "config.json")); err != nil {
+	cfgPath := filepath.Join(cfgDir, "config.json")
+	var renameStart, renameEnd atomic.Int64
+	diagConfigLoadFailed = func(err error) { diagProbeConfig(t, cfgPath, err, renameStart.Load(), renameEnd.Load()) }
+	t.Cleanup(func() { diagConfigLoadFailed = nil })
+	renameStart.Store(time.Now().UnixNano())
+	err = os.Rename(tmp.Name(), cfgPath)
+	renameEnd.Store(time.Now().UnixNano())
+	if err != nil {
 		t.Fatal(err)
 	}
 	select {

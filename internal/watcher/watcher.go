@@ -812,6 +812,9 @@ func (w *Watcher) run(ctx context.Context, repoRoot string, repoID int64, deboun
 			if configChanged {
 				w.eventsIgnored.Add(1)
 				nextCfg, loadErr := config.LoadRepo(repoRoot)
+				if loadErr != nil && diagConfigLoadFailed != nil {
+					diagConfigLoadFailed(loadErr)
+				}
 				if loadErr != nil {
 					if kind, ok := transientKind(loadErr); ok {
 						degradeRegistration(kind)
@@ -1073,3 +1076,6 @@ func queueFailure() error {
 	}
 	return nil
 }
+
+// Diagnosis branch only: sees every failed config reload on the event path.
+var diagConfigLoadFailed func(error)
