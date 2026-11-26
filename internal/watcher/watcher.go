@@ -182,8 +182,9 @@ func nextDelay(d time.Duration) time.Duration {
 }
 
 // transientKind classifies err as a failure a later retry can clear: the OS
-// out of watches or descriptors, or SQLite busy. Everything else, including
-// cancellation, is permanent and stops the watcher.
+// out of watches or descriptors, SQLite busy, or an index or update holding
+// the repository's writer lock. Everything else, including cancellation, is
+// permanent and stops the watcher.
 func transientKind(err error) (string, bool) {
 	switch {
 	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -196,6 +197,8 @@ func transientKind(err error) (string, bool) {
 		return "enfile", true
 	case store.IsBusy(err):
 		return "sqlite_busy", true
+	case errors.Is(err, store.ErrScanActive):
+		return "scan_active", true
 	}
 	return "", false
 }
@@ -230,7 +233,7 @@ type WatchStats struct {
 	// the last failure or start.
 	State string `json:"state"`
 	// TransientErrors counts retryable failures; LastTransient names the
-	// latest (enospc, emfile, enfile, sqlite_busy).
+	// latest (enospc, emfile, enfile, sqlite_busy, scan_active).
 	TransientErrors int64  `json:"transient_errors,omitempty"`
 	LastTransient   string `json:"last_transient,omitempty"`
 	// Recoveries counts re-registrations of the watch tree after a failure.
