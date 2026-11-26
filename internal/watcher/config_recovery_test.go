@@ -157,6 +157,7 @@ func TestDegradedWatcherKeepsReconcilePendingAcrossExternalScan(t *testing.T) {
 	}
 	select {
 	case err := <-r.done:
+		r.done <- err
 		t.Fatalf("watcher stopped during the external scan: %v", err)
 	default:
 	}

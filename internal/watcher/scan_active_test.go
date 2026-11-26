@@ -51,6 +51,7 @@ func TestWatcherRetriesFlushRefusedByActiveScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(release)
 	writeFile(t, filepath.Join(r.root, "b.go"), goFile)
 	r.waitTransient(t, "scan_active")
 	release()
@@ -93,10 +94,16 @@ func TestDegradedWatcherKeepsPendingWhenFlushMeetsActiveScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(release)
 	// Windows reports a file created in an unwatched directory as a write to
 	// that directory; inotify and kqueue report nothing. Deliver it here so
 	// the flush meets the held lock on every OS.
-	fw.Load().Events <- fsnotify.Event{Name: newdir, Op: fsnotify.Write}
+	select {
+	case fw.Load().Events <- fsnotify.Event{Name: newdir, Op: fsnotify.Write}:
+	case err := <-r.done:
+		r.done <- err
+		t.Fatalf("watcher stopped before the event: %v", err)
+	}
 	r.waitTransient(t, "scan_active")
 	release()
 	if _, err := indexer.New(other, parser.NewRegistry(goparser.New()), nil).Update(context.Background(), indexer.Options{RepoRoot: r.root}); err != nil {

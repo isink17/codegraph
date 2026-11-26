@@ -301,8 +301,9 @@ as a full scan, so after every commit freshness reads `stale_known` with
 | `recovering` | A retryable failure left registration or queued work unverified. |
 
 Retryable failures are the OS running out of watches or descriptors
-(`ENOSPC`, `EMFILE`, `ENFILE`), SQLite reporting busy or locked, and an `index`
-or `update` holding the repository's writer lock (`scan_active`). On one the
+(`ENOSPC`, `EMFILE`, `ENFILE`), SQLite reporting busy or locked, and another scan
+(`index`, `update`, `index --rebuild` or another watcher's pass) holding the
+repository's writer lock (`scan_active`). On one the
 watcher records `reconcile_pending`, keeps every claimed path in the dirty
 queue, and retries after a delay that doubles from 250 ms to 30 s. A failed
 registration is retried by re-registering the whole tree (the old watches are
