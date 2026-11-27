@@ -2076,10 +2076,13 @@ func watchRepo(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 		return err
 	}
 	defer app.Close()
-	watchStartHook()
+	watchStartHook("opened")
 	startLock, err := app.Store.OpenWatcherLock(repoID)
 	if err == nil {
 		err = startLock.Hold()
+	}
+	if err == nil {
+		watchStartHook("locked")
 	}
 	releaseWriter()
 	// Held until the watcher holds its own locks, which it takes before ready.
@@ -2172,6 +2175,7 @@ func watchRepo(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 			ready()
 		}
 	}
+	watchStartHook("run")
 	err = w.RunWithReady(ctx, repo.RootPath, repoID, cfg.WatchDebounce, started)
 	reporterCancel()
 	reporterDone.Wait()
@@ -2765,8 +2769,9 @@ func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
 
 var repoDBRemove = os.Remove
 
-// watchStartHook runs once watch has opened its database; tests pause there.
-var watchStartHook = func() {}
+// watchStartHook marks the stages of watch startup (opened, locked, run); tests
+// pause there.
+var watchStartHook = func(stage string) {}
 
 func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
 	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)

@@ -176,49 +176,91 @@ func (f *rebuildFixture) waitIndexed(t *testing.T, rel string, run *watchRun) {
 
 func repoLocalConfig() config.Config { return config.Config{DBDir: config.RepoDBDir} }
 
-// A watcher that has opened its database but not yet taken its watcher locks
-// is still protected: a rebuild in that window must not replace the file, and
-// once the watcher runs its writes must reach the database at the path.
+// A starting watcher is protected at every stage of startup: right after it
+// opens its database and right after it takes its watcher lock, both under the
+// writer lock, a rebuild is refused as an active scan; once the writer lock is
+// released and before the watcher runs, the start lock refuses it. In no stage
+// may the file be replaced, and once the watcher runs its writes must reach the
+// database at the path and its start lock must be gone.
 func TestRebuildCannotReplaceDatabaseOfStartingWatcher(t *testing.T) {
-	for name, cfg := range map[string]func(t *testing.T) config.Config{
+	configs := map[string]func(t *testing.T) config.Config{
 		"shared-db-dir": func(t *testing.T) config.Config { return config.Config{DBDir: t.TempDir()} },
 		"repo-local":    func(*testing.T) config.Config { return repoLocalConfig() },
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := newRebuildFixture(t, cfg(t))
-			opened, proceed := make(chan struct{}), make(chan struct{})
-			watchStartHook = func() { close(opened); <-proceed }
-			t.Cleanup(func() { watchStartHook = func() {} })
-			before := f.identity(t)
-			run := startWatch(t, f.cfg, f.root)
-			select {
-			case <-opened:
-			case err := <-run.done:
-				t.Fatalf("watch stopped before opening its database: %v", err)
-			}
-			err := f.rebuild()
-			close(proceed)
-			if !errors.Is(err, store.ErrScanActive) || *f.removals != 0 || !os.SameFile(before, f.identity(t)) {
-				t.Fatalf("rebuild while watch was starting: err=%v removals=%d", err, *f.removals)
-			}
-			run.waitState(t, watchRunWatching)
-			if err := f.rebuild(); !errors.Is(err, store.ErrWatcherActive) || *f.removals != 0 {
-				t.Fatalf("rebuild while watching: err=%v removals=%d", err, *f.removals)
-			}
-			if err := os.WriteFile(filepath.Join(f.root, "b.go"), []byte("package main\nfunc Added() {}\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			f.waitIndexed(t, "b.go", run)
-			if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-				t.Fatalf("watch: %v", err)
-			}
-			if err := f.rebuild(); err != nil || *f.removals == 0 {
-				t.Fatalf("rebuild after watch exited: err=%v removals=%d", err, *f.removals)
-			}
-			if !slices.Contains(f.livePaths(t), "b.go") {
-				t.Fatal("rebuild after watch lost b.go")
-			}
-		})
+	}
+	stages := map[string]error{"opened": store.ErrScanActive, "locked": store.ErrScanActive, "run": store.ErrWatcherActive}
+	for name, cfg := range configs {
+		for stage, want := range stages {
+			t.Run(name+"/"+stage, func(t *testing.T) {
+				f := newRebuildFixture(t, cfg(t))
+				paused, proceed := make(chan struct{}), make(chan struct{})
+				watchStartHook = func(s string) {
+					if s == stage {
+						close(paused)
+						<-proceed
+					}
+				}
+				t.Cleanup(func() { watchStartHook = func(string) {} })
+				before := f.identity(t)
+				run := startWatch(t, f.cfg, f.root)
+				select {
+				case <-paused:
+				case err := <-run.done:
+					t.Fatalf("watch stopped before stage %s: %v", stage, err)
+				}
+				err := f.rebuild()
+				close(proceed)
+				if !errors.Is(err, want) || *f.removals != 0 || !os.SameFile(before, f.identity(t)) {
+					t.Fatalf("rebuild at watch stage %s: err=%v removals=%d, want %v and no removal", stage, err, *f.removals, want)
+				}
+				run.waitState(t, watchRunWatching)
+				f.waitLiveWatcher(t, store.LiveWatcherWatching)
+				if err := f.rebuild(); !errors.Is(err, store.ErrWatcherActive) || *f.removals != 0 {
+					t.Fatalf("rebuild while watching: err=%v removals=%d", err, *f.removals)
+				}
+				if err := os.WriteFile(filepath.Join(f.root, "b.go"), []byte("package main\nfunc Added() {}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				f.waitIndexed(t, "b.go", run)
+				if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("watch: %v", err)
+				}
+				if err := f.rebuild(); err != nil || *f.removals == 0 {
+					t.Fatalf("rebuild after watch exited: err=%v removals=%d", err, *f.removals)
+				}
+				if !slices.Contains(f.livePaths(t), "b.go") {
+					t.Fatal("rebuild after watch lost b.go")
+				}
+			})
+		}
+	}
+}
+
+// waitLiveWatcher waits until a fresh read reports want: a watcher that has
+// reconciled must not keep reading as unverified because of its start lock.
+func (f *rebuildFixture) waitLiveWatcher(t *testing.T, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s, err := store.Open(f.dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		repo, err := s.UpsertRepo(context.Background(), f.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fr, err := s.FreshnessStatus(context.Background(), repo.ID)
+		_ = s.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fr.LiveWatcher == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live watcher %s, want %s (verdict %s)", fr.LiveWatcher, want, fr.Verdict)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -258,7 +300,11 @@ func TestWatchStartRefusedWhileRebuildReplacesDatabase(t *testing.T) {
 	rebuilt := make(chan error, 1)
 	go func() { rebuilt <- f.rebuild() }()
 	<-removing
-	err := watchRepo(context.Background(), f.cfg, io.Discard, []string{"--jsonl", f.root})
+	watchStartHook = func(string) { t.Error("watch opened the database during a rebuild") }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := watchRepo(ctx, f.cfg, io.Discard, []string{"--jsonl", f.root})
+	cancel()
+	watchStartHook = func(string) {}
 	close(finish)
 	if !errors.Is(err, store.ErrScanActive) {
 		t.Fatalf("watch during rebuild: %v", err)
@@ -299,8 +345,8 @@ func TestStoppedWatchStartLeavesRebuildFree(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		f := newRebuildFixture(t, config.Config{DBDir: t.TempDir()})
 		ctx, cancel := context.WithCancel(context.Background())
-		watchStartHook = cancel
-		t.Cleanup(func() { watchStartHook = func() {} })
+		watchStartHook = func(string) { cancel() }
+		t.Cleanup(func() { watchStartHook = func(string) {} })
 		if err := watchRepo(ctx, f.cfg, io.Discard, []string{"--jsonl", f.root}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled watch: %v", err)
 		}
@@ -342,7 +388,10 @@ func TestRebuildExcludesWatchInAnotherProcess(t *testing.T) {
 		}
 		in := bufio.NewScanner(os.Stdin)
 		ctx, cancel := context.WithCancel(context.Background())
-		watchStartHook = func() {
+		watchStartHook = func(stage string) {
+			if stage != "opened" {
+				return
+			}
 			os.Stdout.WriteString("{\"type\":\"helper_opened\"}\n")
 			in.Scan()
 			go func() { in.Scan(); cancel() }()
