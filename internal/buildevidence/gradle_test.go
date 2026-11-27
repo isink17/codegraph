@@ -462,8 +462,8 @@ func TestExportGradlePinnedFixture(t *testing.T) {
 	if a.Evidence.Dimensions.Source.State != Incomplete || a.Evidence.Dimensions.Dependency.State != Incomplete {
 		t.Fatalf("producer overstated dimensions: %+v", a.Evidence.Dimensions)
 	}
-	if a.Tools.GradleVersion != "9.3.1" || a.Tools.KotlinPluginVersion == "" || a.Tools.KotlinCompilerVersion != "2.3.20" || a.Compilation.GradleTask != ":app:compileKotlin" {
-		t.Fatalf("fixture tool identity = %+v; want Gradle 9.3.1 and pinned Kotlin plugin", a.Tools)
+	if a.Tools.GradleVersion != "9.3.1" || a.Tools.KotlinPluginVersion != "2.3.20" || a.Tools.KotlinCompilerVersion != "2.3.20" || a.Compilation.GradleTask != ":app:compileKotlin" {
+		t.Fatalf("fixture tool identity = %+v; want Gradle 9.3.1 and Kotlin plugin/compiler 2.3.20", a.Tools)
 	}
 	if a.Evidence.Dimensions.CompilerIdentity.State != Incomplete {
 		t.Fatalf("compiler identity overstated: %+v", a.Evidence.Dimensions.CompilerIdentity)
