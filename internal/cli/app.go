@@ -834,6 +834,15 @@ func runIndex(ctx context.Context, cfg config.Config, stdout io.Writer, cmdName 
 			return err
 		}
 		defer release()
+		for _, path := range paths {
+			live, err := store.WatcherActive(path)
+			if err != nil {
+				return err
+			}
+			if live {
+				return fmt.Errorf("rebuild refused: %w; stop `codegraph watch` for this repository and retry", store.ErrWatcherActive)
+			}
+		}
 		removedDBFiles, err = removeRepoDBFiles(cfg, repoRoot, canonical)
 		if err != nil {
 			return err
@@ -2045,11 +2054,42 @@ func watchRepo(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 	if err != nil {
 		return err
 	}
-	app, repo, repoID, err := openApp(ctx, cfg, repoRoot)
+	canonical, err := store.CanonicalRepoPath(repoRoot)
 	if err != nil {
 		return err
 	}
+	dbPath, err := dbPathForRepo(cfg, repoRoot, canonical)
+	if err != nil {
+		return err
+	}
+	// A rebuild replaces the database while it holds the writer lock, after
+	// checking for watcher locks. Opening the database and taking a watcher
+	// lock under the writer lock leaves no point where a rebuild finds no
+	// watcher lock yet replaces the file this watcher opened.
+	openCtx, releaseWriter, err := store.AcquireRepositoryScan(ctx, dbPath, canonical)
+	if err != nil {
+		return fmt.Errorf("watch cannot start: %w", err)
+	}
+	app, repo, repoID, err := openApp(openCtx, cfg, repoRoot)
+	if err != nil {
+		releaseWriter()
+		return err
+	}
 	defer app.Close()
+	watchStartHook("opened")
+	startLock, err := app.Store.OpenWatcherLock(repoID)
+	if err == nil {
+		err = startLock.Hold()
+	}
+	if err == nil {
+		watchStartHook("locked")
+	}
+	releaseWriter()
+	// Held until the watcher holds its own locks, which it takes before ready.
+	defer startLock.Close()
+	if err != nil {
+		return err
+	}
 	if *jsonl {
 		if err := writeJSONL(stdout, map[string]any{
 			"type":      "watch_started",
@@ -2129,7 +2169,14 @@ func watchRepo(ctx context.Context, cfg config.Config, stdout io.Writer, args []
 			writeEvent(statusEvent(watchRunWatching))
 		}
 	}
-	err = w.RunWithReady(ctx, repo.RootPath, repoID, cfg.WatchDebounce, ready)
+	started := func() {
+		startLock.Close()
+		if ready != nil {
+			ready()
+		}
+	}
+	watchStartHook("run")
+	err = w.RunWithReady(ctx, repo.RootPath, repoID, cfg.WatchDebounce, started)
 	reporterCancel()
 	reporterDone.Wait()
 	if *jsonl {
@@ -2721,6 +2768,10 @@ func newEmbedder(cfg config.EmbeddingConfig) embedding.Embedder {
 }
 
 var repoDBRemove = os.Remove
+
+// watchStartHook marks the stages of watch startup (opened, locked, run); tests
+// pause there.
+var watchStartHook = func(stage string) {}
 
 func dbPathForRepo(cfg config.Config, repoRoot, canonical string) (string, error) {
 	paths, err := repoDBPathsForRepo(cfg, repoRoot, canonical)
