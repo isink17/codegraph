@@ -56,7 +56,7 @@ Malformed `use` declarations are skipped.
 
 Only the Rust module pass resolves Rust calls, and generic repository-wide matching never sees a Rust edge. Crate membership comes from primary evidence only:
 - Any `lib.rs` or `main.rs` is a crate root, identified by its full stored path. A matching basename never makes two roots the same crate.
-- Membership spreads through `mod` declarations to exactly one of `name.rs` or `name/mod.rs`.
+- Membership spreads through `mod` declarations to exactly one of `name.rs` or `name/mod.rs`. A `mod name;` inside inline modules is looked up one directory deeper per inline module, as rustc does (`mod m { mod sub; }` in `lib.rs` is `m/sub.rs`). Under an inline module with an attribute that may move or remove it, such as `#[path]` or `#[cfg]`, the declaration links no file.
 - Two candidate files, or a file claimed by two crates, prove nothing.
 - Stored membership is a cache, not proof. A file whose `mod` declaration disappears loses its membership.
 - Finding roots by directory prefix only decides which rows to load.

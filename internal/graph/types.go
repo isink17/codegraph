@@ -444,6 +444,8 @@ type RustModule struct {
 	// ("name" under lib.rs, main.rs or mod.rs; "<file stem>/name" otherwise).
 	// The store joins it with the declaring file's logical repository path and
 	// matches "<stem>.rs" or "<stem>/mod.rs" exactly. Empty for inline modules.
+	// Inline modules around the declaration are not in the stem: the store
+	// inserts one directory per inline module of OwnerModule before the name.
 	ExternalPath string
 	Inline       bool
 	Visibility   string
