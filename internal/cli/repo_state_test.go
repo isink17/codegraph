@@ -182,6 +182,43 @@ func TestServeExplicitUnindexedRootWritesNothing(t *testing.T) {
 	assertUntouched(t, root, before)
 }
 
+func TestServeStartupDoesNotScanAnIndexedRoot(t *testing.T) {
+	repoStateCLI(t)
+	root := sourceRepo(t)
+	if _, _, err := runCLI(t, "index", root); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	writeFile(t, filepath.Join(root, "startup-only.go"), "package main\n\nfunc StartupOnly() {}\n")
+
+	res, err := serveSession(t, []string{"--repo-root", root}, callFindHello)
+	if err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if text, isErr := res.toolText(t, 10); isErr || !strings.Contains(text, "Hello") {
+		t.Fatalf("find_symbol during startup = %q (error %v)", text, isErr)
+	}
+
+	canonical, err := store.CanonicalRepoPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(store.SQLiteDriverName(), filepath.Join(canonical, config.RepoArtifactsDir, store.RepoDatabaseFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var files, scans int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&files); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scans WHERE status='completed'`).Scan(&scans); err != nil {
+		t.Fatal(err)
+	}
+	if files != 1 || scans != 1 {
+		t.Fatalf("serve startup scanned the root: files=%d completed_scans=%d", files, scans)
+	}
+}
+
 func TestServeIndexRepoCreatesThenLaterSessionReuses(t *testing.T) {
 	repoStateCLI(t)
 	root := sourceRepo(t)
