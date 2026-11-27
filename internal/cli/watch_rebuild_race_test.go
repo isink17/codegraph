@@ -206,6 +206,8 @@ func TestRebuildCannotReplaceDatabaseOfStartingWatcher(t *testing.T) {
 				case <-paused:
 				case err := <-run.done:
 					t.Fatalf("watch stopped before stage %s: %v", stage, err)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("watch never reached stage %s", stage)
 				}
 				err := f.rebuild()
 				close(proceed)
